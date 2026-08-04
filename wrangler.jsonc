@@ -1,0 +1,244 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+
+  // ⚠️ MUST MATCH THE WORKER NAME IN THE CLOUDFLARE DASHBOARD.
+  //
+  // The Worker service created by Workers Builds is called "app-ordence".
+  // This file previously said "ordence". When those two disagree, the build
+  // succeeds and then the deploy step either targets a Worker that does not
+  // exist or silently creates a SECOND one — leaving you looking at an
+  // app-ordence that never receives the code. Cloudflare's own dashboard
+  // banner ("Update wrangler.jsonc in your repo to keep settings
+  // consistent") is warning about exactly this line.
+  "name": "app-ordence",
+
+  "main": ".open-next/worker.js",
+
+  // Pinned. A newer date can change runtime behaviour under you between
+  // deploys, which is the last thing you want on a production CRM.
+  "compatibility_date": "2025-03-25",
+  "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
+
+  "assets": {
+    "directory": ".open-next/assets",
+    "binding": "ASSETS"
+  },
+
+  // ⚠️ "service" must be the SAME string as "name" above. This is how the
+  // Worker calls itself for Next.js features that re-enter the app
+  // (revalidation, ISR). A stale name here fails at runtime, not build
+  // time — the worst kind of mismatch, because the deploy looks green.
+  "services": [
+    { "binding": "WORKER_SELF_REFERENCE", "service": "app-ordence" }
+  ],
+
+  /**
+   * ⚠️ THE ROUTES MUST BE DECLARED HERE OR THE NEXT DEPLOY DELETES THEM.
+   *
+   * `wrangler deploy` replaces the Worker's ENTIRE remote configuration
+   * with this file — not just the variables. The v21 deploy log said so
+   * outright:
+   *
+   *   "The local configuration ... differs from the remote configuration
+   *    of your Worker set via the Cloudflare Dashboard:
+   *      -  pattern: "*.ordence.com/*"
+   *      -  pattern: "app.ordence.com"  custom_domain: true
+   *    Uploading the Worker will override the remote configuration."
+   *
+   * Those minus signs are removals. The only reason the routes still
+   * exist is that the deploy FAILED on size before it got that far. The
+   * first successful deploy would have taken app.ordence.com offline and
+   * removed every tenant subdomain with it — and reported success.
+   *
+   * ⚠️ `custom_domain: true` on app.ordence.com is not cosmetic. It is
+   * what makes Cloudflare manage the DNS record and the TLS certificate
+   * for that hostname. Declaring it as a plain route instead would leave
+   * the certificate unmanaged.
+   */
+  "routes": [
+    {
+      "pattern": "app.ordence.com",
+      "zone_name": "ordence.com",
+      "custom_domain": true
+    },
+    {
+      "pattern": "*.ordence.com/*",
+      "zone_name": "ordence.com"
+    }
+  ],
+
+  "observability": { "enabled": true },
+
+  // ── Non-secret configuration ───────────────────────────────────────
+  //
+  // 🛑 THESE MUST LIVE HERE, NOT IN THE DASHBOARD. READ THIS BEFORE
+  //    MOVING THEM BACK.
+  //
+  // `npx wrangler deploy` REPLACES the Worker's configuration with this
+  // file. Anything set through the dashboard's "Variables and secrets"
+  // panel that is absent here is DELETED on the next deploy.
+  //
+  // Secrets are exempt — Cloudflare stores those separately and wrangler
+  // leaves them alone. Plaintext variables are not. That asymmetry is
+  // what made the failure so confusing: after every push the three
+  // Secrets remained and all four plaintext variables vanished, so the
+  // app broke again with "Missing publishableKey" and it looked like
+  // somebody had deleted them by hand.
+  //
+  // Nothing below is secret. The Clerk PUBLISHABLE key is designed to be
+  // read by browsers; the two URLs are public by definition; the admin
+  // email is already on the marketing site. The four genuine secrets —
+  // DATABASE_URL, DATABASE_URL_UNPOOLED, CLERK_SECRET_KEY and
+  // CLERK_WEBHOOK_SIGNING_SECRET — stay in the dashboard as Secrets and
+  // must NEVER appear in this file, which is committed to git.
+  "vars": {
+    /**
+     * ⭐ PRODUCTION CLERK KEY — changed v0.54.0.
+     *
+     * ══════════════════════════════════════════════════════════════════
+     * 🛑 DO NOT DEPLOY THIS UNTIL CLERK SAYS "SSL certificates: Issued"
+     * ══════════════════════════════════════════════════════════════════
+     * This key is base64 for `clerk.ordence.com$` — it tells every
+     * browser to load Clerk's script from `https://clerk.ordence.com`.
+     *
+     * That hostname does not serve Clerk yet. Its five DNS records are
+     * still Unverified, so no TLS certificate has been issued for it, so
+     * the browser refuses the script before it runs. The result is a
+     * sign-in page that renders and does nothing — no error a user could
+     * report, and identical in appearance to the Account Portal bug we
+     * fixed in v0.50.0.
+     *
+     * ⚠️ AND `clerk.ordence.com` ALREADY RESOLVES, WHICH IS THE TRAP.
+     * The `*.ordence.com` wildcard added for tenant subdomains catches
+     * every hostname with no record of its own — so `clerk.ordence.com`
+     * currently answers, proxied, pointing at THIS Worker. Verified from
+     * outside: it returns 172.67.186.39, the same address as
+     * app.ordence.com. "The DNS resolves" therefore proves nothing here,
+     * and is exactly what Clerk's "could not determine the current DNS
+     * value" message is complaining about.
+     *
+     * The gate is Clerk's own SSL panel, nothing else.
+     *
+     * Rollback if it goes wrong: put the old development key back —
+     * pk_test_cHJldHR5LXNocmV3LTQyLmNsZXJrLmFjY291bnRzLmRldiQ — and
+     * restore the development CLERK_SECRET_KEY in the dashboard. Both
+     * instances stay live, so this reverts cleanly.
+     */
+    "NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY": "pk_live_Y2xlcmsub3JkZW5jZS5jb20k",
+    "NEXT_PUBLIC_APP_URL": "https://app.ordence.com",
+    "NEXT_PUBLIC_ROOT_DOMAIN": "app.ordence.com",
+
+    // ⭐ THE ZONE TENANT SUBDOMAINS HANG OFF — added v0.43.0.
+    //
+    // ⚠️ THESE TWO MUST LIVE HERE, NOT ONLY IN THE DASHBOARD. `wrangler
+    // deploy` REPLACES the Worker's plaintext variables with whatever
+    // this block says. A variable added through the dashboard and absent
+    // here is deleted by the next successful deploy — silently, with the
+    // deploy reporting success. The deploy log lists the bindings it is
+    // about to apply; if a variable is missing from that list, it is
+    // about to be removed.
+    //
+    // Losing these two does not break the build or throw an error. It
+    // just makes admin.ordence.com stop being the staff console and
+    // acme.ordence.com stop resolving to a tenant, which looks like a
+    // code bug and is not one.
+    "NEXT_PUBLIC_ZONE_DOMAIN": "ordence.com",
+    "PLATFORM_HOST": "admin.ordence.com",
+    "PLATFORM_ADMIN_EMAILS": "Sahil@ordence.com",
+
+    // Background jobs run inside the request until a real queue is bound.
+    // "0" would make them refuse rather than run — never silently skip.
+    "ORDENCE_INLINE_JOBS": "1",
+
+    /**
+     * ⭐ EMAIL — added v0.49.0.
+     *
+     * ⚠️ THE DOMAIN HERE IS `updates.ordence.com`, NOT `ordence.com`.
+     *
+     * That is the subdomain actually verified in Resend. Resend rejects a
+     * send whose From address is on an unverified domain, and the error is
+     * a 403 at send time — not at deploy time, not at build time. So a
+     * `noreply@ordence.com` here looks completely fine until the first
+     * demand notice silently fails to go out.
+     *
+     * Sending transactional mail from a SUBDOMAIN is also the right call
+     * on its own merits: a deliverability problem on bulk mail then cannot
+     * damage the reputation of the root domain your human staff email
+     * from.
+     *
+     * The RESEND_API_KEY is a Secret and lives in the dashboard, never
+     * here.
+     */
+    "RESEND_FROM_EMAIL": "Ordence <noreply@updates.ordence.com>",
+
+    /**
+     * ⭐ CACHE & RATE LIMITING — added v0.49.0.
+     *
+     * The REST URL is not a credential; it is a hostname anyone can
+     * resolve. UPSTASH_REDIS_REST_TOKEN is the credential and is a Secret.
+     *
+     * ⚠️ This database is in Mumbai (ap-south-1) and Neon is in Singapore
+     * (ap-southeast-1). That is fine — the Worker talks to each
+     * independently, so the two never wait on each other — but it does
+     * mean cache reads are NOT automatically faster than database reads
+     * from every edge location. Measure before assuming a cache helps.
+     */
+    "UPSTASH_REDIS_REST_URL": "https://joint-whale-180742.upstash.io",
+
+    /**
+     * ⭐ CONTENT-SECURITY-POLICY — added v0.67.0.
+     *
+     * ══════════════════════════════════════════════════════════════════
+     * 🛑 THIS IS "false" ON PURPOSE. DO NOT SET IT TO "true" BLIND.
+     * ══════════════════════════════════════════════════════════════════
+     * The policy is sent on every HTML response either way. The only
+     * thing this variable changes is WHICH HEADER carries it:
+     *
+     *   "false" → Content-Security-Policy-Report-Only
+     *             The browser evaluates the policy, logs every violation
+     *             to the console, and blocks NOTHING.
+     *
+     *   "true"  → Content-Security-Policy
+     *             The browser blocks. Anything the policy failed to
+     *             anticipate stops working, for every customer, at once.
+     *
+     * This application has never run behind a CSP, so the true set of
+     * sources it needs is currently a belief rather than a measurement.
+     * An enforcing policy that is one directive short does not degrade
+     * gracefully — it white-screens the app, and the only evidence is in
+     * each user's own browser console.
+     *
+     * ⚠️ THE ORDER OF OPERATIONS, WHEN YOU ARE READY:
+     *   1. Leave it "false" and use the product normally for a few days —
+     *      sign in, upload a document, open the dashboard, run a report.
+     *   2. Open DevTools → Console on each and look for
+     *      "Refused to load … because it violates the following
+     *      Content Security Policy directive".
+     *   3. Add each blocked source to the right directive in
+     *      `lib/security/csp.ts`. Re-deploy. Repeat until a full pass
+     *      through the app is silent.
+     *   4. ONLY THEN set this to "true".
+     *
+     * Rollback is this variable and a re-deploy. Nothing else changes.
+     */
+    "CSP_ENFORCE": "false"
+  },
+
+  // ── Storage ────────────────────────────────────────────────────────
+  // NEXT_INC_CACHE_R2_BUCKET  — Next.js page cache
+  // DOCUMENTS                 — customer uploads (replaces Vercel Blob)
+  //
+  // 🛑 BOTH BUCKETS MUST ALREADY EXIST IN YOUR CLOUDFLARE ACCOUNT before a
+  // deploy can succeed. Wrangler does not create them for you; it fails
+  // with "The specified bucket does not exist" and the whole build goes
+  // red. Create them at: Storage & databases → R2 → Create bucket.
+  //
+  // ⚠️ Serving customer files from R2 is what keeps this within
+  // Cloudflare's terms. Their CDN rules permit serving large/non-HTML
+  // content provided it is hosted on a Cloudflare service; R2 qualifies,
+  // an outside file host would not.
+  "r2_buckets": [
+    { "binding": "NEXT_INC_CACHE_R2_BUCKET", "bucket_name": "ordence-cache" },
+    { "binding": "DOCUMENTS", "bucket_name": "ordence-documents" }
+  ]
+}

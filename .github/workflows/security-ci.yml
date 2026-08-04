@@ -1,0 +1,565 @@
+name: Security CI
+
+# ══════════════════════════════════════════════════════════════════════════
+# THE POINT OF THIS FILE
+# ══════════════════════════════════════════════════════════════════════════
+#
+# Five phases of the platform enforce tenant isolation, balanced books and an
+# unalterable audit trail. Every one of those guarantees lives in code and SQL
+# that a future commit could quietly break.
+#
+# This pipeline runs on EVERY push and pull request to `main`. If any security
+# test fails, the run goes red. Combined with a branch protection rule
+# (see docs/PHASE-6-DEPLOYMENT.md), that means broken security cannot merge —
+# and therefore cannot reach Vercel.
+#
+# The database here is a real, throwaway PostgreSQL 16 started as a service
+# container. Not a mock. The tests assert what the DATABASE does, so a mock
+# would prove nothing.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  # Lets you run it by hand from the Actions tab.
+  workflow_dispatch:
+
+# Cancel an in-flight run when new commits land on the same branch —
+# saves GitHub Actions minutes on the free tier.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: "20"
+
+jobs:
+  # ────────────────────────────────────────────────────────────────────
+  # JOB 1 — Types and build
+  # ────────────────────────────────────────────────────────────────────
+  build:
+    name: Type-check & Build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: TypeScript strict check
+        run: npx tsc --noEmit
+
+      - name: Production build
+        # Placeholder values only. The build must not require real secrets —
+        # if it does, that itself is a problem worth failing on.
+        env:
+          NEXT_PUBLIC_APP_URL: http://localhost:3000
+          NEXT_PUBLIC_ROOT_DOMAIN: localhost:3000
+          NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY: pk_test_ZmFrZS1jbGVyay1idWlsZC5hY2NvdW50cy5kZXYk
+          CLERK_SECRET_KEY: sk_test_ci_placeholder_not_a_real_key
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/placeholder
+          DATABASE_URL_UNPOOLED: postgresql://postgres:postgres@localhost:5432/placeholder
+        run: npm run build
+
+      - name: Verify no secrets reached the client bundle
+        # A real leak check against the compiled output, not an assumption.
+        run: |
+          echo "Scanning .next/static for server secrets…"
+          # ══════════════════════════════════════════════════════════════
+          # 🔴 THIS GUARD IS THE WHOLE STEP. IT WAS MISSING.
+          # ══════════════════════════════════════════════════════════════
+          # Every check below is `grep -rq … .next/static/ 2>/dev/null`,
+          # and grep over a directory that DOES NOT EXIST exits 1 with the
+          # error swallowed. That is the same exit code as "found nothing".
+          #
+          # So the step printed "✅ No server secrets in the client bundle"
+          # and exited 0 — truthfully reporting on a directory it never
+          # read. The day an output-mode change or an opennextjs upgrade
+          # stops emitting `.next/static`, the leak check silently becomes
+          # a no-op and keeps saying ✅ forever.
+          #
+          # A check that cannot fail is worse than no check, because it is
+          # believed.
+          # ══════════════════════════════════════════════════════════════
+          if [ ! -d .next/static ]; then
+            echo "::error::.next/static does not exist — the build produced no client bundle, so this leak check would have passed vacuously"
+            exit 1
+          fi
+          FAILED=0
+          if grep -rq "sk_test_ci_placeholder" .next/static/ 2>/dev/null; then
+            echo "::error::CLERK_SECRET_KEY found in the client bundle"
+            FAILED=1
+          fi
+          if grep -rq "postgresql://" .next/static/ 2>/dev/null; then
+            echo "::error::A postgres connection string found in the client bundle"
+            FAILED=1
+          fi
+          if [ $FAILED -eq 0 ]; then
+            echo "✅ No server secrets in the client bundle"
+          fi
+          exit $FAILED
+
+  # ────────────────────────────────────────────────────────────────────
+  # JOB 2 — Security tests against a real PostgreSQL
+  # ────────────────────────────────────────────────────────────────────
+  security-tests:
+    name: Security Test Suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: ameya_test
+        ports:
+          - 5432:5432
+        # Do not start the job until the database is actually accepting
+        # connections — otherwise the first query races the container.
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install PostgreSQL client
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+
+      - name: Create the schema
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/ameya_test
+          DATABASE_URL_UNPOOLED: postgresql://postgres:postgres@localhost:5432/ameya_test
+        run: npx drizzle-kit push --force
+
+      - name: Create a NON-superuser application role
+        # ══════════════════════════════════════════════════════════════
+        # WITHOUT THIS STEP THE ENTIRE SUITE IS WORTHLESS.
+        #
+        # A PostgreSQL superuser bypasses Row-Level Security completely.
+        # Running the isolation tests as `postgres` would report green
+        # forever — including on the day someone drops every policy.
+        #
+        # So the tests connect as `ordence_app`, which is NOSUPERUSER and
+        # NOBYPASSRLS, exactly like the application does in production.
+        #
+        # ⚠️ AND IT RUNS BEFORE THE SQL FILES — REORDERED IN v0.31.0.
+        #
+        # This blanket `GRANT ... ON ALL TABLES` is deliberately broad,
+        # and every SQL file below then NARROWS it: ALL-IN-ONE revokes
+        # UPDATE on `plans` (so a tenant cannot reprice themselves) and
+        # UPDATE/DELETE on `payment_events` (so payment evidence cannot
+        # be altered); 0022 revokes DELETE on the three tables recording
+        # what our own staff did.
+        #
+        # Run the other way round — as this workflow did until v0.31.0 —
+        # the blanket grant lands LAST and silently undoes all of them.
+        # Measured on a fresh database: `npm run db:verify` then reports
+        #
+        #     THE APPLICATION ROLE HOLDS: UPDATE on plans (can reprice
+        #     itself); UPDATE on payment_events; DELETE on
+        #     payment_events; DELETE on subscriptions
+        #
+        # Nothing else notices. The application works perfectly.
+        # ══════════════════════════════════════════════════════════════
+        env:
+          PGPASSWORD: postgres
+        run: |
+          psql -h localhost -U postgres -d ameya_test -v ON_ERROR_STOP=1 <<'SQL'
+            DROP ROLE IF EXISTS ordence_app;
+            CREATE ROLE ordence_app LOGIN PASSWORD 'ci_test_password'
+              NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE;
+            GRANT USAGE ON SCHEMA public TO ordence_app;
+            GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO ordence_app;
+            GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO ordence_app;
+            ALTER DEFAULT PRIVILEGES IN SCHEMA public
+              GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO ordence_app;
+          SQL
+          echo "✅ Non-superuser role created — RLS will actually apply"
+
+      - name: Apply the security SQL
+        # This is also a test in its own right: if ALL-IN-ONE-SETUP.sql has a
+        # syntax error or references a missing table, the pipeline fails here.
+        env:
+          PGPASSWORD: postgres
+        run: |
+          psql -h localhost -U postgres -d ameya_test \
+               -v ON_ERROR_STOP=1 \
+               -f SQL-FILES/ALL-IN-ONE-SETUP.sql
+          echo "✅ Security SQL applied without error"
+
+      - name: ⭐ Apply the numbered SQL files, in order
+        # ══════════════════════════════════════════════════════════════
+        # 🔴 THIS STEP WAS MISSING, AND CI COULD NOT HAVE BEEN GREEN.
+        # ══════════════════════════════════════════════════════════════
+        # `ALL-IN-ONE-SETUP.sql` is the PHASE 1–22 BASELINE. It is not
+        # the whole database. Everything from Phase 23 onward ships as a
+        # numbered file, and none of them was being applied here:
+        #
+        #   0017  change_log        0020  saved_views
+        #   0018  workflows         0021  gst_*
+        #   0019  dynamic_objects   0022  the admin console
+        #
+        # `drizzle-kit push` creates those TABLES, so the suite appeared
+        # to work — but their RLS POLICIES live in these files, and
+        # policies are exactly what push does not know about. The
+        # verifier below names all of those tables, so it would have
+        # failed on every one.
+        #
+        # ⚠️ ORDER MATTERS TWICE OVER.
+        #
+        # Between the files: each depends on functions and tables the
+        # previous ones create (`record_change()`, `set_updated_at()`,
+        # `dynamic_objects`). `ON_ERROR_STOP=1` means a wrong order is a
+        # red build rather than a half-applied database.
+        #
+        # And AFTER the blanket role grant above, not before. 0022
+        # REVOKEs DELETE on the three evidence tables; run first, that
+        # revoke would be silently undone by the `GRANT ... ON ALL
+        # TABLES` that followed it, and an operator would regain the
+        # ability to erase the record of their own access.
+        #
+        # ══════════════════════════════════════════════════════════════
+        # 🔴 THE `env:` BLOCK BELOW APPEARS ONCE. IT USED TO APPEAR TWICE.
+        # ══════════════════════════════════════════════════════════════
+        # This step carried two `env: PGPASSWORD: postgres` mappings,
+        # separated by the comment block that follows. YAML forbids a
+        # duplicate key in one mapping, so GitHub rejected the FILE — not
+        # the step, not the job, the whole workflow — with
+        #
+        #     'env' is already defined
+        #
+        # A workflow that fails to parse produces no jobs, no red cross on
+        # the commit, and no notification. It is indistinguishable from a
+        # workflow nobody triggered. That is why this pipeline was "never
+        # observed passing": it never ran once.
+        #
+        # ⚠️ The lesson is not "be careful with YAML". It is that a
+        # comment written between a key and its intended position is how
+        # the duplicate got there — the second `env:` was added while
+        # documenting the loop below, directly beneath its own prose.
+        # Keep step-level configuration ABOVE all commentary.
+        # ══════════════════════════════════════════════════════════════
+        env:
+          PGPASSWORD: postgres
+        # ══════════════════════════════════════════════════════════════
+        # 🔴 THIS LOOP USED TO BE A HAND-TYPED LIST ENDING AT 0022.
+        #
+        # Nine files — 0023 purchases, 0024 GSTR-2B, 0025 TDS, 0026 Tally,
+        # 0027 receivables, 0028 orders, 0029 inventory, 0030 land, 0031
+        # RA bills — were written, shipped, and applied to the production
+        # database, and never once applied here. `drizzle-kit push`
+        # created their TABLES, so nothing looked obviously absent; only
+        # their POLICIES were missing, which is precisely the thing this
+        # pipeline exists to check. Every phase after 32 was effectively
+        # untested for tenant isolation.
+        #
+        # A list that must be edited by hand every time a file is added is
+        # a list that will be forgotten, and the forgetting is silent. So
+        # it globs now. The glob is anchored to the `NNNN_` prefix so that
+        # the RUN-THESE-IN-ORDER-*.sql copies — which are duplicates of
+        # 0028–0031, cut for the operator to paste into Neon by hand —
+        # are not applied a second time.
+        #
+        # `sort` is what makes the ordering real rather than incidental:
+        # shell glob expansion is locale-dependent, and these files must
+        # run in numeric order because each depends on functions and
+        # tables the earlier ones create.
+        # ══════════════════════════════════════════════════════════════
+        run: |
+          shopt -s nullglob
+          FILES=$(ls SQL-FILES/[0-9][0-9][0-9][0-9]_*.sql | sort)
+          if [ -z "$FILES" ]; then
+            echo "::error::No numbered SQL files matched — the glob is wrong"
+            exit 1
+          fi
+          COUNT=0
+          for f in $FILES; do
+            echo "── $f"
+            psql -h localhost -U postgres -d ameya_test \
+                 -v ON_ERROR_STOP=1 \
+                 -f "$f"
+            COUNT=$((COUNT + 1))
+          done
+          echo "✅ $COUNT numbered SQL files applied in order"
+
+      - name: Verify RLS coverage before running tests
+        # A fast fail: if fewer than 100 tables are protected, something in
+        # the SQL did not apply and the detailed tests would be
+        # misleading. The floor was 25 when the baseline was the whole
+        # database; it is raised here so that a numbered file failing to
+        # apply cannot pass this step.
+        #
+        # ⚠️ THE COMMENT USED TO SAY 55 WHILE THE CODE SAID 100. Whichever
+        # of the two a future reader trusts, one of them is wrong, and a
+        # threshold nobody trusts gets lowered the first time it is
+        # inconvenient. They now agree. Static count of
+        # `ALTER TABLE … ENABLE ROW LEVEL SECURITY` targets across
+        # SQL-FILES/ is 95, plus the tables enabled inside the
+        # `DO … EXECUTE format(...)` loops in 0019 and 0029–0038.
+        env:
+          PGPASSWORD: postgres
+        run: |
+          COUNT=$(psql -h localhost -U postgres -d ameya_test -tAc \
+            "SELECT count(*) FROM pg_tables WHERE schemaname='public' AND rowsecurity=true")
+          echo "RLS-protected tables: $COUNT"
+          if [ "$COUNT" -lt 100 ]; then
+            echo "::error::Expected at least 100 RLS-protected tables, found $COUNT"
+            exit 1
+          fi
+          echo "✅ $COUNT tables protected"
+
+      - name: ⭐ Verify the security state survived the schema push
+        # `drizzle-kit push` DROPS RLS policies — it treats anything not in
+        # the Drizzle schema as drift. Measured during Phase 10:
+        #   before push -> 25 tables with RLS, 25 policies
+        #   after  push ->  0 tables with RLS,  0 policies
+        # The setup SQL above restores them. This asserts it actually did,
+        # because the failure has no symptom other than tenants reading
+        # each other's data.
+        #
+        # ⚠️ BOTH VARIABLES ARE SET, AND THE SECOND ONE IS THE POINT.
+        # `scripts/verify-security.ts` reads
+        #     process.env.DATABASE_URL_UNPOOLED ?? process.env.DATABASE_URL
+        # so on a self-hosted runner that already exports the unpooled
+        # variable — pointing at a REAL database — this step would have
+        # verified, and potentially written to, production. Setting both
+        # explicitly means the ambient environment cannot redirect it.
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/ameya_test
+          DATABASE_URL_UNPOOLED: postgresql://postgres:postgres@localhost:5432/ameya_test
+        run: npm run db:verify
+
+      - name: Write .env.test
+        run: |
+          cat > .env.test <<'EOF'
+          TEST_DATABASE_URL="postgresql://ordence_app:ci_test_password@localhost:5432/ameya_test"
+          TEST_ADMIN_DATABASE_URL="postgresql://postgres:postgres@localhost:5432/ameya_test"
+          ALLOW_DESTRUCTIVE_TESTS="true"
+          NODE_ENV="test"
+          EOF
+
+      - name: Run the security test suite
+        run: npm run test:security
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: test-results/
+          retention-days: 14
+          if-no-files-found: ignore
+
+  # ────────────────────────────────────────────────────────────────────
+  # JOB 2b — UI behaviour tests (no database required)
+  # ────────────────────────────────────────────────────────────────────
+  #
+  # These render real components in jsdom and drive them with real keyboard
+  # input. They exist because two guarantees in this product are enforced
+  # in the browser as well as the database, and a `disabled` attribute that
+  # silently stops working is invisible until a customer reports it:
+  #
+  #   - the double-entry form must refuse to submit unbalanced entries
+  #   - the dynamic JSONB form must render an input per field definition
+  #
+  # Both were caught regressing during Phase 7 development by exactly these
+  # tests, so they earn their place in the gate.
+  ui-tests:
+    name: UI Behaviour Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run the UI test suite
+        run: npm run test:ui
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ui-test-results
+          path: test-results/
+          retention-days: 14
+          if-no-files-found: ignore
+
+  # ────────────────────────────────────────────────────────────────────
+  # JOB 3 — Dependency audit
+  # ────────────────────────────────────────────────────────────────────
+  dependency-audit:
+    name: Dependency Audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Audit PRODUCTION dependencies
+        # ══════════════════════════════════════════════════════════════
+        # 🔴 THIS STEP USED TO BE `npm audit --omit=dev --audit-level=high`
+        #    AND IT FAILED EVERY SINGLE RUN.
+        # ══════════════════════════════════════════════════════════════
+        # Three high advisories sit inside dependencies that Next.js
+        # BUNDLES — `postcss` (build-time only) and `sharp` (the image
+        # optimiser, unused on Cloudflare Workers). The only remedy npm
+        # offers is `next@16`, a major upgrade.
+        #
+        # So this gate was red permanently, for a reason nobody could act
+        # on. A permanently-red gate is not strict — it is one everybody
+        # learns to skip, and the day a real advisory lands in a real
+        # dependency it arrives on a job that was already failing.
+        #
+        # `scripts/audit-gate.mjs` fails on every high/critical advisory
+        # EXCEPT ones listed by GHSA id with a written reason and an
+        # EXPIRY DATE. Past its date an exception stops applying and the
+        # build goes red on its own — so the decision gets made again by
+        # someone who has to look at it. Read the header of that file.
+        #
+        # Only `--omit=dev`. Dev-tool advisories never ship to users, and
+        # failing the build on them would train everyone to ignore this.
+        run: |
+          echo "Auditing production dependencies…"
+          node scripts/audit-gate.mjs
+
+      - name: Report dev-dependency advisories (informational)
+        continue-on-error: true
+        run: |
+          echo "Dev-dependency advisories (informational — does not fail the build):"
+          npm audit --audit-level=high || true
+
+  # ────────────────────────────────────────────────────────────────────
+  # JOB 4 — Secret scanning
+  # ────────────────────────────────────────────────────────────────────
+  secret-scan:
+    name: Secret Scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check that no .env file was committed
+        run: |
+          FOUND=$(git ls-files | grep -E '^\.env($|\.local$|\.production$|\.test$)' || true)
+          if [ -n "$FOUND" ]; then
+            echo "::error::An environment file is tracked in git: $FOUND"
+            echo "Remove it and rotate every key it contained."
+            exit 1
+          fi
+          echo "✅ No environment files tracked in git"
+
+      - name: Scan the working tree for live secret patterns
+        run: |
+          FAILED=0
+          # Live Clerk secret keys.
+          if git grep -nE 'sk_live_[A-Za-z0-9]{20,}' -- . ':!*.md' ':!.github/*' 2>/dev/null; then
+            echo "::error::A live Clerk secret key appears in the source"
+            FAILED=1
+          fi
+          # Real-looking database URLs with an embedded password.
+          if git grep -nE 'postgres(ql)?://[^:]+:[^@]{8,}@' -- . ':!*.md' ':!*.example' ':!.github/*' 2>/dev/null; then
+            echo "::error::A database URL with a password appears in the source"
+            FAILED=1
+          fi
+          # AWS access keys.
+          if git grep -nE 'AKIA[0-9A-Z]{16}' -- . ':!*.md' 2>/dev/null; then
+            echo "::error::An AWS access key appears in the source"
+            FAILED=1
+          fi
+          if [ $FAILED -eq 0 ]; then
+            echo "✅ No live secret patterns found"
+          fi
+          exit $FAILED
+
+  # ────────────────────────────────────────────────────────────────────
+  # GATE — everything must pass
+  # ────────────────────────────────────────────────────────────────────
+  security-gate:
+    name: Security Gate
+    runs-on: ubuntu-latest
+    needs: [build, security-tests, ui-tests, dependency-audit, secret-scan]
+    if: always()
+
+    steps:
+      - name: Evaluate
+        # `needs.*.result` is checked explicitly because a skipped or cancelled
+        # job is NOT a pass, and `if: always()` would otherwise let it through.
+        run: |
+          echo "Build:            ${{ needs.build.result }}"
+          echo "Security tests:   ${{ needs.security-tests.result }}"
+          echo "UI tests:         ${{ needs.ui-tests.result }}"
+          echo "Dependency audit: ${{ needs.dependency-audit.result }}"
+          echo "Secret scan:      ${{ needs.secret-scan.result }}"
+          echo ""
+
+          if [ "${{ needs.build.result }}" != "success" ] || \
+             [ "${{ needs.security-tests.result }}" != "success" ] || \
+             [ "${{ needs.ui-tests.result }}" != "success" ] || \
+             [ "${{ needs.dependency-audit.result }}" != "success" ] || \
+             [ "${{ needs.secret-scan.result }}" != "success" ]; then
+            echo "::error::SECURITY GATE FAILED — this commit must not be deployed."
+            exit 1
+          fi
+
+          echo "════════════════════════════════════════════════"
+          echo "  ✅ SECURITY GATE PASSED"
+          echo "════════════════════════════════════════════════"
+          echo "  Tenant isolation ....... verified"
+          echo "  Financial integrity .... verified"
+          echo "  Audit immutability ..... verified"
+          echo "  Balance gate (UI) ...... verified"
+          echo "  Document isolation ..... verified"
+          echo "  Blob token gate ........ verified"
+          echo "  Portal token gate ...... verified"
+          echo "  Signature replay ....... verified"
+          echo "  Analytics view RLS ..... verified"
+          echo "  No secrets leaked ...... verified"
+          echo "  Production deps clean .. verified"
+          echo "════════════════════════════════════════════════"

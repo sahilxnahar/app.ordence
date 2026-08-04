@@ -1,0 +1,61 @@
+# dependencies
+/node_modules
+/.pnp
+.pnp.*
+
+# next.js
+/.next/
+/out/
+next-env.d.ts
+
+# production
+/build
+/dist
+
+# misc
+.DS_Store
+*.pem
+.vscode/
+.idea/
+
+# debug logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# ==========================================
+# SECRETS — never commit these
+# ==========================================
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+*.key
+*.pem
+secrets.json
+
+# vercel
+.vercel
+
+# typescript
+*.tsbuildinfo
+
+# drizzle
+/db/migrations/meta/_journal.json.bak
+
+# test environment (never commit)
+.env.test
+
+# Cloudflare build output
+/.open-next/
+.wrangler/
+
+# Local Workers secrets — NEVER commit. Holds real database and Clerk keys
+# for `wrangler dev`, which reads it automatically.
+.dev.vars
+.dev.vars.*
+
+# Vitest JUnit output — generated, never committed.
+test-results/
