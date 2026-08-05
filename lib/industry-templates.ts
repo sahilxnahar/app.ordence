@@ -320,6 +320,13 @@ const REAL_ESTATE_TEMPLATE: IndustryTemplate = {
          * sequence in their head every time they use it.
          */
         { id: "boq", label: "BOQ", href: "/boq", icon: "file-text" },
+        // ⚠️ Variations sits BETWEEN the BOQ and the bills, deliberately.
+        // That is the order the work happens in: scope is agreed, scope
+        // changes, and only then is the changed scope billed. A menu that
+        // puts variations after billing invites the sequence people
+        // actually regret — bill first, regularise later.
+        { id: "variations", label: "Variations", href: "/variations", icon: "file-text" },
+        { id: "site-labour", label: "Site labour", href: "/site-labour", icon: "users" },
         { id: "ra-bills", label: "RA Bills", href: "/ra-bills", icon: "indian-rupee" },
         { id: "cost-control", label: "Cost Control", href: "/reports/cost", icon: "indian-rupee" },
         { id: "contracts", label: "Contracts", href: "/assets?type=contract", icon: "file-text" },

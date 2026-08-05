@@ -76,6 +76,14 @@ const OPTIONAL = [
   "UPLOAD_TICKET_SECRET",
   "CRON_SECRET",
   "WORKER_API_SECRET",
+  /* ---- v0.73.0-alpha: were read by the code and reported by nothing ---- */
+  "QSTASH_CURRENT_SIGNING_KEY",
+  "QSTASH_NEXT_SIGNING_KEY",
+  // ⚠️ Guards seeding against production. Nothing verified its state.
+  "SEED_ALLOW_PROD",
+  "NEXT_PUBLIC_RELEASE",
+  // Unset means the CSP is report-only, which is the current state.
+  "CSP_ENFORCE",
 
   // Background jobs run inline until a queue is bound.
   "ORDENCE_INLINE_JOBS",

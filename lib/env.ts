@@ -86,6 +86,81 @@ const serverSchema = z.object({
 
   // --- Platform ---
   PLATFORM_ADMIN_EMAILS: z.string().optional(),
+
+  /* ================================================================== *
+   * ⭐ RECONCILIATION — v0.73.0-alpha (Batch 3)
+   * ================================================================== *
+   * 🔴 EVERY VARIABLE BELOW WAS ALREADY BEING READ BY THE CODE AND WAS
+   *    ABSENT FROM THIS SCHEMA.
+   *
+   * Three inventories of "what configures Ordence" existed and all three
+   * disagreed:
+   *
+   *     lib/env.ts       31 variables   ← validated at boot
+   *     /api/diag        26 variables   ← reported to the operator
+   *     .env.example     12 variables   ← what a new developer copies
+   *
+   * The true figure was 43. The twelve missing from here were invisible
+   * to `getServerEnv()`, so a typo in one produced no error at boot, no
+   * error at build, and a feature that silently did nothing.
+   *
+   * Two of them are load-bearing:
+   *
+   *   • UPLOAD_TICKET_SECRET — absent, and EVERY FILE UPLOAD REFUSES.
+   *     `getTicketSecret()` returns null below 32 characters.
+   *   • WORKER_API_SECRET — absent, and `/api/workers` returns 503, so
+   *     ALL BACKGROUND JOBS STOP.
+   *
+   * Both fail CLOSED, which is right — the system is never insecure, it
+   * is inert. But inert with no error is exactly the failure mode this
+   * project has hit four times: something stops working and reports
+   * success. Declaring them here makes them visible.
+   *
+   * ⚠️ THEY STAY OPTIONAL, DELIBERATELY. Making them required would make
+   * `npm run build` depend on a real secret — which is precisely what the
+   * CI build asserts must NOT be true. Optional-and-declared beats
+   * required-and-breaks-the-build, and beats undeclared by a mile.
+   * ================================================================== */
+
+  /** HMAC key for upload tickets. ⚠️ Minimum 32 characters, or uploads refuse. */
+  UPLOAD_TICKET_SECRET: z.string().optional(),
+
+  /** Bearer secret for `/api/workers`. Compared with `timingSafeEqual`. */
+  WORKER_API_SECRET: z.string().optional(),
+
+  /** Vercel-cron auth path. Vestigial on Railway; retained for the rollback. */
+  CRON_SECRET: z.string().optional(),
+
+  /** QStash delivery signatures. Two keys so Upstash can rotate without downtime. */
+  QSTASH_CURRENT_SIGNING_KEY: z.string().optional(),
+  QSTASH_NEXT_SIGNING_KEY: z.string().optional(),
+
+  /**
+   * Run queued jobs in-process instead of dispatching them.
+   * The documented stopgap until a Railway cron service exists.
+   */
+  ORDENCE_INLINE_JOBS: z.string().optional(),
+
+  /** ⚠️ PRINTED ON EVERY INVOICE WE ISSUE. Wrong here is wrong on paper. */
+  PLATFORM_LEGAL_NAME: z.string().optional(),
+  PLATFORM_ADDRESS: z.string().optional(),
+
+  /** Staff-console host override. Defaults to `admin.<zone>`. */
+  PLATFORM_HOST: z.string().optional(),
+
+  /**
+   * ⚠️ GUARDS SEEDING AGAINST PRODUCTION.
+   *
+   * Undeclared until now, and nothing verified it was configured as
+   * intended — a safety catch nobody could see the state of.
+   */
+  SEED_ALLOW_PROD: z.string().optional(),
+
+  /**
+   * Enforce the Content-Security-Policy rather than only reporting it.
+   * Unset means report-only, which is the current production state.
+   */
+  CSP_ENFORCE: z.string().optional(),
 });
 
 /* ------------------------- CLIENT (PUBLIC) --------------------------- */
@@ -96,6 +171,22 @@ const clientSchema = z.object({
   NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY: z.string().min(1),
   NEXT_PUBLIC_CLERK_SIGN_IN_URL: z.string().default("/sign-in"),
   NEXT_PUBLIC_CLERK_SIGN_UP_URL: z.string().default("/sign-up"),
+
+  /* ---- reconciliation, v0.73.0-alpha ---- */
+
+  /**
+   * The zone tenant subdomains hang off. Read by the middleware; was
+   * reported by `/api/diag` and absent from this schema.
+   */
+  NEXT_PUBLIC_ZONE_DOMAIN: z.string().optional(),
+
+  /**
+   * Client-visible release stamp.
+   *
+   * ⚠️ Do NOT wire this to `VERCEL_GIT_COMMIT_SHA` — Railway never sets
+   * that, which is why telemetry rows currently read "unknown".
+   */
+  NEXT_PUBLIC_RELEASE: z.string().optional(),
 });
 
 /* ----------------------------- LOADERS ------------------------------- */

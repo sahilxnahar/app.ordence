@@ -1,0 +1,78 @@
+# ============================================================
+# ORDENCE - Railway variables for the app.ordence service
+# ============================================================
+# Paste this WHOLE block into Railway > Variables > Raw Editor.
+# Then replace every PASTE_HERE with the real value.
+#
+# Lines starting with # are notes. Railway ignores them.
+# A line with nothing after the = is fine - that feature is
+# simply switched off until you fill it in.
+#
+# !! NEVER put these values in a file you push to GitHub. !!
+# ============================================================
+
+# ---- 1. THE THREE YOU CANNOT SKIP --------------------------
+# REQUIRED - Neon connection string
+DATABASE_URL=PASTE_HERE
+# REQUIRED - Clerk dashboard, Secret key
+CLERK_SECRET_KEY=PASTE_HERE
+# REQUIRED - Clerk dashboard, Publishable key
+NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY=PASTE_HERE
+
+# ---- 2. ALREADY FILLED IN FOR YOU --------------------------
+# your app address
+NEXT_PUBLIC_APP_URL=https://app.ordence.com
+NEXT_PUBLIC_ROOT_DOMAIN=ordence.com
+NEXT_PUBLIC_ZONE_DOMAIN=ordence.com
+PLATFORM_HOST=app.ordence.com
+NEXT_PUBLIC_CLERK_SIGN_IN_URL=/sign-in
+NEXT_PUBLIC_CLERK_SIGN_UP_URL=/sign-up
+NODE_ENV=production
+# run background jobs in-process until you add QStash
+ORDENCE_INLINE_JOBS=true
+# turn on once you confirm nothing is blocked
+CSP_ENFORCE=false
+# NEVER set this to true
+SEED_ALLOW_PROD=false
+
+# ---- 3. FILL IN LATER, AS YOU TURN THINGS ON ---------------
+# Neon direct (non-pooled) string - for migrations
+DATABASE_URL_UNPOOLED=
+# Clerk webhook - user sync stops without it
+CLERK_WEBHOOK_SIGNING_SECRET=
+# any long random text - document uploads are inert without it
+UPLOAD_TICKET_SECRET=
+# any long random text - background jobs are inert without it
+WORKER_API_SECRET=
+# any long random text - scheduled jobs
+CRON_SECRET=
+# email sending
+RESEND_API_KEY=
+RESEND_FROM_EMAIL=
+FINANCE_ALERT_EMAILS=
+# who can reach the admin console
+PLATFORM_ADMIN_EMAILS=
+# rate limiting
+UPSTASH_REDIS_REST_URL=
+UPSTASH_REDIS_REST_TOKEN=
+# background job queue
+QSTASH_CURRENT_SIGNING_KEY=
+QSTASH_NEXT_SIGNING_KEY=
+# taking payments
+RAZORPAY_KEY_ID=
+RAZORPAY_KEY_SECRET=
+RAZORPAY_WEBHOOK_SECRET=
+STRIPE_SECRET_KEY=
+STRIPE_WEBHOOK_SECRET=
+# your own GSTIN, for the invoices you issue
+PLATFORM_GSTIN=
+PLATFORM_GST_STATE_CODE=
+PLATFORM_INVOICE_PREFIX=
+PLATFORM_LEGAL_NAME=
+PLATFORM_ADDRESS=
+# document storage
+BLOB_READ_WRITE_TOKEN=
+TELEMETRY_RELEASE=
+NEXT_PUBLIC_RELEASE=
+TELEMETRY_DISABLED=
+

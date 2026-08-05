@@ -281,3 +281,6 @@ export * from "./construction";
 // who was actually on site, and that is this file. Without it the gate
 // verifies a document against nothing
 export * from "./labour";
+
+// ⭐ MCP access — tokens and the append-only call log (Batch 5).
+export * from "./mcp";

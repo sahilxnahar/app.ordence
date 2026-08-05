@@ -1,6 +1,6 @@
 {
   "name": "ordence",
-  "version": "0.21.0-alpha",
+  "version": "0.75.0-alpha",
   "private": true,
   "scripts": {
     "dev": "next dev",
@@ -10,7 +10,7 @@
     "typecheck": "tsc --noEmit",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "drizzle-kit migrate",
-    "db:push": "node -e \"if(process.env.NODE_ENV==='production'){console.error('\\\\n\\u26d4 drizzle-kit push is FORBIDDEN in this project: it drops RLS policies on 160 tables. Use the numbered SQL-FILES/ instead.\\\\n');process.exit(1)}\" && drizzle-kit push && echo '\\n⚠️  drizzle-kit push DROPS RLS POLICIES. Now run SQL-FILES/ALL-IN-ONE-SETUP.sql, then: npm run db:verify\\n'",
+    "db:push": "node -e \"if(process.env.NODE_ENV==='production'){console.error('\\\\n\\u26d4 drizzle-kit push is FORBIDDEN in this project: it drops RLS policies on 160 tables. Use the numbered SQL-FILES/ instead.\\\\n');process.exit(1)}\" && drizzle-kit push && echo '\\n\u26a0\ufe0f  drizzle-kit push DROPS RLS POLICIES. Now run SQL-FILES/ALL-IN-ONE-SETUP.sql, then: npm run db:verify\\n'",
     "db:studio": "drizzle-kit studio",
     "security:audit": "npm audit --audit-level=moderate",
     "seed": "tsx scripts/seed-basaveshwar-project.ts",
@@ -27,7 +27,7 @@
     "cf:build": "opennextjs-cloudflare build",
     "cf:preview": "opennextjs-cloudflare build && opennextjs-cloudflare preview",
     "cf:deploy": "opennextjs-cloudflare build && opennextjs-cloudflare deploy",
-    "deploy": "opennextjs-cloudflare build && opennextjs-cloudflare deploy",
+    "deploy": "node -e \"console.error('\\n\\u26d4 Ordence deploys from GitHub to Railway.\\n   Commit and push in GitHub Desktop. Railway builds automatically.\\n   (The old Cloudflare command is still available as: npm run cf:deploy)\\n'); process.exit(1)\"",
     "seed:contracting": "tsx scripts/seed-contracting-demo.ts"
   },
   "dependencies": {
@@ -90,5 +90,8 @@
     "typescript": "^5.7.3",
     "vitest": "^3.2.7",
     "wrangler": "^4.118.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
   }
 }

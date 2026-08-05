@@ -17,8 +17,15 @@
  * SILENT: a customer sees a menu item they did not buy, or does not see
  * one they did, and nothing anywhere reports a problem. The sidebar was
  * measurably in that state when this file was written — it advertised
- * SEVEN links to routes that do not exist (see `status: "coming_soon"`
- * below), and had never once consulted the entitlement catalogue.
+ * seven links to routes that did not exist, and had never once consulted
+ * the entitlement catalogue.
+ *
+ * ⚠️ HISTORICAL NOTE — v0.73.0-alpha. All seven of those routes were
+ * built by v36, and every module below is now `live`. The paragraph
+ * above is kept because it explains WHY this file exists; the dead links
+ * it describes are gone. A stale comment claiming broken links still
+ * exist is worse than no comment, because it sends whoever reads it
+ * hunting a problem that was already fixed.
  *
  * This file is the join. Each entry says: here is a thing the product
  * does, here is what to call it in plain English, here is where it lives
@@ -88,15 +95,18 @@ export const MODULE_GROUPS: Readonly<
 /**
  * `coming_soon` is the important one and it is not decoration.
  *
- * Seven sidebar entries currently point at routes that were never
- * built — `/search`, `/deals`, `/documents`, `/reports/cost`,
- * `/calendar`, `/billing`, `/settings/objects`. Every one of them
- * renders a 404 when clicked. A customer cannot tell a missing feature
- * from a broken product; both look like software that does not work.
+ * ⚠️ HISTORICAL — v0.73.0-alpha. Seven sidebar entries once pointed at
+ * routes that were never built: `/search`, `/deals`, `/documents`,
+ * `/reports/cost`, `/calendar`, `/billing`, `/settings/objects`. Every
+ * one rendered a 404 when clicked, and a customer cannot tell a missing
+ * feature from a broken product — both look like software that does not
+ * work. ALL SEVEN NOW EXIST. No module in this registry is
+ * `coming_soon` today.
  *
- * Marking them here removes them from the menu without deleting the
- * intent to build them, and without anybody having to remember which
- * links were dead.
+ * The status stays in the type, because the next unbuilt module will
+ * need it, and because the reasoning still holds: marking a module
+ * removes it from the menu without deleting the intent to build it, and
+ * without anybody having to remember which links were dead.
  */
 export type ModuleStatus = "live" | "beta" | "coming_soon";
 
@@ -410,6 +420,49 @@ export const MODULE_REGISTRY: Readonly<Record<string, ModuleDescriptor>> =
       feature: "construction.boq",
       status: "live",
       href: "/boq",
+    },
+
+    /**
+     * ⭐ VARIATIONS — added in Batch 2.1.
+     *
+     * ⚠️ IT SHARES `construction.boq`, DELIBERATELY. A variation changes
+     * the BOQ's authorised quantities and rates; a tenant that has paid
+     * for bills of quantities but not for "variations" would be able to
+     * agree scope it can never record a change to, and the first change
+     * order on any real site would put the register and the contract out
+     * of step permanently.
+     *
+     * The separately-grantable control is the PERMISSION
+     * `construction.variation.approve`, not the feature — because the
+     * thing worth separating is who may approve, not who may see.
+     */
+    variations: {
+      navId: "variations",
+      label: "Variations",
+      description: "Every change to agreed scope, and what happened to it.",
+      group: "site",
+      feature: "construction.boq",
+      status: "live",
+      href: "/variations",
+    },
+
+    /**
+     * ⭐ SITE LABOUR — added in Batch 2.2.
+     *
+     * ⚠️ Also on `construction.boq`. A tenant that can raise an RA bill
+     * but cannot record who was on site has bought half a system: the
+     * bill says work was done and nothing says who did it. The EPF
+     * challan will not reconcile, and the gap is only discovered at the
+     * quarterly filing.
+     */
+    "site-labour": {
+      navId: "site-labour",
+      label: "Site labour",
+      description: "Who may work, who was there, and what has not been billed.",
+      group: "site",
+      feature: "construction.boq",
+      status: "live",
+      href: "/site-labour",
     },
 
     "ra-bills": {

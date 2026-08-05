@@ -167,6 +167,22 @@ const isPublicRoute = createRouteMatcher([
   // authenticates at all — a diagnostic behind the broken gate is useless.
   // ══════════════════════════════════════════════════════════════
   "/api/diag",
+  /**
+   * ⭐ MCP — v0.74.0-alpha.
+   *
+   * ⚠️ "PUBLIC" HERE MEANS "NO BROWSER SESSION REQUIRED", NOT
+   *    "UNAUTHENTICATED".
+   *
+   * An MCP client has no cookie jar and is never redirected through a
+   * sign-in page, so `clerkMiddleware` cannot authenticate it. The route
+   * authenticates ITSELF: every request must carry a bearer token that
+   * resolves, in the database, to a live, unrevoked, unexpired grant.
+   * Without one it answers 401 and touches nothing.
+   *
+   * The tenant is derived FROM THE TOKEN. A client cannot assert it —
+   * which is the same rule that makes step 1 above strip six headers.
+   */
+  "/api/mcp",
 ]);
 
 /** Routes that require platform-staff privileges, not just any session. */
