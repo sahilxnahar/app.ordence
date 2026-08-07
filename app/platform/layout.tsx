@@ -56,6 +56,7 @@ export const dynamic = "force-dynamic";
  */
 const NAV = [
   { href: "/platform", label: "Workspaces" },
+  { href: "/platform/users", label: "Users" },
   // Sits beside the directory rather than inside it: the directory
   // answers "find me Acme", this answers "who needs me today?" — see the
   // header of `app/platform/tenants/page.tsx`.

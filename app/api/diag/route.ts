@@ -38,76 +38,140 @@ function readRuntimeEnv(name: string): string | undefined {
   }
 }
 
-/**
- * ⚠️ REQUIRED means "the app is broken without it", not "somebody meant to
- * set it". Every name here is read on a path a signed-in user reaches.
- *
- * The webhook secret is in this list deliberately. Without it the Clerk
- * webhook cannot be verified, so no tenant is ever provisioned — and
- * nothing about the running app looks wrong until the first sign-up.
- */
-const REQUIRED = [
-  // Database — the pooled string serves requests, the unpooled one runs
-  // migrations. Both are Secrets in Cloudflare, never in wrangler.jsonc.
-  "DATABASE_URL",
-  "DATABASE_URL_UNPOOLED",
+type EnvCategory = {
+  name: string;
+  required: string[];
+  optional: string[];
+  description: string;
+};
 
-  // Authentication.
-  "CLERK_SECRET_KEY",
-  "CLERK_WEBHOOK_SIGNING_SECRET",
-  "NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY",
+const CATEGORIES: EnvCategory[] = [
+  {
+    name: "Database",
+    description: "Neon Postgres — pooled for requests, unpooled for migrations.",
+    required: ["DATABASE_URL"],
+    optional: ["DATABASE_URL_UNPOOLED"],
+  },
+  {
+    name: "Authentication",
+    description: "Clerk — sign-in, webhooks, encryption.",
+    required: [
+      "CLERK_SECRET_KEY",
+      "NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY",
+    ],
+    optional: [
+      "CLERK_WEBHOOK_SIGNING_SECRET",
+      "CLERK_ENCRYPTION_KEY",
+      "NEXT_PUBLIC_CLERK_SIGN_IN_URL",
+      "NEXT_PUBLIC_CLERK_SIGN_UP_URL",
+    ],
+  },
+  {
+    name: "Hosts & Domains",
+    description: "Subdomain routing, admin portal, platform identification.",
+    required: [
+      "NEXT_PUBLIC_APP_URL",
+      "NEXT_PUBLIC_ROOT_DOMAIN",
+      "NEXT_PUBLIC_ZONE_DOMAIN",
+    ],
+    optional: ["PLATFORM_HOST"],
+  },
+  {
+    name: "Platform Admin",
+    description: "Staff console access, platform tax identity for invoices.",
+    required: ["PLATFORM_ADMIN_EMAILS"],
+    optional: [
+      "PLATFORM_LEGAL_NAME",
+      "PLATFORM_GSTIN",
+      "PLATFORM_GST_STATE_CODE",
+      "PLATFORM_ADDRESS",
+      "PLATFORM_INVOICE_PREFIX",
+    ],
+  },
+  {
+    name: "Object Storage (R2)",
+    description: "Cloudflare R2 over S3 API — all four or none.",
+    required: [],
+    optional: ["S3_ENDPOINT", "S3_BUCKET", "S3_ACCESS_KEY_ID", "S3_SECRET_ACCESS_KEY"],
+  },
+  {
+    name: "AI Providers",
+    description: "LLM routing — at least one enables the AI assistant.",
+    required: [],
+    optional: [
+      "CLOUDFLARE_ACCOUNT_ID",
+      "CF_AI_TOKEN",
+      "GROQ_API_KEY",
+      "CEREBRAS_API_KEY",
+      "GOOGLE_AI_API_KEY",
+      "MISTRAL_API_KEY",
+      "COHERE_API_KEY",
+      "GITHUB_MODELS_TOKEN",
+    ],
+  },
+  {
+    name: "Email",
+    description: "Resend — transactional email delivery.",
+    required: [],
+    optional: ["RESEND_API_KEY", "RESEND_FROM_EMAIL", "FINANCE_ALERT_EMAILS"],
+  },
+  {
+    name: "Payments",
+    description: "Razorpay and/or Stripe — billing and subscriptions.",
+    required: [],
+    optional: [
+      "RAZORPAY_KEY_ID",
+      "RAZORPAY_KEY_SECRET",
+      "RAZORPAY_WEBHOOK_SECRET",
+      "STRIPE_SECRET_KEY",
+      "STRIPE_WEBHOOK_SECRET",
+    ],
+  },
+  {
+    name: "Cache & Queue",
+    description: "Upstash Redis for caching, QStash for scheduled jobs.",
+    required: [],
+    optional: [
+      "UPSTASH_REDIS_REST_URL",
+      "UPSTASH_REDIS_REST_TOKEN",
+      "QSTASH_CURRENT_SIGNING_KEY",
+      "QSTASH_NEXT_SIGNING_KEY",
+    ],
+  },
+  {
+    name: "Workers & Secrets",
+    description: "Background job authentication and inline execution.",
+    required: [],
+    optional: [
+      "UPLOAD_TICKET_SECRET",
+      "WORKER_API_SECRET",
+      "CRON_SECRET",
+      "ORDENCE_INLINE_JOBS",
+    ],
+  },
+  {
+    name: "Security",
+    description: "CSP enforcement and seed safety catches.",
+    required: [],
+    optional: ["CSP_ENFORCE", "SEED_ALLOW_PROD"],
+  },
+  {
+    name: "Telemetry",
+    description: "Release tracking and telemetry opt-out.",
+    required: [],
+    optional: ["TELEMETRY_RELEASE", "NEXT_PUBLIC_RELEASE", "TELEMETRY_DISABLED"],
+  },
+  {
+    name: "Legacy",
+    description: "Kept for rollback safety; no live code path.",
+    required: [],
+    optional: ["BLOB_READ_WRITE_TOKEN"],
+  },
+];
 
-  // Host resolution. Losing either of these does not throw — it just makes
-  // admin.ordence.com stop being the staff console and every tenant
-  // subdomain stop resolving, which reads as a code bug and is not one.
-  "NEXT_PUBLIC_APP_URL",
-  "NEXT_PUBLIC_ROOT_DOMAIN",
-  "NEXT_PUBLIC_ZONE_DOMAIN",
-  "PLATFORM_HOST",
-  "PLATFORM_ADMIN_EMAILS",
-] as const;
-
-/**
- * OPTIONAL means a named feature is inert without it, and the rest of the
- * app is unaffected. `present: false` here is information, not a fault.
- */
-const OPTIONAL = [
-  // Signed URLs and scheduled work. Absent = uploads and cron refuse.
-  "UPLOAD_TICKET_SECRET",
-  "CRON_SECRET",
-  "WORKER_API_SECRET",
-  /* ---- v0.73.0-alpha: were read by the code and reported by nothing ---- */
-  "QSTASH_CURRENT_SIGNING_KEY",
-  "QSTASH_NEXT_SIGNING_KEY",
-  // ⚠️ Guards seeding against production. Nothing verified its state.
-  "SEED_ALLOW_PROD",
-  "NEXT_PUBLIC_RELEASE",
-  // Unset means the CSP is report-only, which is the current state.
-  "CSP_ENFORCE",
-
-  // Background jobs run inline until a queue is bound.
-  "ORDENCE_INLINE_JOBS",
-
-  // Email.
-  "RESEND_API_KEY",
-  "RESEND_FROM_EMAIL",
-
-  // Billing.
-  "RAZORPAY_KEY_ID",
-  "RAZORPAY_KEY_SECRET",
-  "RAZORPAY_WEBHOOK_SECRET",
-
-  // Our own tax identity, printed on platform invoices.
-  "PLATFORM_LEGAL_NAME",
-  "PLATFORM_GSTIN",
-  "PLATFORM_GST_STATE_CODE",
-  "PLATFORM_ADDRESS",
-  "PLATFORM_INVOICE_PREFIX",
-
-  // Cache and rate limiting.
-  "UPSTASH_REDIS_REST_URL",
-  "UPSTASH_REDIS_REST_TOKEN",
-] as const;
+/** Flattened arrays kept for backward compatibility with the response shape. */
+const REQUIRED = CATEGORIES.flatMap((c) => c.required);
+const OPTIONAL = CATEGORIES.flatMap((c) => c.optional);
 
 export async function GET() {
   const settings: Record<string, { present: boolean; length: number }> = {};
@@ -118,6 +182,27 @@ export async function GET() {
   }
 
   const missing = REQUIRED.filter((name) => !settings[name]?.present);
+
+  // Build a per-category summary for the response.
+  const categories = CATEGORIES.map((cat) => {
+    const all = [...cat.required, ...cat.optional];
+    const present = all.filter((n) => settings[n]?.present).length;
+    const requiredMissing = cat.required.filter((n) => !settings[n]?.present);
+    return {
+      name: cat.name,
+      description: cat.description,
+      total: all.length,
+      present,
+      requiredMissing,
+      vars: Object.fromEntries(all.map((n) => [n, settings[n] ?? { present: false, length: 0 }])),
+    };
+  });
+
+  // AI providers: check if at least one is configured.
+  const aiProviderKeys = ["CLOUDFLARE_ACCOUNT_ID", "CF_AI_TOKEN", "GROQ_API_KEY", "CEREBRAS_API_KEY", "GOOGLE_AI_API_KEY", "MISTRAL_API_KEY", "COHERE_API_KEY", "GITHUB_MODELS_TOKEN"];
+  const aiConfigured = aiProviderKeys.some((k) => settings[k]?.present);
+  const storageKeys = ["S3_ENDPOINT", "S3_BUCKET", "S3_ACCESS_KEY_ID", "S3_SECRET_ACCESS_KEY"];
+  const storageConfigured = storageKeys.every((k) => settings[k]?.present);
 
   /* ── Can the Worker actually reach the database? ──────────────────────
    *
@@ -353,15 +438,32 @@ export async function GET() {
     {
       ok,
       reachedTheApplication: true,
+      version: readRuntimeEnv("NEXT_PUBLIC_RELEASE") || "unset",
       missingRequiredSettings: missing,
       settings,
+      categories,
+      features: {
+        aiAssistant: aiConfigured
+          ? "enabled"
+          : "disabled — set at least one AI provider key (GROQ_API_KEY, CF_AI_TOKEN, etc.)",
+        documentStorage: storageConfigured
+          ? "enabled"
+          : "disabled — set all four S3_* variables",
+        email: settings.RESEND_API_KEY?.present ? "enabled" : "disabled",
+        payments:
+          settings.RAZORPAY_KEY_ID?.present || settings.STRIPE_SECRET_KEY?.present
+            ? "enabled"
+            : "disabled",
+        cache: settings.UPSTASH_REDIS_REST_URL?.present ? "enabled" : "disabled",
+        workers: settings.WORKER_API_SECRET?.present ? "enabled" : "disabled",
+      },
       database,
       transaction,
       platform,
       hint: ok
-        ? "Everything the application needs is present. If a page still fails, the fault is in that page, not the deployment."
+        ? "Everything the application needs is present. Check `features` for optional capabilities."
         : missing.length > 0
-          ? `Add these in Cloudflare → Settings → Variables and secrets, then redeploy: ${missing.join(", ")}`
+          ? `Add these in Railway → Variables, then redeploy: ${missing.join(", ")}`
           : database.connected !== true
             ? "Settings are present but the database refused the connection. Read database.error above."
             : "Simple queries work but TRANSACTIONS do not. Read transaction.error — this is why signed-in pages fail while the webhook succeeds.",

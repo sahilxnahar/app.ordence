@@ -54,6 +54,10 @@ import {
   ContractPipelinePanel,
   ActivityPanel,
   QuickActionsPanel,
+  CompliancePanel,
+  ReceivablesPanel,
+  AIInsightsPanel,
+  NotificationsSummaryPanel,
 } from "./panels";
 import {
   StatTilesSkeleton,
@@ -155,6 +159,76 @@ export default async function DashboardPage() {
             }
           >
             <ContractPipelinePanel />
+          </Suspense>
+        </div>
+      </div>
+
+      {/* ── COMPLIANCE + RECEIVABLES (v0.82.0-alpha) ─────────────── */}
+      <div className="grid gap-6 lg:grid-cols-2">
+        <div className="rounded-md border border-border p-4">
+          <Suspense
+            fallback={
+              <div className="space-y-3" aria-hidden="true">
+                <div className="h-4 w-32 animate-pulse rounded bg-muted" />
+                <div className="grid grid-cols-3 gap-3">
+                  {Array.from({ length: 3 }).map((_, i) => (
+                    <div key={i} className="h-16 animate-pulse rounded-md bg-muted" />
+                  ))}
+                </div>
+              </div>
+            }
+          >
+            <CompliancePanel />
+          </Suspense>
+        </div>
+
+        <div className="rounded-md border border-border p-4">
+          <Suspense
+            fallback={
+              <div className="space-y-3" aria-hidden="true">
+                <div className="h-4 w-32 animate-pulse rounded bg-muted" />
+                <div className="grid grid-cols-2 gap-3">
+                  {Array.from({ length: 2 }).map((_, i) => (
+                    <div key={i} className="h-16 animate-pulse rounded-md bg-muted" />
+                  ))}
+                </div>
+              </div>
+            }
+          >
+            <ReceivablesPanel />
+          </Suspense>
+        </div>
+      </div>
+
+      {/* ── AI INSIGHTS + NOTIFICATIONS (v0.82.0-alpha) ──────────── */}
+      <div className="grid gap-6 lg:grid-cols-2">
+        <div className="rounded-md border border-border p-4">
+          <Suspense
+            fallback={
+              <div className="space-y-3" aria-hidden="true">
+                <div className="h-4 w-32 animate-pulse rounded bg-muted" />
+                {Array.from({ length: 4 }).map((_, i) => (
+                  <div key={i} className="h-8 animate-pulse rounded bg-muted" />
+                ))}
+              </div>
+            }
+          >
+            <AIInsightsPanel />
+          </Suspense>
+        </div>
+
+        <div className="rounded-md border border-border p-4">
+          <Suspense
+            fallback={
+              <div className="space-y-3" aria-hidden="true">
+                <div className="h-4 w-32 animate-pulse rounded bg-muted" />
+                {Array.from({ length: 4 }).map((_, i) => (
+                  <div key={i} className="h-8 animate-pulse rounded bg-muted" />
+                ))}
+              </div>
+            }
+          >
+            <NotificationsSummaryPanel />
           </Suspense>
         </div>
       </div>

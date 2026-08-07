@@ -14,6 +14,9 @@ const TABS = [
   { href: "/settings/team", label: "Team" },
   { href: "/settings/financial", label: "Financial" },
   { href: "/settings/billing", label: "Billing" },
+  { href: "/settings/integrations", label: "Integrations" },
+  { href: "/settings/ai", label: "AI assistant" },
+  { href: "/settings/notifications", label: "Notifications" },
   // ⚠️ THE DEFINITIONS, NOT THE RECORDS. `/objects` is where the records
   // live and is reached from the main navigation; this tab is where the
   // shapes are inspected. Two routes, two questions.

@@ -128,6 +128,8 @@ const isPublicRoute = createRouteMatcher([
   // control. Read the header of app/api/workers/route.ts.
   // ══════════════════════════════════════════════════════════════
   "/api/workers",
+  // Same authentication model — bearer secret, no Clerk cookie.
+  "/api/workers/ai-monitors",
   // ══════════════════════════════════════════════════════════════
   // TELEMETRY INGEST (Phase 19)
   //

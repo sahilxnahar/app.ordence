@@ -39,7 +39,7 @@ import "server-only";
  */
 
 import { createHash } from "node:crypto";
-import { and, eq, desc, asc, sql, isNull } from "drizzle-orm";
+import { and, eq, desc, asc, sql, isNull, inArray } from "drizzle-orm";
 import { withTenant } from "@/db";
 import {
   mcpTokens,
@@ -55,6 +55,31 @@ import {
   pieceRateEntries,
   dailySiteLogs,
   projects,
+  // GST
+  gstRegistrations,
+  gstParties,
+  // Purchases & ITC
+  vendors,
+  purchaseInvoices,
+  itcRegister,
+  // Receivables
+  demandNotices,
+  receipts,
+  // Compliance
+  complianceTasks,
+  complianceObligations,
+  complianceLicences,
+  // Inventory
+  stockItems,
+  stockBalances,
+  // Scheduling
+  scheduleResources,
+  scheduleBookings,
+  // Field operations
+  fieldJobs,
+  // TDS
+  tdsDeductions,
+  tdsDeductees,
 } from "@/db/schema";
 import { MCP_TOOLS, findTool, scopePermits, type McpScope } from "@/lib/mcp/registry";
 import { MODULE_REGISTRY } from "@/lib/modules/registry";
@@ -66,7 +91,15 @@ import { upsertDailySiteLog } from "@/server/actions/labour";
 /* ------------------------------------------------------------------ */
 
 export type McpSession = {
-  tokenId: string;
+  /**
+   * The MCP token id, or null for UI-originated calls (the assistant chat).
+   *
+   * ⚠️ When null, the call log records the tool name and outcome but
+   * cannot update a token's last-used timestamp (there is no token).
+   * The audit trail is still complete — every tool call is logged
+   * with the acting user's id and the tenant id.
+   */
+  tokenId: string | null;
   tenantId: string;
   scope: McpScope;
   actingUserId: string;
@@ -157,7 +190,7 @@ async function logCall(
         refusalReason: refusalReason ?? null,
       });
 
-      if (outcome === "ok") {
+      if (outcome === "ok" && session.tokenId) {
         await tx
           .update(mcpTokens)
           .set({
@@ -535,6 +568,754 @@ async function runTool(
       }));
     }
 
+    /* ---------------- GST registrations ---------------- */
+    case "ordence_list_gst_registrations": {
+      return withTenant(session.tenantId, async (tx) => {
+        const rows = await tx
+          .select({
+            id: gstRegistrations.id,
+            gstin: gstRegistrations.gstin,
+            stateCode: gstRegistrations.stateCode,
+            legalName: gstRegistrations.legalName,
+            tradeName: gstRegistrations.tradeName,
+            registrationType: gstRegistrations.registrationType,
+            isPrimary: gstRegistrations.isPrimary,
+            isActive: gstRegistrations.isActive,
+            effectiveFrom: gstRegistrations.effectiveFrom,
+            effectiveTo: gstRegistrations.effectiveTo,
+          })
+          .from(gstRegistrations)
+          .where(eq(gstRegistrations.tenantId, session.tenantId))
+          .orderBy(asc(gstRegistrations.stateCode));
+
+        return rows.map((r) => ({
+          ...r,
+          isPrimary: r.isPrimary,
+          status: r.isActive ? "active" : "surrendered",
+        }));
+      });
+    }
+
+    /* ---------------- GST parties ---------------- */
+    case "ordence_list_gst_parties": {
+      const partyType =
+        typeof args.partyType === "string" ? args.partyType : null;
+      return withTenant(session.tenantId, async (tx) => {
+        let query = tx
+          .select({
+            id: gstParties.id,
+            partyType: gstParties.partyType,
+            legalName: gstParties.legalName,
+            tradeName: gstParties.tradeName,
+            gstin: gstParties.gstin,
+            panNumber: gstParties.panNumber,
+            registrationType: gstParties.registrationType,
+            stateCode: gstParties.stateCode,
+          })
+          .from(gstParties)
+          .where(eq(gstParties.tenantId, session.tenantId))
+          .orderBy(asc(gstParties.legalName))
+          .limit(200);
+
+        if (partyType === "customer" || partyType === "vendor") {
+          query = tx
+            .select({
+              id: gstParties.id,
+              partyType: gstParties.partyType,
+              legalName: gstParties.legalName,
+              tradeName: gstParties.tradeName,
+              gstin: gstParties.gstin,
+              panNumber: gstParties.panNumber,
+              registrationType: gstParties.registrationType,
+              stateCode: gstParties.stateCode,
+            })
+            .from(gstParties)
+            .where(
+              and(
+                eq(gstParties.tenantId, session.tenantId),
+                eq(gstParties.partyType, partyType),
+              ),
+            )
+            .orderBy(asc(gstParties.legalName))
+            .limit(200);
+        }
+
+        return await query;
+      });
+    }
+
+    /* ---------------- purchase invoices ---------------- */
+    case "ordence_list_purchase_invoices": {
+      const status =
+        typeof args.status === "string" ? args.status : null;
+      return withTenant(session.tenantId, async (tx) => {
+        const conditions = [eq(purchaseInvoices.tenantId, session.tenantId)];
+        if (status) {
+          // Use a cast rather than importing the enum — the dispatch
+          // layer validates by passing through; the DB CHECK enforces the
+          // value.
+          conditions.push(sql`${purchaseInvoices.status} = ${status}::purchase_invoice_status`);
+        }
+
+        const rows = await tx
+          .select({
+            id: purchaseInvoices.id,
+            invoiceNumber: purchaseInvoices.invoiceNumber,
+            invoiceDate: purchaseInvoices.invoiceDate,
+            supplierGstin: purchaseInvoices.supplierGstin,
+            taxableValueMinor: purchaseInvoices.taxableValueMinor,
+            igstMinor: purchaseInvoices.igstMinor,
+            cgstMinor: purchaseInvoices.cgstMinor,
+            sgstMinor: purchaseInvoices.sgstMinor,
+            cessMinor: purchaseInvoices.cessMinor,
+            totalMinor: purchaseInvoices.totalMinor,
+            itcEligibleTaxMinor: purchaseInvoices.itcEligibleTaxMinor,
+            itcBlockedTaxMinor: purchaseInvoices.itcBlockedTaxMinor,
+            taxPeriod: purchaseInvoices.taxPeriod,
+            status: purchaseInvoices.status,
+            isReverseCharge: purchaseInvoices.isReverseCharge,
+            vendorId: purchaseInvoices.vendorId,
+          })
+          .from(purchaseInvoices)
+          .where(and(...conditions))
+          .orderBy(desc(purchaseInvoices.invoiceDate))
+          .limit(100);
+
+        // Join vendor names for context
+        const vendorIds = [...new Set(rows.map((r) => r.vendorId))];
+        const vendorRows = vendorIds.length
+          ? await tx
+              .select({ id: vendors.id, legalName: vendors.legalName })
+              .from(vendors)
+              .where(
+                and(
+                  eq(vendors.tenantId, session.tenantId),
+                  inArray(vendors.id, vendorIds),
+                ),
+              )
+          : [];
+        const vendorMap = new Map(vendorRows.map((v) => [v.id, v.legalName]));
+
+        return rows.map((r) => ({
+          id: r.id,
+          invoiceNumber: r.invoiceNumber,
+          invoiceDate: r.invoiceDate,
+          supplierGstin: r.supplierGstin,
+          vendorName: vendorMap.get(r.vendorId) ?? null,
+          taxableValue: money(r.taxableValueMinor),
+          igst: money(r.igstMinor),
+          cgst: money(r.cgstMinor),
+          sgst: money(r.sgstMinor),
+          cess: money(r.cessMinor),
+          total: money(r.totalMinor),
+          itcEligible: money(r.itcEligibleTaxMinor),
+          itcBlocked: money(r.itcBlockedTaxMinor),
+          taxPeriod: r.taxPeriod,
+          status: r.status,
+          isReverseCharge: r.isReverseCharge,
+        }));
+      });
+    }
+
+    /* ---------------- ITC register ---------------- */
+    case "ordence_itc_register": {
+      const status =
+        typeof args.status === "string" ? args.status : null;
+      return withTenant(session.tenantId, async (tx) => {
+        const conditions = [eq(itcRegister.tenantId, session.tenantId)];
+        if (status) {
+          conditions.push(sql`${itcRegister.status} = ${status}::itc_register_status`);
+        }
+
+        const rows = await tx
+          .select({
+            id: itcRegister.id,
+            taxPeriod: itcRegister.taxPeriod,
+            status: itcRegister.status,
+            reason: itcRegister.reason,
+            statutoryRef: itcRegister.statutoryRef,
+            note: itcRegister.note,
+            cgstMinor: itcRegister.cgstMinor,
+            sgstMinor: itcRegister.sgstMinor,
+            igstMinor: itcRegister.igstMinor,
+            cessMinor: itcRegister.cessMinor,
+            purchaseInvoiceId: itcRegister.purchaseInvoiceId,
+            vendorId: itcRegister.vendorId,
+            filedAt: itcRegister.filedAt,
+          })
+          .from(itcRegister)
+          .where(and(...conditions))
+          .orderBy(desc(itcRegister.taxPeriod), desc(itcRegister.createdAt))
+          .limit(100);
+
+        return rows.map((r) => {
+          const total =
+            (r.cgstMinor ?? 0n) +
+            (r.sgstMinor ?? 0n) +
+            (r.igstMinor ?? 0n) +
+            (r.cessMinor ?? 0n);
+          return {
+            id: r.id,
+            taxPeriod: r.taxPeriod,
+            status: r.status,
+            reason: r.reason,
+            statutoryRef: r.statutoryRef,
+            note: r.note,
+            cgst: money(r.cgstMinor),
+            sgst: money(r.sgstMinor),
+            igst: money(r.igstMinor),
+            cess: money(r.cessMinor),
+            total: money(total),
+            filedAt: r.filedAt,
+          };
+        });
+      });
+    }
+
+    /* ---------------- demand notices ---------------- */
+    case "ordence_list_demand_notices": {
+      const status =
+        typeof args.status === "string" ? args.status : null;
+      return withTenant(session.tenantId, async (tx) => {
+        const conditions = [eq(demandNotices.tenantId, session.tenantId)];
+        if (status) {
+          conditions.push(sql`${demandNotices.status} = ${status}::demand_status`);
+        }
+
+        const rows = await tx
+          .select({
+            id: demandNotices.id,
+            noticeNumber: demandNotices.noticeNumber,
+            triggerLabel: demandNotices.triggerLabel,
+            noticeDate: demandNotices.noticeDate,
+            dueDate: demandNotices.dueDate,
+            principalMinor: demandNotices.principalMinor,
+            taxMinor: demandNotices.taxMinor,
+            totalMinor: demandNotices.totalMinor,
+            allocatedMinor: demandNotices.allocatedMinor,
+            status: demandNotices.status,
+            dunningStage: demandNotices.dunningStage,
+            projectId: demandNotices.projectId,
+          })
+          .from(demandNotices)
+          .where(and(...conditions))
+          .orderBy(desc(demandNotices.noticeDate))
+          .limit(100);
+
+        return rows.map((r) => ({
+          id: r.id,
+          noticeNumber: r.noticeNumber,
+          triggerLabel: r.triggerLabel,
+          noticeDate: r.noticeDate,
+          dueDate: r.dueDate,
+          principal: money(r.principalMinor),
+          tax: money(r.taxMinor),
+          total: money(r.totalMinor),
+          allocated: money(r.allocatedMinor),
+          outstanding: money(
+            (r.totalMinor ?? 0n) - (r.allocatedMinor ?? 0n),
+          ),
+          status: r.status,
+          dunningStage: r.dunningStage,
+        }));
+      });
+    }
+
+    /* ---------------- receipts ---------------- */
+    case "ordence_list_receipts": {
+      return withTenant(session.tenantId, async (tx) => {
+        const rows = await tx
+          .select({
+            id: receipts.id,
+            receiptNumber: receipts.receiptNumber,
+            receivedOn: receipts.receivedOn,
+            amountMinor: receipts.amountMinor,
+            tdsCreditMinor: receipts.tdsCreditMinor,
+            allocatedMinor: receipts.allocatedMinor,
+            method: receipts.method,
+            status: receipts.status,
+            instrumentRef: receipts.instrumentRef,
+            clearedOn: receipts.clearedOn,
+            bouncedOn: receipts.bouncedOn,
+          })
+          .from(receipts)
+          .where(eq(receipts.tenantId, session.tenantId))
+          .orderBy(desc(receipts.receivedOn))
+          .limit(100);
+
+        return rows.map((r) => ({
+          id: r.id,
+          receiptNumber: r.receiptNumber,
+          receivedOn: r.receivedOn,
+          amount: money(r.amountMinor),
+          tdsCredit: money(r.tdsCreditMinor),
+          allocated: money(r.allocatedMinor),
+          method: r.method,
+          status: r.status,
+          instrumentRef: r.instrumentRef,
+          clearedOn: r.clearedOn,
+          bouncedOn: r.bouncedOn,
+        }));
+      });
+    }
+
+    /* ---------------- compliance calendar ---------------- */
+    case "ordence_compliance_calendar": {
+      const statusFilter =
+        typeof args.status === "string" ? args.status : null;
+      return withTenant(session.tenantId, async (tx) => {
+        // When no status is specified, show non-terminal tasks only.
+        // These are hardcoded constants, not user input — no injection risk.
+        const terminalFilter = sql`${complianceTasks.status} NOT IN ('filed','not_applicable','waived')`;
+
+        let rows;
+        if (statusFilter) {
+          rows = await tx
+            .select({
+              id: complianceTasks.id,
+              periodLabel: complianceTasks.periodLabel,
+              dueDate: complianceTasks.dueDate,
+              status: complianceTasks.status,
+              severity: complianceTasks.severity,
+              filingReference: complianceTasks.filingReference,
+              daysLate: complianceTasks.daysLate,
+              lateFeeMinor: complianceTasks.lateFeeMinor,
+              obligationId: complianceTasks.obligationId,
+              subjectCompanyId: complianceTasks.subjectCompanyId,
+            })
+            .from(complianceTasks)
+            .where(
+              and(
+                eq(complianceTasks.tenantId, session.tenantId),
+                sql`${complianceTasks.status} = ${statusFilter}::compliance_task_status`,
+              ),
+            )
+            .orderBy(asc(complianceTasks.dueDate))
+            .limit(200);
+        } else {
+          rows = await tx
+            .select({
+              id: complianceTasks.id,
+              periodLabel: complianceTasks.periodLabel,
+              dueDate: complianceTasks.dueDate,
+              status: complianceTasks.status,
+              severity: complianceTasks.severity,
+              filingReference: complianceTasks.filingReference,
+              daysLate: complianceTasks.daysLate,
+              lateFeeMinor: complianceTasks.lateFeeMinor,
+              obligationId: complianceTasks.obligationId,
+              subjectCompanyId: complianceTasks.subjectCompanyId,
+            })
+            .from(complianceTasks)
+            .where(
+              and(
+                eq(complianceTasks.tenantId, session.tenantId),
+                terminalFilter,
+              ),
+            )
+            .orderBy(asc(complianceTasks.dueDate))
+            .limit(200);
+        }
+
+        // Join obligation names
+        const obligationIds = [
+          ...new Set(rows.map((r) => r.obligationId).filter(Boolean)),
+        ] as string[];
+        const obligationRows = obligationIds.length
+          ? await tx
+              .select({
+                id: complianceObligations.id,
+                name: complianceObligations.name,
+                authority: complianceObligations.authority,
+                code: complianceObligations.code,
+              })
+              .from(complianceObligations)
+              .where(
+                and(
+                  eq(complianceObligations.tenantId, session.tenantId),
+                  inArray(complianceObligations.id, obligationIds),
+                ),
+              )
+          : [];
+        const obligationMap = new Map(
+          obligationRows.map((o) => [o.id, o]),
+        );
+
+        const today = new Date().toISOString().slice(0, 10);
+
+        return rows.map((r) => {
+          const obligation = obligationMap.get(r.obligationId);
+          const isOverdue =
+            (r.status === "pending" || r.status === "in_progress") &&
+            r.dueDate < today;
+          return {
+            id: r.id,
+            obligationName: obligation?.name ?? "Unknown",
+            authority: obligation?.authority ?? null,
+            code: obligation?.code ?? null,
+            periodLabel: r.periodLabel,
+            dueDate: r.dueDate,
+            status: r.status,
+            severity: r.severity,
+            overdue: isOverdue,
+            filingReference: r.filingReference,
+            daysLate: r.daysLate,
+            lateFee: money(r.lateFeeMinor),
+          };
+        });
+      });
+    }
+
+    /* ---------------- licences ---------------- */
+    case "ordence_list_licences": {
+      return withTenant(session.tenantId, async (tx) => {
+        const rows = await tx
+          .select({
+            id: complianceLicences.id,
+            licenceNumber: complianceLicences.licenceNumber,
+            name: complianceLicences.name,
+            authority: complianceLicences.authority,
+            status: complianceLicences.status,
+            issuedOn: complianceLicences.issuedOn,
+            validFrom: complianceLicences.validFrom,
+            validUntil: complianceLicences.validUntil,
+            subjectCompanyId: complianceLicences.subjectCompanyId,
+            appliesTo: complianceLicences.appliesTo,
+          })
+          .from(complianceLicences)
+          .where(eq(complianceLicences.tenantId, session.tenantId))
+          .orderBy(asc(complianceLicences.validUntil))
+          .limit(200);
+
+        const today = new Date().toISOString().slice(0, 10);
+
+        return rows.map((r) => ({
+          id: r.id,
+          licenceNumber: r.licenceNumber,
+          name: r.name,
+          authority: r.authority,
+          status: r.status,
+          issuedOn: r.issuedOn,
+          validFrom: r.validFrom,
+          validUntil: r.validUntil,
+          appliesTo: r.appliesTo,
+          expiresSoon:
+            r.validUntil &&
+            r.validUntil <=
+              new Date(Date.now() + 30 * 86_400_000)
+                .toISOString()
+                .slice(0, 10),
+          isExpired: r.validUntil && r.validUntil < today,
+        }));
+      });
+    }
+
+    /* ---------------- stock position ---------------- */
+    case "ordence_stock_position": {
+      const lowStockOnly = args.lowStockOnly === true;
+      return withTenant(session.tenantId, async (tx) => {
+        // Join stock_balances with stock_items for a position view.
+        const rows = await tx
+          .select({
+            itemId: stockItems.id,
+            sku: stockItems.sku,
+            itemName: stockItems.name,
+            uom: stockItems.uom,
+            reorderLevel: stockItems.reorderLevel,
+            reorderQuantity: stockItems.reorderQuantity,
+            warehouseId: stockBalances.warehouseId,
+            onHand: stockBalances.quantityOnHand,
+            reserved: stockBalances.quantityReserved,
+          })
+          .from(stockItems)
+          .innerJoin(
+            stockBalances,
+            and(
+              eq(stockBalances.tenantId, session.tenantId),
+              eq(stockBalances.stockItemId, stockItems.id),
+            ),
+          )
+          .where(
+            and(
+              eq(stockItems.tenantId, session.tenantId),
+              isNull(stockItems.deletedAt),
+              eq(stockItems.isActive, true),
+            ),
+          )
+          .orderBy(asc(stockItems.sku))
+          .limit(200);
+
+        const formatted = rows.map((r) => {
+          const onHandNum = Number(r.onHand ?? 0);
+          const reservedNum = Number(r.reserved ?? 0);
+          const available = onHandNum - reservedNum;
+          const reorderLevelNum = r.reorderLevel
+            ? Number(r.reorderLevel)
+            : null;
+          const isLow =
+            reorderLevelNum !== null && onHandNum <= reorderLevelNum;
+          return {
+            itemId: r.itemId,
+            sku: r.sku,
+            name: r.itemName,
+            uom: r.uom,
+            warehouseId: r.warehouseId,
+            onHand: r.onHand?.toString() ?? "0",
+            reserved: r.reserved?.toString() ?? "0",
+            available: available.toString(),
+            reorderLevel: r.reorderLevel?.toString() ?? null,
+            reorderQuantity: r.reorderQuantity?.toString() ?? null,
+            isLowStock: isLow,
+          };
+        });
+
+        return lowStockOnly
+          ? formatted.filter((r) => r.isLowStock)
+          : formatted;
+      });
+    }
+
+    /* ---------------- scheduling bookings ---------------- */
+    case "ordence_list_bookings": {
+      const statusFilter =
+        typeof args.status === "string" ? args.status : null;
+      return withTenant(session.tenantId, async (tx) => {
+        let rows;
+        if (statusFilter) {
+          rows = await tx
+            .select({
+              id: scheduleBookings.id,
+              reference: scheduleBookings.reference,
+              resourceId: scheduleBookings.resourceId,
+              status: scheduleBookings.status,
+              startTime: scheduleBookings.startsAt,
+              endTime: scheduleBookings.endsAt,
+              tenantId: scheduleBookings.tenantId,
+            })
+            .from(scheduleBookings)
+            .where(
+              and(
+                eq(scheduleBookings.tenantId, session.tenantId),
+                sql`${scheduleBookings.status} = ${statusFilter}::schedule_booking_status`,
+              ),
+            )
+            .orderBy(asc(scheduleBookings.startsAt))
+            .limit(100);
+        } else {
+          // Active bookings only: held, confirmed, checked_in, in_progress
+          rows = await tx
+            .select({
+              id: scheduleBookings.id,
+              reference: scheduleBookings.reference,
+              resourceId: scheduleBookings.resourceId,
+              status: scheduleBookings.status,
+              startTime: scheduleBookings.startsAt,
+              endTime: scheduleBookings.endsAt,
+              tenantId: scheduleBookings.tenantId,
+            })
+            .from(scheduleBookings)
+            .where(
+              and(
+                eq(scheduleBookings.tenantId, session.tenantId),
+                sql`${scheduleBookings.status} IN ('held','confirmed','checked_in','in_progress')`,
+              ),
+            )
+            .orderBy(asc(scheduleBookings.startsAt))
+            .limit(100);
+        }
+
+        // Join resource names
+        const resourceIds = [
+          ...new Set(rows.map((r) => r.resourceId).filter(Boolean)),
+        ] as string[];
+        const resourceRows = resourceIds.length
+          ? await tx
+              .select({
+                id: scheduleResources.id,
+                name: scheduleResources.name,
+                code: scheduleResources.code,
+                kind: scheduleResources.kind,
+              })
+              .from(scheduleResources)
+              .where(
+                and(
+                  eq(scheduleResources.tenantId, session.tenantId),
+                  inArray(scheduleResources.id, resourceIds),
+                ),
+              )
+          : [];
+        const resourceMap = new Map(resourceRows.map((r) => [r.id, r]));
+
+        return rows.map((r) => ({
+          id: r.id,
+          reference: r.reference,
+          resourceName: resourceMap.get(r.resourceId)?.name ?? null,
+          resourceCode: resourceMap.get(r.resourceId)?.code ?? null,
+          resourceKind: resourceMap.get(r.resourceId)?.kind ?? null,
+          status: r.status,
+          startTime: r.startTime,
+          endTime: r.endTime,
+        }));
+      });
+    }
+
+    /* ---------------- field jobs ---------------- */
+    case "ordence_list_field_jobs": {
+      const statusFilter =
+        typeof args.status === "string" ? args.status : null;
+      return withTenant(session.tenantId, async (tx) => {
+        let rows;
+        if (statusFilter) {
+          rows = await tx
+            .select({
+              id: fieldJobs.id,
+              jobNumber: fieldJobs.jobNumber,
+              title: fieldJobs.title,
+              jobKind: fieldJobs.jobKind,
+              status: fieldJobs.status,
+              priority: fieldJobs.priority,
+              windowStart: fieldJobs.windowStart,
+              windowEnd: fieldJobs.windowEnd,
+              siteAddress: fieldJobs.siteAddress,
+              assignedUserId: fieldJobs.assignedUserId,
+              visitCount: fieldJobs.visitCount,
+              completedAt: fieldJobs.completedAt,
+              failureReason: fieldJobs.failureReason,
+            })
+            .from(fieldJobs)
+            .where(
+              and(
+                eq(fieldJobs.tenantId, session.tenantId),
+                sql`${fieldJobs.status} = ${statusFilter}::field_job_status`,
+                isNull(fieldJobs.deletedAt),
+              ),
+            )
+            .orderBy(asc(fieldJobs.windowStart))
+            .limit(100);
+        } else {
+          // Active jobs: scheduled, dispatched, travelling, on_site, paused
+          rows = await tx
+            .select({
+              id: fieldJobs.id,
+              jobNumber: fieldJobs.jobNumber,
+              title: fieldJobs.title,
+              jobKind: fieldJobs.jobKind,
+              status: fieldJobs.status,
+              priority: fieldJobs.priority,
+              windowStart: fieldJobs.windowStart,
+              windowEnd: fieldJobs.windowEnd,
+              siteAddress: fieldJobs.siteAddress,
+              assignedUserId: fieldJobs.assignedUserId,
+              visitCount: fieldJobs.visitCount,
+              completedAt: fieldJobs.completedAt,
+              failureReason: fieldJobs.failureReason,
+            })
+            .from(fieldJobs)
+            .where(
+              and(
+                eq(fieldJobs.tenantId, session.tenantId),
+                sql`${fieldJobs.status} IN ('scheduled','dispatched','travelling','on_site','paused')`,
+                isNull(fieldJobs.deletedAt),
+              ),
+            )
+            .orderBy(asc(fieldJobs.windowStart))
+            .limit(100);
+        }
+
+        return rows.map((r) => ({
+          id: r.id,
+          jobNumber: r.jobNumber,
+          title: r.title,
+          jobKind: r.jobKind,
+          status: r.status,
+          priority: r.priority,
+          windowStart: r.windowStart,
+          windowEnd: r.windowEnd,
+          siteAddress: r.siteAddress,
+          visitCount: r.visitCount,
+          completedAt: r.completedAt,
+          failureReason: r.failureReason,
+        }));
+      });
+    }
+
+    /* ---------------- TDS deductions ---------------- */
+    case "ordence_list_tds_deductions": {
+      const sectionFilter =
+        typeof args.section === "string" ? args.section : null;
+      return withTenant(session.tenantId, async (tx) => {
+        const conditions = [eq(tdsDeductions.tenantId, session.tenantId)];
+        if (sectionFilter) {
+          conditions.push(sql`${tdsDeductions.section} = ${sectionFilter}::tds_section`);
+        }
+
+        const rows = await tx
+          .select({
+            id: tdsDeductions.id,
+            deducteeId: tdsDeductions.deducteeId,
+            section: tdsDeductions.section,
+            financialYear: tdsDeductions.financialYear,
+            quarter: tdsDeductions.quarter,
+            deductionDate: tdsDeductions.deductionDate,
+            paymentBaseMinor: tdsDeductions.paymentBaseMinor,
+            chargeableBaseMinor: tdsDeductions.chargeableBaseMinor,
+            rateBps: tdsDeductions.rateBps,
+            tdsMinor: tdsDeductions.tdsMinor,
+            totalDeductedMinor: tdsDeductions.totalDeductedMinor,
+            outcome: tdsDeductions.outcome,
+            explanation: tdsDeductions.explanation,
+            challanId: tdsDeductions.challanId,
+          })
+          .from(tdsDeductions)
+          .where(and(...conditions))
+          .orderBy(desc(tdsDeductions.deductionDate))
+          .limit(100);
+
+        // Join deductee names
+        const deducteeIds = [
+          ...new Set(rows.map((r) => r.deducteeId).filter(Boolean)),
+        ] as string[];
+        const deducteeRows = deducteeIds.length
+          ? await tx
+              .select({
+                id: tdsDeductees.id,
+                legalName: tdsDeductees.legalName,
+                panNumber: tdsDeductees.panNumber,
+              })
+              .from(tdsDeductees)
+              .where(
+                and(
+                  eq(tdsDeductees.tenantId, session.tenantId),
+                  inArray(tdsDeductees.id, deducteeIds),
+                ),
+              )
+          : [];
+        const deducteeMap = new Map(deducteeRows.map((d) => [d.id, d]));
+
+        return rows.map((r) => {
+          const deductee = deducteeMap.get(r.deducteeId);
+          return {
+            id: r.id,
+            deducteeName: deductee?.legalName ?? null,
+            deducteePan: deductee?.panNumber ?? null,
+            section: r.section,
+            financialYear: r.financialYear,
+            quarter: r.quarter,
+            deductionDate: r.deductionDate,
+            paymentBase: money(r.paymentBaseMinor),
+            chargeableBase: money(r.chargeableBaseMinor),
+            rateBps: r.rateBps,
+            ratePercent: ((r.rateBps ?? 0) / 100).toFixed(2) + "%",
+            tdsAmount: money(r.tdsMinor),
+            totalDeducted: money(r.totalDeductedMinor),
+            outcome: r.outcome,
+            explanation: r.explanation,
+            deposited: r.challanId !== null,
+          };
+        });
+      });
+    }
+
     /* ---------------- WRITES ---------------- */
     case "ordence_raise_variation": {
       /**
@@ -573,6 +1354,85 @@ async function runTool(
         issues: typeof args.issues === "string" ? args.issues : null,
       });
       return result;
+    }
+
+    /* ---- v0.83.0-alpha: Additional write tools ---- */
+
+    case "ordence_create_compliance_task": {
+      return withTenant(session.tenantId, async (tx) => {
+        const result = await tx
+          .insert(complianceTasks)
+          .values({
+            tenantId: session.tenantId,
+            obligationId: requireString(args, "obligationId"),
+            periodLabel: requireString(args, "periodLabel"),
+            dueDate: requireString(args, "dueDate"),
+            status: "pending",
+          } as unknown as typeof complianceTasks.$inferInsert)
+          .returning({ id: complianceTasks.id });
+        return { id: result[0]?.id, status: "created" };
+      });
+    }
+
+    case "ordence_create_reminder": {
+      const { createNotification } = await import("@/server/actions/notifications");
+      const result = await createNotification({
+        tenantId: session.tenantId,
+        title: requireString(args, "title"),
+        body: typeof args.body === "string" ? args.body : undefined,
+        category: requireString(args, "category"),
+        severity: typeof args.severity === "string" ? args.severity : "info",
+        actionUrl: typeof args.actionUrl === "string" ? args.actionUrl : undefined,
+        source: "ai_agent",
+      });
+      return result.ok ? { id: result.id, status: "created" } : { error: result.error };
+    }
+
+    case "ordence_update_deal_stage": {
+      const { deals } = await import("@/db/schema");
+      return withTenant(session.tenantId, async (tx) => {
+        await tx
+          .update(deals)
+          .set({
+            stage: requireString(args, "stage") as "lead" | "qualified" | "proposal" | "negotiation" | "won" | "lost",
+            updatedAt: new Date(),
+          })
+          .where(and(eq(deals.id, requireString(args, "dealId")), eq(deals.tenantId, session.tenantId)));
+        return { id: requireString(args, "dealId"), status: "updated" };
+      });
+    }
+
+    case "ordence_create_note": {
+      // Notes are stored as audit log entries with resourceType = "note"
+      const { auditLogs } = await import("@/db/schema");
+      return withTenant(session.tenantId, async (tx) => {
+        await tx.insert(auditLogs).values({
+          tenantId: session.tenantId,
+          action: "create",
+          resourceType: requireString(args, "recordType"),
+          resourceId: requireString(args, "recordId"),
+          newValue: { note: requireString(args, "body") },
+          reason: "Note created via AI assistant",
+        });
+        return { status: "created" };
+      });
+    }
+
+    case "ordence_send_email": {
+      const resendKey = process.env.RESEND_API_KEY;
+      if (!resendKey) {
+        throw new Error("Email sending is not configured. Set RESEND_API_KEY.");
+      }
+      const { Resend } = await import("resend");
+      const resend = new Resend(resendKey);
+      const fromEmail = process.env.RESEND_FROM_EMAIL || "Ordence <notifications@mail.ordence.com>";
+      const result = await resend.emails.send({
+        from: fromEmail,
+        to: requireString(args, "to"),
+        subject: requireString(args, "subject"),
+        text: requireString(args, "body"),
+      });
+      return { id: result.data?.id, status: "sent" };
     }
 
     default:

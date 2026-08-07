@@ -159,6 +159,232 @@ const READ_TOOLS: readonly McpToolDefinition[] = [
     scope: "read_only",
     parameters: [],
   },
+
+  /* ---- GST ------------------------------------------------------- */
+  {
+    name: "ordence_list_gst_registrations",
+    title: "The workspace's own GST registrations",
+    description:
+      "Every GSTIN this workspace holds, with its state code, legal name, " +
+      "registration type and whether it is the primary. A developer " +
+      "registered in more than one state has multiple rows. Use this to " +
+      "answer 'which GSTIN do we issue from' before looking at invoices.",
+    scope: "read_only",
+    parameters: [],
+  },
+  {
+    name: "ordence_list_gst_parties",
+    title: "Counterparty GSTINs",
+    description:
+      "Every GSTIN that is not ours — buyers, vendors, contractors — with " +
+      "their registration type, state code and PAN. Filtered to active " +
+      "parties. Useful before raising or matching a tax document.",
+    scope: "read_only",
+    parameters: [
+      {
+        name: "partyType",
+        type: "string",
+        required: false,
+        description: "Filter: 'customer' or 'vendor'. Omit for all.",
+      },
+    ],
+  },
+
+  /* ---- Purchases & ITC ------------------------------------------- */
+  {
+    name: "ordence_list_purchase_invoices",
+    title: "Vendor bills received",
+    description:
+      "Purchase invoices recorded in the workspace, newest first, with the " +
+      "supplier's invoice number, date, taxable value, total tax and ITC " +
+      "eligibility per line. Useful for 'what did we buy this month' and " +
+      "for GSTR-2B reconciliation prep.",
+    scope: "read_only",
+    parameters: [
+      {
+        name: "status",
+        type: "string",
+        required: false,
+        description:
+          "Filter by status: draft, recorded, approved, paid, cancelled. " +
+          "Omit for all.",
+      },
+    ],
+  },
+  {
+    name: "ordence_itc_register",
+    title: "Input tax credit position",
+    description:
+      "The ITC register: every credit movement with its period, reason, " +
+      "amount and status (claimed, blocked, deferred, reversed). This is " +
+      "what answers 'how much input tax credit can we claim this period'.",
+    scope: "read_only",
+    parameters: [
+      {
+        name: "status",
+        type: "string",
+        required: false,
+        description:
+          "Filter: claimed, blocked, deferred, reversed. Omit for all.",
+      },
+    ],
+  },
+
+  /* ---- Receivables ----------------------------------------------- */
+  {
+    name: "ordence_list_demand_notices",
+    title: "Demand notices (receivables)",
+    description:
+      "Demand notices raised against construction-linked milestones, with " +
+      "notice number, due date, principal, tax, total, allocated so far and " +
+      "status (draft, issued, part_paid, paid, cancelled, superseded). " +
+      "Useful for 'what is outstanding' and 'who is overdue'.",
+    scope: "read_only",
+    parameters: [
+      {
+        name: "status",
+        type: "string",
+        required: false,
+        description:
+          "Filter: draft, issued, part_paid, paid, cancelled, superseded. " +
+          "Omit for all.",
+      },
+    ],
+  },
+  {
+    name: "ordence_list_receipts",
+    title: "Receipts collected",
+    description:
+      "Receipts recorded in the workspace, newest first, with method, " +
+      "amount, status (pending, cleared, bounced, cancelled) and the demand " +
+      "notice they were allocated against. A bounced cheque is visible here " +
+      "because it was never money.",
+    scope: "read_only",
+    parameters: [],
+  },
+
+  /* ---- Compliance ------------------------------------------------ */
+  {
+    name: "ordence_compliance_calendar",
+    title: "Compliance calendar — what is due and what is late",
+    description:
+      "Every compliance task in the workspace, ordered by due date, with " +
+      "the obligation name, authority, period label, due date, status and " +
+      "severity. Tasks that are pending or in_progress and past their due " +
+      "date are flagged as overdue. This is what answers 'what filings are " +
+      "due this month' and 'are we behind on anything'.",
+    scope: "read_only",
+    parameters: [
+      {
+        name: "status",
+        type: "string",
+        required: false,
+        description:
+          "Filter: pending, in_progress, awaiting_client, ready_to_file, " +
+          "filed, late_filed, missed, not_applicable, waived. Omit for all " +
+          "non-terminal (excludes filed, not_applicable, waived).",
+      },
+    ],
+  },
+  {
+    name: "ordence_list_licences",
+    title: "Licences and registrations",
+    description:
+      "Licences and statutory registrations held by the workspace or its " +
+      "client companies, with status (active, renewal_due, under_renewal, " +
+      "expired, suspended, cancelled) and expiry date. Useful for 'what " +
+      "expires soon' and 'are we operating on an expired licence'.",
+    scope: "read_only",
+    parameters: [],
+  },
+
+  /* ---- Inventory ------------------------------------------------- */
+  {
+    name: "ordence_stock_position",
+    title: "Stock on hand and available",
+    description:
+      "Every stock item with its on-hand quantity and available quantity " +
+      "(on hand minus reserved), per warehouse, plus reorder level. Items " +
+      "at or below their reorder level are flagged. This is what answers " +
+      "'what needs reordering' and 'can we fulfil this order'.",
+    scope: "read_only",
+    parameters: [
+      {
+        name: "lowStockOnly",
+        type: "boolean",
+        required: false,
+        description:
+          "If true, returns only items at or below their reorder level.",
+      },
+    ],
+  },
+
+  /* ---- Scheduling ------------------------------------------------ */
+  {
+    name: "ordence_list_bookings",
+    title: "Scheduled bookings",
+    description:
+      "Bookings on the scheduling calendar, ordered by start time, with " +
+      "resource name, reference, status and the time window. Useful for " +
+      "'what is booked today' and 'is this resource free'.",
+    scope: "read_only",
+    parameters: [
+      {
+        name: "status",
+        type: "string",
+        required: false,
+        description:
+          "Filter: held, confirmed, checked_in, in_progress, completed, " +
+          "no_show, cancelled, waitlisted. Omit for active (held, " +
+          "confirmed, checked_in, in_progress).",
+      },
+    ],
+  },
+
+  /* ---- Field operations ------------------------------------------ */
+  {
+    name: "ordence_list_field_jobs",
+    title: "Field jobs",
+    description:
+      "Field and mobile operations jobs, ordered by scheduled window, with " +
+      "job number, title, kind, status, priority, assigned person, site " +
+      "address and visit count. Useful for 'what is dispatched today', " +
+      "'what is overdue' and 'which jobs needed multiple visits'.",
+    scope: "read_only",
+    parameters: [
+      {
+        name: "status",
+        type: "string",
+        required: false,
+        description:
+          "Filter: draft, scheduled, dispatched, travelling, on_site, " +
+          "paused, completed, could_not_complete, cancelled. Omit for " +
+          "active (scheduled, dispatched, travelling, on_site, paused).",
+      },
+    ],
+  },
+
+  /* ---- TDS ------------------------------------------------------- */
+  {
+    name: "ordence_list_tds_deductions",
+    title: "TDS deductions",
+    description:
+      "Tax Deducted at Source entries, newest first, with the deductee " +
+      "name, PAN, section, rate, amount deducted, amount paid and the " +
+      "period. Useful for 'how much TDS did we deduct this quarter' and " +
+      "'are we behind on any deductions'.",
+    scope: "read_only",
+    parameters: [
+      {
+        name: "section",
+        type: "string",
+        required: false,
+        description:
+          "Filter by TDS section: 194C, 194J_a, 194J_b, 194I_a, 194I_b, " +
+          "194IA, 194Q, 194H, 194A, 195. Omit for all.",
+      },
+    ],
+  },
 ];
 
 /* ------------------------------------------------------------------ */
@@ -226,6 +452,83 @@ const WRITE_TOOLS: readonly McpToolDefinition[] = [
       { name: "hoursLost", type: "string", required: false, description: "Hours." },
       { name: "workDone", type: "string", required: false, description: "What was built." },
       { name: "issues", type: "string", required: false, description: "Problems." },
+    ],
+  },
+
+  /* ---- v0.83.0-alpha: Additional write tools ---- */
+
+  {
+    name: "ordence_create_compliance_task",
+    title: "Create a compliance task",
+    description:
+      "Creates a compliance tracking task with a due date. Useful for " +
+      "agents that identify an obligation the tenant needs to track.",
+    scope: "read_write",
+    caution: "Creates a task. It does not file anything or meet any deadline.",
+    parameters: [
+      { name: "obligationId", type: "string", required: true, description: "Link to an existing compliance obligation." },
+      { name: "periodLabel", type: "string", required: true, description: "e.g. 'GST Aug 2026' or 'TDS Q2 2026'." },
+      { name: "dueDate", type: "string", required: true, description: "YYYY-MM-DD." },
+      { name: "notes", type: "string", required: false, description: "Optional context." },
+    ],
+  },
+  {
+    name: "ordence_create_reminder",
+    title: "Create a reminder notification",
+    description:
+      "Creates an in-app notification for the tenant. The notification " +
+      "appears in the bell icon and the notification center.",
+    scope: "read_write",
+    caution: "Creates a notification. It does not send an email or push alert.",
+    parameters: [
+      { name: "title", type: "string", required: true, description: "Short title." },
+      { name: "body", type: "string", required: false, description: "Details." },
+      { name: "category", type: "string", required: true, description: "compliance, finance, gst, receivables, inventory, field_ops, or system." },
+      { name: "severity", type: "string", required: false, description: "info, warning, critical. Default: info." },
+      { name: "actionUrl", type: "string", required: false, description: "Deep link to the relevant page." },
+    ],
+  },
+  {
+    name: "ordence_update_deal_stage",
+    title: "Update a deal's stage",
+    description:
+      "Moves a deal to a new stage in the sales pipeline. Does not close " +
+      "or delete the deal.",
+    scope: "read_write",
+    caution: "Updates a deal's stage. It cannot close, win, or delete a deal.",
+    parameters: [
+      { name: "dealId", type: "string", required: true, description: "The deal to update." },
+      { name: "stage", type: "string", required: true, description: "New stage: lead, qualified, proposal, negotiation, won, lost." },
+    ],
+  },
+  {
+    name: "ordence_create_note",
+    title: "Create a note on a record",
+    description:
+      "Adds a text note to a contact, deal, project, or compliance task. " +
+      "Notes are append-only — existing notes are not modified.",
+    scope: "read_write",
+    caution: "Appends a note. It cannot edit or delete existing notes.",
+    parameters: [
+      { name: "recordType", type: "string", required: true, description: "contact, deal, project, or compliance_task." },
+      { name: "recordId", type: "string", required: true, description: "The record to note on." },
+      { name: "body", type: "string", required: true, description: "The note text." },
+    ],
+  },
+  {
+    name: "ordence_send_email",
+    title: "Send an email notification",
+    description:
+      "Sends a transactional email via the configured Resend integration. " +
+      "Requires RESEND_API_KEY to be set.",
+    scope: "read_write",
+    caution:
+      "Sends an email to an external address. The recipient, subject, and body " +
+      "are visible to the LLM provider. Do not include sensitive data.",
+    parameters: [
+      { name: "to", type: "string", required: true, description: "Recipient email address." },
+      { name: "subject", type: "string", required: true, description: "Email subject line." },
+      { name: "body", type: "string", required: true, description: "Plain text email body." },
     ],
   },
 ];

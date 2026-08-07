@@ -39,7 +39,7 @@
  */
 
 import { z } from "zod";
-import { and, eq, desc, gte, sql } from "drizzle-orm";
+import { and, eq, desc, gte, sql, isNull } from "drizzle-orm";
 import { withTenant } from "@/db";
 import {
   vAssetPortfolio,
@@ -47,6 +47,11 @@ import {
   vContractPipeline,
   auditLogs,
   users,
+  complianceTasks,
+  complianceLicences,
+  demandNotices,
+  tenantPatterns,
+  notifications,
 } from "@/db/schema";
 import { requireTenantContext, TenantAccessError } from "@/server/tenant-context";
 import type { ActionResult } from "@/lib/validators/crm";
@@ -464,4 +469,236 @@ function paiseToDecimal(paise: bigint): string {
   const whole = abs / 100n;
   const fraction = (abs % 100n).toString().padStart(2, "0");
   return `${negative ? "-" : ""}${whole}.${fraction}`;
+}
+
+
+/* ------------------------------------------------------------------ */
+/* COMPLIANCE SUMMARY (v0.82.0-alpha)                                  */
+/* ------------------------------------------------------------------ */
+
+export type ComplianceSummary = {
+  pendingCount: number;
+  overdueCount: number;
+  dueIn7Days: number;
+  nextDeadline: string | null;
+  expiringLicences: number;
+};
+
+export async function getComplianceSummary(): Promise<ActionResult<ComplianceSummary>> {
+  try {
+    const ctx = await requireTenantContext();
+    const today = new Date().toISOString().slice(0, 10);
+    const sevenAhead = new Date(Date.now() + 7 * 86400000).toISOString().slice(0, 10);
+
+    const result = await withTenant(ctx.tenant.id, async (tx) => {
+      const pending = await tx
+        .select({ count: sql<number>`count(*)::int` })
+        .from(complianceTasks)
+        .where(eq(complianceTasks.status, "pending"));
+
+      const overdue = await tx
+        .select({ count: sql<number>`count(*)::int` })
+        .from(complianceTasks)
+        .where(and(eq(complianceTasks.status, "pending"), sql`${complianceTasks.dueDate} < ${today}`));
+
+      const dueSoon = await tx
+        .select({ count: sql<number>`count(*)::int` })
+        .from(complianceTasks)
+        .where(and(
+          eq(complianceTasks.status, "pending"),
+          sql`${complianceTasks.dueDate} >= ${today}`,
+          sql`${complianceTasks.dueDate} <= ${sevenAhead}`,
+        ));
+
+      const next = await tx
+        .select({ dueDate: complianceTasks.dueDate, label: complianceTasks.periodLabel })
+        .from(complianceTasks)
+        .where(eq(complianceTasks.status, "pending"))
+        .orderBy(sql`${complianceTasks.dueDate} ASC`)
+        .limit(1);
+
+      const expiring = await tx
+        .select({ count: sql<number>`count(*)::int` })
+        .from(complianceLicences)
+        .where(and(
+          sql`${complianceLicences.validUntil} IS NOT NULL`,
+          sql`${complianceLicences.validUntil} <= ${sevenAhead}`,
+        ));
+
+      return {
+        pendingCount: pending[0]?.count ?? 0,
+        overdueCount: overdue[0]?.count ?? 0,
+        dueIn7Days: dueSoon[0]?.count ?? 0,
+        nextDeadline: next[0]?.dueDate ?? null,
+        expiringLicences: expiring[0]?.count ?? 0,
+      };
+    });
+
+    return { ok: true, data: result };
+  } catch (err) {
+    return toActionError(err);
+  }
+}
+
+
+/* ------------------------------------------------------------------ */
+/* RECEIVABLES SUMMARY (v0.82.0-alpha)                                 */
+/* ------------------------------------------------------------------ */
+
+export type ReceivablesSummary = {
+  totalOverdue: number;
+  totalOutstanding: number;
+  overdueCount: number;
+  oldestDays: number;
+};
+
+export async function getReceivablesSummary(): Promise<ActionResult<ReceivablesSummary>> {
+  try {
+    const ctx = await requireTenantContext();
+    const today = new Date().toISOString().slice(0, 10);
+
+    const result = await withTenant(ctx.tenant.id, async (tx) => {
+      const overdue = await tx
+        .select({
+          count: sql<number>`count(*)::int`,
+          total: sql<number>`coalesce(sum(${demandNotices.principalMinor}), 0)::float8`,
+          oldestDays: sql<number>`coalesce(max(extract(epoch from (${today}::date - ${demandNotices.noticeDate}::date)) / 86400), 0)::int`,
+        })
+        .from(demandNotices)
+        .where(and(
+          sql`${demandNotices.principalMinor} > 0`,
+          sql`coalesce(outstanding_minor, principal_minor) > 0`,
+        ));
+
+      const totalOutstanding = await tx
+        .select({
+          total: sql<number>`coalesce(sum(coalesce(outstanding_minor, principal_minor)), 0)::float8`,
+        })
+        .from(demandNotices)
+        .where(sql`coalesce(outstanding_minor, principal_minor) > 0`);
+
+      return {
+        totalOverdue: Math.round(overdue[0]?.total ?? 0),
+        totalOutstanding: Math.round(totalOutstanding[0]?.total ?? 0),
+        overdueCount: overdue[0]?.count ?? 0,
+        oldestDays: overdue[0]?.oldestDays ?? 0,
+      };
+    });
+
+    return { ok: true, data: result };
+  } catch (err) {
+    return toActionError(err);
+  }
+}
+
+
+/* ------------------------------------------------------------------ */
+/* AI INSIGHTS SUMMARY (v0.82.0-alpha)                                 */
+/* ------------------------------------------------------------------ */
+
+export type AIInsight = {
+  patternType: string;
+  patternKey: string;
+  summary: string;
+  occurrenceCount: number;
+  lastSeen: string;
+};
+
+export type AIInsightsSummary = {
+  insights: AIInsight[];
+  totalPatterns: number;
+};
+
+export async function getAIInsights(): Promise<ActionResult<AIInsightsSummary>> {
+  try {
+    const ctx = await requireTenantContext();
+
+    const { getTenantPatterns } = await import("@/lib/ai/patterns");
+    const patterns = await getTenantPatterns(ctx.tenant.id);
+
+    const insights: AIInsight[] = patterns.slice(0, 6).map((p) => ({
+      patternType: p.patternType,
+      patternKey: p.patternKey,
+      summary: (p.patternData as { summary?: string }).summary ?? p.patternType,
+      occurrenceCount: p.occurrenceCount,
+      lastSeen: p.lastSeen.toISOString(),
+    }));
+
+    return {
+      ok: true,
+      data: {
+        insights,
+        totalPatterns: patterns.length,
+      },
+    };
+  } catch (err) {
+    return toActionError(err);
+  }
+}
+
+
+/* ------------------------------------------------------------------ */
+/* NOTIFICATIONS SUMMARY (v0.82.0-alpha)                               */
+/* ------------------------------------------------------------------ */
+
+export type NotificationSummary = {
+  unreadCount: number;
+  recent: Array<{
+    id: string;
+    title: string;
+    severity: string;
+    category: string;
+    actionUrl: string | null;
+    createdAt: string;
+  }>;
+};
+
+export async function getNotificationsSummary(): Promise<ActionResult<NotificationSummary>> {
+  try {
+    const ctx = await requireTenantContext();
+
+    const result = await withTenant(ctx.tenant.id, async (tx) => {
+      const recent = await tx
+        .select({
+          id: notifications.id,
+          title: notifications.title,
+          severity: notifications.severity,
+          category: notifications.category,
+          actionUrl: notifications.actionUrl,
+          createdAt: notifications.createdAt,
+        })
+        .from(notifications)
+        .where(and(
+          eq(notifications.tenantId, ctx.tenant.id),
+          isNull(notifications.dismissedAt),
+        ))
+        .orderBy(desc(notifications.createdAt))
+        .limit(5);
+
+      const unread = await tx
+        .select({ count: sql<number>`count(*)::int` })
+        .from(notifications)
+        .where(and(
+          eq(notifications.tenantId, ctx.tenant.id),
+          isNull(notifications.readAt),
+          isNull(notifications.dismissedAt),
+        ));
+
+      return {
+        unreadCount: unread[0]?.count ?? 0,
+        recent: recent.map((r) => ({
+          id: r.id,
+          title: r.title,
+          severity: r.severity,
+          category: r.category,
+          actionUrl: r.actionUrl,
+          createdAt: r.createdAt.toISOString(),
+        })),
+      };
+    });
+
+    return { ok: true, data: result };
+  } catch (err) {
+    return toActionError(err);
+  }
 }

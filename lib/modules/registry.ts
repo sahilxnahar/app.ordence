@@ -203,6 +203,15 @@ export const MODULE_REGISTRY: Readonly<Record<string, ModuleDescriptor>> =
       status: "live", // 🔴 /search does not exist — 404s today
       href: "/search",
     },
+    assistant: {
+      navId: "assistant",
+      label: "Assistant",
+      description: "AI assistant for GST, receivables, compliance, and more.",
+      group: "home",
+      feature: null,
+      status: "live",
+      href: "/assistant",
+    },
 
     /* ---- CUSTOMERS ----------------------------------------------- */
 
@@ -715,6 +724,42 @@ export const MODULE_REGISTRY: Readonly<Record<string, ModuleDescriptor>> =
       description: "Deductions, challans and quarterly returns.",
       group: "money", feature: "tds.deductions", status: "live", href: "/tds",
     },
+    gstr2b: {
+      navId: "gstr2b",
+      label: "GSTR-2B Reconciliation",
+      description: "Match purchase invoices against the auto-generated GSTR-2B.",
+      group: "money",
+      feature: "gst.gstr2b",
+      status: "live",
+      href: "/gstr2b",
+    },
+    tally: {
+      navId: "tally",
+      label: "Tally Export",
+      description: "Export vouchers and masters for Tally import.",
+      group: "money",
+      feature: "accounting.tally",
+      status: "live",
+      href: "/tally",
+    },
+    land: {
+      navId: "land",
+      label: "Land & Title",
+      description: "Land parcels, survey numbers and the chain of title.",
+      group: "projects",
+      feature: "land.title",
+      status: "live",
+      href: "/land",
+    },
+    stock: {
+      navId: "stock",
+      label: "Materials",
+      description: "Stock on hand, reserved and available. Reorder alerts.",
+      group: "site",
+      feature: "inventory.stock",
+      status: "live",
+      href: "/inventory",
+    },
 
     automations: {
       navId: "automations",
@@ -724,6 +769,36 @@ export const MODULE_REGISTRY: Readonly<Record<string, ModuleDescriptor>> =
       feature: "workflows.builder",
       status: "live",
       href: "/automations",
+    },
+
+    notifications: {
+      navId: "notifications",
+      label: "Notifications",
+      description: "Alerts from compliance deadlines, receivables, GST, and background workers.",
+      group: "setup",
+      feature: null, // always available
+      status: "live",
+      href: "/notifications",
+    },
+
+    setup: {
+      navId: "setup",
+      label: "Setup Wizard",
+      description: "Guided first-time setup for new workspaces.",
+      group: "setup",
+      feature: null, // always available
+      status: "live",
+      href: "/setup",
+    },
+
+    reports: {
+      navId: "reports",
+      label: "Reports",
+      description: "Predefined reports: GST, receivables, TDS, compliance, inventory, profitability.",
+      group: "setup",
+      feature: null, // always available
+      status: "live",
+      href: "/reports",
     },
   });
 

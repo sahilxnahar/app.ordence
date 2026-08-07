@@ -38,6 +38,7 @@ import { requiredFeatureKeys } from "@/lib/modules/registry";
 import { filterNavigationByEntitlement } from "@/lib/modules/nav";
 import { Sidebar } from "@/components/layout/sidebar";
 import { IndustryProvider } from "@/components/layout/industry-provider";
+import { NotificationBell } from "@/components/layout/notification-bell";
 
 export const dynamic = "force-dynamic";
 
@@ -149,6 +150,7 @@ export default async function CrmLayout({
               />
             </div>
             <div className="flex items-center gap-3">
+              <NotificationBell />
               <span className="hidden text-sm text-muted-foreground sm:inline">
                 {user.firstName ?? user.email}
               </span>

@@ -1,76 +1,74 @@
 # Ordence
 
-Enterprise multi-tenant CRM platform. Edge-first, built on Next.js + Vercel.
+Enterprise multi-tenant CRM + ERP for the Indian market. One codebase, one
+database, many customer workspaces — isolated by PostgreSQL row-level security.
 
-**Current version:** `v0.10.0-alpha` — Executive Dashboards & Financial Analytics
+**Current version:** `v0.83.0-alpha` — Settings hub (integrations, AI, notifications), write-capable AI tools, conversation memory, email delivery, 6 reports, dashboard command center
 
-**[📋 Project Status — what is done and what is pending](docs/PROJECT-STATUS.md)**
+**[📋 Deploy Guide — start here](DEPLOY.md)**
 
 ## Quick start
 
 ```bash
 npm install
 cp .env.example .env.local   # fill in your keys
-npm run db:push              # create tables
+npm run db:push              # create tables (dev only — never in production)
 npm run dev                  # http://localhost:3000
 ```
 
 Then run **`SQL-FILES/ALL-IN-ONE-SETUP.sql`** in your Neon SQL Editor.
 **This step is required** — it turns on database-level tenant isolation, the
-append-only audit trail, and double-entry balance enforcement. One file, all phases.
+append-only audit trail, and double-entry balance enforcement.
 
-## Documentation
+For production deployments, see **[DEPLOY.md](DEPLOY.md)**.
 
-| Document | Purpose |
+## What this version includes
+
+| Feature | Description |
 |---|---|
-| [`docs/DEPLOYMENT-GUIDE.md`](docs/DEPLOYMENT-GUIDE.md) | Step-by-step deploy, written for non-developers |
-| [`docs/COST-AND-UPGRADE-PATH.md`](docs/COST-AND-UPGRADE-PATH.md) | What's free, what costs money, when to upgrade |
-| [`docs/PROJECT-STATUS.md`](docs/PROJECT-STATUS.md) | **Done vs pending — start here** |
-| [`docs/PHASE-6-DEPLOYMENT.md`](docs/PHASE-6-DEPLOYMENT.md) | Phase 6 test setup |
-| [`docs/SECURITY-REPORT-v0.6.0.md`](docs/SECURITY-REPORT-v0.6.0.md) | Phase 6 security audit |
-| [`docs/SECURITY-REPORT-v0.7.0.md`](docs/SECURITY-REPORT-v0.7.0.md) | Phase 7 security audit |
-| [`docs/PHASE-7-DEPLOYMENT.md`](docs/PHASE-7-DEPLOYMENT.md) | Phase 7 step-by-step deployment |
-| [`docs/SECURITY-REPORT-v0.8.0.md`](docs/SECURITY-REPORT-v0.8.0.md) | Phase 8 security audit |
-| [`docs/PHASE-8-DEPLOYMENT.md`](docs/PHASE-8-DEPLOYMENT.md) | Phase 8 step-by-step deployment |
-| [`docs/SECURITY-REPORT-v0.9.0.md`](docs/SECURITY-REPORT-v0.9.0.md) | Phase 9 security audit |
-| [`docs/PHASE-9-DEPLOYMENT.md`](docs/PHASE-9-DEPLOYMENT.md) | Phase 9 step-by-step deployment |
-| [`docs/SECURITY-REPORT-v0.10.0.md`](docs/SECURITY-REPORT-v0.10.0.md) | Phase 10 security audit |
-| [`docs/PHASE-10-DEPLOYMENT.md`](docs/PHASE-10-DEPLOYMENT.md) | Phase 10 step-by-step deployment |
-| [`docs/PHASE-5-DEPLOYMENT.md`](docs/PHASE-5-DEPLOYMENT.md) | Phase 5 setup |
-| [`docs/SECURITY-REPORT-v0.5.0.md`](docs/SECURITY-REPORT-v0.5.0.md) | Phase 5 security audit |
-| [`docs/PHASE-4-DEPLOYMENT.md`](docs/PHASE-4-DEPLOYMENT.md) | Phase 4 setup |
-| [`docs/SECURITY-REPORT-v0.4.0.md`](docs/SECURITY-REPORT-v0.4.0.md) | Phase 4 security audit |
-| [`docs/PHASE-3-DEPLOYMENT.md`](docs/PHASE-3-DEPLOYMENT.md) | Phase 3 migration + seeding |
-| [`docs/SECURITY-REPORT-v0.3.0.md`](docs/SECURITY-REPORT-v0.3.0.md) | Phase 3 security audit |
-| [`docs/PHASE-2-DEPLOYMENT.md`](docs/PHASE-2-DEPLOYMENT.md) | Phase 2 migration + webhook setup |
-| [`docs/SECURITY-REPORT-v0.2.0.md`](docs/SECURITY-REPORT-v0.2.0.md) | Phase 2 security audit |
-| [`docs/SECURITY-REPORT-v0.1.0.md`](docs/SECURITY-REPORT-v0.1.0.md) | Phase 1 security audit |
-| [`CHANGELOG.md`](CHANGELOG.md) | Version history |
+| **Multi-tenancy** | RLS + FORCE on every table, Clerk Organizations, RBAC, audit log |
+| **Six engines** | Scheduling, pricing, field ops, compliance calendar, utility metering, sensitive-data vault |
+| **India accounting** | GST, GSTR-2B reconciliation, TDS, Tally integration, double-entry ledger, receivables & dunning |
+| **Construction** | BOQ, RA bills, variations, site labour, land & title, measurement books |
+| **24 MCP tools** | Read tools for every module + write tools for variations and site logs |
+| **7 AI agents** | GST assistant, reconciliation, compliance monitor, receivables, BOQ estimator, field dispatcher, Tally export |
+| **Assistant chat UI** | In-CRM chat with agent picker, tool call indicators, conversation history |
+| **Goal planner** | Natural language to workflow draft — describe a goal, AI generates a validated workflow program |
+| **6 background workers** | GST deadlines, receivables aging, reconciliation drift, inventory reorder, compliance gap, site labour anomaly |
+| **AI pattern memory** | Per-tenant learned business facts for smarter agent runs |
+| **Construction vertical** | Complete end-to-end: BOQ, variations, site labour, RA bills, cost control, land & title, compliance, finance (GST/TDS/accounting/receivables), materials, documents |
+| **13 industry templates** | All 13 verticals complete with Finance (GST, GSTR-2B, TDS, Ledger, Tally), Compliance, and Documents sections |
 
 ## Project structure
 
 ```
 ordence/
-├── app/                    # Next.js App Router (pages & API routes)
-│   ├── (auth)/             # Sign-in / sign-up  [Clerk]
-│   ├── (platform)/         # Authenticated app surface
-│   ├── api/health/         # Liveness probe  [Edge]
-│   ├── onboarding/         # Create-organization flow
-│   └── access-denied/      # Tenant mismatch landing
-├── components/ui/          # shadcn/ui primitives
+├── app/                    # Next.js App Router
+│   ├── (auth)/             # Sign-in / sign-up [Clerk]
+│   ├── (crm)/              # The CRM application (40 routes, incl. /assistant)
+│   ├── platform/           # Admin console
+│   ├── api/                # API routes (health, diag, mcp, assistant, workers, webhooks)
+│   └── portal/             # External client portal
+├── components/             # React components
 ├── db/
-│   ├── schema.ts           # Drizzle schema — single source of truth
-│   ├── index.ts            # Serverless client + withTenant()
-│   └── migrations/         # SQL migrations incl. RLS policies
+│   ├── schema/             # Drizzle schema (41 files, 150+ tables)
+│   ├── index.ts            # Serverless client + withTenant() (RLS enforcement)
+│   └── migrations/         # SQL migrations
 ├── lib/
-│   ├── env.ts              # Zod-validated env (blocks browser access)
-│   ├── tenant.ts           # Edge-safe host → tenant resolution
-│   ├── redis.ts            # Tenant-namespaced cache & rate limiting
-│   └── utils.ts            # cn() helper
+│   ├── ai/                 # AI provider registry, router, client, agents, goal-planner
+│   ├── mcp/                # MCP tool registry (24 tools)
+│   ├── modules/            # Module registry (59 modules)
+│   ├── env.ts              # Zod-validated env
+│   ├── workflows/          # Workflow engine (triggers, actions, validation)
+│   └── industry-templates.ts  # 13 industry packs
 ├── server/
-│   └── tenant-context.ts   # Authoritative tenant verification  [server-only]
+│   ├── ai/                 # Agent runner, background workers
+│   ├── mcp/                # MCP dispatch (token auth, RLS, audit log)
+│   └── actions/            # Server actions (50 files)
+├── SQL-FILES/              # Numbered SQL migrations (0001–0044)
 ├── middleware.ts           # Edge multi-tenant auth gate
-└── docs/                   # Guides & security reports
+├── railway.json            # Railway deployment config
+└── DEPLOY.md               # Full deploy guide
 ```
 
 ## The isolation model
@@ -87,15 +85,18 @@ Three independent layers must all fail before cross-tenant data can leak:
 |---|---|
 | `npm run dev` | Start local dev server |
 | `npm run build` | Production build |
-| `npm run typecheck` | TypeScript check, no emit |
-| `npm run db:push` | Sync schema to database |
-| `npm run db:studio` | Visual database browser |
-| `npm run seed` | Populate the Basaveshwar Nagar demo project |
-| `npm run seed:phase5` | Populate ledgers, periods, audit logs & RBAC |
-| `npm run test:security` | Run the 69 security tests |
-| `npm run security:audit` | Dependency vulnerability scan |
+| `npm run typecheck` | TypeScript strict check |
+| `npm run test` | Run test suite (946 tests) |
+| `npm run test:security` | Run security tests (requires live DB) |
+| `npm run db:verify` | Verify RLS is enforced on all tables |
+| `npm run seed` | Populate demo project |
 
 ## Stack
 
 Next.js 15 (App Router) · TypeScript strict · Tailwind CSS · shadcn/ui ·
-PostgreSQL (Neon) · Drizzle ORM · Clerk Organizations · Upstash Redis · Zod
+PostgreSQL (Neon) · Drizzle ORM · Clerk Organizations · Upstash Redis ·
+Railway (deploy) · Cloudflare (DNS + R2)
+
+## License
+
+Private. All rights reserved.

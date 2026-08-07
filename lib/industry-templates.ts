@@ -116,6 +116,7 @@ const CORE_NAV_SECTION: NavSection = {
   items: [
     { id: "dashboard", label: "Dashboard", href: "/dashboard", icon: "layout-dashboard" },
     { id: "search", label: "Search", href: "/search", icon: "search" },
+    { id: "assistant", label: "Assistant", href: "/assistant", icon: "bot" },
   ],
 };
 
@@ -289,6 +290,7 @@ const REAL_ESTATE_TEMPLATE: IndustryTemplate = {
         { id: "buildings", label: "Buildings", href: "/assets?type=building", icon: "building-2" },
         { id: "units", label: "Units", href: "/assets?type=unit", icon: "door-open" },
         { id: "plots", label: "Land & Plots", href: "/assets?type=plot", icon: "map" },
+        { id: "land", label: "Land & Title", href: "/land", icon: "map-pin" },
       ],
     },
     {
@@ -327,9 +329,39 @@ const REAL_ESTATE_TEMPLATE: IndustryTemplate = {
         // actually regret — bill first, regularise later.
         { id: "variations", label: "Variations", href: "/variations", icon: "file-text" },
         { id: "site-labour", label: "Site labour", href: "/site-labour", icon: "users" },
+        { id: "stock", label: "Materials", href: "/inventory", icon: "package" },
         { id: "ra-bills", label: "RA Bills", href: "/ra-bills", icon: "indian-rupee" },
         { id: "cost-control", label: "Cost Control", href: "/reports/cost", icon: "indian-rupee" },
         { id: "contracts", label: "Contracts", href: "/assets?type=contract", icon: "file-text" },
+      ],
+    },
+    {
+      id: "compliance",
+      label: "Compliance",
+      items: [
+        { id: "compliance-board", label: "Deadlines", href: "/compliance", icon: "calendar-check" },
+        { id: "licences", label: "Licences", href: "/compliance/licences", icon: "badge-check" },
+      ],
+    },
+    {
+      id: "finance",
+      label: "Finance",
+      items: [
+        { id: "gst", label: "GST", href: "/gst", icon: "receipt" },
+        { id: "gstr2b", label: "GSTR-2B", href: "/gstr2b", icon: "file-check" },
+        { id: "tds", label: "TDS", href: "/tds", icon: "receipt" },
+        { id: "accounting", label: "Ledger", href: "/accounting", icon: "book-open" },
+        { id: "receivables", label: "Payments Due", href: "/receivables", icon: "indian-rupee" },
+        { id: "purchases", label: "Purchases", href: "/purchases", icon: "shopping-cart" },
+        { id: "statements", label: "Statements", href: "/statements", icon: "file-text" },
+        { id: "tally", label: "Tally Export", href: "/tally", icon: "download" },
+      ],
+    },
+    {
+      id: "docs",
+      label: "Documents",
+      items: [
+        { id: "documents", label: "Documents", href: "/documents", icon: "folder" },
       ],
     },
     ADMIN_NAV_SECTION,
@@ -510,6 +542,32 @@ const COMPLIANCE_NAV_SECTION: NavSection = {
   ],
 };
 
+/**
+ * Present in every vertical that files GST, deducts TDS and keeps books —
+ * which is every vertical. The same five modules, in the same order, so
+ * that the finance tab is muscle memory regardless of industry.
+ */
+const FINANCE_NAV_SECTION: NavSection = {
+  id: "finance",
+  label: "Finance",
+  items: [
+    { id: "gst", label: "GST", href: "/gst", icon: "receipt" },
+    { id: "gstr2b", label: "GSTR-2B", href: "/gstr2b", icon: "file-check" },
+    { id: "tds", label: "TDS", href: "/tds", icon: "receipt" },
+    { id: "accounting", label: "Ledger", href: "/accounting", icon: "book-open" },
+    { id: "tally", label: "Tally Export", href: "/tally", icon: "download" },
+  ],
+};
+
+/** Documents — present in every vertical. */
+const DOCS_NAV_SECTION: NavSection = {
+  id: "docs",
+  label: "Documents",
+  items: [
+    { id: "documents", label: "Documents", href: "/documents", icon: "folder" },
+  ],
+};
+
 /* ---- 1 · HOSPITALITY ---------------------------------------------- */
 
 const HOSPITALITY_TEMPLATE = makeVertical({
@@ -540,7 +598,9 @@ const HOSPITALITY_TEMPLATE = makeVertical({
         { id: "receivables", label: "Payments Due", href: "/receivables", icon: "hand-coins" },
       ],
     },
+    FINANCE_NAV_SECTION,
     COMPLIANCE_NAV_SECTION,
+    DOCS_NAV_SECTION,
   ],
   dashboard: [
     { id: "occupancy", title: "Occupancy", kind: "stat", metric: "scheduling.utilisation", span: 1, icon: "percent", format: "percent" },
@@ -594,7 +654,9 @@ const HEALTHCARE_TEMPLATE = makeVertical({
         { id: "rates", label: "Tariff", href: "/rates", icon: "indian-rupee" },
       ],
     },
+    FINANCE_NAV_SECTION,
     COMPLIANCE_NAV_SECTION,
+    DOCS_NAV_SECTION,
   ],
   dashboard: [
     { id: "beds-occupied", title: "Bed Occupancy", kind: "stat", metric: "scheduling.utilisation", span: 1, icon: "bed", format: "percent" },
@@ -648,7 +710,9 @@ const LOGISTICS_TEMPLATE = makeVertical({
         { id: "inventory", label: "Warehouse Stock", href: "/inventory", icon: "boxes" },
       ],
     },
+    FINANCE_NAV_SECTION,
     COMPLIANCE_NAV_SECTION,
+    DOCS_NAV_SECTION,
   ],
   dashboard: [
     { id: "in-transit", title: "In Transit", kind: "stat", metric: "orders.inTransit", span: 1, icon: "truck", format: "number" },
@@ -690,6 +754,8 @@ const TRADING_TEMPLATE = makeVertical({
         { id: "purchases", label: "Purchases", href: "/purchases", icon: "truck" },
         { id: "inventory", label: "Stock", href: "/inventory", icon: "boxes" },
         { id: "rates", label: "Price Lists", href: "/rates", icon: "indian-rupee" },
+        { id: "companies", label: "Accounts", href: "/companies", icon: "building-2" },
+        { id: "contacts", label: "Buyers", href: "/contacts", icon: "user-round" },
       ],
     },
     {
@@ -699,10 +765,14 @@ const TRADING_TEMPLATE = makeVertical({
         { id: "receivables", label: "Payments Due", href: "/receivables", icon: "hand-coins" },
         { id: "statements", label: "Statements", href: "/statements", icon: "file-text" },
         { id: "gst", label: "GST", href: "/gst", icon: "landmark" },
+        { id: "gstr2b", label: "GSTR-2B", href: "/gstr2b", icon: "file-check" },
         { id: "tds", label: "TDS", href: "/tds", icon: "scissors" },
+        { id: "accounting", label: "Ledger", href: "/accounting", icon: "book-open" },
+        { id: "tally", label: "Tally Export", href: "/tally", icon: "download" },
       ],
     },
     COMPLIANCE_NAV_SECTION,
+    DOCS_NAV_SECTION,
   ],
   dashboard: [
     { id: "stock-value", title: "Stock Value", kind: "stat", metric: "inventory.value", span: 1, icon: "boxes", format: "currency" },
@@ -755,7 +825,9 @@ const ELECTRICITY_TEMPLATE = makeVertical({
         { id: "field-jobs", label: "Site Work", href: "/field-jobs", icon: "hard-hat" },
       ],
     },
+    FINANCE_NAV_SECTION,
     COMPLIANCE_NAV_SECTION,
+    DOCS_NAV_SECTION,
   ],
   dashboard: [
     { id: "units-billed", title: "Units Billed", kind: "stat", metric: "metering.unitsBilled", span: 1, icon: "zap", format: "number" },
@@ -808,7 +880,9 @@ const SOLAR_TEMPLATE = makeVertical({
         { id: "inventory", label: "Panels & Spares", href: "/inventory", icon: "boxes" },
       ],
     },
+    FINANCE_NAV_SECTION,
     COMPLIANCE_NAV_SECTION,
+    DOCS_NAV_SECTION,
   ],
   dashboard: [
     { id: "capacity", title: "Installed Capacity", kind: "stat", metric: "assets.capacity", span: 1, icon: "sun", format: "number" },
@@ -861,7 +935,9 @@ const SOFTWARE_TEMPLATE = makeVertical({
         { id: "receivables", label: "Payments Due", href: "/receivables", icon: "hand-coins" },
       ],
     },
+    FINANCE_NAV_SECTION,
     COMPLIANCE_NAV_SECTION,
+    DOCS_NAV_SECTION,
   ],
   dashboard: [
     { id: "utilisation", title: "Utilisation", kind: "stat", metric: "timesheets.utilisation", span: 1, icon: "percent", format: "percent" },
@@ -967,11 +1043,15 @@ const FINANCE_TEMPLATE = makeVertical({
       items: [
         { id: "receivables", label: "Repayments", href: "/receivables", icon: "hand-coins" },
         { id: "statements", label: "Statements", href: "/statements", icon: "file-text" },
-        { id: "accounting", label: "Ledger", href: "/accounting", icon: "book-open" },
+        { id: "gst", label: "GST", href: "/gst", icon: "receipt" },
+        { id: "gstr2b", label: "GSTR-2B", href: "/gstr2b", icon: "file-check" },
         { id: "tds", label: "TDS", href: "/tds", icon: "scissors" },
+        { id: "accounting", label: "Ledger", href: "/accounting", icon: "book-open" },
+        { id: "tally", label: "Tally Export", href: "/tally", icon: "download" },
       ],
     },
     COMPLIANCE_NAV_SECTION,
+    DOCS_NAV_SECTION,
   ],
   dashboard: [
     { id: "aum", title: "Book Size", kind: "stat", metric: "receivables.principal", span: 1, icon: "landmark", format: "currency" },
@@ -1037,6 +1117,8 @@ const PROFESSIONAL_TEMPLATE = makeVertical({
         { id: "contracts", label: "Engagements", href: "/contracts", icon: "file-text" },
       ],
     },
+    FINANCE_NAV_SECTION,
+    DOCS_NAV_SECTION,
   ],
   dashboard: [
     { id: "due-week", title: "Due This Week", kind: "stat", metric: "compliance.dueSoon", span: 1, icon: "calendar-check", format: "number" },

@@ -96,11 +96,15 @@ describe("registry completeness", () => {
     // Every entry here is a thing that can never be charged for. Changing
     // this list is a commercial decision, so it is written down.
     expect(free).toEqual([
+      "assistant",
       "billing",
       "dashboard",
       "hearings",
+      "notifications",
+      "reports",
       "search",
       "settings",
+      "setup",
       "team",
     ]);
   });

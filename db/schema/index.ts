@@ -284,3 +284,11 @@ export * from "./labour";
 
 // ⭐ MCP access — tokens and the append-only call log (Batch 5).
 export * from "./mcp";
+
+// ⭐ Tenant pattern memory — learned business facts for AI agents (Phase D).
+// Structured JSONB facts, per-tenant, RLS-protected. The Ordence equivalent
+// of RUFLO's self-learning memory, but auditable and tenant-scoped.
+export * from "./ai-patterns";
+
+// Notifications — per-tenant notification center for alerts and insights
+export * from "./notifications";
