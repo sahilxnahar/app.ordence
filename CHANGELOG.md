@@ -1,5 +1,32 @@
 # Changelog
 
+## v0.87.0-alpha — a deploy you can prove landed
+
+No behaviour changes. This release exists so that one glance at the landing page
+answers "did the tree I pushed actually ship?"
+
+For roughly eighty releases the landing page printed a hardcoded `v0.1.0-alpha`.
+v0.85.0-alpha replaced it with `lib/version.ts`, which reads `package.json` at
+build time. On 11 August 2026 the live site was still printing `v0.1.0-alpha`
+**after** a deployment reported SUCCESS — which means the tree that was pushed
+was not the tree that had the fix. The deploy was green and the artefact was
+wrong, and nothing in the pipeline said so.
+
+So this version number is deliberately one the live site has never shown. After
+deploying, https://app.ordence.com must read `v0.87.0-alpha`. If it reads
+anything else, the push came from the wrong folder — regardless of what Railway
+says.
+
+- `package.json` — version 0.86.0-alpha → 0.87.0-alpha
+- `lib/version.ts` — stale version comment removed; it named a release the file
+  does not control, which is the same drift the file exists to prevent
+- `DEPLOY-VERIFY.md` — the post-deploy checks, in order, with what each proves
+
+Deliberately NOT changed: `app/api/health/route.ts`. It documents a decision to
+reveal nothing about internals — no version, no dependency status. A liveness
+probe that leaks the build is a fingerprint; the landing page already carries
+the version for humans, and that is the right place for it.
+
 ## v0.84.0-alpha — CI hardening: the three gates that would have caught this project's worst incidents
 
 Every check below exists because something got through. None is hypothetical.

@@ -1,6 +1,6 @@
 /**
  * Ordence — Application version
- * Version: v0.85.0-alpha
+ * Version: read from package.json — see APP_VERSION below
  *
  * WHY THIS FILE EXISTS
  * --------------------
