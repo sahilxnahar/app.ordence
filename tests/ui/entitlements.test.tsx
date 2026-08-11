@@ -370,11 +370,30 @@ describe("the gate is used consistently across server actions", () => {
   it("every file that imports requireFeature also handles FeatureLockedError", () => {
     // Otherwise a locked feature surfaces as "something went wrong",
     // which the customer cannot act on. "Upgrade to Advanced" they can.
+    //
+    // ⚠️ Strip comments before deciding whether a file gates features — the
+    // same way the `planTier` test above does, and for the same reason.
+    // Without this, a file that merely *documents* the gate order in a
+    // comment —
+    //
+    //     requireAccess() → requireFeature() → requirePermission()
+    //
+    // — is treated as if it called `requireFeature()`, and the test demands a
+    // catch clause for an error the file can never throw. `companies.ts` is
+    // exactly that case: it carries the comment, calls no gate, and failed
+    // this assertion for prose.
+    //
+    // This is not a relaxation. The claim is "code that CALLS requireFeature
+    // must HANDLE FeatureLockedError", and stripping comments is what makes
+    // the assertion measure that claim instead of a near neighbour. A check
+    // that fires on correct code is worse than no check: it is the shape that
+    // teaches people to silence checks.
     for (const file of readdirSync(ACTIONS_DIR).filter((f) => f.endsWith(".ts"))) {
       const source = readFileSync(join(ACTIONS_DIR, file), "utf8");
-      if (!source.includes("requireFeature(")) continue;
+      const code = source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
+      if (!code.includes("requireFeature(")) continue;
       expect(
-        source,
+        code,
         `${file} gates features but never catches FeatureLockedError`,
       ).toContain("instanceof FeatureLockedError");
     }

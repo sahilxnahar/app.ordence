@@ -1,5 +1,7 @@
 import Link from "next/link";
 
+import { APP_VERSION_LABEL } from "@/lib/version";
+
 export default function HomePage() {
   return (
     <main className="flex min-h-screen flex-col items-center justify-center gap-6 p-8">
@@ -28,7 +30,12 @@ export default function HomePage() {
           Create workspace
         </Link>
       </div>
-      <p className="text-xs text-muted-foreground">v0.1.0-alpha</p>
+      {/*
+        Read from package.json via lib/version.ts — never hardcode this again.
+        It doubles as the deployment marker: if this string does not match the
+        version you released, the domain is not being served by that release.
+      */}
+      <p className="text-xs text-muted-foreground">{APP_VERSION_LABEL}</p>
     </main>
   );
 }

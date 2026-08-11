@@ -1,6 +1,6 @@
 {
   "name": "ordence",
-  "version": "0.84.0-alpha",
+  "version": "0.85.0-alpha",
   "private": true,
   "scripts": {
     "dev": "next dev",
@@ -17,7 +17,7 @@
     "release": "bash scripts/make-release.sh",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "drizzle-kit migrate",
-    "db:push": "node -e \"if(process.env.NODE_ENV==='production'){console.error('\\\\n\\u26d4 drizzle-kit push is FORBIDDEN in this project: it drops RLS policies on 160 tables. Use the numbered SQL-FILES/ instead.\\\\n');process.exit(1)}\" && drizzle-kit push && echo '\\n⚠️  drizzle-kit push DROPS RLS POLICIES. Now run SQL-FILES/ALL-IN-ONE-SETUP.sql, then: npm run db:verify\\n'",
+    "db:push": "node -e \"if(process.env.NODE_ENV==='production'){console.error('\\\\n\\u26d4 drizzle-kit push is FORBIDDEN in this project: it drops RLS policies on 160 tables. Use the numbered SQL-FILES/ instead.\\\\n');process.exit(1)}\" && drizzle-kit push && echo '\\n\u26a0\ufe0f  drizzle-kit push DROPS RLS POLICIES. Now run SQL-FILES/ALL-IN-ONE-SETUP.sql, then: npm run db:verify\\n'",
     "db:studio": "drizzle-kit studio",
     "security:audit": "npm audit --audit-level=moderate",
     "seed": "tsx scripts/seed-basaveshwar-project.ts",
