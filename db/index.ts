@@ -1,6 +1,16 @@
+import "server-only";
+
 /**
  * Ordence — Serverless Database Client
  * Version: v0.1.0-alpha
+ *
+ * ⚠️ GUARD ADDED v0.84.0. This module exports `db`, `withTenant()` and
+ * `withPlatformScope()` — the database client itself and the two
+ * functions that pin tenant scope. It is the single most important thing
+ * in the repository never to reach a browser, and it was the one file
+ * that did not say so. No script imports it (they use `pg` directly), and
+ * `vitest.config.ts` aliases `server-only` to the package's own empty.js,
+ * so nothing downstream changes.
  *
  * WHY THIS SHAPE (Blueprint: "Vercel Architecture Principles"):
  * Vercel functions are short-lived and can scale to hundreds of concurrent
@@ -194,6 +204,83 @@ export type WithTenantOptions = {
   impersonationId?: string | null;
 };
 
+/* ------------------------------------------------------------------ */
+/* THE SHARED POOL — one per process, not one per call                 */
+/* ------------------------------------------------------------------ */
+
+/**
+ * ⭐ ONE POOL FOR THE LIFETIME OF THE PROCESS.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 WHY THIS CHANGED, AND WHY THE OLD SHAPE WAS ONCE CORRECT
+ * ══════════════════════════════════════════════════════════════════════
+ * `withTenant()` and `withPlatformScope()` each used to open a brand-new
+ * `Pool` and `await pool.end()` in a `finally`. The comment justifying it
+ * read: "a leaked pool on a serverless instance is a hard outage."
+ *
+ * That was RIGHT for Cloudflare Workers. A Worker isolate handles one
+ * request and is discarded; a pool that outlives the request leaks, and
+ * there is no next request on that isolate to reuse it anyway.
+ *
+ * ⚠️ ORDENCE NOW RUNS ON RAILWAY — a long-lived Node process serving
+ * every request, for days. Under that model the old shape is a fresh TCP
+ * handshake, a fresh TLS negotiation and a fresh Postgres session setup
+ * on EVERY tenant-scoped query, followed immediately by tearing it all
+ * down. Connection setup then dominates the cost of most queries, and
+ * under concurrency the churn drives straight into Neon's connection
+ * limit — the exact failure the old comment was trying to avoid, reached
+ * from the opposite direction.
+ *
+ * A pool is the correct object here precisely BECAUSE the process is
+ * long-lived: it keeps a small number of connections warm and hands them
+ * out, instead of building one per caller.
+ *
+ * ⚠️ THIS DOES NOT WEAKEN TENANT ISOLATION, and the reason is the one
+ * already documented at length below: every setting is written with
+ * `set_config(..., is_local => true)` INSIDE an explicit transaction, so
+ * it is discarded at COMMIT — before the connection returns to the pool.
+ * That is what makes pooling safe here, and it is why `is_local = false`
+ * remains forbidden. Sharing a pool with session-scoped settings would be
+ * the cross-tenant leak described below; sharing it with transaction-local
+ * settings is not.
+ *
+ * ⚠️ Created lazily, never at import, for the same reason `getDb()` is:
+ * `next build` runs in a container with no DATABASE_URL, and touching
+ * `getServerEnv()` at module scope fails the build with a message naming
+ * whichever route Next happened to import first.
+ */
+const globalForPool = globalThis as unknown as { __ordencePool?: Pool };
+
+let cachedPool: Pool | null = null;
+
+function getPool(): Pool {
+  if (cachedPool) return cachedPool;
+  if (globalForPool.__ordencePool) {
+    cachedPool = globalForPool.__ordencePool;
+    return cachedPool;
+  }
+
+  const { DATABASE_URL } = getServerEnv();
+  const pool = new Pool({ connectionString: DATABASE_URL });
+
+  /*
+   * ⚠️ An idle client that errors — Neon closing an idle connection, a
+   * network blip — emits 'error' on the POOL. Node's default for an
+   * unhandled 'error' event is to throw, which on a server means the
+   * process dies and every in-flight request with it. The pool evicts the
+   * bad client on its own; this handler exists only so that eviction is
+   * not fatal.
+   */
+  pool.on("error", (err) => {
+    console.error("[ordence:db] Idle pool client error (evicted, not fatal):", err);
+  });
+
+  cachedPool = pool;
+  // Survive hot reloads in dev, which would otherwise leak a pool per edit.
+  if (process.env.NODE_ENV !== "production") globalForPool.__ordencePool = pool;
+  return pool;
+}
+
 export async function withTenant<T>(
   tenantId: string,
   callback: (tx: Parameters<Parameters<ReturnType<typeof drizzleServerless<typeof schema>>["transaction"]>[0]>[0]) => Promise<T>,
@@ -215,30 +302,29 @@ export async function withTenant<T>(
     throw new Error("[SECURITY] withTenant() called with a malformed impersonation id.");
   }
 
-  const { DATABASE_URL } = getServerEnv();
-  const pool = new Pool({ connectionString: DATABASE_URL });
+  const database = drizzleServerless(getPool(), { schema });
 
-  try {
-    const database = drizzleServerless(pool, { schema });
+  /*
+   * ⚠️ NO `finally { pool.end() }`. The pool is process-wide now; ending it
+   * here would close it for every other in-flight request. The CONNECTION is
+   * still released — Drizzle returns it to the pool when the transaction
+   * commits or rolls back, which is the thing that actually needed to happen.
+   */
+  return database.transaction(async (tx) => {
+    // Parameterised — tenantId is never string-concatenated into SQL.
+    // `true` = transaction-local, which is only meaningful because we are
+    // genuinely inside a transaction here, and is what makes a SHARED pool
+    // safe: the setting dies at COMMIT, before the connection is reused.
+    await tx.execute(sql`SELECT set_config('app.current_tenant_id', ${tenantId}, true)`);
 
-    return await database.transaction(async (tx) => {
-      // Parameterised — tenantId is never string-concatenated into SQL.
-      // `true` = transaction-local, which is only meaningful because we are
-      // genuinely inside a transaction here.
-      await tx.execute(sql`SELECT set_config('app.current_tenant_id', ${tenantId}, true)`);
+    if (impersonationId !== null) {
+      await tx.execute(
+        sql`SELECT set_config('app.impersonation_id', ${impersonationId}, true)`,
+      );
+    }
 
-      if (impersonationId !== null) {
-        await tx.execute(
-          sql`SELECT set_config('app.impersonation_id', ${impersonationId}, true)`,
-        );
-      }
-
-      return callback(tx);
-    });
-  } finally {
-    // Always release; a leaked pool on a serverless instance is a hard outage.
-    await pool.end();
-  }
+    return callback(tx);
+  });
 }
 
 /**
@@ -301,22 +387,17 @@ export async function withPlatformScope<T>(
     console.warn(`[PLATFORM SCOPE] Reading across tenants: ${reason}`);
   }
 
-  const { DATABASE_URL } = getServerEnv();
-  const pool = new Pool({ connectionString: DATABASE_URL });
+  const database = drizzleServerless(getPool(), { schema });
 
-  try {
-    const database = drizzleServerless(pool, { schema });
-
-    return await database.transaction(async (tx) => {
-      // Transaction-local, exactly as in `withTenant()` — so the marker is
-      // discarded at COMMIT and cannot leak to the next borrower of a
-      // pooled connection.
-      await tx.execute(sql`SELECT set_config('app.platform_scope', 'on', true)`);
-      return callback(tx);
-    });
-  } finally {
-    await pool.end();
-  }
+  return database.transaction(async (tx) => {
+    // Transaction-local, exactly as in `withTenant()` — so the marker is
+    // discarded at COMMIT and cannot leak to the next borrower of a
+    // pooled connection. On a SHARED pool that guarantee is now doing real
+    // work: this marker grants cross-tenant reads, and a session-scoped
+    // version of it would hand that power to the next borrower.
+    await tx.execute(sql`SELECT set_config('app.platform_scope', 'on', true)`);
+    return callback(tx);
+  });
 }
 
 function isUuid(value: string): boolean {

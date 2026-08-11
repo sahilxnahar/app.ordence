@@ -1,5 +1,335 @@
 # Changelog
 
+## v0.84.0-alpha — CI hardening: the three gates that would have caught this project's worst incidents
+
+Every check below exists because something got through. None is hypothetical.
+
+### Added — `scripts/check-server-boundaries.mjs` (`npm run check:boundaries`)
+
+A recursive `sed` once stripped `import "server-only"` from **66 files**,
+including `tenant-context.ts`, `billing/access.ts`, `platform/guard.ts`,
+`audit.ts` and both payment providers. **Every existing gate stayed green** —
+`tsc`, the build, the entire security suite. The guard has no runtime
+behaviour; deleting it removes only the alarm.
+
+Checks: every module reaching `@/db`, `next/headers`, `@clerk/nextjs/server`
+or `@/lib/env` declares a boundary · no `"use client"` file imports a
+`server-only` module · a `"use server"` file exports only async functions.
+
+**Found two real gaps on its first run**, both now fixed: `lib/queue/processors.ts`
+(opens `withTenant()` transactions, no guard) and `db/index.ts` (exports the
+client and both scope functions — the single most important module never to
+reach a browser, and the one file that did not say so). 80 → **84** guarded.
+
+⚠️ Its first draft flagged 30+ files in `lib/` that import `@/db/schema` for
+**types only**. Type imports are erased at compile time — those modules are
+pure GST/interest/seat arithmetic and are correctly importable anywhere.
+Demanding a boundary on them is how a check trains people to silence it. The
+rule now strips type imports and ignores `@/db/schema` entirely.
+
+### Added — `scripts/check-migrations.mjs` (`npm run check:migrations`)
+
+Three files were numbered 0062/0072/0076 when the highest real one was 0045.
+`SQL-FILES/` is applied in numeric order, so numbering **is** execution order.
+Nothing in CI read SQL filenames.
+
+Checks duplicates, gaps, and reuse of a `_superseded/` number. The two
+historical gaps (0004, 0010) are allowed **by name, with reasons** — a check
+that tolerates a category of fault stops catching that fault.
+
+### Added — `scripts/check-rls-coverage.mjs` (`npm run check:rls`)
+
+Four tenant-scoped tables shipped with no RLS at all. The existing CI step
+asserts a **floor** (`count >= 100`) — adding four unprotected tables to 160
+protected ones leaves the count at 160. **A floor measures what was done
+right; it cannot see what was done wrong.**
+
+This asks the opposite question, exhaustively: for *every* table with a
+`tenant_id` column — RLS enabled, forced, policied on `app_current_tenant_id()`,
+and no `app_platform_scope()` in `WITH CHECK`. Zero thresholds. Fails closed
+when it cannot run, because "found nothing" is not "passed".
+
+### Added — `scripts/preflight.mjs` (`npm run preflight`)
+
+One gate, invoked identically by CI and locally. Ordered by cost: the two
+static checks take milliseconds and catch the two worst incidents here, so the
+common case fails in under a second instead of after a four-minute build.
+Runs all checks even after one fails, and reports a table.
+
+### Added — `scripts/neon-status.mjs` (`npm run db:status`)
+
+`SQL-FILES/` has no migration ledger — nothing records what ran. This reads
+every `CREATE TABLE` out of every numbered file and reports each as APPLIED,
+PARTIAL or MISSING against a live database. Read-only. **PARTIAL is the
+interesting result**: a file that failed part-way, or a `drizzle-kit push`
+that dropped something, leaves a database no single file describes.
+
+### Added — `scripts/make-release.sh` (`npm run release`)
+
+Builds a verified archive into `~/Downloads/ORDENCE ERP - APP.ORDENCE.COM/`.
+Runs preflight first and aborts on failure — a zip built from a tree that does
+not compile is worse than no zip. Verifies with `unzip -t` (a truncated
+archive lists its entries happily until the central directory is read),
+scans for secrets with an **anchored** match, and writes a checksum and
+release notes.
+
+⚠️ The secret scan is `grep -x`, not a substring. Unanchored, it flags
+`.env.test.example` — a committed template with no real values — and a check
+that cries wolf on a safe file is one people learn to ignore.
+
+### Changed — `.github/workflows/security-ci.yml`
+
+Boundary census and migration numbering run in the `build` job before `tsc`.
+Exhaustive RLS coverage runs in `security-tests` after the SQL is applied,
+alongside the existing floor check rather than replacing it.
+
+**No `TEST_DATABASE_URL` secret is required.** CI starts its own PostgreSQL 16
+service container and writes `.env.test` itself, so `billing-gate.test.ts`
+runs automatically under `npm run test:security`.
+
+## v0.83.2-alpha — Security Track S1: the billing gate on core CRM writes
+
+`tsc --noEmit` passes clean. No new dependencies.
+
+### 🔴 S1 — `past_due` workspaces could still write core CRM records
+
+`requireAccess()` had **17 call sites** against `requirePermission()`'s 151,
+and was absent from the three most-used write paths in the product. A
+workspace in `past_due` or `unpaid` is supposed to be read-only; it could
+still create, edit and delete contacts and companies.
+
+Added to all six writes, immediately after `requireTenantContext()` and
+**before** `parse()`:
+
+| File | Guarded |
+|---|---|
+| `server/actions/contacts.ts` | `createContact`, `updateContact`, `deleteContact` |
+| `server/actions/companies.ts` | `createCompany`, `updateCompany`, `deleteCompany` |
+
+Before validation deliberately: a read-only workspace should hear that it is
+read-only, not receive a field error for a form it was never going to be
+allowed to submit.
+
+`AccessRestrictedError` is now caught **first** in each file's
+`toActionError()` and surfaced with the billing wording. Folding it into
+"Something went wrong. Please try again." would tell a customer whose card
+expired that the software is broken — the one message guaranteed to produce
+a support ticket instead of a payment.
+
+Reads are untouched. A customer in arrears must still be able to see their
+own data.
+
+### 🔴 The MCP surface bypassed the gate entirely
+
+`server/actions/deals.ts` needed no change — its only export is
+`listDealPipeline()`, a read. Auditing *why* surfaced the real hole: the
+**only** deal write in the codebase is `ordence_update_deal_stage` in
+`server/mcp/dispatch.ts`, and that dispatcher checked the token, the scope
+and RLS — but never whether the workspace was still paying.
+
+So a company's own staff were correctly read-only while an AI agent holding
+a `read_write` token for the same workspace kept writing. Read-only that one
+caller can walk around is not read-only.
+
+- **`server/billing/access.ts`** — added `getAccessDecisionForTenant()` and
+  `requireAccessForTenant()`. The existing path resolves the tenant from a
+  Clerk session; MCP has no Clerk session, only `session.tenantId`. Both new
+  functions fail OPEN on their own errors, matching `getAccessDecision()` —
+  a billing-table outage must not stop a customer's agent pipeline. The
+  subscription read runs inside `withTenant()`, because a plain `db` read
+  with no tenant context returns zero rows under RLS and would have looked
+  like "no subscription" and granted everyone full access.
+- **`server/mcp/dispatch.ts`** — every tool declared `scope: "read_write"`
+  now passes the gate before executing. Read tools are unaffected; an agent
+  answering "what do I owe?" is the call most likely to end in a payment.
+
+### Changed
+
+- **`server/actions/deals.ts`** — a header explaining why it has no
+  `requireAccess()` call and what to do the moment a write is added. A new
+  write added without the guard silently reopens this hole and nothing in
+  the type system would notice.
+
+### Removed / renamed
+
+- **`lib/command/registry.ts`** — deleted. Dead code with zero importers;
+  the working ⌘K palette is `components/layout/command-bar.tsx` and carries
+  its own action list. Two lists of command destinations would drift.
+- **`MASTER_PLAN.md` → `docs/BATCH-PLAN-460.md`** — renamed rather than
+  deleted. It is **not** a duplicate of `docs/MASTER-PLAN.md`: that file is
+  a v0.25.0-alpha product roadmap (Waves A–H, "what unlocks money") and
+  contains zero mentions of the 460 batches, the seven departments or
+  `ui_governance_checks`. Deleting it would have destroyed the roadmap the
+  batch work runs from. The similar names were the actual problem.
+
+### Tests
+
+**`tests/security/billing-gate.test.ts`** — 16 assertions across five groups,
+against a real throwaway Postgres.
+
+⚠️ **It drives `unpaid` + expired grace, NOT `past_due`** — and the header
+explains why at length. `tests/ui/access-state.test.tsx` already pins the
+commercial rule in a test named *"⭐ past_due NEVER restricts writes, at any
+failure count"*: while the provider is still retrying, cutting access loses
+the customer **and** the payment. Restriction begins only once the status is
+`unpaid` and its seven-day grace window has closed — roughly three weeks
+after the first failure.
+
+A suite written against `past_due` would have gone red and looked like the S1
+gate was broken, inviting somebody to "fix" it by making `past_due`
+restrictive — silently reversing that decision and locking customers out on
+their first failed card.
+
+Covers: writes refused · **reads still succeed** · billing and export never
+blocked · healthy workspace untouched · fails **open** on a lookup fault ·
+MCP `read_write` gated while read tools stay available · RLS unaffected by
+billing state.
+
+Two of the groups are **source assertions**, deliberately. Every behavioural
+test above passes whether or not `contacts.ts` actually calls the gate — they
+test the gate, not its callers, and that is the exact shape of the original
+defect: a correct, tested `requireAccess` with 17 call sites where 151 were
+needed. So the suite also reads the source and asserts each write path calls
+it, that `AccessRestrictedError` is surfaced rather than swallowed, that the
+dispatcher still contains the `read_write` branch, and that `deals.ts` has
+gained no write function.
+
+### Coverage
+
+`requireAccess` / `requireAccessForTenant` call sites: **17 → 32**.
+
+## v0.83.1-alpha — The Build Fix, the Pooling Fix, and the Missing RLS
+
+Canonical tree: **`ordence-v55 2`**. `tsc --noEmit` passes clean.
+No new dependencies — `package.json` gained nothing.
+
+### 🔴 THE BUILD FAILURE — found and fixed
+
+`next build` had been failing with:
+
+    x You're importing a component that needs "server-only".
+    ./server/platform/users.ts
+    Import trace: ./components/platform/user-actions.tsx
+
+`components/platform/user-actions.tsx` is a `"use client"` component and it
+imported `updateUserStatus` / `updateUserRole` **straight from**
+`server/platform/users.ts` — a `server-only` module that reaches
+`guard.ts` → `withPlatformScope()`, the cross-tenant read escape hatch.
+
+This is why `tsc --noEmit` always passed: TypeScript does not check bundler
+boundaries. Only webpack catches it.
+
+**The fix is the house rule already written at the top of
+`server/platform/actions.ts`:** *"Every one delegates immediately to a module
+that starts with `import "server-only"`."* A client calls a `"use server"`
+wrapper; the wrapper delegates to the server-only implementation, which does
+its own authorisation. The two wrappers for users had simply never been
+written. Added `updateUserStatusAction` and `updateUserRoleAction`.
+
+**⚠️ A `sed` had deleted `import "server-only";` from `users.ts` as an
+attempted fix. That has been reverted** (restored byte-identical from the
+untouched sibling). Deleting the line removes the alarm, not the fault — and
+it does not even work: the same error immediately reappears in `guard.ts`,
+which also imports `next/headers` and genuinely cannot exist client-side.
+
+**Swept all 33 client components** that import `@/server/*`. This was the
+only violation; the other 32 were already correct.
+
+### 🔴 Missing row-level security
+
+`SQL-FILES/0062`, `0072` and `0076` created four tenant-scoped tables —
+`deployment_releases`, `deployment_backups`, `security_batches`,
+`flow_submissions` — with **no `ENABLE`, no `FORCE`, no policy**. In this
+codebase RLS *is* the tenant boundary; a `tenant_id` column with no policy
+behind it is a column, not isolation.
+
+They were also numbered 0062/0072/0076 when the highest real migration was
+0045, leaving permanent gaps.
+
+Replaced by **`0046_deployment_flows_governance.sql`** — contiguous
+numbering, the same four tables plus the `ui_governance_checks` tracker the
+460-batch plan referenced but never defined, all with the policy shape every
+other table here uses:
+
+    USING      (tenant_id = app_current_tenant_id() OR app_platform_scope())
+    WITH CHECK (tenant_id = app_current_tenant_id())
+
+Platform scope in `USING` only — read across tenants for support, never
+write. The old files moved to `SQL-FILES/_superseded/` with a README. 0046
+is idempotent, so it repairs an already-migrated database rather than
+duplicating.
+
+### 🔴 The v55 notification regression
+
+- **Every notification emailed everyone.** The severity test read
+  `critical || warning || !input.severity` — the third clause meant the
+  DEFAULT case emailed every active user, and `background-workers.ts`
+  creates those on a schedule.
+- **50 sequential awaited Resend calls** on the request path → now
+  `Promise.allSettled`, one round, cannot reject.
+- **Returned the literal string `"created"`** instead of the UUID its own
+  return type promised. `ordence_create_reminder` was handing the word
+  "created" to an AI agent.
+- **The tenant-name lookup read zero rows, always** — it used the plain `db`
+  client with no tenant context, so RLS matched nothing. Every email said
+  "Your workspace". Folded into the tenant transaction, collapsing three
+  connections per notification into one.
+
+### ⭐ `withTenant()` no longer opens a pool per call
+
+`db/index.ts` created a new `Pool` and called `pool.end()` on **every**
+tenant-scoped query — correct for Cloudflare Workers, wrong for the
+long-lived Node process Railway runs, where it meant a fresh TCP handshake
+and TLS negotiation per query and a straight run at Neon's connection limit.
+
+Now one lazily-created process-wide pool with an `error` handler so an
+evicted idle client cannot kill the process. **Isolation is unaffected:**
+every setting uses `set_config(..., is_local => true)` inside an explicit
+transaction, so it is discarded at COMMIT before the connection is reused.
+
+### 🔴 `ordence_create_compliance_task` could never have run
+
+It omitted `period_start` and `period_end` (both NOT NULL) and supplied
+`due_date`, whose schema comment reads *"Written by trigger. Never accept
+this from a form."* A cast — `as unknown as typeof complianceTasks.$inferInsert`
+— suppressed the only check that would have caught it. Now matches the
+documented convention in `server/actions/compliance.ts` and is idempotent by
+constraint.
+
+### Added
+
+- `components/layout/command-bar.tsx` — ⌘K palette on `@radix-ui/react-dialog`
+  (already a dependency) rather than adding `cmdk`. Filtering is server-side
+  via `globalSearch()` under RLS. 200ms debounce, because search is
+  rate-limited server-side.
+- `server/actions/bulk.ts` — bulk soft-delete and owner reassignment over a
+  hardcoded entity allowlist. One transaction, one audit entry with a
+  `batchId`, permission checked once before the first write, capped at 500.
+  Soft delete only. Calls `requireAccess()`.
+- `lib/documents/csv.ts` — CSV export with formula-injection neutralising
+  (CWE-1236), UTF-8 BOM so ₹ and Devanagari survive Excel, CRLF per RFC 4180,
+  explicit column allowlist.
+
+### Notes
+
+- **No `cmdk`, no `xlsx`, no `puppeteer`.** Puppeteer in particular pulls
+  ~170 MB of Chromium at install on a builder that was already the fragile
+  part of this project, and `lib/billing/invoice-render.ts` already emits a
+  Rule-46 invoice with print styles.
+- **The seven files pasted in from the previous AI session are retained and
+  currently imported by zero modules** — `lib/ui/tokens.ts`,
+  `lib/command/registry.ts`, `lib/flows/registry.ts`,
+  `lib/security/toolkit.ts`, the two `components/ui/` wrappers, and
+  `deployment-control/page.tsx`. They compile; nothing uses them yet.
+  `lib/security/toolkit.ts` also duplicates token hashing that
+  `server/mcp/dispatch.ts` already does — two hashing paths will diverge.
+- **Still open:** `requireAccess()` has 17 call sites against
+  `requirePermission()`'s 151, and is absent from `contacts.ts`,
+  `companies.ts` and `deals.ts`. A `past_due` workspace is meant to be
+  read-only and can still write core CRM records.
+- `npm install` reports 12 vulnerabilities (6 high) and an
+  `eslint@10` / `eslint-config-next@16` peer conflict against `next@15`.
+
 ## v0.21.0-alpha — PITR, Backup & Restore (1 August 2026)
 
 **Wave 2 complete** (bar the admin-console wiring). A recycle bin, a

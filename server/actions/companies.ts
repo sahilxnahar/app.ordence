@@ -26,6 +26,7 @@ import { and, eq, isNull, ilike, or, desc, asc, count, sql } from "drizzle-orm";
 import { db } from "@/db";
 import { companies, contacts } from "@/db/schema";
 import { requireTenantContext, TenantAccessError } from "@/server/tenant-context";
+import { requireAccess, AccessRestrictedError } from "@/server/billing/access";
 import {
   assertImpersonationAllows,
   ImpersonationForbiddenError,
@@ -51,6 +52,15 @@ function fail(error: string, fieldErrors?: Record<string, string[]>): ActionResu
 }
 
 function toActionError(err: unknown): ActionResult<never> {
+  /*
+   * ⚠️ FIRST, AND WITH THE BILLING WORDING — S1, v0.83.2.
+   * A restricted workspace is in arrears, not broken and not
+   * under-permissioned. Four gates, four remedies; see
+   * `server/billing/access.ts`.
+   */
+  if (err instanceof AccessRestrictedError) {
+    return fail(err.decision.detail ?? err.decision.headline ?? err.message);
+  }
   if (err instanceof TenantAccessError) return fail(err.message);
   if (err instanceof ImpersonationForbiddenError) return fail(err.message);
   if (err instanceof z.ZodError) {
@@ -187,6 +197,22 @@ export async function createCompany(
 ): Promise<ActionResult<Company>> {
   try {
     const ctx = await requireTenantContext();
+
+    /*
+     * ⚠️ ACCESS BEFORE ANYTHING ELSE — S1, v0.83.2.
+     *
+     * The order prescribed by `server/billing/access.ts`:
+     *     requireAccess() → requireFeature() → requirePermission()
+     * Broadest first, so a customer in arrears is told to pay rather than
+     * told they lack a permission and sent to an administrator who is
+     * themselves.
+     *
+     * Placed before `parse()` deliberately: a read-only workspace should
+     * hear that it is read-only, not receive a validation error for a form
+     * it was never going to be allowed to submit.
+     */
+    await requireAccess("companies:create", ctx);
+
     const data = createCompanySchema.parse(input);
 
     if (data.domain) {
@@ -247,6 +273,9 @@ export async function updateCompany(
 ): Promise<ActionResult<Company>> {
   try {
     const ctx = await requireTenantContext();
+    // Access before validation — see `createCompany`.
+    await requireAccess("companies:update", ctx);
+
     const data = updateCompanySchema.parse(input);
     const { id, ...changes } = data;
 
@@ -298,6 +327,9 @@ export async function updateCompany(
 export async function deleteCompany(id: string): Promise<ActionResult<{ id: string }>> {
   try {
     const ctx = await requireTenantContext();
+    // Access before anything else — see `createCompany`.
+    await requireAccess("companies:delete", ctx);
+
     await assertImpersonationAllows("delete:company", ctx);
     const parsedId = uuidSchema.parse(id);
 

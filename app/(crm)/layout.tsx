@@ -39,6 +39,7 @@ import { filterNavigationByEntitlement } from "@/lib/modules/nav";
 import { Sidebar } from "@/components/layout/sidebar";
 import { IndustryProvider } from "@/components/layout/industry-provider";
 import { NotificationBell } from "@/components/layout/notification-bell";
+import { CommandBar } from "@/components/layout/command-bar";
 
 export const dynamic = "force-dynamic";
 
@@ -134,6 +135,14 @@ export default async function CrmLayout({
       dashboard={template.dashboard}
       assetTypes={template.assetTypes}
     >
+      {/*
+        ⚠️ Mounted at the layout, not per page, so ⌘K works everywhere inside
+        `(crm)` including on a page that is still streaming. It renders
+        nothing until opened — the Radix portal is empty while closed — so
+        the cost of it being here is one keydown listener.
+      */}
+      <CommandBar />
+
       <div className="flex h-screen overflow-hidden">
         <Sidebar
           sections={sections}

@@ -47,6 +47,30 @@ import { withTenant } from "@/db";
 import { deals, companies, contacts } from "@/db/schema/crm";
 import { users } from "@/db/schema/core";
 import { requirePermission } from "@/server/audit";
+
+/*
+ * ══════════════════════════════════════════════════════════════════════
+ * ⚠️ THIS FILE CONTAINS NO WRITES — AND THAT IS WHY IT HAS NO
+ *    `requireAccess()` CALL. READ THIS BEFORE ADDING ONE.
+ * ══════════════════════════════════════════════════════════════════════
+ * The S1 sweep (v0.83.2) added the billing gate to every write in
+ * `contacts.ts` and `companies.ts`. `deals.ts` was audited at the same
+ * time and needed nothing: its only export is `listDealPipeline()`, a
+ * read, and a read stays available to a lapsed workspace on purpose — a
+ * customer in arrears must still be able to see their own data.
+ *
+ * The ONLY deal write in the codebase is `ordence_update_deal_stage` in
+ * `server/mcp/dispatch.ts`, which is now gated centrally: every tool
+ * declared `scope: "read_write"` passes through
+ * `requireAccessForTenant()` before it runs.
+ *
+ * ⚠️ SO: THE MOMENT A WRITE IS ADDED HERE — createDeal, updateDealStage,
+ * deleteDeal — IT MUST CALL `requireAccess("deals:create" | "deals:update"
+ * | "deals:delete", ctx)` IMMEDIATELY AFTER `requireTenantContext()`,
+ * before validation. Copy the shape from `server/actions/contacts.ts`.
+ * A new write added without it silently reopens the hole this sweep
+ * closed, and nothing in the type system will notice.
+ */
 import type { ActionResult } from "@/lib/validators/crm";
 
 /* ------------------------------------------------------------------ */

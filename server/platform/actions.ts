@@ -26,7 +26,6 @@
  *      live in `lib/platform/schemas.ts`.
  *
  *   2. THESE ARE THIN. Every one delegates immediately to a module that
- *      starts with `import "server-only"` and performs its own
  *      authorisation. Nothing decides anything here — a wrapper that does
  *      half the checking is a wrapper somebody eventually calls the inner
  *      function around.
@@ -60,6 +59,10 @@ import {
   grantSupportConsent as grantSupportConsentImpl,
   revokeSupportConsent as revokeSupportConsentImpl,
 } from "./consent";
+import {
+  updateUserStatus as updateUserStatusImpl,
+  updateUserRole as updateUserRoleImpl,
+} from "./users";
 import { requirePlatformAdmin, recordStepUp } from "./guard";
 
 /* ------------------------------------------------------------------ */
@@ -233,5 +236,68 @@ export async function grantSupportConsentAction(input: unknown) {
 export async function revokeSupportConsentAction(input: unknown) {
   const result = await revokeSupportConsentImpl(input);
   if (result.ok) revalidatePath("/settings");
+  return result;
+}
+
+/* ------------------------------------------------------------------ */
+/* USERS — v0.83.1                                                     */
+/* ------------------------------------------------------------------ */
+
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 THESE TWO WRAPPERS WERE MISSING, AND THEIR ABSENCE BROKE THE BUILD
+ * ══════════════════════════════════════════════════════════════════════
+ * `components/platform/user-actions.tsx` is a `"use client"` component. It
+ * imported `updateUserStatus` and `updateUserRole` STRAIGHT FROM
+ * `./users`, skipping this file entirely — which is the one layer that
+ * makes a server function callable from a browser.
+ *
+ * tripwire whose entire purpose is to fail the build when a server module
+ * is pulled toward a client bundle, and it did exactly that:
+ *
+ *     ./components/platform/user-actions.tsx
+ *
+ *     > Build failed because of webpack errors
+ *
+ * tried. It does not work and it is dangerous:
+ *
+ *   • It removes the alarm, not the fault. The client component still
+ *     reaches `guard.ts`, which uses `withPlatformScope()` — the
+ *     deliberate CROSS-TENANT read escape hatch, the one whose own
+ *     comments call it "deliberately verbose so it is easy to grep for in
+ *     a security review". That path must never travel toward a browser.
+ *   • It does not even compile. Strip it from `users.ts` and the same
+ *     error reappears in `guard.ts`, which also imports `next/headers` —
+ *     and that genuinely cannot exist client-side. Deletion just moves the
+ *     error one file deeper until something ships that should not.
+ *
+ * The correct fix is the house rule stated at the top of this file: a
+ * client calls a `"use server"` wrapper, and the wrapper delegates to a
+ * are thin for exactly that reason — `updateUserStatusImpl` already calls
+ * `requireCapability("tenants:suspend")` and `updateUserRoleImpl` already
+ * calls `requireCapability("tenants:configure")`. Nothing is decided here.
+ *
+ * ⚠️ AND REMEMBER WHAT `"use server"` MEANS: both of these are now public
+ * HTTP endpoints with stable action ids, reachable by POST from any page.
+ * That is safe ONLY because the capability check lives in the
+ * implementation. Do not add a check here and remove it there.
+ */
+export async function updateUserStatusAction(input: {
+  userId: string;
+  tenantId: string;
+  status: string;
+}) {
+  const result = await updateUserStatusImpl(input);
+  if (result.ok) revalidatePath("/platform/users");
+  return result;
+}
+
+export async function updateUserRoleAction(input: {
+  userId: string;
+  tenantId: string;
+  role: string;
+}) {
+  const result = await updateUserRoleImpl(input);
+  if (result.ok) revalidatePath("/platform/users");
   return result;
 }

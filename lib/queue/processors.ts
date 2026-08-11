@@ -1,6 +1,16 @@
+import "server-only";
+
 /**
  * Ordence — Job Processors
  * Version: v0.4.0-alpha
+ *
+ * ⚠️ GUARD ADDED v0.84.0 — found by `scripts/check-server-boundaries.mjs`
+ * on its first run. This module opens tenant-scoped transactions via
+ * `withTenant()` and had no boundary declared, so nothing would have
+ * failed the build if a client component imported it. Its only callers
+ * are `server/actions/documents.ts` and `app/api/workers/route.ts`, both
+ * server-side, so the guard changes no behaviour — it just makes the
+ * mistake impossible rather than merely absent.
  *
  * The actual work each job kind performs. Shared by both execution paths:
  *   - `/api/workers` (Vercel, batch drain)

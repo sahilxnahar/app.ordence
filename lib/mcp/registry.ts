@@ -464,11 +464,14 @@ const WRITE_TOOLS: readonly McpToolDefinition[] = [
       "Creates a compliance tracking task with a due date. Useful for " +
       "agents that identify an obligation the tenant needs to track.",
     scope: "read_write",
-    caution: "Creates a task. It does not file anything or meet any deadline.",
+    caution:
+      "Creates a task. It does not file anything or meet any deadline. The " +
+      "due date is DERIVED from the period by the database — it cannot be set here.",
     parameters: [
       { name: "obligationId", type: "string", required: true, description: "Link to an existing compliance obligation." },
-      { name: "periodLabel", type: "string", required: true, description: "e.g. 'GST Aug 2026' or 'TDS Q2 2026'." },
-      { name: "dueDate", type: "string", required: true, description: "YYYY-MM-DD." },
+      { name: "periodLabel", type: "string", required: true, description: "Display label only, e.g. 'GST Aug 2026' or 'TDS Q2 2026'." },
+      { name: "periodStart", type: "string", required: true, description: "First day of the period the filing covers. YYYY-MM-DD." },
+      { name: "periodEnd", type: "string", required: true, description: "Last day of the period the filing covers. YYYY-MM-DD. The statutory due date is computed from this plus the obligation's offset." },
       { name: "notes", type: "string", required: false, description: "Optional context." },
     ],
   },

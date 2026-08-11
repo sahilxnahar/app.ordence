@@ -227,15 +227,47 @@ export async function createNotification(input: {
   source?: string;
   expiresAt?: Date;
 }): Promise<{ ok: true; id: string } | { ok: false; error: string }> {
+  const severity = input.severity ?? "info";
+
+  /*
+   * ⚠️ EMAIL IS OPT-IN BY SEVERITY, AND THE TEST IS EXHAUSTIVE ON PURPOSE.
+   *
+   * This condition used to read:
+   *
+   *     severity === "critical" || severity === "warning" || !input.severity
+   *
+   * The third clause meant the DEFAULT — an ordinary `info` notification with
+   * no severity passed — also emailed every active user in the workspace.
+   * `server/ai/background-workers.ts` creates these on a schedule, so the
+   * practical effect was a mail-out per worker run per tenant. The comment
+   * above it said "only if severity warrants it"; the code disagreed.
+   */
+  const shouldEmail = severity === "critical" || severity === "warning";
+
   try {
-    await withTenant(input.tenantId, async (tx) => {
+    /*
+     * ⚠️ ONE TRANSACTION, NOT THREE ROUND TRIPS.
+     *
+     * The insert, the tenant name and the recipient list are all tenant-scoped
+     * reads, so they belong in the same `withTenant()` block. Previously this
+     * was an insert in one transaction, a `db` read, and a SECOND transaction
+     * for the recipients — three separate connections per notification.
+     *
+     * 🔴 The tenant-name lookup was also silently broken. It used the plain
+     * `db` client, which carries NO tenant context, so every RLS policy
+     * evaluates `tenant_id = app_current_tenant_id()` against NULL and matches
+     * nothing — the same failure documented on `withPlatformScope()`. It
+     * returned zero rows and fell through to "Your workspace" every single
+     * time. Inside the transaction it actually resolves.
+     */
+    const created = await withTenant(input.tenantId, async (tx) => {
       const result = await tx
         .insert(notifications)
         .values({
           tenantId: input.tenantId,
           userId: input.userId ?? null,
           category: input.category,
-          severity: input.severity ?? "info",
+          severity,
           title: input.title,
           body: input.body ?? null,
           actionUrl: input.actionUrl ?? null,
@@ -245,56 +277,78 @@ export async function createNotification(input: {
         })
         .returning({ id: notifications.id });
 
-      return result[0]?.id;
+      const id = result[0]?.id;
+      if (!id) throw new Error("Notification insert returned no id.");
+
+      if (!shouldEmail) {
+        return { id, tenantName: null as string | null, recipients: [] as string[] };
+      }
+
+      const tenantRow = await tx
+        .select({ name: tenants.name })
+        .from(tenants)
+        .where(eq(tenants.id, input.tenantId))
+        .limit(1);
+
+      const userRows = await tx
+        .select({ email: users.email })
+        .from(users)
+        .where(and(eq(users.tenantId, input.tenantId), eq(users.status, "active")))
+        .limit(50);
+
+      return {
+        id,
+        tenantName: tenantRow[0]?.name ?? null,
+        recipients: userRows.map((u) => u.email).filter(Boolean),
+      };
     });
 
-    // Best-effort email delivery for critical/warning notifications.
-    // Only sends if RESEND_API_KEY is configured and severity warrants it.
-    if (input.severity === "critical" || input.severity === "warning" || !input.severity) {
-      try {
-        const tenantRow = await db
-          .select({ name: tenants.name })
-          .from(tenants)
-          .where(eq(tenants.id, input.tenantId))
-          .limit(1);
+    if (shouldEmail && created.recipients.length > 0) {
+      /*
+       * ⚠️ PARALLEL, NOT SEQUENTIAL, AND NEVER ALLOWED TO THROW.
+       *
+       * This was a `for` loop with an `await` inside it — up to fifty
+       * sequential HTTPS round trips to Resend, on the request path, before
+       * the caller got its notification id back. `allSettled` collapses that
+       * to one round and cannot reject, so a single bad address cannot lose
+       * the other forty-nine.
+       *
+       * TODO: move this to the existing QStash queue (`lib/queue/`). Email is
+       * not the caller's business and should not be on its clock at all.
+       * Parallelising is the containment, not the cure.
+       */
+      const appUrl = process.env.NEXT_PUBLIC_APP_URL || "https://app.ordence.com";
+      const { html, text } = buildNotificationEmail({
+        title: input.title,
+        body: input.body,
+        actionUrl: input.actionUrl,
+        severity,
+        tenantName: created.tenantName ?? "Your workspace",
+        appUrl,
+      });
 
-        const tenantName = tenantRow[0]?.name ?? "Your workspace";
+      const subject = `[${severity.toUpperCase()}] ${input.title}`;
 
-        // Get active users with email addresses for this tenant
-        const userRows = await withTenant(input.tenantId, async (tx) => {
-          return tx
-            .select({ email: users.email })
-            .from(users)
-            .where(and(eq(users.tenantId, input.tenantId), eq(users.status, "active")))
-            .limit(50);
-        });
+      const results = await Promise.allSettled(
+        created.recipients.map((to) => sendEmail({ to, subject, html, text })),
+      );
 
-        const appUrl = process.env.NEXT_PUBLIC_APP_URL || "https://app.ordence.com";
-        const { html, text } = buildNotificationEmail({
-          title: input.title,
-          body: input.body,
-          actionUrl: input.actionUrl,
-          severity: input.severity ?? "info",
-          tenantName,
-          appUrl,
-        });
-
-        // Send to all active users (best-effort, errors are caught)
-        for (const user of userRows) {
-          await sendEmail({
-            to: user.email,
-            subject: `[${input.severity?.toUpperCase() ?? "INFO"}] ${input.title}`,
-            html,
-            text,
-          });
-        }
-      } catch (emailErr) {
-        // Email delivery is best-effort. The in-app notification was already created.
-        console.error("[notifications] Email delivery failed:", emailErr);
+      const failed = results.filter((r) => r.status === "rejected").length;
+      if (failed > 0) {
+        console.error(
+          `[notifications] ${failed}/${created.recipients.length} notification emails failed for tenant ${input.tenantId}.`,
+        );
       }
     }
 
-    return { ok: true, id: "created" };
+    /*
+     * ⚠️ THE REAL ID. This used to return the literal string "created",
+     * discarding the UUID the transaction had just computed. Every caller
+     * that stored or echoed the id — including the `ordence_create_reminder`
+     * MCP tool, which hands it to an AI agent — received the word "created"
+     * where a UUID was promised by this function's own return type.
+     */
+    return { ok: true, id: created.id };
   } catch (err) {
     return {
       ok: false,

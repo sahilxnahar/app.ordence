@@ -12,7 +12,24 @@
 # ============================================================
 
 # ---- 1. THE THREE YOU CANNOT SKIP --------------------------
-# REQUIRED - Neon connection string
+#
+# !! DATABASE_URL — WHICH ROLE MATTERS AS MUCH AS WHICH DATABASE !!
+#
+# Use `ordence_app`, NOT `neondb_owner`.
+#
+# `neondb_owner` carries the BYPASSRLS attribute, which overrides even
+# FORCE ROW LEVEL SECURITY. Connected as that role, every row-level
+# policy on all 165 tenant tables is skipped — the app works perfectly
+# and one forgotten WHERE clause returns another tenant's data.
+#
+# `ordence_app` is NOSUPERUSER + NOBYPASSRLS, so the policies apply.
+# Verify before switching:
+#   SELECT rolname, rolcanlogin, rolbypassrls FROM pg_roles
+#    WHERE rolname = 'ordence_app';
+#   -- want: can_login = t, bypasses_rls = f
+#
+# ⚠️ If the password contains @ : / ? # or &, URL-encode it, or the
+#    connection string parser will split the URL in the wrong place.
 DATABASE_URL=PASTE_HERE
 # REQUIRED - Clerk dashboard, Secret key
 CLERK_SECRET_KEY=PASTE_HERE
@@ -20,11 +37,22 @@ CLERK_SECRET_KEY=PASTE_HERE
 NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY=PASTE_HERE
 
 # ---- 2. ALREADY FILLED IN FOR YOU --------------------------
-# your app address
-NEXT_PUBLIC_APP_URL=https://app.ordence.com
+#
+# !! CORRECTED v0.84.0 !!
+# These said app.ordence.com. That domain is NOT connected yet —
+# Railway > Settings > Networking shows only the generated address,
+# and the Custom Domain button is unused.
+#
+# A wrong NEXT_PUBLIC_APP_URL is not cosmetic: Clerk builds its
+# sign-in redirects from it, so a mismatch sends users to a domain
+# that does not resolve and the login loop never completes.
+#
+# When you do connect app.ordence.com, change these three back and
+# update the Clerk webhook endpoint to match.
+NEXT_PUBLIC_APP_URL=https://appordence-production.up.railway.app
 NEXT_PUBLIC_ROOT_DOMAIN=ordence.com
 NEXT_PUBLIC_ZONE_DOMAIN=ordence.com
-PLATFORM_HOST=app.ordence.com
+PLATFORM_HOST=appordence-production.up.railway.app
 NEXT_PUBLIC_CLERK_SIGN_IN_URL=/sign-in
 NEXT_PUBLIC_CLERK_SIGN_UP_URL=/sign-up
 NODE_ENV=production

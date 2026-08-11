@@ -1359,6 +1359,35 @@ async function runTool(
     /* ---- v0.83.0-alpha: Additional write tools ---- */
 
     case "ordence_create_compliance_task": {
+      /*
+       * 🔴 THIS INSERT WAS UNRUNNABLE UNTIL v0.83.1, AND A CAST HID IT.
+       *
+       * The original carried `as unknown as typeof complianceTasks.$inferInsert`,
+       * which switches off the ONLY check that would have caught two faults:
+       *
+       *   1. `period_start` and `period_end` are both NOT NULL and neither was
+       *      supplied. Every call would have raised a null-violation.
+       *   2. `due_date` was taken from the caller. `db/schema/compliance.ts`
+       *      says of that column, verbatim: "⚠️ Written by trigger. Never
+       *      accept this from a form." An AI agent is not a form, it is worse
+       *      — it would have been guessing a statutory deadline. The trigger
+       *      derives it from `period_end` plus the obligation's own offset.
+       *
+       * The period is now what the caller supplies, which is the thing it can
+       * legitimately know. The deadline stays derived.
+       */
+      const periodStart = requireString(args, "periodStart");
+      const periodEnd = requireString(args, "periodEnd");
+
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(periodStart) || !/^\d{4}-\d{2}-\d{2}$/.test(periodEnd)) {
+        throw new Error("periodStart and periodEnd must be YYYY-MM-DD dates.");
+      }
+      if (periodEnd < periodStart) {
+        throw new Error("periodEnd cannot fall before periodStart.");
+      }
+
+      const notes = typeof args.notes === "string" ? args.notes : null;
+
       return withTenant(session.tenantId, async (tx) => {
         const result = await tx
           .insert(complianceTasks)
@@ -1366,11 +1395,42 @@ async function runTool(
             tenantId: session.tenantId,
             obligationId: requireString(args, "obligationId"),
             periodLabel: requireString(args, "periodLabel"),
-            dueDate: requireString(args, "dueDate"),
+            periodStart,
+            periodEnd,
+            /**
+             * ⚠️ THIS VALUE IS DISCARDED — same convention as
+             * `server/actions/compliance.ts`, deliberately identical so
+             * there is one pattern in the codebase and not two.
+             *
+             * `due_date` is NOT NULL with no default, so Drizzle's insert
+             * type demands something, but `trg_compliance_tasks_010_due_date`
+             * overwrites it BEFORE the row lands. `period_end` is the
+             * placeholder precisely because it is never a plausible due date
+             * on its own: if the trigger were ever missing, the register
+             * would show filings due on the last day of their own period and
+             * somebody would notice within a day — rather than quietly
+             * inheriting a date an AI agent guessed, which would look right
+             * and be wrong.
+             */
+            dueDate: periodEnd,
+            notes,
             status: "pending",
-          } as unknown as typeof complianceTasks.$inferInsert)
+          })
+          /*
+           * ⚠️ Idempotent by constraint. An agent that retries a timed-out
+           * tool call must not create the same period twice, and the unique
+           * index on (obligation_id, period_start) already exists for the
+           * generator in `server/actions/compliance.ts`.
+           */
+          .onConflictDoNothing({
+            target: [complianceTasks.obligationId, complianceTasks.periodStart],
+          })
           .returning({ id: complianceTasks.id });
-        return { id: result[0]?.id, status: "created" };
+
+        const id = result[0]?.id;
+        return id
+          ? { id, status: "created" }
+          : { status: "already_exists", detail: "A task for this obligation and period already exists." };
       });
     }
 
@@ -1474,6 +1534,51 @@ export async function dispatchTool(
       `A person has to grant that deliberately in the Ordence admin console.`;
     await logCall(session, toolName, "refused", Date.now() - started, argumentKeys, reason);
     return { ok: false, refused: true, reason };
+  }
+
+  /* --- 4b. is the WORKSPACE still in good standing? — S1, v0.83.2 --- */
+  //
+  // ══════════════════════════════════════════════════════════════════════
+  // 🔴 THE GAP THIS CLOSES
+  // ══════════════════════════════════════════════════════════════════════
+  // Until v0.83.2 this dispatcher checked three things — the token exists,
+  // its scope permits the tool, and RLS pins the tenant — and never asked
+  // whether the workspace was still PAYING.
+  //
+  // Meanwhile the browser path refuses writes from a `past_due` or
+  // `unpaid` workspace via `requireAccess()`. The result was that a
+  // company's own staff were correctly put into read-only mode while an
+  // AI agent holding a `read_write` token for the SAME workspace carried
+  // on writing. Read-only that one caller can walk around is not
+  // read-only.
+  //
+  // ⚠️ ONLY FOR WRITE TOOLS. Reads stay available deliberately: a lapsed
+  // customer must still be able to see their own data, and an agent
+  // answering "what do I owe?" is the call most likely to end in a
+  // payment. This mirrors `ALWAYS_PERMITTED_WRITE_PREFIXES`.
+  //
+  // ⚠️ IT FAILS OPEN on its own errors — see `getAccessDecisionForTenant`.
+  // A billing-table outage must not stop a customer's agent pipeline.
+  if (tool.scope === "read_write") {
+    const { requireAccessForTenant, AccessRestrictedError } = await import(
+      "@/server/billing/access"
+    );
+    try {
+      await requireAccessForTenant(session.tenantId, `mcp:${toolName}`);
+    } catch (err) {
+      if (err instanceof AccessRestrictedError) {
+        // ⚠️ The customer-facing wording, passed through to the agent, so
+        // it can tell the user to settle the account rather than retrying
+        // a call that will never succeed.
+        const reason =
+          err.decision.detail ??
+          err.decision.headline ??
+          "This workspace is read-only until billing is brought up to date.";
+        await logCall(session, toolName, "refused", Date.now() - started, argumentKeys, reason);
+        return { ok: false, refused: true, reason };
+      }
+      throw err;
+    }
   }
 
   /* --- 5. execute --- */

@@ -24,6 +24,7 @@ import {
   assertImpersonationAllows,
   ImpersonationForbiddenError,
 } from "@/server/platform/impersonation";
+import { requireAccess, AccessRestrictedError } from "@/server/billing/access";
 import {
   uuidSchema,
   createContactSchema,
@@ -47,6 +48,23 @@ function fail(error: string, fieldErrors?: Record<string, string[]>): ActionResu
 
 /** Convert thrown errors into a safe envelope — never leak internals to the client. */
 function toActionError(err: unknown): ActionResult<never> {
+  /*
+   * ⚠️ FIRST, AND WITH THE BILLING WORDING — S1, v0.83.2.
+   *
+   * `AccessRestrictedError` means the WORKSPACE is in arrears, not that
+   * anything is broken and not that this person lacks a permission. It
+   * carries a headline and a call to action written for a customer; folding
+   * it into "Something went wrong. Please try again." would tell somebody
+   * whose card expired that the software is faulty — the one message
+   * guaranteed to produce a support ticket instead of a payment.
+   *
+   * `server/billing/access.ts` states the rule this obeys: four gates, four
+   * remedies. Collapsing any two guarantees somebody is eventually told to
+   * solve the wrong problem.
+   */
+  if (err instanceof AccessRestrictedError) {
+    return fail(err.decision.detail ?? err.decision.headline ?? err.message);
+  }
   if (err instanceof TenantAccessError) return fail(err.message);
   // ⚠️ Surfaced with its own sentence, not folded into "something went
   // wrong". The operator is our own staff member and the message tells
@@ -191,6 +209,25 @@ export async function createContact(
 ): Promise<ActionResult<Contact>> {
   try {
     const ctx = await requireTenantContext();
+
+    /*
+     * ⚠️ ACCESS BEFORE ANYTHING ELSE — S1, v0.83.2.
+     *
+     * `server/billing/access.ts` prescribes the order and the reason:
+     *
+     *     requireAccess()      ← is the account in good standing?
+     *     requireFeature()     ← is it in the plan?
+     *     requirePermission()  ← may this person do it?
+     *
+     * Broadest first, so the customer hears the outermost reason rather
+     * than an inner one they cannot act on.
+     *
+     * ⚠️ IT IS ALSO BEFORE `parse()`. A restricted workspace should be told
+     * it is read-only, not handed a validation error for a form it was
+     * never going to be allowed to submit.
+     */
+    await requireAccess("contacts:create", ctx);
+
     const data = createContactSchema.parse(input);
 
     // A supplied companyId must belong to THIS tenant. Without this check a
@@ -260,6 +297,9 @@ export async function updateContact(
 ): Promise<ActionResult<Contact>> {
   try {
     const ctx = await requireTenantContext();
+    // Access before validation — see `createContact`.
+    await requireAccess("contacts:update", ctx);
+
     const { id, ...data } = updateContactSchema.parse(input);
 
     const existing = await db.query.contacts.findFirst({
@@ -323,6 +363,8 @@ export async function updateContact(
 export async function deleteContact(id: string): Promise<ActionResult<{ id: string }>> {
   try {
     const ctx = await requireTenantContext();
+    // Access before anything else — see `createContact`.
+    await requireAccess("contacts:delete", ctx);
     /*
       ⭐ A SOFT DELETE IS AN UPDATE, SO THE DATABASE GUARD NEVER SEES IT.
       `refuse_delete_under_impersonation()` fires on DELETE. This row is

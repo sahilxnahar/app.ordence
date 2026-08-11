@@ -14,7 +14,25 @@
 
 import { useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
-import { updateUserStatus, updateUserRole } from "@/server/platform/users";
+/*
+ * ⚠️ IMPORTED FROM `actions`, NOT FROM `users` — v0.83.1.
+ *
+ * This is a `"use client"` file. `@/server/platform/users` begins with
+ * `import "server-only"` and reaches `guard.ts`, so importing it here
+ * failed the production build:
+ *
+ *     x You're importing a component that needs "server-only".
+ *     > Build failed because of webpack errors
+ *
+ * `updateUserStatusAction` / `updateUserRoleAction` are the `"use server"`
+ * wrappers over the same two functions. They are the supported way for a
+ * browser to reach them, and they keep the authorisation check where it
+ * belongs — inside the server-only implementation.
+ */
+import {
+  updateUserStatusAction,
+  updateUserRoleAction,
+} from "@/server/platform/actions";
 import { Button } from "@/components/ui/button";
 
 const ROLES = [
@@ -47,7 +65,7 @@ export function UserActions({
   function changeStatus(status: string) {
     setError(null);
     start(async () => {
-      const res = await updateUserStatus({ userId, tenantId, status });
+      const res = await updateUserStatusAction({ userId, tenantId, status });
       if (!res.ok) {
         setError(res.error);
         return;
@@ -60,7 +78,7 @@ export function UserActions({
     setError(null);
     setShowRolePicker(false);
     start(async () => {
-      const res = await updateUserRole({ userId, tenantId, role });
+      const res = await updateUserRoleAction({ userId, tenantId, role });
       if (!res.ok) {
         setError(res.error);
         return;

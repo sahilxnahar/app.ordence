@@ -292,3 +292,13 @@ export * from "./ai-patterns";
 
 // Notifications — per-tenant notification center for alerts and insights
 export * from "./notifications";
+
+/**
+ * Deployment releases/backups, the 460-batch tracker, and quick-flow
+ * submissions — the four tables created by `SQL-FILES/0046`.
+ *
+ * ⚠️ Registered here because `drizzle-kit push` DROPS anything it does
+ * not recognise. Present in SQL but absent from this barrel, they were
+ * one `db:push` away from deletion.
+ */
+export * from "./governance";

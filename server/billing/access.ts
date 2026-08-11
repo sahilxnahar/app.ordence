@@ -181,6 +181,137 @@ export async function checkAccess(ctx?: TenantContext): Promise<AccessDecision> 
   return getAccessDecision(ctx);
 }
 
+/* ------------------------------------------------------------------ */
+/* THE NON-BROWSER PATH — S1, v0.83.2                                  */
+/* ------------------------------------------------------------------ */
+
+/**
+ * ⭐ BILLING STANDING FOR A CALLER THAT HAS NO CLERK SESSION.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * WHY THIS EXISTS SEPARATELY FROM `getAccessDecision()`
+ * ══════════════════════════════════════════════════════════════════════
+ * Everything above resolves the tenant from `requireTenantContext()`,
+ * which reads a Clerk session. The MCP surface has no Clerk session — it
+ * authenticates a BEARER TOKEN and carries only `session.tenantId`.
+ *
+ * That mismatch left a real hole. `server/mcp/dispatch.ts` checks that the
+ * token exists, that its scope permits the tool, and that RLS pins the
+ * tenant — but nothing anywhere asked whether the workspace was still
+ * PAYING. So an AI agent holding a `read_write` token could keep writing
+ * to a `past_due` workspace that the same company's staff had just been
+ * put into read-only mode. The rule has to be the same for both, or the
+ * read-only state is decoration.
+ *
+ * ⚠️ FAILS OPEN, exactly like `getAccessDecision()` and for the same
+ * reason stated at the top of this file: a billing-table outage must not
+ * become an outage in our customers' businesses. The revenue risk of a
+ * few hours of unbilled agent activity is far smaller than an agent
+ * pipeline stopping because one query timed out.
+ *
+ * ⚠️ NOT WRAPPED IN React `cache()`. That deduplicates within a single
+ * React render pass, which an MCP request is not.
+ */
+export async function getAccessDecisionForTenant(
+  tenantId: string,
+): Promise<AccessDecision> {
+  const now = new Date();
+
+  try {
+    const { withTenant } = await import("@/db");
+    const { tenants } = await import("@/db/schema");
+
+    /*
+     * ⚠️ INSIDE `withTenant()`. A plain `db` read here would carry no
+     * tenant context, every RLS policy would evaluate against NULL, and
+     * the query would return zero rows — which would silently look like
+     * "no subscription" and grant full access to everyone. That is the
+     * same failure documented on `withPlatformScope()` in `db/index.ts`.
+     */
+    const row = await withTenant(tenantId, async (tx) => {
+      const [tenant] = await tx
+        .select({
+          status: tenants.status,
+          planTier: tenants.planTier,
+          trialEndsAt: tenants.trialEndsAt,
+        })
+        .from(tenants)
+        .where(eq(tenants.id, tenantId))
+        .limit(1);
+
+      const [sub] = await tx
+        .select({
+          status: subscriptions.status,
+          trialEndsAt: subscriptions.trialEndsAt,
+          graceEndsAt: subscriptions.graceEndsAt,
+          currentPeriodEnd: subscriptions.currentPeriodEnd,
+          failedPaymentCount: subscriptions.failedPaymentCount,
+          cancelAtPeriodEnd: subscriptions.cancelAtPeriodEnd,
+          tier: plans.tier,
+        })
+        .from(subscriptions)
+        .innerJoin(plans, eq(plans.id, subscriptions.planId))
+        .where(
+          and(
+            eq(subscriptions.tenantId, tenantId),
+            sql`${subscriptions.deletedAt} IS NULL`,
+            sql`${subscriptions.status} IN ('trialing','active','past_due','unpaid','paused','cancelled')`,
+          ),
+        )
+        .limit(1);
+
+      return { tenant, sub };
+    });
+
+    return evaluateAccess({
+      subscriptionStatus: row.sub?.status ?? null,
+      planTier: row.sub?.tier ?? row.tenant?.planTier ?? "trial",
+      tenantStatus: row.tenant?.status ?? "active",
+      trialEndsAt: row.sub?.trialEndsAt ?? row.tenant?.trialEndsAt ?? null,
+      graceEndsAt: row.sub?.graceEndsAt ?? null,
+      currentPeriodEnd: row.sub?.currentPeriodEnd ?? null,
+      failedPaymentCount: row.sub?.failedPaymentCount ?? 0,
+      cancelAtPeriodEnd: row.sub?.cancelAtPeriodEnd ?? false,
+      now,
+    });
+  } catch (error) {
+    console.error(
+      "[billing:access] Could not resolve standing for tenant; failing OPEN.",
+      error instanceof Error ? error.message : "unknown",
+    );
+    return evaluateAccess({
+      subscriptionStatus: null,
+      planTier: "trial",
+      tenantStatus: "active",
+      trialEndsAt: null,
+      graceEndsAt: null,
+      currentPeriodEnd: null,
+      failedPaymentCount: 0,
+      cancelAtPeriodEnd: false,
+      now,
+    });
+  }
+}
+
+/**
+ * Throwing variant for the MCP surface.
+ *
+ * `operation` follows the same `namespace:verb` convention the browser
+ * path uses, so the exempt prefixes in `ALWAYS_PERMITTED_WRITE_PREFIXES`
+ * (billing, payment, export, session, support) behave identically.
+ */
+export async function requireAccessForTenant(
+  tenantId: string,
+  operation: string,
+): Promise<AccessDecision> {
+  const decision = await getAccessDecisionForTenant(tenantId);
+
+  if (decision.canWrite) return decision;
+  if (isExemptWrite(operation)) return decision;
+
+  throw new AccessRestrictedError(decision);
+}
+
 /**
  * Everything a banner needs, serialisable for a client component.
  *
