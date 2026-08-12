@@ -1,5 +1,59 @@
 # Changelog
 
+## v0.88.0-alpha — a published endpoint that took the tenant as a parameter
+
+🔴 **Security.** `createNotification` was exported from
+`server/actions/notifications.ts`, a `"use server"` file. That file's own header
+states the rule it was obeying:
+
+> ⚠️ EVERY EXPORT IS AN ASYNC FUNCTION. A "use server" file that exports
+> anything else publishes it as an RPC endpoint reachable by anyone.
+
+Every export *was* an async function. That is what made this one dangerous.
+`createNotification` took `tenantId` **from its caller** and passed it to
+`withTenant()`. It never called `requireTenantContext()`.
+
+So it was a browser-reachable endpoint that accepted the tenant to write into as
+a parameter. Any authenticated session could invoke it with another workspace's
+uuid and:
+
+- insert a row into that workspace's notification feed,
+- with an attacker-chosen `title`, `body` and `actionUrl`,
+- and at severity `critical` or `warning`, send an **Ordence-branded email to
+  every active user of that workspace**, containing a link the attacker chose.
+
+Row-level security could not catch it. RLS enforces the tenant the transaction
+declares, and this function let the caller declare it. That is the one route
+past it, and it was reachable from a browser.
+
+**The fix is the boundary, not a check inside the function.** Adding
+`requireTenantContext()` would have broken the two real callers —
+`server/ai/background-workers.ts` and `server/mcp/dispatch.ts` — which have no
+user session and legitimately act for a tenant they were handed. The function
+moved to `server/notifications/create.ts`, an internal `server-only` module that
+is not callable from a browser at all. `check:boundaries` enforces the
+declaration.
+
+- **new** `server/notifications/create.ts` — the function, unchanged, with the
+  reasoning recorded above it
+- `server/actions/notifications.ts` — export removed; a comment block explains
+  why, and what shape a future UI-facing wrapper must take (derive the tenant
+  from `requireTenantContext()`, never from the client)
+- `server/ai/background-workers.ts`, `server/mcp/dispatch.ts` — imports repointed
+- unused imports cleaned from the action file
+
+No behaviour change for either legitimate caller. No schema change, no migration,
+no new dependency.
+
+**Not changed, deliberately:** `server/actions/assets.ts` and
+`server/actions/grid.ts` write without a permission gate, but both derive the
+tenant from `requireTenantContext()` and carry tenant predicates on every query —
+`grid.ts` says so in a comment: *"Fetching by id alone would be the IDOR."* They
+are tenant-safe. What they lack is a per-role permission, and there is no
+`assets:*` permission key in the catalogue to use. Adding one is a product
+decision plus a role-seeding migration; gating them blind would lock every
+existing user out of assets.
+
 ## v0.87.0-alpha — a deploy you can prove landed
 
 No behaviour changes. This release exists so that one glance at the landing page

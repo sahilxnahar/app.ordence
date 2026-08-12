@@ -1435,7 +1435,7 @@ async function runTool(
     }
 
     case "ordence_create_reminder": {
-      const { createNotification } = await import("@/server/actions/notifications");
+      const { createNotification } = await import("@/server/notifications/create");
       const result = await createNotification({
         tenantId: session.tenantId,
         title: requireString(args, "title"),

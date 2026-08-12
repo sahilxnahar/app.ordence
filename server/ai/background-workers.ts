@@ -33,7 +33,7 @@ import "server-only";
 import { withTenant } from "@/db";
 import { chatCompletion, type ChatMessage } from "@/lib/ai/client";
 import { recordPattern } from "@/lib/ai/patterns";
-import { createNotification } from "@/server/actions/notifications";
+import { createNotification } from "@/server/notifications/create";
 import {
   complianceTasks,
   complianceObligations,
