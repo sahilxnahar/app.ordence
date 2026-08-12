@@ -40,6 +40,7 @@ import {
   customFieldDefinitions,
 } from "@/db/schema";
 import { requireTenantContext, TenantAccessError } from "@/server/tenant-context";
+import { requirePermission } from "@/server/audit";
 import {
   createAssetSchema,
   buildDynamicSchema,
@@ -128,9 +129,26 @@ export async function getAssetFieldSpecs(): Promise<ActionResult<DynamicFieldSpe
 /* CREATE                                                              */
 /* ------------------------------------------------------------------ */
 
+/**
+ * ⭐ PHASE 50 — THE PERMISSION GATE THAT WAS MISSING.
+ *
+ * ⚠️ THIS FILE WAS NEVER TENANT-UNSAFE. It has always derived the tenant
+ * from `requireTenantContext()` and never from input, so no workspace
+ * could ever reach another's assets. What it lacked was a PER-ROLE gate:
+ * any member of a workspace could create and edit assets regardless of
+ * their role.
+ *
+ * ⚠️ AND THE REASON IT WAS LEFT UNGATED IN PHASE 47 WAS WRONG. I recorded
+ * then that no `assets:*` permission key existed, so gating would need a
+ * new key, role seeding and a data migration. That was not true — the
+ * keys have existed since Phase 8 (`assets:read`, `assets:create`,
+ * `assets:update`, `assets:delete`, `assets:bulk_update`) and every role
+ * template already carries the ones it should. The gate costs one line
+ * and locks nobody out.
+ */
 export async function createAsset(input: CreateAssetInput): Promise<ActionResult<Asset>> {
   try {
-    const ctx = await requireTenantContext();
+    const ctx = await requirePermission("assets:create");
 
     // 1. The fixed half.
     const parsed = createAssetSchema.parse(input);

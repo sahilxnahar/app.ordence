@@ -168,3 +168,80 @@ export const bounceReceiptSchema = z.object({
 export type RaiseInvoiceInput = z.infer<typeof raiseInvoiceFromOrderSchema>;
 export type RecordReceiptInput = z.infer<typeof recordReceiptSchema>;
 export type AllocateReceiptInput = z.infer<typeof allocateReceiptSchema>;
+
+/**
+ * A statement of account, as at a date.
+ *
+ * ⚠️ `asOf` IS REQUIRED AND IS NOT DEFAULTED TO TODAY ON THE SERVER.
+ * Ageing is a function of a date, and a statement whose date came from
+ * the server's clock cannot be reproduced by the person who printed it —
+ * they ask "why does it say 31–60 now when it said 1–30 this morning",
+ * and the answer is a timezone.
+ */
+export const statementSchema = z.object({
+  companyId: uuidSchema,
+  asOf: civilDaySchema,
+});
+
+/* ------------------------------------------------------------------ */
+/* CREDIT NOTES                                                        */
+/* ------------------------------------------------------------------ */
+
+/**
+ * ⚠️ THE GROUNDS ARE A CLOSED LIST BECAUSE SECTION 34(1) IS A CLOSED
+ *    LIST. A credit note may be issued where the taxable value or tax
+ *    charged exceeds what is payable, where goods are returned, or where
+ *    the supply is found deficient. "Because the customer asked" is not
+ *    a ground, and a free-text field would let it become one — which is
+ *    the credit note an officer disallows.
+ */
+export const CREDIT_NOTE_REASONS = [
+  "sales_return",
+  "rate_revision",
+  "deficiency",
+  "post_sale_discount",
+  "other",
+] as const;
+
+export const raiseCreditNoteSchema = z.object({
+  invoiceId: uuidSchema,
+  noteDate: civilDaySchema,
+  reasonCode: z.enum(CREDIT_NOTE_REASONS),
+  reason: z
+    .string()
+    .trim()
+    .min(4, "Say what is being credited and why. It is read back at an audit.")
+    .max(1000),
+  lines: z
+    .array(
+      z.object({
+        invoiceLineId: uuidSchema.optional(),
+        description: z.string().trim().min(1).max(500),
+        quantity: quantitySchema,
+        unitPriceMinor: minorAmountSchema,
+        taxRateBps: z.number().int().min(0).max(10000),
+        hsnSacCode: z.string().trim().max(10).optional(),
+      }),
+    )
+    .min(1, "A credit note needs at least one line."),
+});
+
+export const issueCreditNoteSchema = z.object({
+  creditNoteId: uuidSchema,
+});
+
+/**
+ * A GSTR-1 period.
+ *
+ * ⚠️ A MONTH, NOT AN ARBITRARY RANGE. GSTR-1 is filed for a calendar
+ * month (or a quarter under QRMP, which is three of these). Letting a
+ * caller pass any two dates would produce a document that looks like a
+ * return and reconciles to nothing the portal expects.
+ */
+export const gstr1PeriodSchema = z.object({
+  /** `YYYY-MM`. */
+  period: z
+    .string()
+    .trim()
+    .regex(/^\d{4}-(0[1-9]|1[0-2])$/, "Use a month in YYYY-MM form, e.g. 2026-04."),
+});

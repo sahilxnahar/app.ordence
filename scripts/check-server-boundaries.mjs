@@ -220,6 +220,114 @@ for (const f of files) {
 }
 
 /* ------------------------------------------------------------------ */
+/* 4. ⭐ NO `"use server"` EXPORT MAY ACCEPT A TENANT                   */
+/* ------------------------------------------------------------------ */
+
+/**
+ * 🔴 THIS RULE EXISTS BECAUSE RULE 3 WAS NOT ENOUGH, AND v005 PROVED IT.
+ *
+ * `server/actions/notifications.ts` obeyed rule 3 perfectly — every
+ * export was an async function, and its own header said so. It was still
+ * a cross-tenant write endpoint reachable from a browser:
+ *
+ *     export async function createNotification(input: {
+ *       tenantId: string;          // <- from the caller
+ *       ...
+ *     }) {
+ *       await withTenant(input.tenantId, ...)   // <- used directly
+ *
+ * Row-level security enforces the tenant THE TRANSACTION DECLARES. A
+ * function that lets its caller declare it is the single route past RLS,
+ * and that one was published as an endpoint. Any authenticated session
+ * could write a notification into another workspace — and at severity
+ * `critical`, email every active user of it.
+ *
+ * ⭐ THE RULE AS WRITTEN IN RULE 3 IS NECESSARY BUT NOT SUFFICIENT. The
+ *    missing half is: **and no export takes the tenant as a parameter.**
+ *    That half is mechanically checkable, so it is checked here.
+ *
+ * ⚠️ WHAT THIS CANNOT SEE. It reads the SIGNATURE only. An action whose
+ * parameter is a named type declared elsewhere, and that type contains
+ * `tenantId`, will pass. That is a real gap and it is not worth closing
+ * with a regex — it needs the type checker. The inline form is what the
+ * v005 bug looked like and what a hurried edit produces, so this catches
+ * the shape that actually occurs.
+ *
+ * ⚠️ AND THE FIX IS NEVER "add a check inside the function". It is to
+ * move the function to an `import "server-only"` module, which rule 1
+ * then covers — exactly what `server/notifications/create.ts`,
+ * `server/credit/position.ts` and `server/invoicing/documents.ts` are.
+ */
+/**
+ * ⚠️ `server/platform/` IS EXEMPT, AND THIS IS THE MOST IMPORTANT
+ *    PARAGRAPH IN THE FILE, BECAUSE AN EXEMPTION IS HOW A CHECK DIES.
+ *
+ * There are TWO tenancy models in this codebase and they are opposites:
+ *
+ *   TENANT actions  — the tenant comes from the SESSION
+ *                     (`requireTenantContext()` → `withTenant()`).
+ *                     A caller-supplied tenant is the v005 bug.
+ *
+ *   PLATFORM actions — the tenant is the SUBJECT of the operation.
+ *                     `admin.ordence.com` exists to act ON a named
+ *                     workspace: suspend it, change its plan, revoke an
+ *                     impersonation. `tenantId` is not a leak here, it is
+ *                     the argument. Their gate is
+ *                     `capabilityOrStepUp()` from `server/platform/
+ *                     guard.ts`, and they use `withPlatformScope()`.
+ *
+ * ⭐ SO THE EXEMPTION IS PAIRED WITH A COMPENSATING CHECK, BELOW: a
+ *    platform action file may not call `withTenant(`. If one ever does,
+ *    it has stopped being a platform action and is operating inside a
+ *    tenant with a tenant id it was handed — which is the v005 bug
+ *    wearing a platform badge, and the exemption would have hidden it.
+ */
+const isPlatformAction = (f) => rel(f).startsWith("server/platform/");
+
+for (const f of files) {
+  const src = read(f);
+  if (!isUseServer(src)) continue;
+
+  if (isPlatformAction(f)) {
+    if (/\bwithTenant\s*\(/.test(src)) {
+      fail(
+        `${rel(f)} is a platform action file and calls withTenant(). Platform actions are ` +
+          `exempt from the tenant-parameter rule because the tenant is their SUBJECT — but ` +
+          `that exemption assumes they use withPlatformScope(). Calling withTenant() with a ` +
+          `caller-supplied tenant is the v005 bug with a platform badge on.`,
+      );
+    }
+    continue;
+  }
+
+  /**
+   * ⚠️ `[^)]*` AND NOT `[\s\S]*?`, AND THE DIFFERENCE MATTERS.
+   *
+   * The first draft of this rule used a lazy `[\s\S]*?` terminated by
+   * `)\s*:`. On an action written `foo(input: unknown) {` — no return
+   * type — there is no `):` to stop at, so the match ran FORWARD through
+   * the file until it found one, swallowing several functions and
+   * reporting the violation against the wrong name. It named
+   * `listTenantsAction`, which takes `input: unknown` and is blameless.
+   *
+   * A check that reports the wrong file is worse than no check: somebody
+   * opens it, sees nothing wrong, and learns to distrust the checker.
+   */
+  for (const m of src.matchAll(/export\s+async\s+function\s+(\w+)\s*\(([^)]*)\)/g)) {
+    const [, name, params] = m;
+    if (/\btenantId\b/.test(params)) {
+      fail(
+        `${rel(f)} is "use server" and its export \`${name}()\` accepts \`tenantId\`. ` +
+          `Every export here is a browser-reachable endpoint, so this lets a caller choose ` +
+          `which workspace to operate on — the one route past row-level security. ` +
+          `Move it to a module with \`import "server-only"\` and derive the tenant from ` +
+          `requireTenantContext(). See server/notifications/create.ts.`,
+      );
+    }
+  }
+}
+
+/* ------------------------------------------------------------------ */
 
 const guarded = files.filter((f) => isServerOnly(read(f))).length;
 const actions = files.filter((f) => isUseServer(read(f))).length;

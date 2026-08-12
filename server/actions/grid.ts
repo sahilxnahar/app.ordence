@@ -34,6 +34,7 @@ import {
   customFieldDefinitions,
   auditLogs,
 } from "@/db/schema";
+import { requirePermission } from "@/server/audit";
 import { requireTenantContext, TenantAccessError } from "@/server/tenant-context";
 import { validateRecordData } from "@/lib/validators/crm";
 import type { ActionResult } from "@/lib/validators/crm";
@@ -179,7 +180,7 @@ export async function updateAssetCell(
   input: CellEditInput,
 ): Promise<ActionResult<{ id: string; columnId: string }>> {
   try {
-    const ctx = await requireTenantContext();
+    const ctx = await requirePermission("assets:update");
     const parsed = cellEditSchema.parse(input);
 
     const column = parseColumnId(parsed.columnId);
@@ -285,7 +286,7 @@ export async function updateCustomRecordCell(
   input: CellEditInput,
 ): Promise<ActionResult<{ id: string; columnId: string }>> {
   try {
-    const ctx = await requireTenantContext();
+    const ctx = await requirePermission("custom_objects:update_record");
     const parsed = cellEditSchema.parse(input);
 
     const column = parseColumnId(parsed.columnId);
@@ -391,7 +392,21 @@ export async function bulkUpdateAssetStatus(
   input: z.input<typeof bulkStatusSchema>,
 ): Promise<ActionResult<{ updated: number }>> {
   try {
-    const ctx = await requireTenantContext();
+    /**
+     * ⚠️ `assets:bulk_update`, NOT `assets:update`, AND THIS CHANGES
+     *    BEHAVIOUR — read before deploying.
+     *
+     * Until now any workspace member could bulk-change the status of
+     * every asset they could see. `assets:bulk_update` is held only by
+     * the owner and the administrator, so after this release a Team
+     * Member editing one asset at a time still works and the bulk button
+     * refuses.
+     *
+     * That is what the separate key is FOR: one careless bulk update
+     * across a whole catalogue is a different act from editing a row,
+     * and it is the one nobody can undo by hand.
+     */
+    const ctx = await requirePermission("assets:bulk_update");
     const parsed = bulkStatusSchema.parse(input);
 
     const allowed = assets.status.enumValues as readonly string[];

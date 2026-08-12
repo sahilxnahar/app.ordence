@@ -384,7 +384,25 @@ function normaliseCode(value: string | null | undefined): string | null {
   return trimmed.length === 1 ? `0${trimmed}` : trimmed;
 }
 
-function taxKindFor(isInterState: boolean, placeOfSupply: string): GstTaxKind {
+/**
+ * ⭐ EXPORTED IN v0.92.0 so the invoicing path can reuse it.
+ *
+ * ⚠️ THIS IS A LOOKUP, NOT A DETERMINATION, AND THE DIFFERENCE IS WHY
+ *    EXPORTING IT IS SAFE.
+ *
+ * `determinePlaceOfSupply()` makes a legal judgement from addresses,
+ * registrations and the nature of the supply, and its result is STORED on
+ * the order. Re-running that judgement at invoice time would be the
+ * divergence this codebase keeps refusing — a delivery address moves and
+ * every historical document silently re-splits.
+ *
+ * This function asks something much smaller of an ALREADY-STORED value:
+ * "is code `35` a Union Territory?" That is a fact about the code, fixed
+ * by statute, and it cannot drift. Phase 49 declined to use it out of
+ * caution and billed every intra-UT supply as CGST + SGST — the right
+ * money in the wrong Act, and the wrong box in GSTR-1.
+ */
+export function taxKindFor(isInterState: boolean, placeOfSupply: string): GstTaxKind {
   if (isInterState) return "igst";
   return isUnionTerritoryCode(placeOfSupply) ? "cgst_utgst" : "cgst_sgst";
 }

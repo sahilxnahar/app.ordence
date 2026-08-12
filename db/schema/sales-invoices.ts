@@ -572,3 +572,154 @@ export type SalesInvoiceLine = typeof salesInvoiceLines.$inferSelect;
 export type CustomerReceipt = typeof customerReceipts.$inferSelect;
 export type CustomerReceiptAllocation = typeof customerReceiptAllocations.$inferSelect;
 export type SalesInvoiceStatus = (typeof salesInvoiceStatusEnum.enumValues)[number];
+
+/* ------------------------------------------------------------------ */
+/* ⭐ CREDIT NOTES — Phase 52                                           */
+/* ------------------------------------------------------------------ */
+
+/**
+ * The only lawful way to reduce an issued tax invoice (Section 34(1)).
+ *
+ * ⚠️ A CREDIT NOTE IS NOT AN EDIT AND MUST NEVER BECOME ONE. Both
+ * documents keep existing: the customer holds the original invoice and
+ * may already have claimed input credit on it, and the pair has to
+ * reconcile in their books and ours.
+ *
+ * ⚠️ THERE IS NO DEBIT NOTE HERE. A debit note INCREASES what is owed and
+ * under Section 34(3) that is a supply — it needs its own tax
+ * determination, not a mirror of this table with a sign column. A sign
+ * column is how a refund eventually gets recorded as a charge.
+ */
+export const salesCreditNotes = pgTable(
+  "sales_credit_notes",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    tenantId: uuid("tenant_id")
+      .notNull()
+      .references(() => tenants.id, { onDelete: "cascade" }),
+
+    creditNoteNumber: varchar("credit_note_number", { length: 60 }).notNull(),
+    financialYear: varchar("financial_year", { length: 9 }).notNull(),
+    /** Shares the invoice status enum — the lifecycle is the same shape. */
+    status: salesInvoiceStatusEnum("status").default("draft").notNull(),
+
+    /**
+     * ⭐ ALWAYS AGAINST AN INVOICE, AND NOT NULL.
+     *
+     * ⚠️ A FREE-FLOATING CREDIT NOTE IS UNRECONCILABLE. GSTR-1 reports it
+     * against the original document and the customer matches it against
+     * the invoice in their books. One that names no invoice is a
+     * reduction nobody can tie to a supply — the first thing an officer
+     * asks about.
+     */
+    invoiceId: uuid("invoice_id").notNull(),
+    companyId: uuid("company_id")
+      .notNull()
+      .references(() => companies.id, { onDelete: "restrict" }),
+
+    noteDate: date("note_date", { mode: "string" }).notNull(),
+
+    /** Section 34(1) grounds. varchar so a new ground is a row, not a migration. */
+    reasonCode: varchar("reason_code", { length: 40 }).notNull(),
+    /** ⚠️ Free text and required — it is read aloud to a customer. */
+    reason: text("reason").notNull(),
+
+    customerLegalName: varchar("customer_legal_name", { length: 255 }),
+    customerGstin: varchar("customer_gstin", { length: 15 }),
+    supplierGstin: varchar("supplier_gstin", { length: 15 }),
+    placeOfSupplyCode: varchar("place_of_supply_code", { length: 2 }),
+    isInterState: boolean("is_inter_state").default(false).notNull(),
+
+    currency: varchar("currency", { length: 3 }).default("INR").notNull(),
+    taxableValueMinor: bigint("taxable_value_minor", { mode: "bigint" })
+      .default(sql`0`)
+      .notNull(),
+    cgstMinor: bigint("cgst_minor", { mode: "bigint" }).default(sql`0`).notNull(),
+    sgstMinor: bigint("sgst_minor", { mode: "bigint" }).default(sql`0`).notNull(),
+    igstMinor: bigint("igst_minor", { mode: "bigint" }).default(sql`0`).notNull(),
+    cessMinor: bigint("cess_minor", { mode: "bigint" }).default(sql`0`).notNull(),
+    roundOffMinor: bigint("round_off_minor", { mode: "bigint" }).default(sql`0`).notNull(),
+    totalMinor: bigint("total_minor", { mode: "bigint" }).default(sql`0`).notNull(),
+
+    issuedAt: timestamp("issued_at", { withTimezone: true }),
+    issuedBy: uuid("issued_by").references(() => users.id, { onDelete: "set null" }),
+    cancelledAt: timestamp("cancelled_at", { withTimezone: true }),
+    cancelReason: text("cancel_reason"),
+
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+    createdBy: uuid("created_by").references(() => users.id, { onDelete: "set null" }),
+    updatedBy: uuid("updated_by").references(() => users.id, { onDelete: "set null" }),
+  },
+  (t) => ({
+    numberPerTenant: uniqueIndex("sales_credit_notes_number_tenant_key").on(
+      t.tenantId,
+      t.creditNoteNumber,
+    ),
+    idTenantUnique: uniqueIndex("sales_credit_notes_id_tenant_key").on(t.id, t.tenantId),
+    tenantIdx: index("sales_credit_notes_tenant_idx").on(t.tenantId, t.noteDate),
+    invoiceIdx: index("sales_credit_notes_invoice_idx").on(t.tenantId, t.invoiceId),
+    companyIdx: index("sales_credit_notes_company_idx").on(t.tenantId, t.companyId, t.status),
+    gstMutuallyExclusive: check(
+      "sales_credit_notes_gst_mutually_exclusive",
+      sql`(${t.igstMinor} = 0) OR (${t.cgstMinor} = 0 AND ${t.sgstMinor} = 0)`,
+    ),
+  }),
+);
+
+export const salesCreditNoteLines = pgTable(
+  "sales_credit_note_lines",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    tenantId: uuid("tenant_id")
+      .notNull()
+      .references(() => tenants.id, { onDelete: "cascade" }),
+    creditNoteId: uuid("credit_note_id").notNull(),
+    lineNo: integer("line_no").notNull(),
+    /** Which invoice line is reduced. Null only for a whole-document adjustment. */
+    invoiceLineId: uuid("invoice_line_id"),
+
+    description: text("description").notNull(),
+    hsnSacCode: varchar("hsn_sac_code", { length: 10 }),
+    taxRateBps: integer("tax_rate_bps"),
+    quantity: numeric("quantity", { precision: 18, scale: 3 }).notNull(),
+    uom: varchar("uom", { length: 20 }).default("nos").notNull(),
+    unitPriceMinor: bigint("unit_price_minor", { mode: "bigint" }).notNull(),
+    taxableValueMinor: bigint("taxable_value_minor", { mode: "bigint" })
+      .default(sql`0`)
+      .notNull(),
+    cgstMinor: bigint("cgst_minor", { mode: "bigint" }).default(sql`0`).notNull(),
+    sgstMinor: bigint("sgst_minor", { mode: "bigint" }).default(sql`0`).notNull(),
+    igstMinor: bigint("igst_minor", { mode: "bigint" }).default(sql`0`).notNull(),
+    cessMinor: bigint("cess_minor", { mode: "bigint" }).default(sql`0`).notNull(),
+    lineTotalMinor: bigint("line_total_minor", { mode: "bigint" }).default(sql`0`).notNull(),
+
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (t) => ({
+    lineNoUnique: uniqueIndex("sales_credit_note_lines_line_no_key").on(
+      t.creditNoteId,
+      t.lineNo,
+    ),
+    parentIdx: index("sales_credit_note_lines_parent_idx").on(t.tenantId, t.creditNoteId),
+    positiveQuantity: check(
+      "sales_credit_note_lines_quantity_positive",
+      sql`${t.quantity} > 0`,
+    ),
+  }),
+);
+
+export const salesCreditNotesRelations = relations(salesCreditNotes, ({ one, many }) => ({
+  invoice: one(salesInvoices, {
+    fields: [salesCreditNotes.invoiceId],
+    references: [salesInvoices.id],
+  }),
+  company: one(companies, {
+    fields: [salesCreditNotes.companyId],
+    references: [companies.id],
+  }),
+  lines: many(salesCreditNoteLines),
+}));
+
+export type SalesCreditNote = typeof salesCreditNotes.$inferSelect;
+export type SalesCreditNoteLine = typeof salesCreditNoteLines.$inferSelect;

@@ -694,6 +694,19 @@ export const MODULE_REGISTRY: Readonly<Record<string, ModuleDescriptor>> =
       description: "Commitments made and not yet delivered.",
       group: "site", feature: "sales.orders", status: "live", href: "/orders",
     },
+    /**
+     * ⭐ PHASE 54 — the outward document finally has a screen.
+     *
+     * ⚠️ `group: "money"`, NOT `"site"`, and the difference is who looks.
+     * Purchases sit under `site` because a site engineer passes a
+     * contractor's bill. A sales invoice is read by whoever chases the
+     * money, and they open the money group.
+     */
+    invoices: {
+      navId: "invoices", label: "Invoices",
+      description: "Tax invoices raised, and what is still owed on them.",
+      group: "money", feature: "sales.orders", status: "live", href: "/invoices",
+    },
     purchases: {
       navId: "purchases", label: "Purchases",
       description: "Vendor invoices and input tax credit.",
