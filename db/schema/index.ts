@@ -14,6 +14,16 @@ export * from "./core";
 export * from "./crm";
 export * from "./credit";
 
+/**
+ * ⭐ Phase 49 — the outward document.
+ *
+ * ⚠️ EXPORTED AFTER `./orders` AND `./gst`, WHICH IT REFERENCES. And note
+ * it is NOT `./billing` — `billing.invoices` is Ordence billing its own
+ * tenants; these are a tenant billing its customers. Same shape, opposite
+ * direction, and merging them puts our revenue in their GSTR-1.
+ */
+export * from "./sales-invoices";
+
 // Dynamic custom object engine (vertical SaaS)
 export * from "./custom-objects";
 

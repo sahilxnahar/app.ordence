@@ -111,6 +111,18 @@ const isPublicRoute = createRouteMatcher([
   "/sign-in(.*)",
   "/sign-up(.*)",
   "/api/health",
+  /**
+   * ⭐ The readiness probe is public, and it has to be.
+   *
+   * An uptime monitor has no session and never will. Requiring auth here
+   * would mean the probe returns 401 during an outage AND during perfect
+   * health — indistinguishable, and therefore useless.
+   *
+   * ⚠️ IT IS SAFE TO EXPOSE BECAUSE OF WHAT IT WITHHOLDS: a SQLSTATE code
+   * and a duration, never a driver message, a host or a user. See the
+   * note in the route.
+   */
+  "/api/ready",
   "/api/webhooks(.*)",
   // ══════════════════════════════════════════════════════════════
   // BACKGROUND WORK (v0.21.0 — Cloudflare)

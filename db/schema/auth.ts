@@ -131,6 +131,26 @@ export const PERMISSION_CATALOG = {
   "sales.credit.manage": "Set credit limits, place and lift credit holds",
   "sales.orders.approve_credit": "Approve an order that exceeds a customer's credit limit",
 
+  // ── ⭐ SALES INVOICING (Phase 49) ────────────────────────────────
+  //
+  // ⚠️ `issue` IS ITS OWN KEY AND IS NOT FOLDED INTO `create`.
+  //
+  // Raising a draft is reversible — delete it, nobody outside the
+  // workspace ever knew. ISSUING is not: under Rule 53 the only lawful
+  // correction to an issued tax invoice is a credit note, its own
+  // numbered document with its own GSTR-1 line. The customer holds their
+  // copy and may already have claimed input credit on it.
+  //
+  // One key for both would make that irreversible step the default
+  // outcome of whoever can type an invoice — which in most workspaces is
+  // the most junior person in the room.
+  "sales.invoices.read": "View sales invoices",
+  "sales.invoices.create": "Raise draft invoices",
+  "sales.invoices.issue": "Issue a tax invoice to a customer",
+  "sales.invoices.cancel": "Cancel an invoice",
+  "sales.receipts.record": "Record money received from a customer",
+  "sales.receipts.allocate": "Apply a receipt to invoices",
+
   // ── ⭐ ENGINE 1 · Scheduling & capacity ──────────────────────────
   "scheduling.bookings.read": "View the schedule",
   "scheduling.bookings.manage": "Create, amend and cancel bookings",
@@ -956,6 +976,11 @@ export const ROLE_TEMPLATES: Readonly<Record<SystemRole, RoleTemplate>> = {
       // the worst-placed person to decide that this one order is fine.
       // That key sits with the owner and the administrator only.
       "sales.credit.read", "sales.credit.manage",
+      // ⭐ PHASE 49 — THE ROLE THAT OWNS THE OUTWARD DOCUMENT. The
+      // accountant files the GSTR-1 these invoices become, so the same
+      // person raises, issues and settles them.
+      "sales.invoices.read", "sales.invoices.create", "sales.invoices.issue",
+      "sales.invoices.cancel", "sales.receipts.record", "sales.receipts.allocate",
       // ⭐ PHASE 33 — THE ROLE THAT OWNS THE INPUT SIDE TOO. The
       // accountant enters the vendor bills, makes the Section 17(5)
       // determination and puts the credit into the GSTR-3B they file.
@@ -1113,7 +1138,7 @@ export const ROLE_TEMPLATES: Readonly<Record<SystemRole, RoleTemplate>> = {
       // ⭐ Phase 48, read only. Counsel drafting a recovery notice recites
       // the terms the customer was trading on; a hold and its reason are
       // part of the account's history the moment the account is disputed.
-      "sales.credit.read",
+      "sales.credit.read", "sales.invoices.read",
       "audit:read",
       // Approves what an automation asks a human to approve — a contract
       // going out, a discount, a cancellation. Reads, approves, publishes
@@ -1167,6 +1192,14 @@ export const ROLE_TEMPLATES: Readonly<Record<SystemRole, RoleTemplate>> = {
       // raise it, every time, at the exact moment the limit was doing
       // its job.
       "sales.credit.read",
+      // ⭐ PHASE 49 — RAISES A DRAFT, NEVER ISSUES ONE.
+      //
+      // A rep who has just delivered should be able to prepare the bill;
+      // making them wait on the accountant to type it is how invoicing
+      // falls a week behind the goods. But ISSUING is irreversible and
+      // lands in a statutory return, and a rep under a monthly target is
+      // the wrong person to hold that button.
+      "sales.invoices.read", "sales.invoices.create",
       // ⚠️ READS, WRITES NOTHING. A rep quoting a flat needs to see the
       // rate that will be charged on it. Letting them CHANGE that rate
       // would let a negotiation move the tax, which is not theirs to
@@ -1256,7 +1289,7 @@ export const ROLE_TEMPLATES: Readonly<Record<SystemRole, RoleTemplate>> = {
       // ⭐ Phase 48, read only. Credit exposure is the first number a
       // director or a lender's analyst asks for, and neither of them
       // should be able to move a rupee of it.
-      "sales.credit.read",
+      "sales.credit.read", "sales.invoices.read",
       "users:read", "settings:read",
       "workflows:read", "workflows:runs_read",
       // Opens saved views; saves none. A read-only role that could create
