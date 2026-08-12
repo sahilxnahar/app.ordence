@@ -1,6 +1,6 @@
 {
   "name": "ordence",
-  "version": "0.88.0-alpha",
+  "version": "0.89.0-alpha",
   "private": true,
   "scripts": {
     "dev": "next dev",

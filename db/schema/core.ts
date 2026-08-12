@@ -452,4 +452,15 @@ export type NewPermission = typeof permissions.$inferInsert;
 export type AuditLog = typeof auditLogs.$inferSelect;
 export type NewAuditLog = typeof auditLogs.$inferInsert;
 export type SystemRole = (typeof systemRoleEnum.enumValues)[number];
+
+/**
+ * The role values as a plain tuple, for Zod and anything else that needs
+ * the list at runtime rather than at type level.
+ *
+ * ⚠️ DERIVED FROM THE ENUM, NEVER RETYPED. A hand-written copy diverges
+ * the day a role is added, and the divergence presents as a validator
+ * rejecting a role the database accepts — which reads as a bug in the
+ * form rather than in the list.
+ */
+export const SYSTEM_ROLE_VALUES = systemRoleEnum.enumValues;
 export type PlanTier = (typeof planTierEnum.enumValues)[number];

@@ -60,7 +60,9 @@ import {
   type OrderLineInput,
 } from "@/lib/validators/orders";
 import { priceLine, summarise, type LinePricing } from "@/lib/orders/pricing";
-import { serializeAmount } from "@/lib/billing/money";
+import { serializeAmount, toBigIntAmount } from "@/lib/billing/money";
+import { assessOrderCredit, assessApprovalAuthority } from "@/server/credit/position";
+import { approveOrderCreditSchema } from "@/lib/validators/credit";
 import type { ActionResult } from "@/lib/validators/crm";
 
 const FEATURE_ORDERS = "sales.orders" as const;
@@ -346,9 +348,15 @@ export async function createOrder(
 /* CONFIRM — the moment the lines freeze                               */
 /* ================================================================== */
 
-export async function confirmOrder(input: unknown): Promise<ActionResult<{ id: string }>> {
+export async function confirmOrder(
+  input: unknown,
+): Promise<ActionResult<{ id: string; status: string; creditMessage: string | null }>> {
   try {
     const data = confirmOrderSchema.parse(input);
+    let outcome: { routeToApproval: boolean; creditMessage: string | null } = {
+      routeToApproval: false,
+      creditMessage: null,
+    };
     const ctx = await guardSalesWrite({
       operation: "orders:confirm",
       feature: FEATURE_ORDERS,
@@ -380,14 +388,76 @@ export async function confirmOrder(input: unknown): Promise<ActionResult<{ id: s
           );
         }
 
+        /**
+         * ══════════════════════════════════════════════════════════════
+         * 🔴 THE CREDIT GATE — v0.89.0
+         * ══════════════════════════════════════════════════════════════
+         * ⚠️ IT RUNS INSIDE THIS TRANSACTION, NOT BEFORE IT.
+         *
+         * Reading a customer's exposure on one connection and writing the
+         * confirmation on another is a race with money in it: two reps
+         * confirm two orders for one customer in the same second, each
+         * reads an exposure that excludes the other, and both clear a
+         * limit that neither should. Sharing `tx` puts the read behind
+         * the same lock as the write.
+         *
+         * ⚠️ AND IT RETURNS `approval_required`, NEVER "denied". An order
+         * over the limit is not refused — it goes to `pending_approval`,
+         * where somebody holding `sales.orders.approve_credit` releases
+         * it. A credit system that says no gets switched off in week one.
+         */
+        let creditMessage: string | null = null;
+        let needsCreditApproval = false;
+
+        if (order.companyId) {
+          const decision = await assessOrderCredit({
+            tx,
+            tenantId: ctx.tenant.id,
+            companyId: order.companyId,
+            orderId: order.id,
+            orderTotalMinor: toBigIntAmount(order.totalMinor),
+          });
+          needsCreditApproval = decision.outcome === "approval_required";
+          creditMessage = decision.message;
+        }
+
+        /**
+         * ⚠️ AN ORDER WITH NO CUSTOMER RECORD IS NOT CREDIT-CHECKED, AND
+         * THAT IS NOT A HOLE — `companyId` is nullable because a cash
+         * counter sale has no company row. There is no account to run up,
+         * because there is no account.
+         */
+
+        /**
+         * ══════════════════════════════════════════════════════════════
+         * 🔴 AND THE FIX THAT MAKES THE GATE MEAN ANYTHING
+         * ══════════════════════════════════════════════════════════════
+         * Until v0.89.0 this block read:
+         *
+         *   approvedBy: order.requiresApproval ? ctx.user.id : ...
+         *   approvedAt: order.requiresApproval ? new Date()   : ...
+         *
+         * The person pressing confirm was written as the person who
+         * approved it. `requiresApproval` therefore enforced nothing: the
+         * same click that raised the flag satisfied it. Worse, the audit
+         * trail then recorded an approval naming a real person at a real
+         * time — every fact true, the sentence they form false.
+         *
+         * ⚠️ NOTHING IN THIS ACTION MAY EVER WRITE `approvedBy` AGAIN.
+         * Approval is `approveOrderCredit`, which requires a different
+         * permission and therefore, in any sane role setup, a different
+         * person. If a future change needs to confirm-and-approve in one
+         * step, that step must check `sales.orders.approve_credit`
+         * explicitly — not infer it from having reached this line.
+         */
+        const routeToApproval = needsCreditApproval || order.requiresApproval;
+
         await tx
           .update(salesOrders)
           .set({
-            status: "confirmed",
-            confirmedAt: new Date(),
-            confirmedBy: ctx.user.id,
-            approvedBy: order.requiresApproval ? ctx.user.id : order.approvedBy,
-            approvedAt: order.requiresApproval ? new Date() : order.approvedAt,
+            status: routeToApproval ? "pending_approval" : "confirmed",
+            confirmedAt: routeToApproval ? null : new Date(),
+            confirmedBy: routeToApproval ? null : ctx.user.id,
             updatedBy: ctx.user.id,
           })
           .where(and(eq(salesOrders.tenantId, ctx.tenant.id), eq(salesOrders.id, data.id)));
@@ -395,12 +465,152 @@ export async function confirmOrder(input: unknown): Promise<ActionResult<{ id: s
         await tx.insert(salesOrderEvents).values({
           tenantId: ctx.tenant.id,
           orderId: data.id,
-          eventType: "confirmed",
+          eventType: routeToApproval ? "held" : "confirmed",
           fromStatus: order.status,
+          toStatus: routeToApproval ? "pending_approval" : "confirmed",
+          revision: order.revision,
+          summary: routeToApproval
+            ? `Order ${order.orderNo} needs approval before it can be confirmed. ${creditMessage ?? "This order is marked as requiring approval."}`
+            : `Order ${order.orderNo} confirmed. Prices and quantities are now fixed; any change from here is a recorded amendment.`,
+          detail: {
+            ...(data.approvalNote ? { approvalNote: data.approvalNote } : {}),
+            ...(creditMessage ? { credit: creditMessage } : {}),
+          },
+          actorUserId: ctx.user.id,
+          impersonationId: ctx.impersonationId,
+        });
+
+        outcome = { routeToApproval, creditMessage };
+      },
+      { impersonationId: ctx.impersonationId },
+    );
+
+    await writeAudit(ctx, {
+      action: "update",
+      resourceType: "sales_order",
+      resourceId: data.id,
+      newValue: {
+        status: outcome.routeToApproval ? "pending_approval" : "confirmed",
+        credit: outcome.creditMessage,
+      },
+      severity: "warning",
+    });
+
+    revalidatePath("/orders");
+    revalidatePath(`/orders/${data.id}`);
+    return {
+      ok: true,
+      data: {
+        id: data.id,
+        status: outcome.routeToApproval ? "pending_approval" : "confirmed",
+        creditMessage: outcome.creditMessage,
+      },
+    };
+  } catch (err) {
+    return toSalesActionError(err, "confirmOrder");
+  }
+}
+
+/* ================================================================== */
+/* ⭐ APPROVE — the second person                                       */
+/* ================================================================== */
+
+/**
+ * Release an order that the credit check, or an explicit
+ * `requiresApproval` flag, routed to a human.
+ *
+ * ⚠️ THE APPROVER IS THE SESSION AND CAN NEVER BE AN ARGUMENT. A field
+ * naming the approver is a field an attacker fills in with somebody
+ * senior, and the audit trail then carries a signature that person never
+ * gave. `approveOrderCreditSchema` has no such field, and this is the
+ * comment that stops one being added.
+ *
+ * ⚠️ AND THE APPROVER'S ROLE IS CHECKED AGAINST ITS APPROVAL LIMIT, not
+ * just against the permission. `sales.orders.approve_credit` says "this
+ * role may approve credit overrides at all"; the limit says "up to how
+ * much". Without the second question a junior with the permission
+ * approves a crore, which is exactly the shape of the loss this whole
+ * phase exists to prevent.
+ */
+export async function approveOrderCredit(
+  input: unknown,
+): Promise<ActionResult<{ id: string }>> {
+  try {
+    const data = approveOrderCreditSchema.parse(input);
+    const ctx = await guardSalesWrite({
+      operation: "orders:approve_credit",
+      feature: FEATURE_ORDERS,
+      permission: "sales.orders.approve_credit",
+      resource: { type: "sales_order", id: data.orderId },
+    });
+
+    await withTenant(
+      ctx.tenant.id,
+      async (tx) => {
+        const [order] = await tx
+          .select()
+          .from(salesOrders)
+          .where(
+            and(eq(salesOrders.tenantId, ctx.tenant.id), eq(salesOrders.id, data.orderId)),
+          )
+          .limit(1);
+
+        if (!order) throw new Error("That order no longer exists.");
+
+        if (order.status !== "pending_approval") {
+          throw new Error(
+            `Order ${order.orderNo} is not waiting for approval — it is ${order.status.replace(/_/g, " ")}. Nothing has been changed.`,
+          );
+        }
+
+        /**
+         * ⚠️ SELF-APPROVAL IS REFUSED HERE, EXPLICITLY, EVEN THOUGH THE
+         * PERMISSIONS USUALLY MAKE IT IMPOSSIBLE.
+         *
+         * "Usually" is not a control. A workspace where one person holds
+         * both keys is a legitimate configuration — a two-person company
+         * — and the honest thing is to refuse and say so, rather than to
+         * record a second signature that is the first signature.
+         */
+        if (order.createdBy && order.createdBy === ctx.user.id) {
+          throw new Error(
+            `You raised order ${order.orderNo}, so you cannot also approve it. Somebody else with approval rights has to release it — that separation is the whole point of the credit limit.`,
+          );
+        }
+
+        const authority = await assessApprovalAuthority({
+          tx,
+          tenantId: ctx.tenant.id,
+          role: ctx.role,
+          scope: "sales_order",
+          valueMinor: toBigIntAmount(order.totalMinor),
+        });
+
+        if (!authority.allowed) throw new Error(authority.message);
+
+        await tx
+          .update(salesOrders)
+          .set({
+            status: "confirmed",
+            approvedBy: ctx.user.id,
+            approvedAt: new Date(),
+            confirmedAt: new Date(),
+            confirmedBy: ctx.user.id,
+            updatedBy: ctx.user.id,
+          })
+          .where(
+            and(eq(salesOrders.tenantId, ctx.tenant.id), eq(salesOrders.id, data.orderId)),
+          );
+
+        await tx.insert(salesOrderEvents).values({
+          tenantId: ctx.tenant.id,
+          orderId: data.orderId,
+          eventType: "confirmed",
+          fromStatus: "pending_approval",
           toStatus: "confirmed",
           revision: order.revision,
-          summary: `Order ${order.orderNo} confirmed. Prices and quantities are now fixed; any change from here is a recorded amendment.`,
-          detail: data.approvalNote ? { approvalNote: data.approvalNote } : {},
+          summary: `Order ${order.orderNo} approved over the customer's credit limit and confirmed. ${data.note}`,
+          detail: { approvalNote: data.note, approverRole: ctx.role },
           actorUserId: ctx.user.id,
           impersonationId: ctx.impersonationId,
         });
@@ -411,16 +621,22 @@ export async function confirmOrder(input: unknown): Promise<ActionResult<{ id: s
     await writeAudit(ctx, {
       action: "update",
       resourceType: "sales_order",
-      resourceId: data.id,
-      newValue: { status: "confirmed" },
-      severity: "warning",
+      resourceId: data.orderId,
+      newValue: { status: "confirmed", creditApproval: data.note },
+      reason: data.note,
+      /**
+       * ⚠️ `critical`. Somebody has just extended credit past a ceiling
+       * another person set. If a workspace reviews one class of event a
+       * month, this is the class.
+       */
+      severity: "critical",
     });
 
     revalidatePath("/orders");
-    revalidatePath(`/orders/${data.id}`);
-    return { ok: true, data: { id: data.id } };
+    revalidatePath(`/orders/${data.orderId}`);
+    return { ok: true, data: { id: data.orderId } };
   } catch (err) {
-    return toSalesActionError(err, "confirmOrder");
+    return toSalesActionError(err, "approveOrderCredit");
   }
 }
 

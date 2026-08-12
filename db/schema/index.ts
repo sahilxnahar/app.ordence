@@ -12,6 +12,7 @@ export * from "./core";
 
 // Standard CRM entities
 export * from "./crm";
+export * from "./credit";
 
 // Dynamic custom object engine (vertical SaaS)
 export * from "./custom-objects";

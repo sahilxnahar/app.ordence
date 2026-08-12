@@ -102,6 +102,35 @@ export const PERMISSION_CATALOG = {
   "sales.orders.cancel": "Cancel orders",
   "sales.orders.dispatch": "Dispatch orders",
 
+  // ── ⭐ CREDIT CONTROL (Phase 48) ─────────────────────────────────
+  //
+  // ⚠️ THREE KEYS, AND THE THIRD IS THE ONE THAT MATTERS.
+  //
+  // `sales.credit.read`   — see a customer's limit, hold and exposure.
+  // `sales.credit.manage` — set the limit, place and lift the hold.
+  // `sales.orders.approve_credit` — confirm an order the credit check
+  //                         routed to a human.
+  //
+  // ⭐ APPROVE IS SEPARATE FROM CONFIRM, AND SEPARATE FROM MANAGE, ON
+  //    PURPOSE, BECAUSE OTHERWISE THE CONTROL IS DECORATION.
+  //
+  // Folded into `sales.orders.confirm`, the person blocked by the limit
+  // approves their own override — which is what this codebase was
+  // already doing at `server/actions/orders.ts:389` before Phase 48, and
+  // the audit trail recorded it as a genuine approval.
+  //
+  // Folded into `sales.credit.manage`, the salesperson raises the
+  // customer's limit instead of asking anyone, and the ceiling becomes a
+  // number that describes the last order rather than constraining the
+  // next one.
+  //
+  // ⚠️ AND NOTE WHICH ROLES GET WHAT, BELOW: the accountant SETS limits
+  //    and does NOT approve overrides; the owner and administrator
+  //    approve overrides. Setting the rule and waiving it are two jobs.
+  "sales.credit.read": "View customer credit limits and exposure",
+  "sales.credit.manage": "Set credit limits, place and lift credit holds",
+  "sales.orders.approve_credit": "Approve an order that exceeds a customer's credit limit",
+
   // ── ⭐ ENGINE 1 · Scheduling & capacity ──────────────────────────
   "scheduling.bookings.read": "View the schedule",
   "scheduling.bookings.manage": "Create, amend and cancel bookings",
@@ -918,6 +947,15 @@ export const ROLE_TEMPLATES: Readonly<Record<SystemRole, RoleTemplate>> = {
       // present — an owner or administrator signs that, not the person
       // who files against it.
       "gst:read", "gst:manage_rates", "gst:manage_parties",
+      // ⭐ PHASE 48 — THE ROLE THAT SETS CREDIT LIMITS. The accountant
+      // knows who pays and who does not; nobody else in a company this
+      // size has that in front of them daily.
+      //
+      // ⚠️ NO `sales.orders.approve_credit`. Setting the ceiling and
+      // waiving it are two jobs, and the accountant chasing the money is
+      // the worst-placed person to decide that this one order is fine.
+      // That key sits with the owner and the administrator only.
+      "sales.credit.read", "sales.credit.manage",
       // ⭐ PHASE 33 — THE ROLE THAT OWNS THE INPUT SIDE TOO. The
       // accountant enters the vendor bills, makes the Section 17(5)
       // determination and puts the credit into the GSTR-3B they file.
@@ -1072,6 +1110,10 @@ export const ROLE_TEMPLATES: Readonly<Record<SystemRole, RoleTemplate>> = {
       // cancellation warning without being able to read the account it is
       // about would be a signature on somebody else's summary.
       "receivables:read", "receivables:warn_cancellation",
+      // ⭐ Phase 48, read only. Counsel drafting a recovery notice recites
+      // the terms the customer was trading on; a hold and its reason are
+      // part of the account's history the moment the account is disputed.
+      "sales.credit.read",
       "audit:read",
       // Approves what an automation asks a human to approve — a contract
       // going out, a discount, a cancellation. Reads, approves, publishes
@@ -1119,6 +1161,12 @@ export const ROLE_TEMPLATES: Readonly<Record<SystemRole, RoleTemplate>> = {
       // that judgement. The bank statement decides, and the accountant
       // reads the bank statement.
       "receivables:read",
+      // ⭐ PHASE 48 — READ, AND ONLY READ. A rep who can see the ceiling
+      // stops promising delivery on an order that is going to sit in
+      // approval for two days. A rep who could RAISE the ceiling would
+      // raise it, every time, at the exact moment the limit was doing
+      // its job.
+      "sales.credit.read",
       // ⚠️ READS, WRITES NOTHING. A rep quoting a flat needs to see the
       // rate that will be charged on it. Letting them CHANGE that rate
       // would let a negotiation move the tax, which is not theirs to
@@ -1205,6 +1253,10 @@ export const ROLE_TEMPLATES: Readonly<Record<SystemRole, RoleTemplate>> = {
       // person up elsewhere, and that we hold only because the Income-tax
       // Act requires it. A role handed out for "let them see the
       // numbers" should not carry a hundred third parties' PANs with it.
+      // ⭐ Phase 48, read only. Credit exposure is the first number a
+      // director or a lender's analyst asks for, and neither of them
+      // should be able to move a rupee of it.
+      "sales.credit.read",
       "users:read", "settings:read",
       "workflows:read", "workflows:runs_read",
       // Opens saved views; saves none. A read-only role that could create
