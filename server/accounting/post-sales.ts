@@ -45,6 +45,7 @@ import {
   buildRaBillPosting,
   constructionRolesUsed,
   buildPurchasePosting,
+  buildVendorPaymentPosting,
   buildRcmPosting,
   purchaseRolesUsed,
   type PurchaseLeg,
@@ -81,7 +82,9 @@ export function salesTransactionKey(
     | "ra_bill"
     | "demand"
     | "booking_receipt"
-    | "possession",
+    | "possession"
+    /** ⭐ v1.11.0 — the event tax is deducted on. */
+    | "vendor_payment",
   documentId: string,
 ): string {
   const tag =
@@ -514,6 +517,125 @@ export async function postPurchaseInvoice(
 /* ================================================================== */
 /* ⭐ CONSTRUCTION — Phase 60                                           */
 /* ================================================================== */
+
+/**
+ * ⭐⭐⭐ THE PAYMENT, WHICH IS THE EVENT THE TDS ENGINE HAS BEEN WAITING
+ *      FOR SINCE 0025.
+ *
+ * 🔴 THE LIABILITY IS CLEARED IN FULL, NOT NET OF THE WITHHOLDING.
+ *
+ *     Dr  Sundry Creditors     gross
+ *         Cr  Bank                       net
+ *         Cr  TDS payable                withheld
+ *
+ * ⚠️ Debiting only the net is the common error, and it leaves the
+ * withheld amount sitting on the vendor's ledger as if it were still
+ * owed to them. On every bill. All year. Until somebody clears the
+ * balance as a "reconciliation difference", which is the firm writing
+ * off its own tax deposits.
+ */
+export async function postVendorPayment(
+  tx: Tx,
+  args: {
+    tenantId: string;
+    userId: string;
+    paymentId: string;
+    paymentNumber: string;
+    paymentDate: string;
+    vendorId: string | null;
+    vendorName: string | null;
+    grossMinor: bigint;
+    tdsMinor: bigint;
+    msmeInterestMinor: bigint;
+    roundOffMinor: bigint;
+    netMinor: bigint;
+    tdsSection: string | null;
+  },
+): Promise<PurchasePostOutcome> {
+  const key = salesTransactionKey("vendor_payment", args.paymentId);
+
+  const [existing] = await tx
+    .select({ id: transactions.id })
+    .from(transactions)
+    .where(
+      and(eq(transactions.tenantId, args.tenantId), eq(transactions.transactionNumber, key)),
+    )
+    .limit(1);
+
+  /**
+   * ⭐ IDEMPOTENT. A payment run that fails halfway and is retried must
+   * not post the same payment twice, and the transaction number is the
+   * only thing that can guarantee it.
+   */
+  if (existing) return { posted: false, reason: "already_posted" };
+
+  const legs = buildVendorPaymentPosting({
+    grossMinor: args.grossMinor,
+    tdsMinor: args.tdsMinor,
+    msmeInterestMinor: args.msmeInterestMinor,
+    roundOffMinor: args.roundOffMinor,
+    netMinor: args.netMinor,
+    paymentNumber: args.paymentNumber,
+    vendorName: args.vendorName,
+    tdsSection: args.tdsSection,
+  });
+
+  const roleMap = await loadPurchaseRoleMap(tx, args.tenantId);
+  const missing = purchaseRolesUsed(legs).filter((r) => !roleMap.has(r));
+  /**
+   * 🔴 CHECKED BEFORE ANYTHING IS WRITTEN. Posting the debit and then
+   * finding the TDS role unmapped would clear the vendor's balance with
+   * the withholding nowhere, and the idempotency key would stop anybody
+   * ever retrying it.
+   */
+  if (missing.length > 0) return { posted: false, reason: "unmapped_roles", missing };
+
+  const debitTotal = legs
+    .filter((l) => l.entryType === "debit")
+    .reduce((sum, l) => sum + l.amountMinor, 0n);
+
+  const [txn] = await tx
+    .insert(transactions)
+    .values({
+      tenantId: args.tenantId,
+      transactionNumber: key,
+      description: `Vendor payment ${args.paymentNumber}`,
+      /** ⚠️ The payment's date, never today. */
+      transactionDate: args.paymentDate,
+      status: "posted",
+      /**
+       * ⚠️ `payment` and not a new enum value. Adding one would mean an
+       * ALTER TYPE on a shared enum for no gain: the transaction number
+       * already carries the kind and the reference id carries the row.
+       */
+      referenceType: "payment",
+      referenceId: args.paymentId,
+      currency: "INR",
+      totalAmount: formatMoneyPlain(debitTotal, "INR"),
+      createdBy: args.userId,
+      postedAt: new Date(),
+    })
+    .returning({ id: transactions.id });
+
+  if (!txn) throw new Error("The journal entry could not be created.");
+
+  await tx.insert(journalEntries).values(
+    legs.map((l) => ({
+      tenantId: args.tenantId,
+      transactionId: txn.id,
+      ledgerId: roleMap.get(l.role) as string,
+      entryType: l.entryType,
+      amount: formatMoneyPlain(l.amountMinor, "INR"),
+      description: l.description,
+      referenceType: "payment" as const,
+      referenceId: args.paymentId,
+      counterpartyType: args.vendorId ? ("company" as const) : null,
+      counterpartyId: args.vendorId,
+    })),
+  );
+
+  return { posted: true, transactionIds: [txn.id] };
+}
 
 export async function postRaBill(
   tx: Tx,

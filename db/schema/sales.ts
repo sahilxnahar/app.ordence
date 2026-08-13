@@ -435,6 +435,63 @@ export const leads = pgTable(
     // `consent_source` are the evidence. A lead with neither is not a
     // lead you may legally call, and having the columns is what makes
     // that checkable rather than assumed.
+    /**
+     * ⭐⭐ ADDED IN v1.10.0 (SQL 0061). The lead was already mostly
+     * generic; what was real-estate-shaped about it was the project
+     * link, and what was missing was a general one.
+     *
+     * 🔴 A SECOND LEAD TABLE WAS NOT BUILT. Two answers to "who
+     * enquired" is worse than a gap, and somebody would reconcile them
+     * forever. Same decision as the price list in 0057.
+     */
+    leadSourceId: uuid("lead_source_id"),
+    stageId: uuid("stage_id"),
+    interestType: varchar("interest_type", { length: 40 }),
+    interestId: uuid("interest_id"),
+    interestLabel: varchar("interest_label", { length: 300 }),
+    contactId: uuid("contact_id"),
+    /**
+     * 🔴 GENERATED ALWAYS, so it cannot drift from the column it comes
+     * from and cannot be forgotten by an import. The last ten digits,
+     * because +91 98765 43210, 098765 43210 and 9876543210 are the same
+     * man and a check on the raw text finds none of them.
+     */
+    phoneDigits: varchar("phone_digits", { length: 10 }).generatedAlwaysAs(
+      sql`right(regexp_replace(COALESCE(phone, ''), '[^0-9]', '', 'g'), 10)`,
+    ),
+    emailKey: varchar("email_key", { length: 320 }).generatedAlwaysAs(
+      sql`lower(btrim(COALESCE(email, '')))`,
+    ),
+    /** ⭐ A duplicate that was decided is recorded, never deleted. */
+    duplicateOf: uuid("duplicate_of"),
+
+    /* --- 0065 · WHERE IT CAME FROM, EXACTLY ------------------------ */
+    /**
+     * ⭐ WHICH CONNECTION, not merely which channel. `leadSourceId`
+     * already answers "IndiaMART"; this answers "the IndiaMART account
+     * we call Main", which is the one somebody can act on.
+     */
+    connectionId: uuid("connection_id"),
+    /**
+     * 🔴 THE SENDER'S OWN ID, and the reason a resent enquiry lands
+     * once. 0065 puts a unique index on `(connection_id, external_id)`.
+     *
+     * ⚠️ NOT OURS. A key we mint cannot answer "have we had this
+     * before", because we mint a new one every time we are asked.
+     *
+     * ⭐ AND IT IS A DIFFERENT QUESTION FROM `phoneDigits` above. That
+     * one asks "is this the same PERSON" and is shown to a salesman;
+     * this one asks "is this the same EVENT" and refuses the row.
+     */
+    externalId: varchar("external_id", { length: 200 }),
+    intakeDeliveryId: uuid("intake_delivery_id"),
+    intakeRunId: uuid("intake_run_id"),
+    /**
+     * ⚠️ WHAT THEY ACTUALLY SAID, redacted and kept verbatim. Every
+     * connector has fields we do not map, and the one nobody mapped is
+     * always the one the customer asks about.
+     */
+    intakePayload: jsonb("intake_payload").$type<Record<string, unknown> | null>(),
     consentAt: timestamp("consent_at", { withTimezone: true }),
     consentSource: varchar("consent_source", { length: 120 }),
 

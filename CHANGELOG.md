@@ -1,3 +1,612 @@
+# v1.16.0-alpha — THE FEATURE THE OWNER ASKED FOR, AND THE HALF THAT IS WORTH MORE
+
+**Repo: `app.ordence`** · 🔴 **SQL: `0068`** · ⚠️ **No new variables**
+
+Front office, batch 10. Session 8 of Option B.
+
+- ⭐⭐ **"The system should recognise purchase patterns of my customers
+  and then notify me that this customer is likely to order today."** That
+  is the top of the new screen, in the owner's own words.
+- 🔴🔴 **AND THE HALF NOBODY ASKED FOR IS WORTH MORE: the customer who
+  has STOPPED.** Somebody who ordered every month for two years and has
+  not ordered for seven weeks has gone elsewhere, and nothing in an ERP
+  reports an absence. Sales reports show what happened; they cannot show
+  what did not. The nudge is worth a call. The silence is worth the
+  account. It sits above the nudge on the screen.
+- 🔴 **THE FAILURE MODE OF EVERY PREDICTION FEATURE IS CONFIDENCE.** It
+  predicts for everybody, the salesman rings four people who were not
+  due, gets four polite refusals, and stops opening the screen. After
+  that it is worse than nothing, because it occupies the place where a
+  real one would go. **So this refuses to predict more often than it
+  predicts**, and the refusals are stored and shown.
+- ⭐ **Four orders minimum.** Two orders is one gap and one gap is a
+  coincidence; three orders is two gaps, and the middle of two numbers is
+  their average again, which defeats the whole reason for a median.
+- 🔴 **Median everywhere, and median absolute deviation for the spread.**
+  One bulk order before a price rise drags a mean from 30 days to 92.
+  Pairing a robust centre with a fragile spread is what makes a model
+  look stable and behave erratically.
+- ⚠️ **If the gaps swing by more than half the typical gap, it says so and
+  predicts nothing.** Every 30 days give or take 5 is predictable; give or
+  take 20 is a customer who orders when they run out.
+- ⭐ **"Stopped" is three times their OWN gap, not ninety days.** A fixed
+  calendar figure is far too patient for a weekly customer and far too
+  twitchy for a quarterly one.
+- ⭐⭐ **And a customer whose gaps are getting longer is flagged even
+  though they are never late.** Somebody drifting from 30 days to 45 over
+  a year is leaving slowly and never appears on an overdue report, because
+  each order is on time against a rhythm that is itself decaying.
+- 🔴 **Confidence is multiplied, not averaged**, so any one of history,
+  tightness and freshness being poor sinks the answer. An average lets two
+  good numbers hide a fatal one, and a score that reads 90% for everybody
+  is a score nobody reads.
+- ⚠️ **A signal is raised once per occurrence.** A nightly job that
+  re-raises "this customer is due" for five nights produces five tasks and
+  the feature is switched off on the third day. The lapse is keyed by
+  month, the nudge by its expected date.
+- 🔴 **A derived row cannot be edited by hand.** A prediction somebody can
+  overrule is a prediction nobody can trust: six months later nothing says
+  which rows were arithmetic and which were an optimistic salesman.
+- ⭐⭐ **A prediction feature nobody scores is astrology.** Every signal
+  records what happened next, cannot be edited afterwards, and cannot be
+  scored twice. The screen says plainly when it has no track record yet,
+  and says so again when its accuracy is worse than useful.
+- 🔴🔴 **AND THE AUTOMATION ENGINE HAS EXISTED SINCE v0.7x WITH NO
+  BUSINESS EVENT EVER REACHING IT.** `workflows` and its five tables have
+  a full executor, conditions, watched-field loop prevention, a run log
+  and a screen — and the only way to start one is a person pressing "run
+  now". `record_created` and `record_updated` are in the trigger
+  vocabulary and nothing has ever emitted one. `automation_events` is that
+  queue, not a second engine.
+- ⚠️ **Queued rather than called inline**, because a trigger that invoked
+  a workflow directly would run somebody's HTTP step inside the
+  transaction that created an invoice, and a slow endpoint would hold a
+  lock on the ledger.
+- 🔴 **A loop brake in the database.** Twenty events on one record in a
+  minute is refused, naming the record. `watchFields` is the right first
+  defence and it depends on the author scoping their trigger — and the
+  author who did not is exactly the author who needs the brake.
+
+All seven gates green. **2,501 tests** (50 new). **31 drills** against a
+real PostgreSQL 16, with RLS re-run as a non-superuser.
+
+---
+
+# v1.15.0-alpha — THE AUDIENCE IS A LIST OF PEOPLE, NOT A SAVED FILTER
+
+**Repo: `app.ordence`** · 🔴 **SQL: `0067`** · ⚠️ **No new variables**
+
+Front office, batch 9. Session 7 of Option B, run alone because a
+marketing send to the wrong list is the mistake this whole batch exists
+to make impossible.
+
+- 🔴🔴 **EVERY MARKETING TOOL STORES THE FILTER AND RE-RUNS IT AT SEND
+  TIME.** So the list that goes out is not the list that was approved:
+  somebody enquires in the twenty minutes between, matches the filter,
+  and receives a campaign nobody decided to send them. The approval screen
+  said 6,000 and 6,140 messages went. **Approval writes rows.**
+  `campaign_recipients` is the audience, resolved once; the filter is kept
+  as evidence of how it was built and never re-run.
+- ⚠️ **And a trigger refuses an approval whose numbers do not match the
+  audience that exists.** A product that resolves a list and then approves
+  a different figure has moved the bug one table along.
+- ⭐⭐ **Every exclusion is a row, with its reason.** A list of 9,000 that
+  becomes 6,000 is a list where 3,000 people were dropped for reasons
+  nobody saw. Some are correct (they withdrew consent), some are a data
+  problem worth fixing (no mobile number), some are a decision somebody
+  may disagree with (messaged last week). A silent exclusion is how a firm
+  discovers it has been mailing 6,000 people instead of 9,000 for a year.
+- 🔴 **The amount is typed, not ticked.** This is the only action in
+  Ordence that spends thousands of rupees in one click and cannot be
+  recalled. An amount somebody had to read and copy is an amount somebody
+  read — forgiving about commas and rupee signs, exact about the number,
+  because rejecting somebody on punctuation teaches them to copy and paste.
+- ⚠️ **A stale audience cannot be approved.** A list built on Friday and
+  approved on Monday has three days of withdrawn consents in it, and those
+  are precisely the people who must not receive it.
+- 🔴 **A campaign that would not fit under today's ceiling is refused
+  before it starts.** One that stops at message 4,000 of 6,000 has told
+  four thousand customers about an offer and left two thousand out, which
+  is worse than never sending it.
+- 🔴🔴 **WhatsApp error 131049 is never retried.** It is the per-user
+  marketing limit — dynamic, personalised, unpublished — and repeated
+  attempts within 24 hours can block delivery to that person for a further
+  day. A loop that treats "failed" as "try again" turns one undelivered
+  message into a customer nobody can reach until tomorrow. Same shape as
+  the paused-template trap in v1.14.0.
+- ⭐ **The default is not to retry at all.** A marketing message that
+  failed once is not worth risking a second charge and a second complaint.
+- 🔴 **The stop button is enforced per message, by the database.** A
+  campaign to ten thousand people takes minutes and the moment somebody
+  notices the wording is wrong is about ninety seconds in. A trigger on
+  every send insert refuses anything from a stopped campaign, and also
+  refuses anything from a campaign nobody approved.
+- ⭐⭐ **Consent is the one thing re-read at send time.** The audience is
+  frozen so nobody is ADDED; a withdrawal is somebody removing themselves,
+  which must win however late it arrives. Under the DPDP Act "the list was
+  already built" is not a defence.
+- ⚠️ **A hold set by a person outranks any consent record.** A system that
+  lets a later automated grant override it will message somebody who
+  complained in writing.
+- ⭐ **Verified, and worth knowing: WhatsApp sits outside TRAI's DLT
+  registry**, which covers SMS and voice. What governs it is Meta's
+  documented opt-in policy and the DPDP Act. Building DLT machinery for
+  WhatsApp would be wasted work; assuming DLT compliance covers DPDP would
+  be worse.
+
+All seven gates green. **2,451 tests** (64 new). **34 drills** against a
+real PostgreSQL 16, with RLS re-run as a non-superuser.
+
+---
+
+# v1.14.0-alpha — THE DUNNING LADDER HAS RECORDED WHATSAPP SERVICE SINCE 0027 AND NOTHING EVER SENT ONE
+
+**Repo: `app.ordence`** · 🔴 **SQL: `0066`** · ⚠️ **No new variables**
+
+Front office, batch 8. Session 6 of Option B, run alone because it is the
+first thing in this system that spends real money per action.
+
+- 🔴🔴 **`dunning_events.channel = 'whatsapp'` HAS BEEN A CLAIM, NOT A
+  FACT.** That table has recorded WhatsApp service since 0027 — channel,
+  recipient, date, amount outstanding, who authorised it — and its own
+  comment calls it "the evidence that the buyer was given every chance".
+  The row was written by a person ticking a box. **Nothing left the
+  building.** A firm could hold a perfect, append-only, legally shaped
+  record that a demand notice was served on a date when no message was
+  sent at all. A gap in evidence is a gap; evidence of something that did
+  not happen is a different problem, and the other side finds it.
+- ⭐ So this batch does not build a messaging product. It builds the thing
+  that makes that column true, and the same machinery then serves every
+  other utility message the system already knew it wanted to send.
+- 🔴🔴 **YOU ARE BILLED ON DELIVERY, NOT ON SEND.** Meta charges "only
+  when a template message is delivered". A cost booked at send time is
+  wrong in both directions: a send to a number that no longer has
+  WhatsApp costs nothing, and a spend ceiling counting attempts stops a
+  business sending messages it was never going to be charged for.
+  `cost_minor` is NULL until the receipt arrives and a CHECK refuses a
+  cost on anything undelivered.
+- ⚠️ **Two facts v1.10.0 got wrong, corrected now that something actually
+  sends.** Per-message billing replaced conversation billing on **1 July
+  2025**, not 1 January 2026; and the charge lands on delivery, not on
+  the click. Nothing depended on either until this session.
+- ⭐⭐ **The 24 hour window is the difference between free and charged,
+  and it is invisible.** A utility template inside an open customer
+  service window is free; the identical template one minute later is
+  charged. Nothing about the message changes, only the clock — which
+  makes it the one optimisation that actually reduces a customer's bill,
+  and no product tells them: send the reminder while the buyer is still
+  in conversation.
+- ⭐ **A free entry point window is 72 hours and everything inside it is
+  free**, including marketing. It is opened by an ad click, so a business
+  running those has a materially different cost profile.
+- 🔴 **A paused template is not a failed one.** Meta pauses on complaints
+  for three hours, then six, then **permanently disables**. A retry loop
+  that treats a pause as transient walks into the third one, which cannot
+  be undone. The second pause says so loudly.
+- ⚠️ **Meta decides the category, not you.** A template written as
+  `utility` that reads like an advertisement is moved to `marketing` and
+  the identical send costs roughly seven times more. Nothing tells the
+  business; the bill does, a month later. The requested category is kept
+  so the drift is visible on screen.
+- 🔴 **The idempotency key is ours, derived from what the message IS.**
+  Meta returns a message id only in the response, which is no use for
+  deciding whether to send. `demand:<id>:rung3` collides with itself,
+  which is the point, and the database refuses the second one.
+- ⚠️ **A timeout is not a failure.** We do not know whether it went, so
+  the row is left pending rather than retried into a second copy of a
+  payment reminder — and the screen shows that count rather than hiding
+  it.
+- 🔴 **The daily ceiling is enforced by a database trigger, counted on
+  ATTEMPTS as well as spend.** Spend lags because it is billed on
+  delivery; a runaway loop moves the attempt count immediately and the
+  money figure minutes later, by which time it is gone. A refusal is
+  recorded and does not count against the ceiling it is the record of.
+- ⭐ **One gate, not five scattered checks**, and consent is first —
+  because it is the only one where proceeding is a legal wrong rather
+  than an expense.
+
+All seven gates green. **2,387 tests** (72 new). **43 drills** against a
+real PostgreSQL 16, with RLS re-run as a non-superuser.
+
+---
+
+# v1.13.0-alpha — THE FRAME NOW CARRIES SOMETHING
+
+**Repo: `app.ordence`** · 🔴 **SQL: `0065`** · ⚠️ **No new variables** (the
+two from v1.12.0 are still required)
+
+Front office, batch 7. Session 5 of Option B: IndiaMART, JustDial and
+Meta lead ads on the frame 0064 built.
+
+- ⭐⭐ **A LEAD IN A LIST NOBODY OPENS IS A LEAD NOBODY RINGS.** That is
+  the whole argument. Every business on the industry list already
+  receives IndiaMART enquiries — as an email and a phone alert, answered
+  when somebody happens to look. The value of importing them is not the
+  row. It is that the row becomes a task with a time on it that shows as
+  overdue when it is not done. 0060 built tasks, 0061 the timeline, 0064
+  the frame; this is the sentence that joins them.
+- 🔴🔴 **`if (!response.ok) markFailed()` IS THE BUG EVERYBODY WRITES.**
+  IndiaMART answers **204 when nobody enquired**. So a quiet Sunday
+  becomes an outage: consecutive failures climb, the backoff lengthens,
+  the connection goes degraded, and the customer is told their
+  integration is broken because business was slow. It is self-confirming
+  — the quieter the account, the louder the false alarm. Their whole code
+  map (204, 400, 401, 429, 500) is now encoded from their documentation.
+- ⚠️ **And a 200 carrying `CODE: 401` is not a successful empty run.**
+  Reading only the HTTP status makes a rejected key look like a quiet
+  month, forever, with the connection reporting healthy.
+- ⭐ **401 usually means "regenerated", not "wrong".** Somebody pressed
+  the button in the seller panel and told nobody, so that is what the
+  message says.
+- 🔴🔴 **INDIAMART DEACTIVATES ITS PUSH AFTER 48 HOURS OF CONTINUOUS
+  REJECTION**, and a person must switch it back on at their end. So a bug
+  in our handler that returns 500 for two days does not delay leads — it
+  **silently unsubscribes the customer**, and nothing reports it, because
+  the requests simply stop, which looks exactly like a quiet week.
+  Therefore: once the bytes are durably stored we answer 200, even for an
+  enquiry we could not parse. A non-200 is reserved for the one case
+  where a retry helps.
+- 🔴 **A v1.12.0 assumption was wrong and is corrected.** A ternary
+  assumed anything that was not JustDial signs with
+  `x-hub-signature-256`. IndiaMART's push documents **no signature, no
+  key and no header at all** — every push would have been recorded
+  `absent` and refused. The verification method is now data in the policy
+  table.
+- ⭐⭐ **"The same EVENT arrived twice" and "the same PERSON enquired
+  again" are different questions, and 0065 answers them differently.**
+  IndiaMART pushes AND answers on the pull AND retries, so every enquiry
+  reaches us more than once by design: a unique index on
+  `(connection_id, external_id)` refuses it. A genuine second enquiry six
+  months later is real business: it is shown as a possible duplicate and
+  never refused, because refusing it teaches the salesman to type a fake
+  number. Scoped to the **connection**, not the tenant — two IndiaMART
+  panels have independent id sequences.
+- ⚠️ **"IndiaMART Buyer" is not a name.** It is the placeholder the
+  platform itself sends, and storing it produces a pipeline of identical
+  rows and a mail merge that opens "Dear IndiaMART Buyer". `leads.name`
+  is NOT NULL, so the fallback is the company, then the number they rang
+  from — never a constant, so two nameless enquiries never look like one
+  person.
+- 🔴 **A Meta webhook is a notification, not a lead.** It carries
+  `leadgen_id`, `form_id` and `ad_id` and **no answers**; those are
+  fetched separately with `leads_retrieval`. The notice is never
+  discarded, because it is the only trace that somebody enquired and the
+  id is what finds them in Meta's own Leads Center.
+- ⚠️ **Meta batches under load**, which is exactly when a campaign is
+  working. Reading `entry[0].changes[0]` drops every enquiry after the
+  first, silently, only when things are going well.
+- ⭐ **A missed call gets a quarter of the follow-up time**, as a
+  fraction of the one number the tenant chose rather than a second dial
+  nobody understands. Somebody who rang and did not get through has tried
+  hardest and is likeliest to be gone tomorrow.
+- 🔴 **An enquiry is not consent to a marketing list.** That is the line
+  every CRM crosses: enquiry becomes contact, contact becomes segment,
+  and eighteen months later somebody who asked one question about pipe
+  fittings gets a Diwali campaign. The narrow basis is recorded and
+  nothing wider; the campaign session will find nothing here, which is
+  correct.
+- 🔴 **`lead_intake_failures` exists because the customer paid for that
+  enquiry too.** Every path through the ingest ends in a row somebody can
+  see, and each reason carries an instruction rather than a category.
+- ⭐⭐ **And the screen reports a connection that is connected, whose
+  every check succeeded, and which has brought nothing for a week.**
+  Nothing else in the system reports that.
+
+All seven gates green. **2,315 tests** (70 new). **41 drills** against a
+real PostgreSQL 16, with RLS re-run as a non-superuser.
+
+---
+
+# v1.12.0-alpha — THE VAULT HAS EXISTED SINCE 0037 AND NOTHING HAD EVER WRITTEN TO IT
+
+**Repo: `app.ordence`** · 🔴 **SQL: `0064`** · ⚠️ **TWO NEW RAILWAY
+VARIABLES, and credentials cannot be saved without them**
+
+Front office, batch 6. Session 4 of Option B, run alone because it is the
+frame five later integrations all sit on.
+
+- ⭐⭐ **ONE FRAME, BUILT ONCE, FOR FIVE INTEGRATIONS.** IndiaMART,
+  JustDial, Meta, WhatsApp and email are five connections. Building the
+  frame five times is five sessions and five different bugs, and the
+  fifth is always the worst because by then nobody remembers how the
+  first handled a retry.
+- 🔴🔴 **AND THE SESSION FOUND A COMPLETE ENGINE NOBODY HAD EVER
+  CALLED.** `vault_secrets` was built in v0.66.0-alpha with
+  ciphertext-only storage, a key named rather than kept, an HMAC blind
+  index, a masked display, a retention date set at write time, an erasure
+  function that actually zeroes the value, and an append-only access log
+  no application role may delete. It has `api_credential` in its own kind
+  list. It is policied, granted, triggered and tested — **and not one
+  line of application code touched it.** The encryption was specified to
+  happen "in the Worker", and the Worker went away when Ordence moved to
+  Railway. The table survived the move; the arm that fills it did not
+  exist to move.
+- ⚠️ **SO THE FIRST DRAFT OF 0064 CREATED A SECOND VAULT.** It is
+  deleted. A private `connection_secrets` table beside the real one would
+  have meant two erasure paths, two rotation stories, and an access log
+  that does not cover the credentials most worth logging. Integration
+  credentials go in `vault_secrets` under `owner_kind = 'connection'`.
+- ⭐ **This is the first time Ordence holds somebody ELSE'S credential.**
+  Everything stored until now was the tenant's own data. An IndiaMART key
+  opens their seller account; a WhatsApp token sends messages in their
+  name. The threat is no longer "somebody reads tenant A's rows", it is
+  "somebody obtains a backup and can post as four hundred businesses" —
+  and RLS does nothing about a stolen dump.
+- 🔴 **Not one export in `server/actions/connections.ts` returns a
+  credential.** Every export in a `"use server"` file is a
+  browser-reachable RPC endpoint, and an action that returned a stored
+  key would be an authenticated URL handing out every tenant's
+  credentials while looking entirely ordinary in review.
+- ⭐ **`api_credential` masking changed from four characters to none.**
+  Nobody recognises an API key by its tail the way they recognise a card,
+  so the four bought no recognition and cost a meaningful fraction of a
+  short token. What a person actually needs — "is the key I just pasted
+  the one that is loaded" — the blind index answers without showing any
+  part of it.
+- ⭐⭐ **`sync_runs` has three counts, not one.** "Fetched 40" answers
+  nothing. Forty seen, forty repeats and nothing new is a healthy quiet
+  day. Forty seen and forty NEW every single time is a cursor that is not
+  moving, which looks like success and is a silent re-import. The health
+  check catches it; nothing else would, because every individual run is
+  green.
+- 🔴 **The throttle is state on the connection, not a comment in a
+  runner.** IndiaMART allows one call every five minutes, locks out for
+  fifteen if five a minute is exceeded, answers a seven day window and
+  keeps 365 days. A locked-out integration looks exactly like a broken
+  one from the outside.
+- 🔴 **A gap that cannot be refetched is reported, never narrowed
+  quietly.** Four hundred days down against 365 days of retained history
+  is thirty-five days nobody can recover. Silently clamping the window
+  produces a successful-looking catch-up over a permanent hole.
+- 🔴 **Not every failure is a retry.** A rejected key is never retried,
+  because that is thousands of failed authentications a day against the
+  customer's account and the far end eventually blocks the account rather
+  than the request. Rate limits honour Retry-After exactly. Backoff is
+  capped, because doubling without a ceiling reaches a nine-hour gap by
+  the fourteenth failure — the far end came back after twenty minutes and
+  the customer loses the day.
+- ⭐⭐ **The customer is told on time, not on count.** "Alert after 5
+  failures" is half an hour for a six-minute poll and five days for a
+  daily one. The threshold is a duration since the last success.
+- 🔴 **Four signature states, not a boolean.** `verified`, `invalid`,
+  `absent`, `not_required`. Collapse the last two and an endpoint whose
+  signing was accidentally switched off reads exactly like one whose
+  signature is passing — every delivery shows a tick and the only real
+  security control disappears without an error anywhere.
+- ⚠️ **A replayed request is correctly signed**, which is what makes it a
+  replay rather than a forgery, so the timestamp is checked even when the
+  signature is perfect — and a timestamp in the FUTURE is rejected too.
+- 🔴🔴 **A drill found a real bug.** The delivery guard froze the payload
+  HASH and left the payload itself editable, so a stored body could be
+  rewritten while the hash beside it went on attesting to the original.
+  That is worse than no record: it is a record that looks verified and is
+  not. Removal is still allowed, because a deletion request has to be
+  answerable.
+- 🔴 **`webhook_deliveries.purge_after` is `NOT NULL`.** A webhook body is
+  somebody's name and phone number, and kept forever in a debugging table
+  it is a DPDP problem hiding inside a developer tool.
+
+All seven gates green. **2,245 tests** (80 new). **51 drills** against a
+real PostgreSQL 16, with RLS re-run as a non-superuser.
+
+---
+
+# v1.11.0-alpha — THE EVENT THE TDS ENGINE HAS BEEN WAITING FOR SINCE 0025
+
+**Repo: `app.ordence`** · 🔴 **SQL: `0063`** · ⚠️ **No new variables**
+
+Front office, batch 5. Session 3 of Option B, run alone because it
+touches the ledger.
+
+- 🔴🔴 **THE UNPOSTED LIST SHRANK FOR THE FIRST TIME IN TWENTY SESSIONS.**
+  **5 of 9** financial modules now reach the ledger, not 4. `tds` came
+  off the list — not reworded, removed — because the payment posts.
+- ⭐ **The TDS engine was never missing a feature. It was missing an
+  EVENT.** Sections, thresholds, catch-up bases, lower deduction
+  certificates, challans, quarterly returns and interest exposure have
+  all existed since 0025. Tax is deducted when the money MOVES, and there
+  were no payments. This migration creates the payment, and the action
+  calls the existing engine rather than reimplementing a single line of
+  its arithmetic.
+- 🔴 **The liability is cleared in FULL, not net of the withholding.**
+  `Dr Sundry Creditors 1,00,000 / Cr Bank 90,000 / Cr TDS payable
+  10,000`. Debiting only the net is the common error and it leaves the
+  withheld amount on the vendor's ledger as if still owed to them, on
+  every bill, all year, until somebody clears it as a "reconciliation
+  difference" — which is the firm writing off its own tax deposits.
+- 🔴 **The payment arithmetic is done by the database.**
+  `net = gross − tds + msme interest + rounding`, as a CHECK constraint.
+  Every one of those has been got wrong in a real system: TDS added
+  instead of deducted, interest netted off instead of added, and a "net"
+  that was simply typed.
+- 🔴 **A payment run over unmatched bills pays the wrong things faster**,
+  which is why the three-way match ships in the same migration. The
+  classic fraud is not a fake invoice: it is a real vendor billing for
+  eleven when ten arrived, every month, for years.
+- ⭐ **A tolerance is reported, never swallowed**, and the shipped
+  default is **zero** — a tolerance nobody chose is a tolerance nobody
+  owns.
+- 🔴 **A bill cannot be paid twice.** The duplicate payment is the
+  commonest loss in accounts payable and almost never involves anybody
+  dishonest: the same invoice arrives by email and by post, gets two
+  internal numbers, and is paid on two runs three weeks apart.
+- 🔴 **The run is not sorted by age.** A bill to a **micro or small**
+  enterprise unpaid at 31 March has its whole expense **added back to
+  taxable income** — not delayed, added back — under s.43B(h) of the
+  Income Tax Act 1961, renumbered **s.37(2)(g) of the Income Tax Act
+  2025** from tax year 2026-27. Both citations are carried.
+- ⚠️ **Fifteen days, not forty-five, unless there is a written
+  agreement**, and no contract can exceed forty-five however it is
+  drafted. The database refuses to record a ninety day clause at all.
+- ⚠️ **Medium enterprises are not covered, and nor are traders.**
+  Treating every registered MSME as in scope makes the report cry wolf
+  until nobody reads it. A `material_supplier` is deliberately **not**
+  assumed to be a manufacturer.
+- ⭐ **s.16 MSMED interest gets its own ledger account**, debited as an
+  expense: three times the RBI bank rate, compounded monthly, and never
+  deductible under any section of the Income Tax Act. Burying it in
+  general interest hides a cost that is treated differently from
+  everything around it. **The bank rate is an argument, not a constant.**
+- 🔴 **A payable had no due date at all**, so nothing could be aged.
+  Added, and ageing runs from it and never from the bill date.
+- 🔴🔴 **A bug the drill found, not the design: voiding a payment left
+  every bill it had settled still showing as paid.** The allocation
+  trigger excluded void payments but only fired on allocation changes,
+  and voiding changes the payment. A cheque bounces, somebody voids it
+  correctly, and the supplier silently stops being paid with no trace of
+  why. `ordence_resync_on_void` fixes it and a test pins it.
+- ⭐ **The migration gate caught a reused number.** 0062 is retired
+  (`0062_security_batches.sql`, superseded), and the gate refused to let
+  it be reused. The batch went out as **0063** with the gap declared.
+
+**82 new tests** (2,165 total). **43 constraint and trigger drills** fired
+against a real PostgreSQL 16 in both directions, plus RLS isolation
+across all six new tables as a non-superuser.
+
+# v1.10.0-alpha — A TICK BOX IS NOT CONSENT
+
+**Repo: `app.ordence`** · 🔴 **SQL: `0061`** · ⚠️ **No new variables**
+
+Front office, batch 3 and 4. Session 2 of Option B.
+
+- ⭐ **NO SECOND LEAD TABLE WAS BUILT.** `leads` already existed and was
+  already mostly generic; what was real-estate-shaped about it was the
+  project link. 0061 **extends** it. Two answers to "who enquired" is
+  worse than a gap, and somebody would reconcile them forever. The same
+  decision as the price list in 0057.
+- 🔴 **The same man, three times.** One person enquires as
+  `+91 98765 43210`, `098765 43210` and `9876543210`, and a duplicate
+  check on the stored text finds **none of them**. `phone_digits` is a
+  **GENERATED ALWAYS** column taking the **last** ten digits, so it
+  cannot drift from the column it comes from and cannot be forgotten by
+  an import.
+- ⚠️ **It is an index, not a unique constraint.** A genuine second
+  enquiry six months later is a real lead. Refusing it teaches the
+  salesman to type a fake number, which destroys the data the check
+  depends on. The match is surfaced with its strength; a person decides.
+- ⚠️ **A name alone is never more than "possible".** Ten thousand people
+  are called Rajesh Kumar, and a product that merges on name quietly
+  destroys real records. A merge is also refused outright where the lead
+  has already turned into real business.
+- 🔴🔴 **Consent, and the deadline is inside this plan.** The DPDP Rules
+  2025 were notified **13 November 2025**; the penalty regime begins
+  **May 2027**. Consent as a boolean is not consent, so there are two
+  tables: the **notice** in the exact words shown, and the **consent**
+  naming the notice it was given against.
+- 🔴 **A grant that does not name its notice is ignored.** Not treated as
+  weak evidence. Ignored, because it says somebody agreed and does not
+  say what to, and that is exactly what an inspection asks for and does
+  not find.
+- 🔴 **A consent record cannot be deleted, at all.** Withdrawal is a
+  state with a date on it, not an absence. The question after a
+  complaint is always when the person said stop and whether anything
+  went out afterwards, and a deleted row cannot answer it.
+- 🔴 **One stop means stop.** A withdrawal defaults to every purpose and
+  every channel. Somebody who unsubscribes from email and keeps getting
+  WhatsApp will complain, and that is a complaint with a statutory shape.
+- 🔴 **A notice is frozen the moment anybody agrees to it.** A notice
+  whose wording can be changed afterwards is worth exactly as much as no
+  notice at all. Publish a new version.
+- ⭐ **A contractual basis covers a dispatch note, never a campaign.**
+  Having a contract is the excuse every firm reaches for when it wants to
+  send an offer, so it unlocks transactional and service only, and it
+  still loses to a withdrawal.
+- 🔴 **Exactly one won stage per pipeline board.** Two win columns
+  produce two conversion rates and every report built on them disagrees
+  with every other one. Positions must be contiguous from 1, or the
+  board silently reorders itself the next time a stage is added.
+- ⭐ **Internal messaging: the cheapest loyalty feature on the plan.**
+  Ledgers do not create habit, conversations do. A discussion about an
+  invoice lives **on the invoice**.
+- 🔴 **You cannot post into a conversation you are not in.** Being able
+  to see a thread and being part of it are two different things, and only
+  one of them is a permission. The screen is not the boundary.
+- ⭐ **A mention adds the person to the thread**, by trigger. A mention
+  that notifies somebody who then cannot read the thread is worse than no
+  mention.
+- 🔴 **A message cannot be deleted and an edit says it was edited.** A
+  conversation that can be quietly rewritten is worse than no record,
+  because people rely on it.
+- ⭐ **Muting never suppresses a message that named you.** Muting is
+  "stop shouting about this", not "hide it from me even when it is
+  addressed to me".
+- ⭐ **WhatsApp send costs are computed before the send.** Marketing is
+  about ₹1.09 a message in India and is never free, whatever the service
+  window says; utility is roughly a seventh and free inside it. A
+  campaign to 10,000 costs about **₹10,900**, spent the instant somebody
+  clicks send. Rates are arguments, not constants.
+
+**83 new tests** (2,083 total). **48 constraint and trigger drills** fired
+against a real PostgreSQL 16 in both directions, plus RLS isolation
+across all seven new tables as a non-superuser.
+
+# v1.9.0-alpha — FIFTY-NINE MIGRATIONS AND NO TASK TABLE
+
+**Repo: `app.ordence`** · 🔴 **SQL: `0060`** · ⚠️ **No new variables**
+
+Front office, batch 1 and 2. The first session of the revised plan in
+document 70.
+
+- 🔴🔴 **Ordence could record what a business IS and not what anybody DID
+  about it.** No task table anywhere in fifty-nine migrations. No
+  follow-up, no assignment, no note against a customer, no "ring him
+  Tuesday". That is why the spreadsheet survives: a system holding the
+  ledger but not the follow-up leaves every human process outside it, and
+  the data follows the process out.
+- ⭐ **Three tables, and they are not the same thing.** `tasks` is what
+  somebody has to do. `activities` is what actually happened.
+  `calendar_events` is where somebody has to be. Merging them is the
+  common mistake and it produces a to-do list full of history and a
+  calendar full of wishes.
+- 🔴 **A completed task must carry its evidence.**
+  `tasks_done_is_evidenced` refuses "done" with no name and no time on
+  it, and the action takes both from the session and the clock, never
+  from the caller. A completion a caller can supply is a completion a
+  caller can forge.
+- 🔴 **The two numbers nobody reports.** Work disappears in two ways that
+  never show as overdue: **assigned to nobody**, and **dated nowhere**.
+  Both get their own counter, in red, ahead of the overdue count, because
+  a dashboard counting only what is late reports a clean desk while both
+  sit there.
+- 🔴 **A repeat counts from the DUE date, not the completion date.** A
+  monthly filing due on the 7th and completed on the 19th is still due on
+  the 7th next month. Counting from completion lets a task that is always
+  late drift out of its own cycle one slip at a time. And the next
+  instance is created **by a trigger on completion**, not by a nightly
+  job, so there is exactly one live copy and no backlog of forty
+  identical rows the first time the job is left off.
+- 🔴 **History that cannot be rewritten.**
+  `ordence_guard_activity_immutable` refuses to edit or delete anything
+  the system or an integration wrote. A manual note can be corrected,
+  because people mistype at seven in the evening, but it cannot be moved
+  to a different record or to a different day. That turns a correction
+  into a fabrication.
+- ⭐ **The calendar is a MERGE, not a table.** Six sources already knew
+  their own dates and each kept its own screen: hearings, statutory
+  filings, licence renewals, payment milestones, tasks and diary entries.
+  A person does not have six days. Nothing on the calendar is stored;
+  every source is still closed where it belongs.
+- 🔴 **The past stays on the agenda.** A calendar starting at today hides
+  the hearing nobody attended last Thursday and the filing due on the
+  20th. Those are the entries the screen exists for. Missed items that
+  **cannot be done late** get their own counter, separate from merely
+  overdue.
+- ⚠️ **A licence appears on its RENEWAL date, not its expiry date.** One
+  expiring 30 June with a 60 day lead time is on the list from 1 May.
+  Showing it on the 30th is showing it on the day it is already too late,
+  which is how a compliance calendar manages to be technically correct
+  and completely useless.
+- ⭐ **Sorted by date first, priority second.** A normal task three weeks
+  late beats an urgent one due next month. Sorting by priority first
+  teaches users that priority is a lever, and within a month everything
+  is urgent.
+- ⚠️ **The business day is Asia/Kolkata, not the server's.** A meeting at
+  eleven at night on the 3rd is on the 3rd for the person attending it.
+
+**78 new tests** (2,000 total). **41 constraint and trigger drills** fired
+against a real PostgreSQL 16 in both directions, plus RLS isolation
+across all four new tables as a non-superuser.
+
 # v1.8.0-alpha — WHO PAYS THE GST ON A LAWYER'S BILL
 
 **Repo: `app.ordence`** · 🔴 **SQL: `0059`** · ⚠️ **No new variables**

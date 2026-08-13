@@ -321,7 +321,23 @@ export type PurchasePostingRole =
   | "input_tax_rcm"
   /** Reverse charge: the cash we owe the Government. */
   | "rcm_payable"
-  | "purchase_round_off";
+  | "purchase_round_off"
+  /**
+   * ⭐⭐ ADDED IN v1.11.0 FOR THE PAYMENT, WHICH IS A DIFFERENT EVENT
+   *     FROM THE BILL.
+   *
+   * 🔴 THE BILL CREATES THE LIABILITY. THE PAYMENT SETTLES IT AND
+   *    WITHHOLDS THE TAX. Tax is deducted at source when the money
+   *    MOVES, not when the bill is booked, which is why the TDS engine
+   *    built in 0025 had nothing to hook onto until now.
+   */
+  /** The bank or cash account the money actually left. */
+  | "bank"
+  /** 🔴 Withheld from the vendor and owed to the Government. */
+  | "tds_payable"
+  /** ⚠️ s.16 MSMED interest. Mandatory, compounding, never deductible. */
+  | "msme_interest"
+  | "payment_round_off";
 
 export type PurchaseLeg = {
   role: PurchasePostingRole;
@@ -480,6 +496,101 @@ export function buildRcmPosting(args: {
   return legs;
 }
 
+/**
+ * ⭐⭐⭐ THE VENDOR PAYMENT, AND WHY IT IS THREE NUMBERS AND NOT ONE.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 TAX IS DEDUCTED WHEN THE MONEY MOVES
+ * ══════════════════════════════════════════════════════════════════════
+ * Paying a ₹1,00,000 bill with 10% withheld under s.194J is not a
+ * ₹90,000 payment against a ₹90,000 liability. The vendor is owed the
+ * whole lakh; ten thousand of it goes to the Government instead of to
+ * them:
+ *
+ *     Dr  Sundry Creditors     1,00,000    the liability, in full
+ *         Cr  Bank                            90,000
+ *         Cr  TDS payable                     10,000
+ *
+ * ⚠️ THE COMMON ERROR IS DEBITING ONLY THE NET. The vendor's ledger then
+ * shows ten thousand still owed, forever, on every bill, and the balance
+ * grows all year until somebody writes it off as a "reconciliation
+ * difference" — which is the firm writing off its own tax deposits.
+ *
+ * ⭐ AND s.16 MSMED INTEREST IS A SEPARATE LEG, DEBITED AS AN EXPENSE.
+ * It is not part of what the vendor was owed under the bill; it arose
+ * because the bill was paid late. Netting it into the settlement would
+ * hide a cost that is never deductible in an account that mostly is.
+ */
+export function buildVendorPaymentPosting(args: {
+  /** What the bills are being settled for, in full. */
+  grossMinor: bigint;
+  /** Withheld and owed to the Government. */
+  tdsMinor: bigint;
+  /** s.16 MSMED interest paid on top. */
+  msmeInterestMinor: bigint;
+  roundOffMinor: bigint;
+  /** What actually left the bank. */
+  netMinor: bigint;
+  paymentNumber: string;
+  vendorName: string | null;
+  tdsSection: string | null;
+}): PurchaseLeg[] {
+  const who = args.vendorName ? ` — ${args.vendorName}` : "";
+  const ref = `Payment ${args.paymentNumber}${who}`;
+
+  if (args.grossMinor < 0n || args.tdsMinor < 0n) {
+    throw new Error("A payment cannot have negative amounts.");
+  }
+  /**
+   * ⚠️ CHECKED BEFORE THE NEGATIVE-NET CHECK, deliberately. Withholding
+   * more than the payment produces a negative net as a symptom, and
+   * reporting the symptom sends somebody looking at the wrong number.
+   */
+  if (args.tdsMinor > args.grossMinor) {
+    throw new Error(
+      "More was withheld than the payment itself. That is a sign error, and it would credit the Government money the vendor was never owed.",
+    );
+  }
+
+  if (args.netMinor < 0n) {
+    throw new Error("A payment cannot have negative amounts.");
+  }
+
+  const expected =
+    args.grossMinor - args.tdsMinor + args.msmeInterestMinor + args.roundOffMinor;
+  if (expected !== args.netMinor) {
+    throw new Error(
+      `The payment does not add up: gross minus TDS plus interest and rounding is ${expected}, and the net recorded is ${args.netMinor}.`,
+    );
+  }
+
+  const section = args.tdsSection ? ` (Section ${args.tdsSection})` : "";
+
+  const legs: PurchaseLeg[] = [
+    /** 🔴 THE LIABILITY IS CLEARED IN FULL, not net of the withholding. */
+    ...pleg("payable", "debit", args.grossMinor, ref),
+    ...pleg(
+      "msme_interest",
+      "debit",
+      args.msmeInterestMinor,
+      `Interest under s.16 MSMED Act on ${args.paymentNumber}${who}`,
+    ),
+    ...pleg(
+      "tds_payable",
+      "credit",
+      args.tdsMinor,
+      `TDS withheld on ${args.paymentNumber}${section}${who}`,
+    ),
+    ...(args.roundOffMinor >= 0n
+      ? pleg("payment_round_off", "debit", args.roundOffMinor, `Round off on ${args.paymentNumber}`)
+      : pleg("payment_round_off", "credit", -args.roundOffMinor, `Round off on ${args.paymentNumber}`)),
+    ...pleg("bank", "credit", args.netMinor, ref),
+  ];
+
+  assertPurchaseBalances(legs);
+  return legs;
+}
+
 export function purchaseRolesUsed(legs: readonly PurchaseLeg[]): PurchasePostingRole[] {
   return [...new Set(legs.map((l) => l.role))];
 }
@@ -488,6 +599,30 @@ export const PURCHASE_ROLE_META: Record<
   PurchasePostingRole,
   { label: string; tallyGroup: string; accountType: string; help: string }
 > = {
+  bank: {
+    label: "Bank / Cash",
+    tallyGroup: "Bank Accounts",
+    accountType: "asset",
+    help: "The account the money actually left. Credited on a vendor payment.",
+  },
+  tds_payable: {
+    label: "TDS Payable",
+    tallyGroup: "Duties & Taxes",
+    accountType: "liability",
+    help: "Withheld from a vendor and owed to the Government. Credited at payment, not when the bill is booked, because tax is deducted when the money moves.",
+  },
+  msme_interest: {
+    label: "Interest on delayed MSME payment",
+    tallyGroup: "Indirect Expenses",
+    accountType: "expense",
+    help: "Section 16 MSMED Act interest. Mandatory, compounding at three times the RBI bank rate, and never deductible under the Income Tax Act — so it is kept in its own account rather than buried in general interest.",
+  },
+  payment_round_off: {
+    label: "Round Off (Payments)",
+    tallyGroup: "Indirect Expenses",
+    accountType: "expense",
+    help: "Rounding on a vendor payment.",
+  },
   payable: {
     label: "Sundry Creditors",
     tallyGroup: "Sundry Creditors",

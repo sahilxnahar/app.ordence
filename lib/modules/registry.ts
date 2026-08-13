@@ -194,6 +194,56 @@ export const MODULE_REGISTRY: Readonly<Record<string, ModuleDescriptor>> =
       status: "live",
       href: "/dashboard",
     },
+    /**
+     * ⭐⭐ ADDED IN v1.9.0. Fifty-nine migrations and there was no task
+     * table anywhere. Ordence could record what a business IS and not
+     * what anybody DID about any of it.
+     *
+     * 🔴 UNDER `home`, NOT `setup`. A task list is not configuration.
+     * It is the first screen a person opens and the last one they close.
+     */
+    tasks: {
+      navId: "tasks",
+      label: "Tasks",
+      description: "What has to be done, by whom, by when.",
+      group: "home",
+      feature: "crm.contacts",
+      status: "live",
+      href: "/tasks",
+    },
+    /**
+     * ⭐ EVERYTHING DATED, IN ONE LIST. Hearings, filings, licence
+     * renewals, money due, tasks and diary entries.
+     *
+     * ⚠️ Replaces the generic calendar the removed `hearings` module
+     * used to point at. That one held nothing; this one holds six
+     * sources and stores none of them.
+     */
+    calendar: {
+      navId: "calendar",
+      label: "Calendar",
+      description: "Everything dated, from every module, in one day.",
+      group: "home",
+      feature: "crm.contacts",
+      status: "live",
+      href: "/calendar",
+    },
+    /**
+     * ⭐⭐ ADDED IN v1.10.0. The cheapest loyalty feature on the plan:
+     * ledgers do not create habit, conversations do.
+     *
+     * 🔴 The conversation lives on the record it is about, so the next
+     * person to open the file finds it.
+     */
+    messages: {
+      navId: "messages",
+      label: "Messages",
+      description: "Conversations, on the record they are about.",
+      group: "home",
+      feature: "crm.contacts",
+      status: "live",
+      href: "/messages",
+    },
     search: {
       navId: "search",
       label: "Search",
@@ -215,6 +265,23 @@ export const MODULE_REGISTRY: Readonly<Record<string, ModuleDescriptor>> =
 
     /* ---- CUSTOMERS ----------------------------------------------- */
 
+    /**
+     * 🔴 THE DPDP RULES 2025 WERE NOTIFIED ON 13 NOVEMBER 2025 AND THE
+     * PENALTY REGIME BEGINS MAY 2027, which is inside the life of the
+     * current plan rather than after it.
+     *
+     * ⚠️ Consent as a tick box is not consent. What matters is the
+     * wording shown, the purpose agreed, and how easily it comes back.
+     */
+    consent: {
+      navId: "consent",
+      label: "Consent",
+      description: "What each person agreed to, and what they were shown.",
+      group: "customers",
+      feature: "crm.contacts",
+      status: "live",
+      href: "/crm/consent",
+    },
     contacts: {
       navId: "contacts",
       label: "Contacts",
@@ -286,6 +353,22 @@ export const MODULE_REGISTRY: Readonly<Record<string, ModuleDescriptor>> =
       feature: "sales.pipeline",
       status: "live",
       href: "/sales/leads",
+    },
+    /**
+     * ⭐⭐ ADDED IN v1.13.0. Enquiries that arrived on their own.
+     *
+     * 🔴 NOT A SECOND LEAD LIST. The leads that filed cleanly are in the
+     * pipeline where they belong; this screen is the ones that could not
+     * be filed, and the customer paid for those exactly as much.
+     */
+    enquiries: {
+      navId: "enquiries",
+      label: "Enquiries",
+      description: "What arrived from connected accounts, and anything that could not be filed.",
+      group: "customers",
+      feature: "crm.contacts",
+      status: "live",
+      href: "/enquiries",
     },
     bookings: {
       navId: "bookings",
@@ -548,6 +631,22 @@ export const MODULE_REGISTRY: Readonly<Record<string, ModuleDescriptor>> =
       status: "live",
       href: "/billing",
     },
+    /**
+     * ⭐⭐ ADDED IN v1.11.0. The money going out had less discipline on
+     * it than the money coming in, which is the wrong way round.
+     *
+     * 🔴 UNDER `money`. It decides which vendor gets paid this week, and
+     * the answer is not "the oldest".
+     */
+    "payment-run": {
+      navId: "payment-run",
+      label: "Payment Run",
+      description: "Who to pay this week, and which bills cannot be paid at all.",
+      group: "money",
+      feature: "purchases.invoices",
+      status: "live",
+      href: "/purchases/payment-run",
+    },
     documents: {
       navId: "documents",
       label: "Documents",
@@ -577,6 +676,76 @@ export const MODULE_REGISTRY: Readonly<Record<string, ModuleDescriptor>> =
       feature: null,
       status: "live",
       href: "/settings/team",
+    },
+    /**
+     * ⭐⭐ ADDED IN v1.12.0. The frame five integrations share.
+     *
+     * 🔴 NOT THE SAME AS `/settings/integrations`. That page is what
+     * ORDENCE is configured with. This one is the customer's OWN
+     * accounts, and it is opened on the morning the enquiries stopped.
+     *
+     * ⚠️ `feature: null`, like Settings and Team. Connecting a lead
+     * source is not a paid module — refusing to let a customer plug in
+     * their own IndiaMART account until they upgrade is how a product
+     * loses the account it was trying to upsell.
+     */
+    /**
+     * ⭐⭐ ADDED IN v1.14.0. What went out, what it cost, and what did
+     * not reach anybody.
+     *
+     * 🔴 UNDER `setup`, beside Connections, because it is the same
+     * question from the other end: that screen says whether the account
+     * is working, this one says what it did today and what it charged.
+     */
+    /**
+     * ⭐⭐ ADDED IN v1.15.0. Marketing sends and who was left out.
+     *
+     * 🔴 `feature: "crm.contacts"`, unlike Messaging. The spend report
+     * has to be free because a customer at risk of a surprise bill must
+     * see it coming; a marketing campaign tool is a paid capability and
+     * charging for it is honest.
+     */
+    /**
+     * ⭐⭐ ADDED IN v1.16.0. The feature the owner asked for by name.
+     *
+     * 🔴 And the half they did not ask for is worth more: the customer
+     * who has quietly stopped. Nothing else in an ERP reports an absence.
+     */
+    rhythms: {
+      navId: "rhythms",
+      label: "Order rhythm",
+      description: "Who is about to order, and who has quietly stopped.",
+      group: "customers",
+      feature: "crm.contacts",
+      status: "live",
+      href: "/rhythms",
+    },
+    campaigns: {
+      navId: "campaigns",
+      label: "Campaigns",
+      description: "Marketing sends, what they cost, and who was left out.",
+      group: "customers",
+      feature: "crm.contacts",
+      status: "live",
+      href: "/campaigns",
+    },
+    messaging: {
+      navId: "messaging",
+      label: "Messaging",
+      description: "WhatsApp spend, templates, and messages that did not arrive.",
+      group: "setup",
+      feature: null,
+      status: "live",
+      href: "/messaging",
+    },
+    connections: {
+      navId: "connections",
+      label: "Connections",
+      description: "Lead sources and messaging accounts, and why one stopped.",
+      group: "setup",
+      feature: null,
+      status: "live",
+      href: "/settings/connections",
     },
     objects: {
       navId: "objects",

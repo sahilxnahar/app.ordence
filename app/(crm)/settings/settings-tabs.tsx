@@ -14,7 +14,12 @@ const TABS = [
   { href: "/settings/team", label: "Team" },
   { href: "/settings/financial", label: "Financial" },
   { href: "/settings/billing", label: "Billing" },
+  // ⚠️ TWO TABS, TWO OWNERS, AND THEY ARE NOT THE SAME THING.
+  // "Integrations" is what ORDENCE is configured with (our Resend key,
+  // our payment provider) and is identical for every tenant.
+  // "Connections" is the customer's OWN accounts on other systems.
   { href: "/settings/integrations", label: "Integrations" },
+  { href: "/settings/connections", label: "Connections" },
   { href: "/settings/ai", label: "AI assistant" },
   { href: "/settings/notifications", label: "Notifications" },
   // ⚠️ THE DEFINITIONS, NOT THE RECORDS. `/objects` is where the records

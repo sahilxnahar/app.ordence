@@ -481,7 +481,20 @@ export const MASK_VISIBLE_SUFFIX: Readonly<Record<VaultKind, number>> =
     ifsc_pair: 4,
     gstin_credential: 4,
     portal_password: 0, // ⚠️ NEVER. Not one character.
-    api_credential: 4,
+    /**
+     * 🔴 CHANGED FROM 4 TO 0 IN v1.12.0, WHEN SOMETHING FINALLY STORED
+     * ONE.
+     *
+     * ⚠️ AN API KEY IS NOT AN IDENTIFIER. Nobody recognises their
+     * IndiaMART key by its tail the way they recognise a card by its
+     * last four, so the four characters buy no recognition at all — and
+     * on a short token they are a meaningful fraction of the secret.
+     *
+     * ⭐ WHAT A PERSON ACTUALLY NEEDS IS "is the key I just pasted the
+     * one that is loaded", and the blind index answers that without
+     * showing any part of it.
+     */
+    api_credential: 0,
     health_identifier: 4,
     salary: 0,
     other: 0,

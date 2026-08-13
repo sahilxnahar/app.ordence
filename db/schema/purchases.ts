@@ -744,6 +744,32 @@ export const purchaseInvoices = pgTable(
       .default(sql`0`)
       .notNull(),
 
+    /**
+     * ⭐⭐ ADDED IN v1.11.0 (SQL 0063). The bill is now tied to what was
+     * ordered and what actually arrived, and the three-way match result
+     * is stored at approval so the REASON a bill was passed survives the
+     * tolerance being changed later.
+     */
+    poId: uuid("po_id"),
+    grnId: uuid("grn_id"),
+    /**
+     * 🔴 THE DATE THE MSME CLOCK RUNS FROM. s.15 MSMED runs from
+     * acceptance, not from the invoice date the vendor chose to print.
+     */
+    acceptedOn: date("accepted_on", { mode: "string" }),
+    amountPaidMinor: bigint("amount_paid_minor", { mode: "bigint" })
+      .default(0n)
+      .notNull(),
+    matchState: varchar("match_state", { length: 20 }),
+    matchNote: text("match_note"),
+    /**
+     * 🔴 THERE WAS NO DUE DATE ON A PAYABLE, so nothing could be aged.
+     * Ageing runs from the due date and never the bill date — these are
+     * different numbers and only one of them is true. The receivables
+     * side has worked this way since 0027 and the payables side has to
+     * agree, or the two reports describe different worlds.
+     */
+    dueDate: date("due_date", { mode: "string" }),
     status: purchaseInvoiceStatusEnum("status").default("draft").notNull(),
 
     /**

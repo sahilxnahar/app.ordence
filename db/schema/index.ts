@@ -163,6 +163,9 @@ export * from "./inventory";
 export * from "./land";
 export * from "./legal";
 export * from "./legal-billing";
+export * from "./work";
+export * from "./front-office";
+export * from "./procurement";
 
 // ⭐ Running-account bills and contractor compliance — PORT WAVE B. The
 // densest money document a developer signs: gross certified, less everything
@@ -315,3 +318,44 @@ export * from "./notifications";
  * one `db:push` away from deletion.
  */
 export * from "./governance";
+
+/**
+ * ⭐ THE INTEGRATION FRAME — connections, sync runs, webhook endpoints
+ * and deliveries (SQL 0064).
+ *
+ * ⚠️ THERE IS DELIBERATELY NO SECRETS TABLE HERE. Integration
+ * credentials go into `vault_secrets` from `./vault`, which has held
+ * `api_credential` in its kind list since 0037 and which nothing had
+ * ever written to. A second secrets table would have meant two erasure
+ * paths and an access log that misses the credentials most worth
+ * logging.
+ */
+export * from "./integrations";
+
+/**
+ * ⭐⭐ UTILITY MESSAGING — templates, the 24 hour window, and what was
+ * actually sent (SQL 0066).
+ *
+ * 🔴 THIS IS WHAT MAKES `dunning_events.channel = 'whatsapp'` TRUE. That
+ * column has recorded WhatsApp service since 0027 in a table built to be
+ * evidence, and nothing had ever sent one.
+ */
+export * from "./messaging";
+
+/**
+ * ⭐⭐ CAMPAIGNS — and the audience frozen as rows at approval (SQL 0067).
+ *
+ * 🔴 NOT A SAVED FILTER. Every marketing tool re-runs the filter at send
+ * time, so the list that goes out is not the list that was approved.
+ */
+export * from "./campaigns";
+
+/**
+ * ⭐⭐ ORDER RHYTHM, ITS SIGNALS, AND THE AUTOMATION EVENT QUEUE
+ * (SQL 0068).
+ *
+ * 🔴 The automation engine has had triggers, conditions, an executor and
+ * a screen since v0.7x, and no business event has ever reached it.
+ * `automationEvents` is that queue, not a second engine.
+ */
+export * from "./patterns";

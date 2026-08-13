@@ -104,10 +104,26 @@ describe("registry completeness", () => {
     //
     // ⚠️ This test failing is the gate working: removing a nav entry
     // silently changes what a workspace gets for nothing.
+    //
+    // ⭐ `messaging` JOINED IN v1.14.0 for the same reason as
+    // `connections`: it is where a customer sees what their own
+    // WhatsApp account is costing them and what stopped working. Putting
+    // the spend report behind a paywall would mean the customers most at
+    // risk of a surprise bill are the ones who cannot see it coming.
+    //
+    // ⭐ `connections` JOINED THIS LIST IN v1.12.0, and that is also a
+    // decision. It is where a customer plugs in their OWN IndiaMART,
+    // JustDial, Meta or WhatsApp account. Refusing to let somebody
+    // connect their own lead source until they upgrade loses the account
+    // the upsell was aimed at, and it is the screen they open on the
+    // morning the enquiries stopped. What gets charged for is the volume
+    // that comes through it, not the socket.
     expect(free).toEqual([
       "assistant",
       "billing",
+      "connections",
       "dashboard",
+      "messaging",
       "notifications",
       "reports",
       "search",

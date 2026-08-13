@@ -56,6 +56,14 @@ const fail = (m) => {
 const KNOWN_GAPS = new Map([
   [4, "never written — phase merged into 0005"],
   [10, "never written — phase merged into 0011"],
+  /**
+   * ⭐ 0062 IS RETIRED, NOT MISSING. `0062_security_batches.sql` was
+   * superseded and moved to `_superseded/`, and this gate correctly
+   * refused to let v1.11.0 reuse the number: two different scripts
+   * sharing one position in history is exactly what it exists to stop.
+   * The batch went out as 0063 instead.
+   */
+  [62, "retired — 0062_security_batches.sql superseded, number not reused"],
 ]);
 
 /* ------------------------------------------------------------------ */

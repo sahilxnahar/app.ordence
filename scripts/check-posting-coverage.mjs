@@ -49,7 +49,26 @@ const FINANCIAL_MODULES = [
   "metering",
   "billing",
   "sales-bookings",
-  "tds",
+  /**
+   * ⭐⭐ RENAMED FROM `tds` IN v1.11.0, AND IT IS A CORRECTION RATHER
+   *     THAN A RELABELLING.
+   *
+   * 🔴 `tds` was never the module with the economic effect. Tax is
+   *    deducted when the money MOVES, so the document that posts is the
+   *    VENDOR PAYMENT, and a `tds_deductions` row is a record of a
+   *    withholding that happened inside one.
+   *
+   * ⚠️ The same reasoning already applied to `labour` below: attendance
+   * and piece rates are INPUTS to a wage calculation, not economic
+   * events. A TDS deduction is an input to a payment in exactly the
+   * same way, and asking `tds.ts` to post would mean inventing a
+   * journal for an event that has none.
+   *
+   * ⭐ The payment posts three legs — the creditor cleared in full, the
+   * bank credited with the net, and TDS payable credited with the
+   * withholding. That is where the tax reaches the ledger.
+   */
+  "vendor-payments",
 ];
 
 /**
@@ -97,7 +116,17 @@ const KNOWN_UNPOSTED = {
    */
   "sales-bookings":
     "A booking reserves a unit and moves no money. What is missing is cancellation forfeiture and channel-partner brokerage — neither has an action yet. Session 11b.",
-  tds: "TDS is deducted at PAYMENT, and vendor payment posting is not built yet. Session 10.",
+  /**
+   * ⭐⭐ `tds` REMOVED FROM THIS LIST IN v1.11.0, BY DECISION.
+   *
+   * It read: "TDS is deducted at PAYMENT, and vendor payment posting is
+   * not built yet." That was the correct diagnosis for twenty sessions.
+   * `server/actions/vendor-payments.ts` now creates the payment and
+   * posts it, crediting TDS payable as one of its legs, so the entry has
+   * been removed rather than reworded.
+   *
+   * ⚠️ A list that never shrinks by decision only shrinks by neglect.
+   */
 };
 
 /** Any of these means the module has a path to the ledger. */

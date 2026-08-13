@@ -115,6 +115,22 @@ const CORE_NAV_SECTION: NavSection = {
   label: null,
   items: [
     { id: "dashboard", label: "Dashboard", href: "/dashboard", icon: "layout-dashboard" },
+    /**
+     * ⭐⭐ ADDED IN v1.9.0, AND IN THE CORE SECTION ON PURPOSE.
+     *
+     * 🔴 Tasks and the calendar are not an industry feature. Every
+     * business in every one of the thirteen profiles has work to do and
+     * dates to keep, and putting them behind an industry section would
+     * mean a trading company and a law firm each getting a different
+     * answer to "what am I doing today".
+     */
+    { id: "tasks", label: "Tasks", href: "/tasks", icon: "check-square" },
+    { id: "calendar", label: "Calendar", href: "/calendar", icon: "calendar" },
+    /**
+     * ⭐ ADDED IN v1.10.0, also in core. Every business talks to itself,
+     * and a firm that talks inside the product opens it every day.
+     */
+    { id: "messages", label: "Messages", href: "/messages", icon: "message-square" },
     { id: "search", label: "Search", href: "/search", icon: "search" },
     { id: "assistant", label: "Assistant", href: "/assistant", icon: "bot" },
   ],

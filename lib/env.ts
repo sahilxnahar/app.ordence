@@ -128,6 +128,40 @@ const serverSchema = z.object({
   /** Bearer secret for `/api/workers`. Compared with `timingSafeEqual`. */
   WORKER_API_SECRET: z.string().optional(),
 
+  /**
+   * 🔴🔴 THE KEY THE VAULT HAS BEEN WAITING FOR SINCE 0037.
+   *
+   * `vault_secrets` holds ciphertext and the NAME of a key. This is the
+   * key. 64 hex characters (32 bytes) for AES-256-GCM, generated once
+   * with `openssl rand -hex 32`.
+   *
+   * ⚠️ WITHOUT IT NOTHING CAN BE VAULTED, AND THAT IS INTENDED. The
+   * alternative — a default key, or storing the value in the clear "for
+   * now" — is how plaintext credentials end up in a database backup. The
+   * screens say the key is missing rather than pretending to work.
+   *
+   * ⚠️ AND CHANGING IT ORPHANS EVERY SECRET ALREADY STORED, which is why
+   * `vault_secrets.key_ref` names the key on every row: an old row can
+   * still say which key it needs while new rows use the new one.
+   */
+  VAULT_ENCRYPTION_KEY: z.string().optional(),
+
+  /**
+   * 🔴 THE PEPPER FOR THE BLIND INDEX, and a different secret from the
+   * key above on purpose.
+   *
+   * ⚠️ The blind index makes "find the record with this PAN" answerable
+   * without decrypting anything. A plain SHA-256 would not: the PAN
+   * space is about 10^9 and a laptop enumerates that in minutes, so the
+   * hash IS the PAN to whoever obtains the column. Under a pepper that
+   * lives outside the database, the same column is inert.
+   *
+   * 🔴 IT MUST NEVER BE ROTATED CASUALLY. Every blind index in the
+   * database is computed under it, and changing it makes all of them
+   * unsearchable at once.
+   */
+  VAULT_BLIND_INDEX_PEPPER: z.string().optional(),
+
   /** Vercel-cron auth path. Vestigial on Railway; retained for the rollback. */
   CRON_SECRET: z.string().optional(),
 
