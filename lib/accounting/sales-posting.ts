@@ -47,7 +47,21 @@ export type PostingRole =
   /** Where receipts land — bank or cash. */
   | "bank"
   /** TDS the customer withheld: an asset until it is claimed. */
-  | "tds_receivable";
+  | "tds_receivable"
+  /**
+   * ⭐⭐ THE STOCK COUNT ROLES, ADDED IN v1.18.0.
+   *
+   * 🔴 THERE ARE TWO VARIANCE ROLES AND NOT ONE, ON PURPOSE. Posting
+   * gains and losses to a single "stock adjustment" account nets them
+   * off in the trial balance, and "how much stock did we lose this
+   * year" then has no answer anywhere in the system. An auditor asks
+   * that question, and "we net it off" is not an answer.
+   */
+  | "inventory_asset"
+  /** Stock found that the books did not have. A credit, reducing cost. */
+  | "inventory_variance_gain"
+  /** Stock the books had and the shelf did not. Shrinkage. */
+  | "inventory_variance_loss";
 
 export type PostingLeg = {
   role: PostingRole;
@@ -294,6 +308,24 @@ export const POSTING_ROLE_META: Record<
     tallyGroup: "Current Assets",
     accountType: "asset",
     help: "Tax a customer withheld and paid on your behalf. An asset you claim, never a write-off.",
+  },
+  inventory_asset: {
+    label: "Stock in Hand",
+    tallyGroup: "Stock-in-Hand",
+    accountType: "asset",
+    help: "The value of stock you hold. A posted stock count moves this by the NET difference it found, because that is what the stock is now actually worth.",
+  },
+  inventory_variance_gain: {
+    label: "Stock Found",
+    tallyGroup: "Indirect Incomes",
+    accountType: "revenue",
+    help: "Stock a count found that the books did not have. Usually a receipt nobody entered or an earlier miscount, so it is worth reading rather than welcoming.",
+  },
+  inventory_variance_loss: {
+    label: "Stock Shrinkage",
+    tallyGroup: "Indirect Expenses",
+    accountType: "expense",
+    help: "Stock the books had and the shelf did not. Kept separate from Stock Found on purpose: netting the two makes a bad month look like a quiet one, and 'how much stock did we lose this year' stops having an answer.",
   },
 };
 

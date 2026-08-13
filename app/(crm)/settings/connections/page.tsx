@@ -26,7 +26,16 @@
  */
 
 import Link from "next/link";
-import { getConnections } from "@/server/actions/connections";
+import {
+  createConnection,
+  generateVerifyToken,
+  getConnections,
+  probeConnection,
+  removeConnection,
+  saveCredential,
+  setConnectionActive,
+} from "@/server/actions/connections";
+import { ConnectionManager } from "@/components/integrations/connection-manager";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 
@@ -98,6 +107,48 @@ export default async function ConnectionsPage() {
           </CardContent>
         </Card>
       )}
+
+      {/**
+       * ⭐⭐⭐ THE PART THAT WAS MISSING FOR FIVE SESSIONS.
+       *
+       * 🔴 Everything below this point is the READ: what broke, when it
+       * last worked, what we are doing about it. That was built first
+       * and correctly, and it is what this screen is for on the bad
+       * morning.
+       *
+       * ⚠️ But `createConnection`, `saveCredential`, `setConnectionActive`
+       * and `removeConnection` have existed since v1.12.0 and nothing
+       * called any of them. The engine was complete and unreachable, so
+       * the honest description of the product was "an integration
+       * platform that needs a database client to set up".
+       *
+       * ⭐ The actions are passed down rather than imported by the client
+       * component, so the `"use server"` boundary stays visible at the
+       * point where a server function crosses into the browser.
+       */}
+      <ConnectionManager
+        vaultReady={vaultReady}
+        available={available}
+        connections={cards.map((c) => ({
+          id: c.id,
+          connectorKey: c.connectorKey,
+          label: c.label,
+          name: c.name,
+          state: c.state,
+          isActive: c.isActive,
+          missingSecrets: c.missingSecrets,
+          storedSecrets: c.storedSecrets,
+          webhookUrl: c.webhookUrl,
+          secretNames: c.secretNames,
+          verifyMethod: c.verifyMethod,
+        }))}
+        createAction={createConnection}
+        saveCredentialAction={saveCredential}
+        setActiveAction={setConnectionActive}
+        removeAction={removeConnection}
+        generateVerifyTokenAction={generateVerifyToken}
+        probeAction={probeConnection}
+      />
 
       {cards.length === 0 ? (
         <Card>

@@ -142,7 +142,41 @@ export interface ConnectorPolicy {
    * nothing on our side reports it because the requests simply stop.
    */
   readonly senderGivesUpAfterHours: number | null;
+
+  /**
+   * ⭐⭐ HOW A PERSON FINDS OUT, AT SETUP TIME, WHETHER IT WORKS.
+   *
+   * ══════════════════════════════════════════════════════════════════
+   * 🔴 "TEST CONNECTION" MEANS FOUR DIFFERENT THINGS AND THAT IS THE
+   * WHOLE PROBLEM
+   * ══════════════════════════════════════════════════════════════════
+   * For IndiaMART it means ask for the narrowest window and see what
+   * comes back. For WhatsApp there is nothing to fetch at all, and the
+   * only useful question is whether the token identifies a real number.
+   * For JustDial there is no outbound call in existence: they push, and
+   * the only truthful answer is whether anything has ever arrived.
+   *
+   * ⚠️ WRITTEN AS `if (connectorKey === …)` INSIDE THE PROBE, the sixth
+   * connector is added by copying the fifth and keeping whichever test
+   * it was copied from. That is the exact failure this table was built
+   * to prevent, and a wrong test is worse than no test: it puts a green
+   * tick next to something that has never worked.
+   */
+  readonly verifyMethod: VerifyMethod;
 }
+
+/**
+ * ⚠️ `inbound_only` IS NOT A GAP IN THE FEATURE. It is the honest answer
+ * for a push connector, and a screen that offers a Test button which
+ * cannot fail is a screen that teaches people to trust a green tick.
+ */
+export type VerifyMethod =
+  /** Make the ordinary pull call over the smallest window allowed. */
+  | "fetch_probe"
+  /** Call a cheap identity endpoint. Proves the credential, fetches nothing. */
+  | "credential_probe"
+  /** Nothing to call. Report whether anything has ever arrived. */
+  | "inbound_only";
 
 /* ------------------------------------------------------------------ */
 /* THE TABLE                                                           */
@@ -175,6 +209,8 @@ export const CONNECTOR_POLICIES: Readonly<Record<ConnectorKey, ConnectorPolicy>>
       webhookVerification: "none",
       webhookSignatureHeader: null,
       senderGivesUpAfterHours: 48,
+      // ⭐ Its pull API IS the probe. One narrow window, one answer.
+      verifyMethod: "fetch_probe",
     }),
 
     justdial: Object.freeze({
@@ -196,6 +232,9 @@ export const CONNECTOR_POLICIES: Readonly<Record<ConnectorKey, ConnectorPolicy>>
       webhookVerification: "none",
       webhookSignatureHeader: null,
       senderGivesUpAfterHours: null,
+      // 🔴 THERE IS NO OUTBOUND CALL TO MAKE. Offering a Test button
+      // here would be offering a button that cannot say anything true.
+      verifyMethod: "inbound_only",
     }),
 
     meta_lead_ads: Object.freeze({
@@ -227,8 +266,43 @@ export const CONNECTOR_POLICIES: Readonly<Record<ConnectorKey, ConnectorPolicy>>
       webhookVerification: "hmac_sha256",
       webhookSignatureHeader: "x-hub-signature-256",
       senderGivesUpAfterHours: null,
+      verifyMethod: "fetch_probe",
     }),
 
+    /**
+     * ══════════════════════════════════════════════════════════════════
+     * ⭐⭐⭐ WHERE THE RESALE DECISION WILL SHOW UP, AND WHY NOTHING HERE
+     * PRE-EMPTS IT
+     * ══════════════════════════════════════════════════════════════════
+     * There are two ways a business ends up sending WhatsApp through
+     * Ordence, and this table supports the first one today.
+     *
+     * ① BRING YOUR OWN TOKEN (what is built). The tenant creates their
+     *    own Meta app, does their own business verification, and pastes
+     *    an access token, an app secret and a phone number id into the
+     *    connections screen. Ordence needs no Meta relationship of any
+     *    kind. It works the day the code ships and it scales to as many
+     *    tenants as can be bothered to do the paperwork.
+     *
+     * ② EMBEDDED SIGNUP (what resale eventually wants). Ordence
+     *    registers as a Meta Tech Provider, and the tenant clicks a
+     *    button that opens Meta's own dialog. They never see a token.
+     *    ⚠️ That requires Ordence's OWN business verification and app
+     *    review, which is the thing Sah does not have and cannot get in
+     *    an afternoon.
+     *
+     * 🔴 THE POINT: ② IS ADDITIVE, NOT A REPLACEMENT. It changes where
+     * `access_token` comes from and nothing else. The vault still holds
+     * it, `credential_probe` still proves it, the send path never knew
+     * the difference. So the paste-your-own route is not throwaway work
+     * and does not need to be designed around.
+     *
+     * ⚠️ THE ONE THING THAT WOULD MAKE ② EXPENSIVE LATER is storing the
+     * token anywhere other than per-connection in the vault. A single
+     * platform-wide WhatsApp credential in an environment variable would
+     * have to be unpicked from every send. That mistake is already
+     * avoided, and this comment exists so it stays avoided.
+     */
     whatsapp: Object.freeze({
       key: "whatsapp",
       label: "WhatsApp Business",
@@ -248,6 +322,9 @@ export const CONNECTOR_POLICIES: Readonly<Record<ConnectorKey, ConnectorPolicy>>
       webhookVerification: "hmac_sha256",
       webhookSignatureHeader: "x-hub-signature-256",
       senderGivesUpAfterHours: null,
+      // ⚠️ NEVER a fetch. The cheap identity call proves the token
+      // without sending anything, and a send costs real money.
+      verifyMethod: "credential_probe",
     }),
 
     email: Object.freeze({
@@ -267,6 +344,7 @@ export const CONNECTOR_POLICIES: Readonly<Record<ConnectorKey, ConnectorPolicy>>
       webhookVerification: "hmac_sha256",
       webhookSignatureHeader: "svix-signature",
       senderGivesUpAfterHours: null,
+      verifyMethod: "inbound_only",
     }),
   });
 

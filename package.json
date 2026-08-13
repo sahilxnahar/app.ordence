@@ -1,6 +1,6 @@
 {
   "name": "ordence",
-  "version": "1.16.0-alpha",
+  "version": "1.20.0-alpha",
   "private": true,
   "scripts": {
     "dev": "next dev",
@@ -37,7 +37,8 @@
     "deploy": "node -e \"console.error('\\n\\u26d4 Ordence deploys from GitHub to Railway.\\n   Commit and push in GitHub Desktop. Railway builds automatically.\\n   (The old Cloudflare command is still available as: npm run cf:deploy)\\n'); process.exit(1)\"",
     "seed:contracting": "tsx scripts/seed-contracting-demo.ts",
     "check:sql": "node scripts/check-sql-completeness.mjs",
-    "check:posting": "node scripts/check-posting-coverage.mjs"
+    "check:posting": "node scripts/check-posting-coverage.mjs",
+    "check:reachability": "node scripts/check-reachability.mjs"
   },
   "dependencies": {
     "@clerk/nextjs": "^6.39.6",

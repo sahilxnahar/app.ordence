@@ -215,6 +215,19 @@ export const syncRuns = pgTable(
     itemsDuplicate: integer("items_duplicate").default(0).notNull(),
     itemsFailed: integer("items_failed").default(0).notNull(),
 
+    /**
+     * ⭐⭐ A TEST SOMEBODY PRESSED, NOT A SCHEDULED FETCH. Added in 0069.
+     *
+     * ⚠️ DEFAULTS TO FALSE SO EVERY ROW WRITTEN BEFORE 0069 KEEPS
+     * MEANING EXACTLY WHAT IT MEANT. A nullable column here would make
+     * the whole history ambiguous to answer one question about today.
+     *
+     * 🔴 THE SCREEN HIDES THESE BY DEFAULT. The runs list is read on the
+     * morning enquiries stopped, and twenty setup attempts at the top of
+     * it push the real failure off the page.
+     */
+    isProbe: boolean("is_probe").default(false).notNull(),
+
     errorCode: varchar("error_code", { length: 60 }),
     /** 🔴 Required for failed and partial, by CHECK in 0064. */
     errorMessage: varchar("error_message", { length: 500 }),

@@ -84,7 +84,16 @@ export function salesTransactionKey(
     | "booking_receipt"
     | "possession"
     /** ⭐ v1.11.0 — the event tax is deducted on. */
-    | "vendor_payment",
+    | "vendor_payment"
+    /**
+     * ⭐ v1.18.0 — the stock count.
+     *
+     * ⚠️ IT GETS ITS OWN TAG RATHER THAN FALLING THROUGH TO THE DEFAULT.
+     * The chain below ends in `"RCP"`, so any unlisted kind silently
+     * becomes a receipt key. Two different documents whose keys claim
+     * to be the same kind is a trail that lies to whoever follows it.
+     */
+    | "stock_count",
   documentId: string,
 ): string {
   const tag =
@@ -102,14 +111,25 @@ export function salesTransactionKey(
                 ? "BRC"
                 : kind === "possession"
                   ? "POS"
-                  : "RCP";
+                  : kind === "stock_count"
+                    ? "SCNT"
+                    : "RCP";
   return `SALES:${tag}:${documentId}`;
 }
 
 export type PostOutcome =
   | { posted: true; transactionId: string }
   | { posted: false; reason: "already_posted" }
-  | { posted: false; reason: "unmapped_roles"; missing: PostingRole[] };
+  | { posted: false; reason: "unmapped_roles"; missing: PostingRole[] }
+  /**
+   * ⭐ ADDED IN v1.18.0 FOR THE STOCK COUNT.
+   *
+   * ⚠️ A count that found no difference is a SUCCESSFUL count, not a
+   * failure, and it has nothing to post. Folding it into
+   * `already_posted` would tell the person their clean count had been
+   * done before, which is both untrue and alarming.
+   */
+  | { posted: false; reason: "nothing_to_post" };
 
 /** The tenant's role → ledger map. */
 async function loadRoleMap(tx: Tx, tenantId: string): Promise<Map<PostingRole, string>> {
@@ -953,5 +973,112 @@ export async function postPossession(
     referenceId: args.bookingId,
     bookingId: args.bookingId,
     buyerName: args.buyerName,
+  });
+}
+
+/* ------------------------------------------------------------------ */
+/* ⭐⭐ THE STOCK COUNT — v1.18.0                                       */
+/* ------------------------------------------------------------------ */
+
+/**
+ * ⭐⭐⭐ A COUNT VARIANCE IS AN ECONOMIC EVENT AND HAS TO REACH THE
+ * LEDGER.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 THE ALTERNATIVE IS A STOCK FIGURE THAT DISAGREES WITH THE ACCOUNTS
+ * ══════════════════════════════════════════════════════════════════════
+ * A count that adjusts quantities without touching the books leaves the
+ * balance sheet carrying stock the warehouse does not have. Nothing
+ * reports it, because each system is internally consistent; the two
+ * simply describe different businesses. It surfaces at year end, when
+ * somebody has to explain a stock figure that no longer ties, and by
+ * then nobody remembers which counts were posted.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * ⚠️ THE NET GOES TO THE LEDGER. THE HALVES GO TO DIFFERENT ACCOUNTS.
+ * ══════════════════════════════════════════════════════════════════════
+ * The stock asset moves by the net, because that is what the stock is
+ * actually worth now. But the other side splits: what was found credits
+ * `inventory_variance_gain` and what was missing debits
+ * `inventory_variance_loss`, so a count that found ₹4 lakh missing and
+ * ₹4 lakh extra does not present itself as a quiet month.
+ *
+ * 🔴 IDEMPOTENT BY THE SAME KEY MECHANISM AS EVERYTHING ELSE HERE. The
+ * partial unique index in 0070 is the real guard; this is the courtesy
+ * that returns a clear outcome instead of a constraint violation.
+ */
+export async function postStockCount(
+  tx: Tx,
+  args: {
+    tenantId: string;
+    userId: string;
+    countId: string;
+    countNo: string;
+    /** ⚠️ The date counting happened, never today. See the note above. */
+    countedOn: string;
+    /** Positive minor units. Stock found that the books did not have. */
+    gainMinor: bigint;
+    /** Positive minor units. Stock the books had and the shelf did not. */
+    lossMinor: bigint;
+  },
+): Promise<PostOutcome> {
+  const net = args.gainMinor - args.lossMinor;
+
+  // ⚠️ A COUNT THAT FOUND NOTHING POSTS NOTHING. A journal of zero legs
+  // is a row that means nothing and has to be filtered out of every
+  // statement written from then on.
+  if (args.gainMinor === 0n && args.lossMinor === 0n) {
+    return { posted: false, reason: "nothing_to_post" };
+  }
+
+  const legs: PostingLeg[] = [];
+
+  // ① The stock asset moves by the net, in whichever direction.
+  if (net > 0n) {
+    legs.push({
+      role: "inventory_asset",
+      entryType: "debit",
+      amountMinor: net,
+      description: `Stock count ${args.countNo}: net increase`,
+    });
+  } else if (net < 0n) {
+    legs.push({
+      role: "inventory_asset",
+      entryType: "credit",
+      amountMinor: -net,
+      description: `Stock count ${args.countNo}: net decrease`,
+    });
+  }
+
+  // ② 🔴 AND THE TWO HALVES GO SEPARATELY, EVEN THOUGH THE ARITHMETIC
+  // WOULD WORK WITH ONE ACCOUNT. See the header.
+  if (args.gainMinor > 0n) {
+    legs.push({
+      role: "inventory_variance_gain",
+      entryType: "credit",
+      amountMinor: args.gainMinor,
+      description: `Stock count ${args.countNo}: found on the shelf`,
+    });
+  }
+  if (args.lossMinor > 0n) {
+    legs.push({
+      role: "inventory_variance_loss",
+      entryType: "debit",
+      amountMinor: args.lossMinor,
+      description: `Stock count ${args.countNo}: missing from the shelf`,
+    });
+  }
+
+  return writePosting(tx, {
+    tenantId: args.tenantId,
+    userId: args.userId,
+    legs,
+    key: salesTransactionKey("stock_count", args.countId),
+    description: `Stock count ${args.countNo}`,
+    transactionDate: args.countedOn,
+    referenceType: "adjustment",
+    referenceId: args.countId,
+    counterpartyId: null,
+    counterpartyName: null,
   });
 }

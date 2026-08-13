@@ -172,7 +172,21 @@ export const automationEvents = pgTable(
       .notNull()
       .references(() => tenants.id, { onDelete: "cascade" }),
 
-    trigger_type: varchar("trigger_type", { length: 30 }).notNull(),
+    /**
+     * ⚠️ RENAMED FROM `trigger_type` TO `triggerType` IN v1.19.0, and it
+     * is a correction rather than a preference.
+     *
+     * 🔴 It was the only snake_case property in a file of camelCase
+     * ones, so `automationEvents.triggerType` — the natural guess, and
+     * what the first caller wrote — failed to compile. That is the
+     * lucky outcome. The unlucky one is a `.values({ triggerType: ... })`
+     * in a loosely typed insert, which drops the key silently and hits
+     * a NOT NULL violation at runtime with a column name nobody typed.
+     *
+     * ⭐ The database column is untouched; only the TypeScript property
+     * changed, so no migration is involved.
+     */
+    triggerType: varchar("trigger_type", { length: 30 }).notNull(),
     recordType: varchar("record_type", { length: 40 }).notNull(),
     recordId: uuid("record_id").notNull(),
 

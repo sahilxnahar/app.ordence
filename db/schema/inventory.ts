@@ -605,6 +605,20 @@ export const stockCounts = pgTable(
       .notNull(),
     notes: text("notes"),
 
+    /**
+     * ⭐⭐ THE JOURNAL THIS COUNT PRODUCED. Added in 0070.
+     *
+     * 🔴 ITS PRESENCE IS THE RECORD THAT THE COUNT HAS BEEN POSTED, so a
+     * second posting has nowhere to write. A partial unique index in
+     * 0070 enforces that at the database rather than by remembering.
+     *
+     * ⚠️ THE FAILURE THIS PREVENTS IS DOUBLE ADJUSTMENT. A count that
+     * finds 40 units missing, posted twice, removes 80. The stock ledger
+     * stays internally consistent, the balance is simply wrong, and the
+     * next count finds 40 units appearing from nowhere.
+     */
+    journalEntryId: uuid("journal_entry_id"),
+
     createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
     createdBy: uuid("created_by").references(() => users.id, { onDelete: "set null" }),

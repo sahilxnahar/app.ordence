@@ -86,6 +86,24 @@ export const messageTemplates = pgTable(
 
     syncedAt: timestamp("synced_at", { withTimezone: true }),
 
+    /**
+     * ⭐⭐ WHERE THIS ROW CAME FROM. Added in 0069.
+     *
+     * `declared` — a person told us this template exists.
+     * `synced`   — we read it back from the provider.
+     *
+     * 🔴 A DECLARED TEMPLATE IS A CLAIM. ONLY A SYNCED ONE IS A FACT,
+     * and 0069 carries the CHECK that stops a declared row ever holding
+     * `status = 'approved'`. Without that separation somebody ticks
+     * approved because it looks approved on Meta's dashboard, a campaign
+     * of four thousand resolves against it, and either every send is
+     * refused for a parameter mismatch or they all go out under a
+     * category Meta quietly moved to marketing at seven times the price.
+     */
+    source: varchar("source", { length: 20 }).default("declared").notNull(),
+    /** ⚠️ When a person asserted it. Null on a row that came from the API. */
+    declaredAt: timestamp("declared_at", { withTimezone: true }),
+
     createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
     createdBy: uuid("created_by").references(() => users.id, { onDelete: "set null" }),

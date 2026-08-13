@@ -35,6 +35,8 @@ export * from "./clm";
 
 // Double-entry trust accounting
 export * from "./accounting";
+export * from "./banking";
+export * from "./agents";
 
 // Granular authorization catalog & denial log
 export * from "./auth";

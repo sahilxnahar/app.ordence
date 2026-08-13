@@ -12,7 +12,8 @@
  */
 
 import Link from "next/link";
-import { getCampaigns } from "@/server/actions/campaigns";
+import { approveCampaign, getCampaigns, stopCampaign } from "@/server/actions/campaigns";
+import { CampaignControls } from "@/components/campaigns/campaign-controls";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 
@@ -137,6 +138,26 @@ export default async function CampaignsPage() {
                   </p>
                 </div>
               </div>
+
+              {/**
+               * ⭐⭐⭐ THE CONTROLS, WHICH HAVE NEVER BEEN ON A SCREEN.
+               *
+               * 🔴 `stopCampaign` was written in v1.15.0 with a header
+               * explaining that it must work in one click from a phone.
+               * Nothing called it, so the only way to stop a campaign in
+               * flight was a database client. The trigger it relies on
+               * fires on every message insert and has always worked; the
+               * button to fire it did not exist.
+               */}
+              <CampaignControls
+                campaignId={c.id}
+                name={c.name}
+                status={c.status}
+                included={c.included}
+                approvedCost={c.approvedCost}
+                approveAction={approveCampaign}
+                stopAction={stopCampaign}
+              />
 
               {c.neverReached > 0 && (
                 <p className="text-sm text-destructive">

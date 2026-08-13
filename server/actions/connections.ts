@@ -46,6 +46,8 @@ import {
   putSecret,
 } from "@/server/vault/secrets";
 import type { ActionResult } from "@/lib/validators/crm";
+import { webhookPathFor, webhookUrlFor } from "@/lib/integrations/webhook-path";
+import { probeConnection as runProbe } from "@/server/integrations/probe";
 import {
   CONNECTOR_POLICIES,
   assessSyncHealth,
@@ -140,7 +142,11 @@ export async function createConnection(
             signatureHeader: policy.webhookSignatureHeader,
             createdBy: ctx.user.id,
           });
-          webhookPath = `/api/webhooks/${data.connectorKey}/${pathToken}`;
+          // 🔴 THE HELPER, NOT A TEMPLATE STRING. This line used to read
+          // `/api/webhooks/${data.connectorKey}/${pathToken}`, and there
+          // has never been a route with a connector segment in it. See
+          // lib/integrations/webhook-path.ts.
+          webhookPath = webhookPathFor(pathToken);
         }
 
         await writeAudit(ctx, {
@@ -437,6 +443,11 @@ export interface ConnectionCard {
   readonly missingSecrets: readonly string[];
   readonly storedSecrets: readonly string[];
   readonly webhookPath: string | null;
+  /** ⭐ The whole address, which is the only form a person can use. */
+  readonly webhookUrl: string | null;
+  /** ⚠️ Which fields the setup screen must offer. From the policy table. */
+  readonly secretNames: readonly string[];
+  readonly verifyMethod: string;
   readonly nextFetchNote: string;
   readonly health: { tone: string; headline: string; detail: string };
   readonly recentRuns: ReadonlyArray<{
@@ -461,12 +472,17 @@ export async function getConnections(): Promise<
       transport: string;
       selfService: boolean;
       setupNote: string;
+      secretNames: readonly string[];
+      verifyMethod: string;
     }>;
   }>
 > {
   try {
     const ctx = await requirePermission(MANAGE);
     const now = new Date();
+    // ⚠️ Read here, not at module scope. A module-level read runs during
+    // `next build`, when the value is legitimately the default.
+    const baseUrl = process.env.NEXT_PUBLIC_APP_URL ?? "";
 
     const cards = await withTenant(
       ctx.tenant.id,
@@ -531,6 +547,11 @@ export async function getConnections(): Promise<
               and(
                 eq(syncRuns.tenantId, ctx.tenant.id),
                 eq(syncRuns.connectionId, row.id),
+                // 🔴 PROBES ARE EXCLUDED, AND THIS IS THE POINT OF THE
+                // FLAG. This list is read on the morning enquiries
+                // stopped. Twenty Test clicks from setup day sitting at
+                // the top of it push the actual failure off the screen.
+                eq(syncRuns.isProbe, false),
               ),
             )
             .orderBy(desc(syncRuns.startedAt))
@@ -579,9 +600,12 @@ export async function getConnections(): Promise<
             missingSecrets: (policy?.secretNames ?? []).filter(
               (n) => !storedNames.includes(n),
             ),
+            secretNames: policy?.secretNames ?? [],
+            verifyMethod: policy?.verifyMethod ?? "inbound_only",
             webhookPath: endpoint[0]
-              ? `/api/webhooks/${row.connectorKey}/${endpoint[0].pathToken}`
+              ? webhookPathFor(endpoint[0].pathToken)
               : null,
+            webhookUrl: endpoint[0] ? webhookUrlFor(baseUrl, endpoint[0].pathToken) : null,
             nextFetchNote: mayFetchNow(snapshot, now).reason,
             health,
             recentRuns: runs.map((r) => ({
@@ -615,10 +639,171 @@ export async function getConnections(): Promise<
           transport: p.transport,
           selfService: p.selfService,
           setupNote: p.setupNote,
+          secretNames: p.secretNames,
+          verifyMethod: p.verifyMethod,
         })),
       },
     };
   } catch (err) {
     return toSalesActionError(err, "getConnections");
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* THE VERIFY TOKEN                                                     */
+/* ------------------------------------------------------------------ */
+
+const verifyTokenSchema = z.object({ connectionId: z.string().uuid() });
+
+/**
+ * ⭐⭐⭐ THE ONE SECRET THAT MUST BE SHOWN, AND THE ONLY MOMENT IT IS.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 A VERIFY TOKEN IS NOT A KEY. ITS PURPOSE IS TO BE TYPED SOMEWHERE
+ * ELSE.
+ * ══════════════════════════════════════════════════════════════════════
+ * Meta confirms a webhook by GETting it with `hub.verify_token` and
+ * expecting `hub.challenge` echoed back. For that to work the same
+ * string has to exist in two places: our vault, and a form on Meta's
+ * dashboard that a person fills in by hand.
+ *
+ * ⚠️ EVERY OTHER SECRET IN THIS SYSTEM IS WRITE-ONLY, AND THIS ONE
+ * CANNOT BE. So the compromise is placed where it does least harm:
+ *
+ * 🔴 THE VALUE IS RETURNED EXACTLY ONCE, AT THE MOMENT IT IS MINTED,
+ * AND CAN NEVER BE READ AGAIN. There is no "show token" button and
+ * there will not be one. Somebody who loses it generates another, which
+ * costs them one paste into Meta and costs us nothing. An action that
+ * could re-read it would be an authenticated URL that hands out every
+ * tenant's webhook tokens, and it would look entirely ordinary in a
+ * review — which is the argument the header of this file already makes
+ * about `saveCredential`.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * ⭐ AND THIS IS WHY IT IS A BUTTON RATHER THAN A TERMINAL COMMAND
+ * ══════════════════════════════════════════════════════════════════════
+ * `openssl rand -hex 32` produces a perfectly good verify token. It
+ * also requires a terminal, which the person setting up their own
+ * WhatsApp account does not have and should not need. A platform whose
+ * onboarding has a shell command in step four is a platform that
+ * onboards nobody without a phone call.
+ */
+export async function generateVerifyToken(
+  input: unknown,
+): Promise<ActionResult<{ verifyToken: string; connectorLabel: string }>> {
+  try {
+    const data = verifyTokenSchema.parse(input);
+    const ctx = await requirePermission(MANAGE);
+
+    const readiness = vaultReadiness();
+    if (!readiness.ready) {
+      return { ok: false, error: readiness.message ?? "The vault is not configured." };
+    }
+
+    const result = await withTenant(
+      ctx.tenant.id,
+      async (tx) => {
+        const [connection] = await tx
+          .select({ id: connections.id, connectorKey: connections.connectorKey })
+          .from(connections)
+          .where(
+            and(
+              eq(connections.tenantId, ctx.tenant.id),
+              eq(connections.id, data.connectionId),
+            ),
+          )
+          .limit(1);
+
+        if (!connection) throw new Error("No such connection.");
+
+        const policy = policyFor(connection.connectorKey);
+        if (!policy || !policy.secretNames.includes("verify_token")) {
+          throw new Error(
+            `${policy?.label ?? "This connector"} does not use a verify token.`,
+          );
+        }
+
+        // ⭐ THE SAME MINT AS THE WEBHOOK PATH. One source of randomness,
+        // already audited, already the right length.
+        const verifyToken = generatePathToken();
+
+        const put = await putSecret({
+          tx,
+          tenantId: ctx.tenant.id,
+          ownerKind: CONNECTION_OWNER_KIND,
+          ownerId: connection.id,
+          kind: "api_credential",
+          label: "verify_token",
+          plaintext: verifyToken,
+          userId: ctx.user.id,
+          userEmail: ctx.user.email ?? null,
+          expiresAt: null,
+        });
+
+        if (!put.ok) throw new Error(put.error);
+
+        await writeAudit(ctx, {
+          action: "update",
+          resourceType: "connection_credential",
+          resourceId: connection.id,
+          // 🔴 THAT ONE WAS MINTED. NEVER WHICH ONE.
+          newValue: { secretName: "verify_token", minted: true, rotated: put.rotated },
+          severity: "critical",
+        });
+
+        return { verifyToken, connectorLabel: policy.label };
+      },
+      { impersonationId: ctx.impersonationId },
+    );
+
+    revalidatePath("/settings/connections");
+    return { ok: true, data: result };
+  } catch (err) {
+    return toSalesActionError(err, "generateVerifyToken");
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* THE PROBE                                                            */
+/* ------------------------------------------------------------------ */
+
+const probeSchema = z.object({ connectionId: z.string().uuid() });
+
+/**
+ * ⭐⭐ "DOES THIS ACTUALLY WORK", ASKED AT THE MOMENT SOMEBODY CARES.
+ *
+ * ⚠️ THE ALTERNATIVE IS FINDING OUT ON THURSDAY. A wrong key and a quiet
+ * week look identical on the connections screen, and the difference is
+ * three days of enquiries that went to a competitor.
+ *
+ * 🔴 A PROBE IS NOT A SYNC. It is recorded as its own kind of run
+ * (`is_probe` in 0069) so that a hundred setup attempts do not drown the
+ * log a person reads on the bad morning, and so that a probe can never
+ * move the cursor and skip real enquiries.
+ */
+export async function probeConnection(
+  input: unknown,
+): Promise<ActionResult<{ ok: boolean; headline: string; detail: string }>> {
+  try {
+    const data = probeSchema.parse(input);
+    const ctx = await requirePermission(MANAGE);
+    const now = new Date();
+
+    const report = await withTenant(
+      ctx.tenant.id,
+      async (tx) =>
+        runProbe({
+          tx,
+          tenantId: ctx.tenant.id,
+          connectionId: data.connectionId,
+          now,
+        }),
+      { impersonationId: ctx.impersonationId },
+    );
+
+    revalidatePath("/settings/connections");
+    return { ok: true, data: report };
+  } catch (err) {
+    return toSalesActionError(err, "probeConnection");
   }
 }
