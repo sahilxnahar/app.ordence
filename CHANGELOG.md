@@ -1,3 +1,58 @@
+# v1.7.0-alpha — THE DATE THAT ENDS A CLAIM
+
+**Repo: `app.ordence`** · 🔴 **SQL: `0058`** · ⚠️ **No new variables**
+
+Legal, batch 1. The first industry batch that is about a deadline rather
+than a document.
+
+- 🔴 **"Matters" and "Cases" both pointed at `/assets?type=…`, and
+  "Hearings" pointed at `/calendar`.** Three nav labels, no code behind
+  any of them. A law firm opening Ordence found a fixed-asset register
+  with the word "Matters" over it. That is not a thin feature, it is a
+  label doing all the work — so `cases` and `hearings` are now **removed
+  from the registry**, not repointed, and `matters` goes to a real screen.
+- 🔴 **Limitation is computed, with its workings, and stored.**
+  `lib/legal/limitation.ts` encodes twelve Articles of the Schedule plus
+  s.34(3) of the Arbitration Act, applies **s.12(1)** (the day the period
+  runs from is excluded), and applies **s.4** (where the period expires on
+  a day the court is closed, it rolls to the reopening day — most software
+  skips this and is quietly wrong in the client's disfavour).
+  The screen shows the reasoning, not just the date: which Article, what it
+  runs from, why that day was excluded, where it lands.
+- 🔴 **The database refuses to revive a dead right.**
+  s.18 starts a fresh period only where the acknowledgement was made
+  *before* the period ran out. The same letter two days later gives
+  nothing, and on a file the two look identical. `ordence_guard_limitation_reset`
+  rejects the second one and says why. It also refuses a "reset" on a legal
+  notice — only an acknowledgement (s.18) or a part payment (s.19) does it.
+- 🔴 **A hearing that was held must produce the next date or a disposal.**
+  `legal_hearings_held_has_a_future`. Neither means nobody is listed to
+  attend, and that is how a suit is dismissed for default of appearance —
+  not by a decision, by a blank field. `not_reached` is deliberately
+  included; it is the most commonly forgotten one because nothing happened.
+- 🔴 **A client ledger cannot go into debit — per client AND per matter.**
+  `ordence_guard_client_account`. Money paid out that was not held for that
+  client is another client's money, and there is no innocent version of that
+  number. Funds on one matter are not available to another without a
+  deliberate transfer. Fees leave the client account only against an issued
+  bill (`client_account_entries_office_transfer_has_bill`). Bar Council of
+  India Rules, Chapter II, Section II.
+- ⭐ **Cheque dishonour deadlines under s.138 NI Act** — 30 days to send
+  the demand, 15 days for the drawer to pay, cause of action the next day,
+  one month to complain. Four dates from one dishonour memo, and the
+  15-day window is the one people miscount.
+- ⚠️ **"No limitation date" gets its own counter, in red, first.**
+  A matter expiring next week is at least on a list. A matter with no
+  expiry never appears on any report, whatever the date.
+- ⚠️ **What this does not do:** court fees (State schedules — next batch),
+  cause-list scraping, e-filing, and it does not reconcile the client bank
+  account. The held figure is what the ledger says; agreeing it to the bank
+  is still a person's job, and it is the job an inspection asks about.
+
+**61 new tests** (1,832 total). **26 constraint and trigger drills** fired
+against a real PostgreSQL 16 in both directions, including RLS isolation
+as a non-superuser.
+
 # v1.6.0-alpha — PRICES THAT ACTUALLY SELL, AND SECTION 15(3)
 
 **Repo: `app.ordence`** · 🔴 **SQL: `0057`** · ⚠️ **No new variables**

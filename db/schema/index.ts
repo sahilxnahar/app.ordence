@@ -161,6 +161,7 @@ export * from "./inventory";
 // relinquishment and a POA revocation are recorded, never deleted, because a
 // deed executed while the POA was live stays good afterwards (Phase 42)
 export * from "./land";
+export * from "./legal";
 
 // ⭐ Running-account bills and contractor compliance — PORT WAVE B. The
 // densest money document a developer signs: gross certified, less everything

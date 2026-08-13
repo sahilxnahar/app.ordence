@@ -415,11 +415,25 @@ const LEGAL_TEMPLATE: IndustryTemplate = {
     {
       id: "practice",
       label: "Practice",
+      /*
+       * ⭐⭐ REWRITTEN IN v1.7.0. Until 0058 this section was three
+       * words over one asset register: "Matters" and "Cases" both went
+       * to /assets, and "Hearings" went to the generic calendar.
+       *
+       * 🔴 `cases` IS GONE RATHER THAN RE-POINTED. A matter and a case
+       * were never two things — they were one word twice — and keeping
+       * both would leave a menu entry that quietly means nothing.
+       *
+       * ⚠️ `hearings` IS GONE TOO, because a hearing only means anything
+       * against the matter it belongs to. The question a clerk asks at
+       * eight in the morning is "what is listed today", and the matters
+       * screen answers it directly.
+       */
       items: [
-        { id: "matters", label: "Matters", href: "/assets?type=matter", icon: "gavel" },
-        { id: "cases", label: "Cases", href: "/assets?type=case", icon: "scale" },
+        { id: "matters", label: "Matters", href: "/legal/matters", icon: "gavel" },
         { id: "contracts", label: "Contracts", href: "/assets?type=contract", icon: "file-text" },
-        { id: "hearings", label: "Hearings", href: "/calendar", icon: "calendar-days" },
+        { id: "time", label: "Time & Billing", href: "/time", icon: "clock" },
+        { id: "client-account", label: "Client Account", href: "/legal/client-account", icon: "landmark" },
       ],
     },
     {

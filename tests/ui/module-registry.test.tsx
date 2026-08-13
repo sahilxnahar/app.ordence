@@ -95,11 +95,19 @@ describe("registry completeness", () => {
 
     // Every entry here is a thing that can never be charged for. Changing
     // this list is a commercial decision, so it is written down.
+    //
+    // ⭐ `hearings` LEFT THIS LIST IN v1.7.0, and the change is
+    // deliberate. It was free because it was `feature: null` — a nav
+    // entry pointing at the generic calendar with nothing behind it. A
+    // real hearing diary, with limitation dates and the next-date rule,
+    // lives on `matters` and is a feature like any other.
+    //
+    // ⚠️ This test failing is the gate working: removing a nav entry
+    // silently changes what a workspace gets for nothing.
     expect(free).toEqual([
       "assistant",
       "billing",
       "dashboard",
-      "hearings",
       "notifications",
       "reports",
       "search",

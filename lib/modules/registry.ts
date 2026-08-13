@@ -362,23 +362,43 @@ export const MODULE_REGISTRY: Readonly<Record<string, ModuleDescriptor>> =
       status: "live",
       href: "/sales/inventory",
     },
+    /**
+     * ⭐⭐ A REAL TABLE NOW, NOT A LABEL OVER THE ASSET CATALOGUE.
+     *
+     * 🔴 Until 0058 "Matters" pointed at `/assets?type=matter` and
+     * "Cases" at `/assets?type=case` — the same asset register wearing
+     * two words. An advocate got a catalogue with no limitation date,
+     * no next-date discipline and no client account. The label was doing
+     * all of the work.
+     *
+     * ⚠️ `cases` is deliberately GONE rather than re-pointed. A matter
+     * and a case were never two things; they were one word twice, and
+     * keeping both would leave a menu entry that quietly means nothing.
+     */
     matters: {
       navId: "matters",
       label: "Matters",
-      description: "Legal matters, from the asset catalogue.",
+      description: "Matters, limitation dates and the hearing diary.",
       group: "projects",
-      feature: "assets.catalog",
+      feature: "sales.orders",
       status: "live",
-      href: "/assets?type=matter",
+      href: "/legal/matters",
+      industries: ["legal_advocate", "professional_services"],
     },
-    cases: {
-      navId: "cases",
-      label: "Cases",
-      description: "Litigation, from the asset catalogue.",
-      group: "projects",
-      feature: "assets.catalog",
+    /**
+     * 🔴 UNDER `money`, NOT `projects`. Client money is a regulated
+     * balance that a Bar Council inspection asks about, and the person
+     * who reconciles it is the person who reconciles the bank.
+     */
+    "client-account": {
+      navId: "client-account",
+      label: "Client Account",
+      description: "Money held for clients, and the rule that it is never the firm's.",
+      group: "money",
+      feature: "sales.orders",
       status: "live",
-      href: "/assets?type=case",
+      href: "/legal/client-account",
+      industries: ["legal_advocate", "professional_services"],
     },
     contracts: {
       navId: "contracts",
@@ -389,15 +409,13 @@ export const MODULE_REGISTRY: Readonly<Record<string, ModuleDescriptor>> =
       status: "live",
       href: "/assets?type=contract",
     },
-    hearings: {
-      navId: "hearings",
-      label: "Hearings",
-      description: "Court dates and the calendar around them.",
-      group: "projects",
-      feature: null,
-      status: "live",
-      href: "/calendar",
-    },
+    /**
+     * ⚠️ FOLDED INTO `matters`, DELIBERATELY. "Hearings" pointed at
+     * `/calendar` with `feature: null` — a generic diary wearing a legal
+     * word. A hearing only means anything against the matter it belongs
+     * to, and the question a clerk asks at eight in the morning is "what
+     * is listed today", which the matters screen answers directly.
+     */
 
     /* ---- SITE ---------------------------------------------------- */
 
