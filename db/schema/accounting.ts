@@ -456,3 +456,46 @@ export const financialPeriodsRelations = relations(financialPeriods, ({ one }) =
 export type FinancialPeriod = typeof financialPeriods.$inferSelect;
 export type NewFinancialPeriod = typeof financialPeriods.$inferInsert;
 export type PeriodStatus = (typeof periodStatusEnum.enumValues)[number];
+
+/* ------------------------------------------------------------------ */
+/* ⭐ WHICH LEDGER EACH PART OF A SALES DOCUMENT POSTS TO — Phase 58    */
+/* ------------------------------------------------------------------ */
+
+/**
+ * ⚠️ A LEDGER CANNOT BE GUESSED FROM ITS NAME OR ITS CODE. Every tenant
+ * builds their own chart of accounts — "4000" is revenue in one and a
+ * bank account in another. Inferring the mapping would post a customer's
+ * turnover into whatever ledger happened to match a string, and a
+ * posting that BALANCES is not the same as a posting that is RIGHT.
+ *
+ * So the mapping is data, declared once per tenant, and posting refuses
+ * when a role is unmapped rather than choosing on their behalf.
+ */
+export const salesPostingAccounts = pgTable(
+  "sales_posting_accounts",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    tenantId: uuid("tenant_id")
+      .notNull()
+      .references(() => tenants.id, { onDelete: "cascade" }),
+
+    /** ⚠️ varchar, not an enum — a new role is a row and a code change. */
+    role: varchar("role", { length: 40 }).notNull(),
+
+    ledgerId: uuid("ledger_id")
+      .notNull()
+      .references(() => ledgers.id, { onDelete: "restrict" }),
+
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+    createdBy: uuid("created_by").references(() => users.id, { onDelete: "set null" }),
+    updatedBy: uuid("updated_by").references(() => users.id, { onDelete: "set null" }),
+  },
+  (t) => ({
+    /** ⭐ One ledger per role per tenant — otherwise posting is non-deterministic. */
+    roleUnique: uniqueIndex("sales_posting_accounts_role_key").on(t.tenantId, t.role),
+    ledgerIdx: index("sales_posting_accounts_ledger_idx").on(t.tenantId, t.ledgerId),
+  }),
+);
+
+export type SalesPostingAccount = typeof salesPostingAccounts.$inferSelect;

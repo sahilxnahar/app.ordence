@@ -725,6 +725,36 @@ export const MODULE_REGISTRY: Readonly<Record<string, ModuleDescriptor>> =
       description: "Vendor invoices and input tax credit.",
       group: "site", feature: "purchases.invoices", status: "live", href: "/purchases",
     },
+    /**
+     * ⚠️ Its own entry rather than a tab under Invoices. Whoever is
+     * clearing unapplied cash at month end is looking for money that has
+     * arrived, not for a document that was sent.
+     */
+    /**
+     * ⚠️ Under `money`, beside the documents it posts. Somebody who
+     * notices the P&L is missing revenue looks here, not in Settings.
+     */
+    "sales-posting": {
+      navId: "sales-posting", label: "Sales Posting",
+      description: "Which ledger each part of a sales document posts to, and what is waiting.",
+      group: "money", feature: "sales.orders", status: "live", href: "/accounting/posting",
+    },
+    /**
+     * 🔴 Its own entry because it is the ONLY place property revenue is
+     * ever recognised. Buried in a booking detail screen it would be
+     * found by nobody, and a developer would report zero turnover while
+     * wondering why.
+     */
+    possession: {
+      navId: "possession", label: "Possession",
+      description: "Handing over flats — the moment property revenue is earned.",
+      group: "money", feature: "sales.receivables", status: "live", href: "/sales/possession",
+    },
+    receipts: {
+      navId: "receipts", label: "Receipts",
+      description: "Money received, and what is still unapplied.",
+      group: "money", feature: "sales.orders", status: "live", href: "/receipts",
+    },
     receivables: {
       navId: "receivables", label: "Payments Due",
       description: "Demands raised, ageing and the dunning ladder.",

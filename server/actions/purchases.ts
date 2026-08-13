@@ -32,6 +32,7 @@
 import { and, eq } from "drizzle-orm";
 import { revalidatePath } from "next/cache";
 import { withTenant } from "@/db";
+import { postPurchaseInvoice } from "@/server/accounting/post-sales";
 import {
   vendors,
   purchaseInvoices,
@@ -524,6 +525,63 @@ export async function recordPurchaseInvoice(
         description: `Purchase invoice ${data.invoiceNumber}`,
         creditMinor: p.totalMinor,
         debitMinor: 0n,
+      });
+
+      /**
+       * ⭐ THE BOOKS ARE TOLD — v1.0.0-rc.
+       *
+       * ⚠️ SAME TRANSACTION AS THE BILL AND ITS LINES. The posting reads
+       * the lines that were just inserted, so it must see them — and a
+       * bill recorded without its journal is the defect this phase
+       * exists to end.
+       *
+       * ⚠️ IT NEVER BLOCKS RECORDING. An unmapped chart of accounts puts
+       * the bill in the backlog at `/accounting/posting`, where posting
+       * it later is safe because it is idempotent.
+       */
+      const postedLines = await tx
+        .select({
+          taxableValueMinor: purchaseInvoiceLines.taxableValueMinor,
+          cgstMinor: purchaseInvoiceLines.cgstMinor,
+          sgstMinor: purchaseInvoiceLines.sgstMinor,
+          igstMinor: purchaseInvoiceLines.igstMinor,
+          cessMinor: purchaseInvoiceLines.cessMinor,
+          itcEligibility: purchaseInvoiceLines.itcEligibility,
+        })
+        .from(purchaseInvoiceLines)
+        .where(
+          and(
+            eq(purchaseInvoiceLines.tenantId, ctx.tenant.id),
+            eq(purchaseInvoiceLines.purchaseInvoiceId, header.id),
+          ),
+        );
+
+      await postPurchaseInvoice(tx, {
+        tenantId: ctx.tenant.id,
+        userId: ctx.user.id,
+        invoiceId: header.id,
+        invoiceNumber: data.invoiceNumber,
+        invoiceDate: data.invoiceDate,
+        vendorId: data.vendorId,
+        vendorName: null,
+        lines: postedLines.map((l) => ({
+          taxableValueMinor: l.taxableValueMinor,
+          cgstMinor: l.cgstMinor,
+          sgstMinor: l.sgstMinor,
+          igstMinor: l.igstMinor,
+          cessMinor: l.cessMinor,
+          /**
+           * ⚠️ ONLY `blocked` IS COST. Rule 42 common credit enters the
+           * ledger in full and is reversed separately by
+           * `runRule42ForPeriod` — treating it as cost here would double
+           * the reversal.
+           */
+          itcBlocked: l.itcEligibility === "blocked",
+        })),
+        roundOffMinor: p.roundOffMinor,
+        totalMinor: p.totalMinor,
+        rcmTaxMinor: p.rcmTaxMinor,
+        rcmSection: data.rcmSection ?? null,
       });
 
       return header.id;

@@ -75,6 +75,9 @@ import {
   resolvePolicies,
 } from "@/server/receivables/registry";
 import { withTenant } from "@/db";
+import { postDemandNotice, postBookingReceipt } from "@/server/accounting/post-sales";
+import { demandNotices, receipts } from "@/db/schema/receivables";
+import { bookings } from "@/db/schema/sales";
 import { and, eq } from "drizzle-orm";
 import {
   dunningPolicies,
@@ -384,6 +387,83 @@ export async function serveDemand(
 
     if (!outcome.ok) return receivablesFail(outcome.error);
 
+    /**
+     * ⭐ THE BOOKS ARE TOLD — v1.0.0-rc.3.
+     *
+     * 🔴 Dr Booking receivable / Cr **Advance from customers** / Cr Output
+     *    GST. NOT revenue — under Ind AS 115 a residential developer
+     *    recognises revenue at POSSESSION, and money taken before then is
+     *    the buyer's. The GST, however, IS payable now: time of supply
+     *    for construction services is the earlier of invoice or payment.
+     *
+     * ⚠️ ITS OWN TRANSACTION, NOT THE ENGINE'S. `issueDemand()` owns its
+     * scope and this runs after it commits — so a posting failure cannot
+     * un-serve a demand the buyer has already received. The backlog at
+     * `/accounting/posting` catches anything that did not land, and
+     * idempotency makes the retry safe.
+     */
+    await withTenant(
+      ctx.tenant.id,
+      async (tx) => {
+        const [d] = await tx
+          .select({
+            id: demandNotices.id,
+            noticeNumber: demandNotices.noticeNumber,
+            bookingId: demandNotices.bookingId,
+            noticeDate: demandNotices.noticeDate,
+            dueDate: demandNotices.dueDate,
+            principalMinor: demandNotices.principalMinor,
+            cgstMinor: demandNotices.cgstMinor,
+            sgstMinor: demandNotices.sgstMinor,
+            igstMinor: demandNotices.igstMinor,
+            cessMinor: demandNotices.cessMinor,
+            totalMinor: demandNotices.totalMinor,
+            bookingReference: bookings.reference,
+          })
+          .from(demandNotices)
+          .leftJoin(
+            bookings,
+            and(
+              eq(bookings.id, demandNotices.bookingId),
+              eq(bookings.tenantId, ctx.tenant.id),
+            ),
+          )
+          .where(
+            and(
+              eq(demandNotices.tenantId, ctx.tenant.id),
+              eq(demandNotices.id, outcome.demand.id),
+            ),
+          )
+          .limit(1);
+
+        if (!d) return;
+
+        await postDemandNotice(tx, {
+          tenantId: ctx.tenant.id,
+          userId: ctx.user.id,
+          demandId: d.id,
+          demandNumber: d.noticeNumber,
+          /**
+           * ⚠️ THE NOTICE DATE, NOT THE DUE DATE. The liability arises
+           * when the demand is issued; the due date is when the buyer is
+           * late. Posting on the due date would move a project's GST
+           * liability into the following month, every time.
+           */
+          servedOn: String(d.noticeDate),
+          bookingId: d.bookingId,
+          bookingReference: d.bookingReference ?? "—",
+          buyerName: null,
+          principalMinor: d.principalMinor,
+          cgstMinor: d.cgstMinor,
+          sgstMinor: d.sgstMinor,
+          igstMinor: d.igstMinor,
+          cessMinor: d.cessMinor,
+          totalMinor: d.totalMinor,
+        });
+      },
+      { impersonationId: ctx.impersonationId },
+    );
+
     await writeAudit(ctx, {
       action: "update",
       resourceType: "demand_notice",
@@ -648,6 +728,55 @@ export async function recordPayment(
       input: data,
     });
     if (!outcome.ok) return receivablesFail(outcome.error);
+
+    /**
+     * ⭐ Dr Bank + Dr TDS receivable / Cr Booking receivable.
+     *
+     * ⚠️ IT TOUCHES NEITHER REVENUE NOR THE ADVANCE — both were recorded
+     * when the demand was served. A receipt only turns a receivable into
+     * cash, and posting it to revenue as well is the double-count that
+     * makes a developer's turnover exactly twice its collections.
+     */
+    await withTenant(
+      ctx.tenant.id,
+      async (tx) => {
+        const [r] = await tx
+          .select({
+            id: receipts.id,
+            receiptNumber: receipts.receiptNumber,
+            receivedOn: receipts.receivedOn,
+            bookingId: receipts.bookingId,
+            amountMinor: receipts.amountMinor,
+            tdsCreditMinor: receipts.tdsCreditMinor,
+            bookingReference: bookings.reference,
+          })
+          .from(receipts)
+          .leftJoin(
+            bookings,
+            and(eq(bookings.id, receipts.bookingId), eq(bookings.tenantId, ctx.tenant.id)),
+          )
+          .where(
+            and(eq(receipts.tenantId, ctx.tenant.id), eq(receipts.id, outcome.receipt.id)),
+          )
+          .limit(1);
+
+        if (!r) return;
+
+        await postBookingReceipt(tx, {
+          tenantId: ctx.tenant.id,
+          userId: ctx.user.id,
+          receiptId: r.id,
+          receiptNumber: r.receiptNumber,
+          receivedOn: String(r.receivedOn),
+          bookingId: r.bookingId,
+          bookingReference: r.bookingReference ?? "—",
+          buyerName: null,
+          cashMinor: r.amountMinor,
+          tdsMinor: r.tdsCreditMinor,
+        });
+      },
+      { impersonationId: ctx.impersonationId },
+    );
 
     await writeAudit(ctx, {
       action: "create",

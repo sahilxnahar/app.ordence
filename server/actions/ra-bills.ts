@@ -64,6 +64,7 @@ import { z } from "zod";
 import { and, eq, sql, desc, inArray, isNull } from "drizzle-orm";
 import { revalidatePath } from "next/cache";
 import { withTenant } from "@/db";
+import { postRaBill } from "@/server/accounting/post-sales";
 import {
   boqs,
   boqItems,
@@ -551,6 +552,63 @@ export async function certifyRaBill(
             updatedAt: new Date(),
           })
           .where(and(eq(raBills.tenantId, ctx.tenant.id), eq(raBills.id, data.raBillId)));
+
+        /**
+         * ⭐ THE BOOKS ARE TOLD — v1.0.0-rc.2.
+         *
+         * ⚠️ ON CERTIFICATION, NOT ON APPROVAL OR PAYMENT. Certification
+         * is the engineer saying the work exists — that is when the cost
+         * was incurred. Waiting for payment understates cost at every
+         * month end and dumps it into whichever month a cheque cleared.
+         *
+         * ⚠️ IT NEVER BLOCKS CERTIFYING. Unmapped roles put the bill in
+         * the backlog at `/accounting/posting`, where posting it later is
+         * safe because it is idempotent.
+         */
+        const [certified] = await tx
+          .select({
+            id: raBills.id,
+            billNo: raBills.billNo,
+            vendorId: raBills.vendorId,
+            periodTo: raBills.periodTo,
+            grossValueMinor: raBills.grossValueMinor,
+            retentionAmountMinor: raBills.retentionAmountMinor,
+            tdsAmountMinor: raBills.tdsAmountMinor,
+            cessAmountMinor: raBills.cessAmountMinor,
+            otherDeductionsMinor: raBills.otherDeductionsMinor,
+            netPayableMinor: raBills.netPayableMinor,
+          })
+          .from(raBills)
+          .where(and(eq(raBills.tenantId, ctx.tenant.id), eq(raBills.id, data.raBillId)))
+          .limit(1);
+
+        if (certified) {
+          await postRaBill(tx, {
+            tenantId: ctx.tenant.id,
+            userId: ctx.user.id,
+            billId: certified.id,
+            billNumber: certified.billNo,
+            /**
+             * ⚠️ THE END OF THE WORK PERIOD, NOT TODAY. An RA bill for
+             * March work certified on 4 April is March's cost. `raBills`
+             * has no bill date of its own, so `period_to` is the closest
+             * true answer — and where it is absent, the certification
+             * date is the only one left.
+             */
+            billDate:
+              certified.periodTo !== null
+                ? String(certified.periodTo)
+                : new Date().toISOString().slice(0, 10),
+            vendorId: certified.vendorId,
+            contractorName: null,
+            grossValueMinor: certified.grossValueMinor,
+            retentionAmountMinor: certified.retentionAmountMinor,
+            tdsAmountMinor: certified.tdsAmountMinor,
+            cessAmountMinor: certified.cessAmountMinor,
+            otherDeductionsMinor: certified.otherDeductionsMinor,
+            netPayableMinor: certified.netPayableMinor,
+          });
+        }
       },
       { impersonationId: ctx.impersonationId },
     );

@@ -1,3 +1,103 @@
+# v1.0.0-rc.4 — POSSESSION: THE DATE THAT MAKES REVENUE REAL
+
+**Repo: `app.ordence`** · 🔴 **SQL: `0052` before pushing** · No new variables
+
+- ⭐ **`/sales/possession`** — the screen `postPossession()` needed and did
+  not have. Without it a developer collects a whole project and reports
+  **zero turnover forever**.
+- ⚠️ **The advance is DERIVED from served demands, never typed** — and it
+  is the PRINCIPAL, never the total, because the GST went to output tax.
+- ⚠️ **Possession is a DATE, not a status.** No `ALTER TYPE`, no second
+  source of truth.
+- 🔴 **A cancelled booking cannot be handed over** — refused in the action
+  and by a CHECK constraint.
+- The form shows the **Indian financial year** the revenue lands in, and
+  warns about uncollected money without blocking.
+
+# v1.0.0-rc.3 — REAL ESTATE REACHES THE LEDGER
+
+**Repo: `app.ordence`** · ⚠️ **No SQL** · No new variables
+
+- 🔴 **Money collected before possession is a LIABILITY, not revenue.**
+  Ind AS 115. Three stages: demand → advance + GST, receipt → cash,
+  possession → the only revenue leg there is.
+- ⚠️ **The GST liability arises at the DEMAND, not at possession** —
+  time of supply for construction services is the earlier of invoice or
+  payment.
+- ⭐ **The counterparty is the BOOKING.** Settles the question left open
+  in Session 2 without inventing a company per home buyer.
+- Section 194-IA TDS is treated as money received.
+- `receivables` off the debt list; gate now **4 of 9**.
+
+# v1.0.0-rc.2 — RA BILLS REACH THE LEDGER
+
+**Repo: `app.ordence`** · ⚠️ **No SQL** · No new variables
+
+- **RA bills post on CERTIFICATION.** Dr Work in Progress (gross),
+  Cr Retention payable, Cr TDS payable, Cr Labour cess payable,
+  Cr Recoveries, Cr Sundry Creditors (net).
+- 🔴 **A NEGATIVE net payable flips the contractor leg to a DEBIT.** Lean
+  months where recovered advances exceed work certified are normal — the
+  schema says so — and a naive posting breaks on them.
+- ⚠️ **Retention is a liability, not a reduction of cost.**
+- ⚠️ **`tds_payable` (we deduct) is distinguished from `tds_receivable`
+  (customers deduct from us)** in the role help text.
+- **Gate debt list CORRECTED, not just extended:** `variations` removed
+  (approving one moves no money), `labour` excuse rewritten to the real
+  blocker (no payroll run exists at all). Now **3 of 9**.
+
+# v1.0.0-rc.1 — THE PURCHASE SIDE, AND THE SEVENTH GATE
+
+**Repo: `app.ordence`** · ⚠️ **No SQL** (`0051` from v016 covers it) · No new variables
+
+- **Purchases post to the ledger.** Dr Expense + Dr Input CGST/SGST/IGST,
+  Cr Sundry Creditors. 🔴 **Blocked ITC (Section 17(5)) is added to the
+  expense, not held as an asset.**
+- **Reverse charge is a SECOND transaction** — Dr Input tax (RCM),
+  Cr RCM payable. The vendor is not a party to it and `rcm_tax_minor` is
+  not part of the bill total.
+- **The eligible/blocked split is taken line by line, never apportioned.**
+- ⭐ **`check:posting` — the seventh gate.** Fails when an action module
+  that writes financial documents has no path to `journal_entries`.
+  Reports **2 of 10** and names the other eight with a reason and a session.
+- Purchase roles share `sales_posting_accounts`; the setup screen splits
+  sales and purchase.
+
+# v0.99.0-alpha — THE BOOKS ARE TOLD
+
+**Repo: `app.ordence`** · 🔴 **SQL: run `0051` BEFORE pushing** · No new variables
+
+🔴 **Sales invoices never posted to the double-entry ledger.** Every invoice
+raised across Phases 49–57 was absent from the P&L, the balance sheet, the
+trial balance, the GST output liability and the Tally export — which reads the
+ledger and only the ledger.
+
+- **`lib/accounting/sales-posting.ts`** — pure leg builders. Invoice, credit
+  note (a mirror, not a negative), receipt (TDS is an asset).
+- **`server/accounting/post-sales.ts`** — resolves roles → the tenant's ledgers,
+  refuses the whole posting when any role is unmapped, shares the caller's
+  transaction.
+- **`0051`** — `sales_posting_accounts` + a partial unique index on
+  `transaction_number LIKE 'SALES:%'` so posting is idempotent at the database.
+- **`/accounting/posting`** — map the roles, see the backlog, post it.
+- Wired into `issueInvoice`, `issueCreditNote`, `recordCustomerReceipt`.
+  ⚠️ Posting never blocks issuing.
+
+# v0.98.0-alpha — THE LAST FOUR INVISIBLE ENGINES
+
+**Repo: `app.ordence`** · **No SQL** · **No new Railway variables**
+
+- **`/credit-notes/[id]/print`** — the credit note as a document, with the
+  original invoice number and date in the header (Rule 53).
+- **`/companies/[id]/statement`** — statement of account. Overdue, not-yet-due
+  and unapplied credit shown as three figures, never netted.
+- **`/gst/gstr1`** — the return, every table, warnings above the figures.
+  Built, not filed, and it says so.
+- **`/receipts` and `/receipts/[id]`** — unapplied cash, and applying one
+  receipt across several invoices. Oldest-first is a button, never a default.
+- 🔴 **`allocate-receipt.tsx` was a second money parser.** Now delegates to
+  `parseMoney`.
+
 # v0.97.0-alpha — THE PRINTED INVOICE
 
 **Repo: `app.ordence`** · **No SQL** · **No new Railway variables**

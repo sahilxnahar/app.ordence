@@ -64,6 +64,11 @@ import {
   gstr1PeriodSchema,
 } from "@/lib/validators/sales-invoices";
 import {
+  postSalesInvoice,
+  postSalesCreditNote,
+  postCustomerReceipt,
+} from "@/server/accounting/post-sales";
+import {
   assessCreditLines,
   assessCreditHeadroom,
   headroomMinor,
@@ -365,6 +370,38 @@ export async function issueInvoice(
             ),
           );
 
+        /**
+         * ⭐ THE BOOKS ARE TOLD — v0.99.0. Until this line, every sales
+         * invoice Ordence ever issued was absent from the P&L, the
+         * balance sheet, the trial balance and the Tally export.
+         *
+         * ⚠️ IT SHARES THIS TRANSACTION. The invoice and the journal that
+         * records it commit together or not at all.
+         *
+         * ⚠️ AND IT NEVER BLOCKS THE ISSUE. A tenant who has not mapped a
+         * chart of accounts must still be able to invoice; the document
+         * lands in the posting backlog at `/accounting/posting` instead,
+         * where posting it later is safe because it is idempotent.
+         */
+        await postSalesInvoice(tx, {
+          tenantId: ctx.tenant.id,
+          userId: ctx.user.id,
+          invoiceId: invoice.id,
+          invoiceNumber,
+          invoiceDate: String(invoice.invoiceDate),
+          companyId: invoice.companyId,
+          customerName: invoice.customerLegalName,
+          tax: {
+            taxableValueMinor: toBigIntAmount(invoice.taxableValueMinor),
+            cgstMinor: toBigIntAmount(invoice.cgstMinor),
+            sgstMinor: toBigIntAmount(invoice.sgstMinor),
+            igstMinor: toBigIntAmount(invoice.igstMinor),
+            cessMinor: toBigIntAmount(invoice.cessMinor),
+            roundOffMinor: toBigIntAmount(invoice.roundOffMinor),
+            totalMinor: toBigIntAmount(invoice.totalMinor),
+          },
+        });
+
         await writeAudit(ctx, {
           action: "update",
           resourceType: "sales_invoice",
@@ -528,6 +565,34 @@ export async function recordCustomerReceipt(
           .returning({ id: customerReceipts.id });
 
         if (!created) throw new Error("The receipt could not be recorded.");
+
+        /**
+         * ⭐ Dr Bank, Dr TDS receivable, Cr Sundry Debtors.
+         *
+         * ⚠️ THE CUSTOMER IS CREDITED CASH **PLUS** TDS. They settled
+         * that part of the invoice as surely as if they had wired it —
+         * they paid it to the Government on our behalf. Crediting only
+         * the cash leaves a permanent shortfall on their account.
+         */
+        const [receiptCompany] = await tx
+          .select({ name: companies.name })
+          .from(companies)
+          .where(
+            and(eq(companies.tenantId, ctx.tenant.id), eq(companies.id, data.companyId)),
+          )
+          .limit(1);
+
+        await postCustomerReceipt(tx, {
+          tenantId: ctx.tenant.id,
+          userId: ctx.user.id,
+          receiptId: created.id,
+          receiptNumber,
+          receivedOn: data.receivedOn,
+          companyId: data.companyId,
+          customerName: receiptCompany?.name ?? null,
+          cashMinor: BigInt(data.amountMinor),
+          tdsMinor: BigInt(data.tdsCreditMinor ?? "0"),
+        });
 
         await writeAudit(ctx, {
           action: "create",
@@ -1322,6 +1387,38 @@ export async function issueCreditNote(
               eq(salesCreditNotes.id, data.creditNoteId),
             ),
           );
+
+        /** ⭐ The mirror posting — revenue debited, output tax reversed. */
+        const [againstInvoice] = await tx
+          .select({ invoiceNumber: salesInvoices.invoiceNumber })
+          .from(salesInvoices)
+          .where(
+            and(
+              eq(salesInvoices.tenantId, ctx.tenant.id),
+              eq(salesInvoices.id, note.invoiceId),
+            ),
+          )
+          .limit(1);
+
+        await postSalesCreditNote(tx, {
+          tenantId: ctx.tenant.id,
+          userId: ctx.user.id,
+          creditNoteId: note.id,
+          creditNoteNumber,
+          noteDate: String(note.noteDate),
+          invoiceNumber: againstInvoice?.invoiceNumber ?? "—",
+          companyId: note.companyId,
+          customerName: note.customerLegalName,
+          tax: {
+            taxableValueMinor: toBigIntAmount(note.taxableValueMinor),
+            cgstMinor: toBigIntAmount(note.cgstMinor),
+            sgstMinor: toBigIntAmount(note.sgstMinor),
+            igstMinor: toBigIntAmount(note.igstMinor),
+            cessMinor: toBigIntAmount(note.cessMinor),
+            roundOffMinor: toBigIntAmount(note.roundOffMinor),
+            totalMinor: toBigIntAmount(note.totalMinor),
+          },
+        });
 
         await writeAudit(ctx, {
           action: "update",
@@ -2588,5 +2685,485 @@ export async function getInvoiceForPrint(input: unknown): Promise<
     return { ok: true, data: result };
   } catch (err) {
     return toSalesActionError(err, "getInvoiceForPrint");
+  }
+}
+
+/* ================================================================== */
+/* ⭐ CREDIT NOTE ON PAPER — Phase 56                                   */
+/* ================================================================== */
+
+/**
+ * ⚠️ A CREDIT NOTE IS A DOCUMENT THE CUSTOMER HAS TO RECEIVE, not an
+ * internal adjustment. They reverse input tax credit against it and their
+ * accountant files it beside the invoice. One that exists only in our
+ * database puts them in default of Section 34 without their knowing.
+ *
+ * ⚠️ RULE 53 REQUIRES IT TO CARRY THE ORIGINAL INVOICE'S NUMBER AND DATE.
+ * That is the single field distinguishing a credit note from an invoice
+ * with a minus sign, and it is why the invoice is looked up here rather
+ * than copied onto the note at raise time.
+ */
+export async function getCreditNoteForPrint(input: unknown): Promise<
+  ActionResult<{
+    note: {
+      id: string;
+      creditNoteNumber: string;
+      noteDate: string;
+      status: string;
+      reasonCode: string;
+      reason: string;
+      invoiceId: string;
+      invoiceNumber: string;
+      invoiceDate: string | null;
+      placeOfSupplyCode: string | null;
+      isInterState: boolean;
+      taxableValueMinor: string;
+      cgstMinor: string;
+      sgstMinor: string;
+      igstMinor: string;
+      cessMinor: string;
+      roundOffMinor: string;
+      totalMinor: string;
+      amountInWords: string;
+    };
+    supplier: PrintedParty;
+    recipient: PrintedParty;
+    lines: {
+      id: string;
+      lineNo: number;
+      description: string;
+      hsnSacCode: string | null;
+      quantity: string;
+      uom: string;
+      taxRateBps: number | null;
+      unitPriceMinor: string;
+      taxableValueMinor: string;
+      cgstMinor: string;
+      sgstMinor: string;
+      igstMinor: string;
+      lineTotalMinor: string;
+    }[];
+    copies: readonly string[];
+    gaps: PrintFinding[];
+  }>
+> {
+  try {
+    const data = issueCreditNoteSchema.parse(input);
+    const ctx = await requirePermission("sales.invoices.read", {
+      type: "sales_credit_note",
+      id: data.creditNoteId,
+    });
+
+    const result = await withTenant(ctx.tenant.id, async (tx) => {
+      const [note] = await tx
+        .select()
+        .from(salesCreditNotes)
+        .where(
+          and(
+            eq(salesCreditNotes.tenantId, ctx.tenant.id),
+            eq(salesCreditNotes.id, data.creditNoteId),
+          ),
+        )
+        .limit(1);
+
+      if (!note) throw new Error("That credit note no longer exists.");
+
+      const [inv] = await tx
+        .select({
+          invoiceNumber: salesInvoices.invoiceNumber,
+          invoiceDate: salesInvoices.invoiceDate,
+          supplyType: salesInvoices.supplyType,
+          supplierRegistrationId: salesInvoices.supplierRegistrationId,
+          supplierStateCode: salesInvoices.supplierStateCode,
+          customerAddress: salesInvoices.customerAddress,
+        })
+        .from(salesInvoices)
+        .where(
+          and(eq(salesInvoices.tenantId, ctx.tenant.id), eq(salesInvoices.id, note.invoiceId)),
+        )
+        .limit(1);
+
+      let supplier: PrintedParty = {
+        legalName: null,
+        tradeName: null,
+        gstin: note.supplierGstin,
+        stateCode: inv?.supplierStateCode ?? null,
+        address: {},
+      };
+
+      if (inv?.supplierRegistrationId) {
+        const [reg] = await tx
+          .select({
+            legalName: gstRegistrations.legalName,
+            tradeName: gstRegistrations.tradeName,
+            address: gstRegistrations.address,
+          })
+          .from(gstRegistrations)
+          .where(
+            and(
+              eq(gstRegistrations.tenantId, ctx.tenant.id),
+              eq(gstRegistrations.id, inv.supplierRegistrationId),
+            ),
+          )
+          .limit(1);
+        if (reg) {
+          supplier = {
+            legalName: reg.legalName,
+            tradeName: reg.tradeName,
+            gstin: note.supplierGstin,
+            stateCode: inv.supplierStateCode,
+            address: (reg.address ?? {}) as PostalAddress,
+          };
+        }
+      }
+
+      const lines = await tx
+        .select()
+        .from(salesCreditNoteLines)
+        .where(
+          and(
+            eq(salesCreditNoteLines.tenantId, ctx.tenant.id),
+            eq(salesCreditNoteLines.creditNoteId, note.id),
+          ),
+        )
+        .orderBy(salesCreditNoteLines.lineNo);
+
+      return {
+        note: {
+          id: note.id,
+          creditNoteNumber: note.creditNoteNumber,
+          noteDate: String(note.noteDate),
+          status: note.status,
+          reasonCode: note.reasonCode,
+          reason: note.reason,
+          invoiceId: note.invoiceId,
+          invoiceNumber: inv?.invoiceNumber ?? "—",
+          invoiceDate: inv?.invoiceDate ? String(inv.invoiceDate) : null,
+          placeOfSupplyCode: note.placeOfSupplyCode,
+          isInterState: note.isInterState,
+          taxableValueMinor: serializeAmount(toBigIntAmount(note.taxableValueMinor)),
+          cgstMinor: serializeAmount(toBigIntAmount(note.cgstMinor)),
+          sgstMinor: serializeAmount(toBigIntAmount(note.sgstMinor)),
+          igstMinor: serializeAmount(toBigIntAmount(note.igstMinor)),
+          cessMinor: serializeAmount(toBigIntAmount(note.cessMinor)),
+          roundOffMinor: serializeAmount(toBigIntAmount(note.roundOffMinor)),
+          totalMinor: serializeAmount(toBigIntAmount(note.totalMinor)),
+          /**
+           * ⚠️ SPOKEN AS A POSITIVE AMOUNT. "Minus Four Thousand Rupees"
+           * on a credit note reads as money owed TO the customer. It is a
+           * reduction of what they owe, and the document says so in words
+           * beside the figure.
+           */
+          amountInWords: rupeesInWords(toBigIntAmount(note.totalMinor)),
+        },
+        supplier,
+        recipient: {
+          legalName: note.customerLegalName,
+          tradeName: null,
+          gstin: note.customerGstin,
+          stateCode: null,
+          address: (inv?.customerAddress ?? {}) as PostalAddress,
+        },
+        lines: lines.map((l) => ({
+          id: l.id,
+          lineNo: l.lineNo,
+          description: l.description,
+          hsnSacCode: l.hsnSacCode,
+          quantity: String(l.quantity),
+          uom: l.uom,
+          taxRateBps: l.taxRateBps,
+          unitPriceMinor: serializeAmount(toBigIntAmount(l.unitPriceMinor)),
+          taxableValueMinor: serializeAmount(toBigIntAmount(l.taxableValueMinor)),
+          cgstMinor: serializeAmount(toBigIntAmount(l.cgstMinor)),
+          sgstMinor: serializeAmount(toBigIntAmount(l.sgstMinor)),
+          igstMinor: serializeAmount(toBigIntAmount(l.igstMinor)),
+          lineTotalMinor: serializeAmount(toBigIntAmount(l.lineTotalMinor)),
+        })),
+        copies: copyLabelsFor(inv?.supplyType ?? "goods"),
+        gaps: printGaps({
+          hasDeliveryAddress: true,
+          hasSignatory: false,
+          supplierGstin: note.supplierGstin,
+          supplierLegalName: supplier.legalName,
+        }),
+      };
+    });
+
+    return { ok: true, data: result };
+  } catch (err) {
+    return toSalesActionError(err, "getCreditNoteForPrint");
+  }
+}
+
+/* ================================================================== */
+/* ⭐ UNAPPLIED CASH — Phase 57                                         */
+/* ================================================================== */
+
+/**
+ * Receipts with money still sitting on them.
+ *
+ * 🔴 THIS IS THE NUMBER NOBODY WAS SHOWN AND EVERYBODY NEEDS. A receipt
+ *    that is recorded but not allocated leaves the invoice looking unpaid
+ *    and the customer looking overdue — so a dunning letter goes to
+ *    somebody who has already paid, which is the fastest way to lose one.
+ *
+ * ⚠️ TDS COUNTS AS RECEIVED. A customer who withheld tax under 194-Q paid
+ * that money to the Government on our behalf. `amount + tds - allocated`
+ * is what remains to apply; leaving TDS out makes a fully-settled account
+ * show a permanent shortfall.
+ *
+ * ⚠️ BOUNCED RECEIPTS ARE EXCLUDED. Money that came back is not money
+ * waiting to be applied, and offering it in an allocation screen is how a
+ * cheque that failed gets applied to an invoice anyway.
+ */
+export async function listUnappliedReceipts(input?: { limit?: number }): Promise<
+  ActionResult<{
+    rows: {
+      id: string;
+      receiptNumber: string;
+      receivedOn: string;
+      companyId: string;
+      customerName: string | null;
+      method: string;
+      status: string;
+      instrumentRef: string | null;
+      amountMinor: string;
+      tdsCreditMinor: string;
+      allocatedMinor: string;
+      unappliedMinor: string;
+    }[];
+    summary: { unappliedTotalMinor: string; receiptCount: number };
+  }>
+> {
+  try {
+    const ctx = await requirePermission("sales.invoices.read");
+    const limit = Math.min(Math.max(input?.limit ?? 100, 1), 500);
+
+    const result = await withTenant(ctx.tenant.id, async (tx) => {
+      const rows = await tx
+        .select({
+          id: customerReceipts.id,
+          receiptNumber: customerReceipts.receiptNumber,
+          receivedOn: customerReceipts.receivedOn,
+          companyId: customerReceipts.companyId,
+          customerName: companies.name,
+          method: customerReceipts.method,
+          status: customerReceipts.status,
+          instrumentRef: customerReceipts.instrumentRef,
+          amountMinor: customerReceipts.amountMinor,
+          tdsCreditMinor: customerReceipts.tdsCreditMinor,
+          allocatedMinor: customerReceipts.allocatedMinor,
+        })
+        .from(customerReceipts)
+        .leftJoin(
+          companies,
+          and(
+            eq(companies.id, customerReceipts.companyId),
+            eq(companies.tenantId, ctx.tenant.id),
+          ),
+        )
+        .where(
+          and(
+            eq(customerReceipts.tenantId, ctx.tenant.id),
+            notInArray(customerReceipts.status, ["bounced"]),
+            sql`${customerReceipts.allocatedMinor} < ${customerReceipts.amountMinor} + ${customerReceipts.tdsCreditMinor}`,
+          ),
+        )
+        .orderBy(desc(customerReceipts.receivedOn))
+        .limit(limit);
+
+      let unappliedTotal = 0n;
+      const mapped = rows.map((r) => {
+        const unapplied =
+          toBigIntAmount(r.amountMinor) +
+          toBigIntAmount(r.tdsCreditMinor) -
+          toBigIntAmount(r.allocatedMinor);
+        unappliedTotal += unapplied;
+        return {
+          id: r.id,
+          receiptNumber: r.receiptNumber,
+          receivedOn: String(r.receivedOn),
+          companyId: r.companyId,
+          customerName: r.customerName,
+          method: r.method,
+          status: r.status,
+          instrumentRef: r.instrumentRef,
+          amountMinor: serializeAmount(toBigIntAmount(r.amountMinor)),
+          tdsCreditMinor: serializeAmount(toBigIntAmount(r.tdsCreditMinor)),
+          allocatedMinor: serializeAmount(toBigIntAmount(r.allocatedMinor)),
+          unappliedMinor: serializeAmount(unapplied),
+        };
+      });
+
+      return {
+        rows: mapped,
+        summary: {
+          unappliedTotalMinor: serializeAmount(unappliedTotal),
+          receiptCount: mapped.length,
+        },
+      };
+    });
+
+    return { ok: true, data: result };
+  } catch (err) {
+    return toSalesActionError(err, "listUnappliedReceipts");
+  }
+}
+
+/**
+ * One receipt, and every invoice of that customer it could be applied to.
+ *
+ * ⚠️ ONLY THAT CUSTOMER'S INVOICES. Applying one company's payment to
+ * another's invoice is not a UI mistake to be undone later — it is two
+ * wrong balances, two wrong statements, and a reconciliation that never
+ * closes. The picker cannot offer what the action would refuse.
+ */
+export async function getReceiptAllocation(input: unknown): Promise<
+  ActionResult<{
+    receipt: {
+      id: string;
+      receiptNumber: string;
+      receivedOn: string;
+      companyId: string;
+      customerName: string | null;
+      method: string;
+      status: string;
+      instrumentRef: string | null;
+      amountMinor: string;
+      tdsCreditMinor: string;
+      allocatedMinor: string;
+      unappliedMinor: string;
+    };
+    openInvoices: {
+      id: string;
+      invoiceNumber: string;
+      invoiceDate: string;
+      dueDate: string | null;
+      status: string;
+      totalMinor: string;
+      receivedMinor: string;
+      outstandingMinor: string;
+    }[];
+  }>
+> {
+  try {
+    const data = bounceReceiptSchema
+      .pick({ receiptId: true })
+      .parse({ receiptId: (input as { receiptId?: unknown })?.receiptId });
+
+    const ctx = await requirePermission("sales.invoices.read", {
+      type: "customer_receipt",
+      id: data.receiptId,
+    });
+
+    const result = await withTenant(ctx.tenant.id, async (tx) => {
+      const [r] = await tx
+        .select({
+          id: customerReceipts.id,
+          receiptNumber: customerReceipts.receiptNumber,
+          receivedOn: customerReceipts.receivedOn,
+          companyId: customerReceipts.companyId,
+          customerName: companies.name,
+          method: customerReceipts.method,
+          status: customerReceipts.status,
+          instrumentRef: customerReceipts.instrumentRef,
+          amountMinor: customerReceipts.amountMinor,
+          tdsCreditMinor: customerReceipts.tdsCreditMinor,
+          allocatedMinor: customerReceipts.allocatedMinor,
+        })
+        .from(customerReceipts)
+        .leftJoin(
+          companies,
+          and(
+            eq(companies.id, customerReceipts.companyId),
+            eq(companies.tenantId, ctx.tenant.id),
+          ),
+        )
+        .where(
+          and(
+            eq(customerReceipts.tenantId, ctx.tenant.id),
+            eq(customerReceipts.id, data.receiptId),
+          ),
+        )
+        .limit(1);
+
+      if (!r) throw new Error("That receipt no longer exists.");
+
+      const invoices = await tx
+        .select({
+          id: salesInvoices.id,
+          invoiceNumber: salesInvoices.invoiceNumber,
+          invoiceDate: salesInvoices.invoiceDate,
+          dueDate: salesInvoices.dueDate,
+          status: salesInvoices.status,
+          totalMinor: salesInvoices.totalMinor,
+          receivedMinor: salesInvoices.receivedMinor,
+        })
+        .from(salesInvoices)
+        .where(
+          and(
+            eq(salesInvoices.tenantId, ctx.tenant.id),
+            eq(salesInvoices.companyId, r.companyId),
+            /**
+             * ⚠️ DRAFTS AND CANCELLED INVOICES ARE NOT OFFERED. Money
+             * against a document the customer has never seen is a
+             * data-entry error, not a payment.
+             */
+            notInArray(salesInvoices.status, ["draft", "cancelled"]),
+          ),
+        )
+        .orderBy(salesInvoices.invoiceDate);
+
+      const open = invoices
+        .map((i) => {
+          const total = toBigIntAmount(i.totalMinor);
+          const received = toBigIntAmount(i.receivedMinor);
+          return {
+            id: i.id,
+            invoiceNumber: i.invoiceNumber,
+            invoiceDate: String(i.invoiceDate),
+            dueDate: i.dueDate ? String(i.dueDate) : null,
+            status: i.status,
+            totalMinor: serializeAmount(total),
+            receivedMinor: serializeAmount(received),
+            outstandingMinorRaw: total - received,
+            outstandingMinor: serializeAmount(total - received),
+          };
+        })
+        /**
+         * ⚠️ A SETTLED INVOICE IS EXCLUDED, NOT SHOWN GREYED OUT. A list
+         * full of rows you cannot choose is a list nobody reads — and the
+         * one invoice that IS open hides in it.
+         */
+        .filter((i) => i.outstandingMinorRaw > 0n)
+        .map(({ outstandingMinorRaw: _drop, ...rest }) => rest);
+
+      const unapplied =
+        toBigIntAmount(r.amountMinor) +
+        toBigIntAmount(r.tdsCreditMinor) -
+        toBigIntAmount(r.allocatedMinor);
+
+      return {
+        receipt: {
+          id: r.id,
+          receiptNumber: r.receiptNumber,
+          receivedOn: String(r.receivedOn),
+          companyId: r.companyId,
+          customerName: r.customerName,
+          method: r.method,
+          status: r.status,
+          instrumentRef: r.instrumentRef,
+          amountMinor: serializeAmount(toBigIntAmount(r.amountMinor)),
+          tdsCreditMinor: serializeAmount(toBigIntAmount(r.tdsCreditMinor)),
+          allocatedMinor: serializeAmount(toBigIntAmount(r.allocatedMinor)),
+          unappliedMinor: serializeAmount(unapplied),
+        },
+        openInvoices: open,
+      };
+    });
+
+    return { ok: true, data: result };
+  } catch (err) {
+    return toSalesActionError(err, "getReceiptAllocation");
   }
 }

@@ -113,6 +113,18 @@ export default async function CreditNoteDetailPage({
             invoiceNumber={note.invoiceNumber}
             totalLabel={inr(note.totalMinor)}
           />
+          {/**
+           * ⚠️ THE CUSTOMER HAS TO RECEIVE THIS DOCUMENT. They reverse
+           * input tax credit against it. A credit note that exists only
+           * in our database leaves them in default of Section 34 without
+           * their knowing.
+           */}
+          <Link
+            href={`/credit-notes/${note.id}/print`}
+            className="mt-4 inline-block text-sm underline underline-offset-4"
+          >
+            Print / Save as PDF
+          </Link>
         </CardContent>
       </Card>
 

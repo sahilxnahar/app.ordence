@@ -247,6 +247,13 @@ export default function GstPage() {
             Registrations, HSN/SAC codes and the rates that apply on any given
             date.
           </p>
+          {/* ⭐ The return itself — built from issued documents, not filed. */}
+          <a
+            href="/gst/gstr1"
+            className="mt-2 inline-block text-sm underline underline-offset-4"
+          >
+            GSTR-1 — outward supplies
+          </a>
         </div>
         <Link
           href="/settings/financial"

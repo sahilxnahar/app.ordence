@@ -54,6 +54,7 @@ import {
   integer,
   bigint,
   numeric,
+  date,
   doublePrecision,
   index,
   uniqueIndex,
@@ -626,6 +627,21 @@ export const bookings = pgTable(
     // What actually happens when a buyer walks away: some of the money
     // is kept, some is returned. Two separate figures, because they are
     // negotiated separately and both appear in the ledger.
+    /**
+     * ⭐ THE DATE THAT MAKES REVENUE REAL — Ind AS 115.
+     *
+     * ⚠️ NOT A STATUS. "Has this flat been handed over" is answered
+     * exactly by `possession_date IS NOT NULL`; a status column carrying
+     * the same fact can disagree with it, and the one that disagrees is
+     * always the one somebody set by hand.
+     */
+    possessionDate: date("possession_date", { mode: "string" }),
+    possessionRecordedAt: timestamp("possession_recorded_at", { withTimezone: true }),
+    possessionRecordedBy: uuid("possession_recorded_by").references(() => users.id, {
+      onDelete: "set null",
+    }),
+    possessionNote: text("possession_note"),
+
     cancelledAt: timestamp("cancelled_at", { withTimezone: true }),
     cancelReason: text("cancel_reason"),
     forfeitAmountMinor: bigint("forfeit_amount_minor", { mode: "bigint" }),
