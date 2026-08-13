@@ -1,4 +1,5 @@
 import type { NextConfig } from "next";
+import { withSentryConfig } from "@sentry/nextjs";
 
 /**
  * Security headers applied to every response.
@@ -64,4 +65,51 @@ const nextConfig: NextConfig = {
   },
 };
 
-export default nextConfig;
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * ⭐ SENTRY — v0.95.0
+ * ══════════════════════════════════════════════════════════════════════
+ * ⚠️ `productionBrowserSourceMaps: false` ABOVE IS UNCHANGED, AND THE TWO
+ *    SETTINGS ARE NOT IN CONFLICT.
+ *
+ * That flag stops maps being SERVED TO BROWSERS, which is the IP
+ * protection it was added for. Sentry's upload does something different:
+ * maps are generated at build time, uploaded to Sentry, and then deleted
+ * from the output. Stack traces become readable in Sentry, and a stranger
+ * hitting app.ordence.com still cannot download the sources.
+ *
+ * ⚠️ `widenClientFileUpload: false` — the wider mode uploads more bundles
+ *    for marginally better traces and materially longer builds. Yours is
+ *    already 50–106 seconds; this is not the place to spend more.
+ */
+const sentryBuildOptions = {
+  org: "ordence",
+  project: "javascript-nextjs",
+
+  /**
+   * ⚠️ UPLOAD ONLY WHEN A TOKEN EXISTS. Without `SENTRY_AUTH_TOKEN` the
+   * plugin logs a warning and continues — so `npm run build` works on
+   * this machine, in CI, and on Railway before the token is ever set.
+   * A build that FAILS because a monitoring vendor is unconfigured is a
+   * build that gets the monitoring removed.
+   */
+  authToken: process.env.SENTRY_AUTH_TOKEN,
+  silent: !process.env.SENTRY_AUTH_TOKEN,
+
+  widenClientFileUpload: false,
+  disableLogger: true,
+
+  /**
+   * ⭐ Routes browser events through your own domain, so an ad-blocker
+   * does not silently discard the errors of the users most likely to
+   * have one.
+   */
+  tunnelRoute: "/monitoring",
+
+  sourcemaps: {
+    /** Deleted after upload — never served, never in the image. */
+    deleteSourcemapsAfterUpload: true,
+  },
+};
+
+export default withSentryConfig(nextConfig, sentryBuildOptions);

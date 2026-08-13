@@ -33,10 +33,41 @@
  * Nothing below reads anything from the request except its path and method.
  */
 
+/**
+ * ⭐ v0.95.0 — SENTRY INITIALISES HERE, and the console logging below
+ *    STAYS. Two destinations, on purpose:
+ *
+ *   Railway logs — always on, no vendor, no quota, and the only thing
+ *     that still works when Sentry itself is the outage.
+ *   Sentry — searchable, grouped, alerting, and it names the commit.
+ *
+ * ⚠️ REMOVING THE `console.error` CALLS WHEN ADDING SENTRY IS THE
+ *    OBVIOUS TIDY-UP AND IT IS WRONG. The 12 August outage was diagnosed
+ *    from Railway logs. A monitoring vendor is one more dependency that
+ *    can be down, misconfigured, or out of quota on the day you need it.
+ */
 export async function register() {
-  // Deliberately empty. This module exists for `onRequestError` alone;
-  // Next.js requires `register` to be exported for the file to load at all.
+  if (!SENTRY_ENABLED) return;
+
+  /**
+   * ⚠️ DYNAMIC IMPORT, GATED ON THE RUNTIME. `@sentry/nextjs`'s Node
+   * integrations pull in `async_hooks` and friends, which do not exist on
+   * the edge runtime — a static top-level import breaks the edge bundle
+   * at build time, not at run time, and the error names neither Sentry
+   * nor the runtime.
+   */
+  if (process.env.NEXT_RUNTIME === "nodejs") {
+    const Sentry = await import("@sentry/nextjs");
+    Sentry.init(baseOptions());
+  }
+
+  if (process.env.NEXT_RUNTIME === "edge") {
+    const Sentry = await import("@sentry/nextjs");
+    Sentry.init(baseOptions());
+  }
 }
+
+import { baseOptions, SENTRY_ENABLED } from "@/lib/observability/sentry-options";
 
 type ErrorRequest = {
   path?: string;
@@ -95,5 +126,38 @@ export function onRequestError(
     console.error(
       `[ordence:error] cause: ${cause?.name ?? typeof err.cause}: ${cause?.message ?? String(err.cause)}`,
     );
+  }
+
+  /**
+   * ⭐ AND THEN TO SENTRY.
+   *
+   * ⚠️ AFTER the console lines, never instead of them, and never in a
+   * way that can throw. If reporting an error itself throws, Next.js
+   * loses the original — the one fault nobody could afford to lose is
+   * the one this whole file exists to preserve.
+   */
+  if (SENTRY_ENABLED) {
+    void import("@sentry/nextjs")
+      .then((Sentry) =>
+        /**
+         * ⚠️ HEADERS ARE PASSED AS EMPTY, DELIBERATELY.
+         *
+         * `captureRequestError` wants a `RequestInfo` carrying headers.
+         * This file's own policy — stated at the top since v0.32.0 — is
+         * that request headers never leave the process: a Clerk session
+         * cookie in a report is a stealable session. `scrubEvent` would
+         * strip them anyway; handing over an empty object means they are
+         * never in the event to begin with, which is one fewer thing
+         * depending on the scrubber being correct.
+         */
+        Sentry.captureRequestError(
+          error,
+          { path: request?.path ?? "", method: request?.method ?? "", headers: {} },
+          context as Parameters<typeof Sentry.captureRequestError>[2],
+        ),
+      )
+      .catch(() => {
+        /* Sentry being unavailable must never mask the original error. */
+      });
   }
 }

@@ -438,7 +438,20 @@ export async function GET() {
     {
       ok,
       reachedTheApplication: true,
-      version: readRuntimeEnv("NEXT_PUBLIC_RELEASE") || "unset",
+      /**
+       * ⚠️ FALLS BACK TO THE COMMIT SHA — v0.95.0.
+       *
+       * This read `"unset"` in production for every release, because
+       * `NEXT_PUBLIC_RELEASE` was never set and nothing else was tried.
+       * Railway injects `RAILWAY_GIT_COMMIT_SHA` on every deploy, so this
+       * now answers "which build is serving me" with no variable to
+       * configure — and it is the same string Sentry uses as its release,
+       * so a diag output and a Sentry issue name the same commit.
+       */
+      version:
+        readRuntimeEnv("NEXT_PUBLIC_RELEASE") ||
+        readRuntimeEnv("RAILWAY_GIT_COMMIT_SHA") ||
+        "unset",
       missingRequiredSettings: missing,
       settings,
       categories,

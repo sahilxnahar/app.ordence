@@ -17,6 +17,7 @@ import { auth } from "@clerk/nextjs/server";
 import { headers } from "next/headers";
 import { eq, and, isNull } from "drizzle-orm";
 import { db } from "@/db";
+import { SENTRY_ENABLED } from "@/lib/observability/sentry-options";
 import { tenants, users } from "@/db/schema";
 import { TENANT_HEADERS } from "@/lib/tenant";
 import { getImpersonatedTenantContext } from "@/server/platform/impersonation-context";
@@ -159,6 +160,39 @@ export async function requireTenantContext(): Promise<TenantContext> {
   }
   if (userRow.status === "suspended" || userRow.status === "offboarded") {
     throw new TenantAccessError(`User is ${userRow.status}.`, "user_suspended");
+  }
+
+  /**
+   * ⭐ TAG THE ERROR SCOPE WITH THE TENANT — v0.95.0.
+   *
+   * ⚠️ THIS IS WHAT TURNS "SOMETHING BROKE" INTO A FIX. An untagged
+   * exception in a multi-tenant ERP tells you a code path failed; it does
+   * not tell you whether one workspace has bad data or every workspace is
+   * down, and those need opposite responses at opposite speeds.
+   *
+   * ⚠️ THE TENANT ID AND THE ROLE. NEVER THE NAME, THE EMAIL OR THE SLUG.
+   * A uuid identifies a workspace to us and means nothing to anyone else;
+   * a workspace NAME is a customer's identity, and it would sit in a
+   * third party's database under someone else's retention policy. The
+   * scrubber would strip an email anyway — this is about never putting
+   * one there.
+   *
+   * ⚠️ FAILURE HERE IS SWALLOWED. Tagging is a convenience for whoever
+   * debugs later; it must never be the reason a request fails now.
+   */
+  if (SENTRY_ENABLED) {
+    void import("@sentry/nextjs")
+      .then((Sentry) => {
+        Sentry.setUser({ id: userRow.id });
+        Sentry.setTags({
+          tenant_id: tenantRow.id,
+          role: userRow.role,
+          plan: tenantRow.planTier ?? "unknown",
+        });
+      })
+      .catch(() => {
+        /* Monitoring must never break the request it is watching. */
+      });
   }
 
   return {
