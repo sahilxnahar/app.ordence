@@ -745,6 +745,21 @@ export const MODULE_REGISTRY: Readonly<Record<string, ModuleDescriptor>> =
      * found by nobody, and a developer would report zero turnover while
      * wondering why.
      */
+    /**
+     * ⭐ UNDER `money`, NOT UNDER `site`, AND NOT BESIDE TIMESHEETS.
+     *
+     * ⚠️ "Timesheets" answers "who was here" from attendance punches and
+     * field visits. THIS answers "what do we bill" — a different fact,
+     * a different table, and a different person opening it. Filing them
+     * together would put a partner's billing screen behind a
+     * supervisor's muster roll.
+     */
+    time: {
+      navId: "time", label: "Time & Billing",
+      description: "Hours recorded, what they are worth, and the invoice they become.",
+      group: "money", feature: "sales.orders", status: "live", href: "/time",
+      industries: ["legal_advocate","professional_services","software"],
+    },
     possession: {
       navId: "possession", label: "Possession",
       description: "Handing over flats — the moment property revenue is earned.",
@@ -769,6 +784,92 @@ export const MODULE_REGISTRY: Readonly<Record<string, ModuleDescriptor>> =
       navId: "accounting", label: "Ledger",
       description: "Double-entry books and period close.",
       group: "money", feature: "accounting.ledger", status: "live", href: "/accounting",
+    },
+    /**
+     * ⭐ UNDER `money`, BESIDE RATES. A price check is opened while
+     * somebody is on the phone to a customer holding an invoice at a
+     * different figure — it answers "which card applied and what beat
+     * what", which is a sales question, not a settings one.
+     */
+    "price-check": {
+      navId: "price-check", label: "Price Check",
+      description: "What a customer pays for a quantity on a date, and which rate card decided it.",
+      group: "money", feature: "sales.orders", status: "live", href: "/rates/price-check",
+      industries: ["trading","small_business","logistics","solar","hospitality"],
+    },
+    /**
+     * 🔴 UNDER `money` BECAUSE IT IS A TAX DECISION, NOT A SALES ONE. A
+     * rebate agreed after the period it covers cannot reduce GST, and
+     * the person who needs to know that is filing a return.
+     */
+    "discounts": {
+      navId: "discounts", label: "Rebates & Discounts",
+      description: "Post-supply rebates, and whether s.15(3) lets them reduce the tax.",
+      group: "money", feature: "gst.registry", status: "live", href: "/gst/discounts",
+      industries: ["trading","small_business","logistics","solar"],
+    },
+    /**
+     * ⭐ ITS OWN ENTRY BECAUSE IT IS A DOCUMENT, NOT A REPORT.
+     *
+     * 🔴 A transfer between two GSTINs is a taxable supply — it lands on
+     * one branch's GSTR-1 and the other's input credit. Burying it under
+     * a stock report would file a tax document as a warehouse task.
+     */
+    transfers: {
+      navId: "transfers", label: "Stock Transfers",
+      description: "Moving stock between our own places — and whether that is a supply.",
+      group: "site", feature: "inventory.stock", status: "live", href: "/inventory/transfers",
+      industries: ["trading","small_business","logistics","solar","real_estate_developer"],
+    },
+    /**
+     * ⚠️ UNDER `site` WITH PURCHASES, NOT UNDER `money`. Whoever files a
+     * freight bill is the person who files purchase invoices, and the
+     * uplift figure is read by a buyer rather than an accountant.
+     */
+    "landed-cost": {
+      navId: "landed-cost", label: "Landed Cost",
+      description: "Freight, duty and clearing — what the goods really cost on the shelf.",
+      group: "site", feature: "purchases.invoices", status: "live", href: "/purchases/landed-cost",
+      industries: ["trading","small_business","solar","logistics"],
+    },
+    /**
+     * ⭐ THREE ENTRIES UNDER `site`, BESIDE THE STOCK THEY DESCRIBE.
+     *
+     * 🔴 Expiry is read DAILY by a storekeeper, not monthly by an
+     * accountant. Filing it under GST — where the ITC reversal lives —
+     * would put a stock rotation screen behind a tax menu.
+     */
+    batches: {
+      navId: "batches", label: "Batches & Expiry",
+      description: "Batch numbers, expiry dates and what has to be written off.",
+      group: "site", feature: "inventory.stock", status: "live", href: "/inventory/batches",
+      industries: ["trading","small_business","solar","logistics","healthcare"],
+    },
+    serials: {
+      navId: "serials", label: "Serial Numbers",
+      description: "Where each unit is, who has it, and what warranty it carries.",
+      group: "site", feature: "inventory.stock", status: "live", href: "/inventory/serials",
+      industries: ["trading","solar","electricity","software"],
+    },
+    "goods-returns": {
+      navId: "goods-returns", label: "Goods Returned",
+      description: "Stock coming back, where it lands, and the s.34(2) tax deadline.",
+      group: "site", feature: "inventory.stock", status: "live", href: "/inventory/returns",
+      industries: ["trading","small_business","logistics","solar"],
+    },
+    /**
+     * ⭐ ITS OWN ENTRY, NOT A TAB UNDER GST.
+     *
+     * 🔴 Everything else under GST is read monthly by an accountant.
+     * This is read DAILY by a dispatch clerk with a driver waiting, and
+     * burying it one click deeper is how a consignment leaves on a
+     * `prepared` bill that covers nothing.
+     */
+    eway: {
+      navId: "eway", label: "E-way Bills",
+      description: "Rule 138 — the document a consignment cannot lawfully move without.",
+      group: "money", feature: "gst.registry", status: "live", href: "/gst/eway",
+      industries: ["trading","logistics","small_business","solar","real_estate_developer"],
     },
     gst: {
       navId: "gst", label: "GST",

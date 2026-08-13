@@ -1,3 +1,212 @@
+# v1.6.0-alpha — PRICES THAT ACTUALLY SELL, AND SECTION 15(3)
+
+**Repo: `app.ordence`** · 🔴 **SQL: `0057`** · ⚠️ **No new variables**
+
+Trading, batch 2. This finishes the industry.
+
+- 🔴 **I did not build a price list table, and that is the point.**
+  `rate_cards` and `rate_slabs` have existed since 0034 with customer,
+  item, priority, half-open validity and `slab_mode`. A second table would
+  have given two answers to "what does this cost this customer today".
+- 🔴 **What was missing is that NOTHING SELECTED ONE.**
+  `sales_order_lines.unit_price_minor` is typed in by hand, so a
+  distributor with negotiated prices retyped them on every line and the
+  price list was decoration. The fix is a resolver, not a schema.
+- 🔴 **Specificity beats priority beats recency.** A card naming the
+  customer always wins over a house list, however recently the list was
+  published — and a card belonging to another customer never applies.
+- ⚠️ **`validTo` is exclusive**, and the tie-break ends on the card code so
+  a quote cannot change between being given and being honoured.
+- 🔴 **Slab bands cannot overlap or leave a gap** — validated by a deferred
+  trigger. A gap is the quiet one: flat pricing falls through to the last
+  band, so a quantity matching nothing is charged at the TOP rate.
+- ⚠️ **Progressive versus flat is 27% of the bill** on a common example.
+  The mode is stated on the card and honoured, never guessed.
+- 🔴 **A quote is checked against LANDED cost, not the invoice price.**
+  On 4–8% trading margins an 8% freight uplift is the whole margin.
+- 🔴 **Section 15(3)(b): a year-end rebate agreed in December cannot take
+  back the GST on April's sales.** The agreement has to have existed at or
+  before the supply. The credit note is legal; the tax is gone.
+- ⚠️ Tested against the **earliest** supply in the period, not the latest —
+  testing the latest would pass a whole year's rebate.
+- 🔴 **The rebate is apportioned across the invoices that earned it**, in
+  the same transaction. Software that stores it as one figure cannot
+  produce the s.15(3)(b)(i) linkage afterwards. Tax is computed at each
+  invoice's own rate, never an average.
+- ⭐ **Circular 212/6/2024 was withdrawn by Circular 253/10/2025-GST on
+  1 October 2025** — no certificate needed. ⚠️ But s.15(3)(b)(ii) itself
+  was not amended: the recipient still has to have reversed the credit.
+- ⭐ Validated against a real PostgreSQL 16: 7 drills, the slab trigger and
+  every constraint refused what they exist to refuse.
+
+# v1.5.0-alpha — STOCK TRANSFERS AND LANDED COST
+
+**Repo: `app.ordence`** · 🔴 **SQL: `0056`** · ⚠️ **No new variables**
+
+Trading, batch 1. Two things a distributor does every day and Ordence could
+not do at all.
+
+- 🔴 **A transfer was two independent movements and nothing joined them.**
+  Post both at dispatch and the stock exists at the destination before the
+  lorry does; post only the OUT and it vanishes off the balance sheet for
+  three days. Both look fine.
+- ⭐ **The `transit` warehouse type has been in the enum since 0029 and
+  nothing ever used it.** It is now where goods live between dispatch and
+  receipt — ours, on the balance sheet, in neither godown.
+- 🔴 **Nothing can be sold out of a transit location** — enforced by trigger.
+  Without that the model collapses back to stock sold from a lorry.
+- 🔴 **An inter-GSTIN transfer is a TAXABLE SUPPLY.** s.25(4) makes each
+  registration a distinct person; Schedule I para 2 makes a supply between
+  them taxable without consideration. Tax invoice, not delivery challan.
+- ⚠️ **And it is decided by the GSTINs, not the states** — the intuitive
+  mistake, wrong in both directions. Two godowns in different states under
+  one GSTIN are not a supply; two in one state under two GSTINs are.
+- ⭐ **Rule 28's second proviso** — where the recipient has full ITC, the
+  invoice value IS the open market value. Where it does not, the screen says
+  an open market value has to be established rather than inventing one.
+- 🔴 **100 bags leave and 98 arrive: the two missing bags do not vanish.**
+  They are still in transit, on a balance somebody must explain. The
+  shortfall is written off with a named approver, and the ITC on it reversed
+  under s.17(5)(h) — "lost" is in the section by name.
+- 🔴 **Landed cost did not exist.** Ind AS 2: cost of purchase includes
+  duties and taxes *"other than those subsequently recoverable"*. Basic
+  customs duty is a cost; **IGST on imports is a credit** — adjacent boxes on
+  one bill of entry, and capitalising the IGST inflates stock AND loses the
+  credit.
+- ⚠️ **Freight apportions by weight, not value.** A container of feathers and
+  lead split by value gives the lead almost no freight.
+- 🔴 **Largest-remainder apportionment** — ₹10,000 over three lines sums to
+  exactly ₹10,000, deterministically.
+- 🔴 **The freight bill arrives after the goods.** The charge splits between
+  stock and cost of sales by what is still on hand. Putting all of it on the
+  remainder overstates closing stock AND the margin already reported — two
+  errors in opposite directions with a correct total.
+- ⭐ Validated against a real PostgreSQL 16: 12 drills, every constraint and
+  the transit guard refused what they exist to refuse.
+
+# v1.4.0-alpha — BATCH, EXPIRY, SERIAL AND GOODS COMING BACK
+
+**Repo: `app.ordence`** · 🔴 **SQL: `0055`** · ⚠️ **No new variables**
+
+Engine 8b. `batch_no`, `serial_no` and `expiry_date` have existed since 0029
+as three free-text strings on a ledger row. This adds the masters they
+should always have pointed at.
+
+- 🔴 **The same batch could carry two different expiry dates**, typed by two
+  people a week apart, with nothing to refuse it. A unique key on
+  (item, batch) plus a trigger that names both dates is the fix.
+- ⭐ **The trigger makes the existing code correct without rewriting it.**
+  Every call site that inserts a movement with a `batch_no` now silently
+  acquires a real batch row — so nothing had to be found and changed, which
+  means nothing could be missed being found and changed.
+- 🔴 **FEFO, not FIFO.** A batch received in January expiring in December
+  must ship AFTER one received in March expiring in June. And a batch with
+  no expiry sorts **last**, not first.
+- 🔴 **Stock is saleable ON its expiry date**, not up to the day before.
+- 🔴 **`tracking_mode = 'serial'` was a label with nothing behind it** — an
+  item could be declared serial-tracked and receive fifty units with no
+  serials. Now refused, and a dispatched serial cannot be dispatched again.
+- ⚠️ **Warranty runs from dispatch, not receipt** — and 31 January plus one
+  month is 28 February, not 3 March.
+- 🔴 **Damaged returns cannot go back into a selling warehouse.** Enforced
+  by trigger, because that stock would be picked for the next customer.
+- 🔴 **Section 17(5)(h)** — a write-off is two entries, not one. The stock
+  leaves AND the input tax credit is reversed. A zero reversal must be
+  explained in a sentence, enforced by CHECK.
+- ⭐ **Section 34(2)** — the credit-note tax deadline (30 November following
+  the FY of the *original supply*) is counted down on screen. After it, the
+  note is still legal and the GST is gone.
+- ⚠️ **No `days_to_expiry` column and no nightly sweep.** Both need a job,
+  and the night it does not run the screen says stock is fine on the day it
+  stopped being fine.
+- ⭐ Validated against a real PostgreSQL 16: 13 drills, every trigger and
+  constraint refused what it exists to refuse.
+
+# v1.3.0-alpha — E-WAY BILL · THE TRUCK THAT IS STANDING STILL
+
+**Repo: `app.ordence`** · 🔴 **SQL: `0054`** · ⚠️ **No new variables**
+
+Engine 8a. Unlocks Trading, Small Business, Solar equipment and Logistics —
+none of them can move a consignment over ₹50,000 without this.
+
+- 🔴 **Ordence PREPARES an e-way bill; it does not generate one.** No GSP
+  credentials, so `prepared` is never rendered as coverage and the NIC
+  EWB-01 JSON is exported for a human to upload. Pretending to submit
+  would produce a screen that looks like it raised one and did not.
+- 🔴 **The off-by-one-day.** Explanation 1 to Rule 138(10): each day
+  expires at midnight of the day **immediately following** generation. A
+  one-day bill raised at 00:04 on the 14th runs to the end of the **15th**.
+  The naive `+ days × 24h` is short by up to a day, in the direction that
+  expires a bill while a lorry is still moving.
+- 🔴 **And it is the IST midnight.** Computing it in UTC moves every expiry
+  5½ hours early — to 18:30 the previous evening.
+- 🔴 **Explanation 2 has two halves that pull opposite ways.** Consignment
+  value **includes** the tax and **excludes** exempt supply *only on a
+  mixed document*. A wholly-exempt invoice keeps its whole value.
+- ⚠️ **No State can raise the inter-state threshold**, and the override
+  refuses to apply there.
+- ⚠️ **200 km/day, and 20 km/day for over-dimensional cargo.**
+- ⚠️ **The windows:** cancel within 24 h (never after verification in
+  transit), extend only 8 h either side of expiry, 180-day document age,
+  360-day lifetime ceiling from *original* generation.
+- 🔴 **Every leg is kept.** Transshipment inserts; it never overwrites —
+  and it buys no extra validity.
+- ⚠️ **No `is_expired` column.** Expiry is computed from the timestamp on
+  every render.
+- ⭐ Validated against a real PostgreSQL 16: every CHECK and unique index
+  refused the row it exists to refuse.
+
+# v1.2.0-alpha — HOURS BECOME A TAX INVOICE
+
+**Repo: `app.ordence`** · ⚠️ **No new SQL — `0053` from v1.1.0 is still required** · No new variables
+
+v1.1.0 shipped the whole time engine with **nothing able to call it**. This
+is the screen, and the last step it was missing.
+
+- ⭐ **`/time`** — record time, rate card, approve, write off, and bill.
+  The engine was tested and unreachable; a firm would have kept its hours
+  in a spreadsheet, which is what the module exists to prevent.
+- 🔴 **`raiseInvoiceFromTime`** — the invoice and the marking-as-billed
+  happen in **ONE transaction**. An invoice raised without the entries
+  being marked bills the same hours again next month.
+- 🔴 **A count mismatch rolls the whole thing back** — two people billing
+  the same time in the same second get a retry, not a double bill.
+- ⚠️ **The value comes from the entry, never from re-pricing.** Each hour
+  carries the rate that applied the day it was worked; re-resolving here
+  would re-price a year of unbilled work at today's card.
+- ⚠️ **Five refusals, each naming its count** — wrong client, already
+  billed, not approved, non-billable, unrated.
+- ⚠️ **Quantity is 1.000 and the unit price IS the line value**, so the
+  invoice cannot disagree with the timesheet by paise. Hours are stated in
+  the description, where a client reads them.
+- 🔴 **`supplyType: "services"`** — Rule 48(1) prints two copies, not
+  three. SAC 9982 by default, never an HSN.
+- ⭐ **The entry form previews the rounding before it is applied**, out of
+  the same functions the server uses. Seven minutes bills as twelve, and
+  the first person to learn that must not be the client.
+- ⚠️ **Selection is per client**, because an invoice is per client.
+  Internal time is shown and cannot be billed.
+
+# v1.1.0-alpha — TIME & BILLING, THE SHARED ENGINE
+
+**Repo: `app.ordence`** · 🔴 **SQL: `0053`** · No new variables
+
+The engine Legal and Professional Services both run on, and neither could
+use — Ordence could invoice an hour, tax it, collect it and post it to the
+ledger, and had nowhere to RECORD it.
+
+- **`billing_rates`** — effective-dated, never overwritten. March work bills
+  at March's rate even when invoiced in September.
+- **`time_entries`** — duration in whole MINUTES as an integer. Never hours
+  as a decimal.
+- 🔴 **Six-minute units, rounded UP** — the legal standard, stated rather
+  than assumed.
+- 🔴 **Value = rate × minutes / 60, in that order, rounded half up.**
+  Dividing first loses paise on every entry.
+- ⭐ **No retainer table** — a retainer IS an unapplied customer receipt,
+  already built in v0.98.0.
+- Approved and pending time are never summed.
+
 # v1.0.0-rc.4 — POSSESSION: THE DATE THAT MAKES REVENUE REAL
 
 **Repo: `app.ordence`** · 🔴 **SQL: `0052` before pushing** · No new variables

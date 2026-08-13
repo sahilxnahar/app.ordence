@@ -375,6 +375,16 @@ export const stockMovements = pgTable(
     serialNo: varchar("serial_no", { length: 120 }),
     expiryDate: date("expiry_date"),
 
+    /**
+     * ⭐ ADDED IN 0055, FILLED BY TRIGGER — never by a call site.
+     *
+     * ⚠️ `batchNo` STAYS EXACTLY WHERE IT IS. Every existing query keeps
+     * working, and `trg_link_stock_batch` populates this beside it. That
+     * is the whole reason nothing had to be found and rewritten — and
+     * therefore nothing could be missed being found and rewritten.
+     */
+    batchId: uuid("batch_id"),
+
     /* --- What caused it. At most one of these is set. --------------- */
     salesOrderId: uuid("sales_order_id").references(() => salesOrders.id, {
       onDelete: "set null",
@@ -773,3 +783,657 @@ export const BIDIRECTIONAL_REASONS: readonly MovementReason[] = [
   "adjustment",
   "reversal",
 ];
+
+/* ------------------------------------------------------------------ */
+/* ⭐⭐ BATCH · EXPIRY · SERIAL · RETURNS — SQL 0055 · v1.4.0-alpha     */
+/* ------------------------------------------------------------------ */
+
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 THE MASTER THAT `batch_no` SHOULD ALWAYS HAVE POINTED AT
+ * ══════════════════════════════════════════════════════════════════════
+ * `stock_movements.batch_no` and `.expiry_date` have existed since 0029
+ * as two free-text strings on a ledger row — which means the SAME BATCH
+ * CAN CARRY TWO DIFFERENT EXPIRY DATES, typed by two people a week
+ * apart, with nothing to refuse it.
+ *
+ * The unique key on (tenant, item, batch_no) is the fix. The expiry date
+ * stops being a property of a movement and becomes a property of the
+ * batch — which is what it always was on the carton.
+ *
+ * ⚠️ POPULATED BY THE TRIGGER IN 0055, not by rewriting call sites.
+ * Every existing insert keeps working and silently acquires a real batch
+ * row, so nothing had to be found and changed — which means nothing
+ * could be MISSED being found and changed.
+ */
+export const stockBatches = pgTable(
+  "stock_batches",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    tenantId: uuid("tenant_id")
+      .notNull()
+      .references(() => tenants.id, { onDelete: "cascade" }),
+    stockItemId: uuid("stock_item_id").notNull(),
+
+    batchNo: varchar("batch_no", { length: 100 }).notNull(),
+    supplierBatchNo: varchar("supplier_batch_no", { length: 100 }),
+
+    manufactureDate: date("manufacture_date", { mode: "string" }),
+    expiryDate: date("expiry_date", { mode: "string" }),
+
+    /** ⚠️ The FIRST time we saw it. Ageing is measured from arrival. */
+    firstReceivedAt: timestamp("first_received_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+
+    /**
+     * 🔴 CHECKED ON THE WAY OUT BY THE TRIGGER, not just shown on a
+     * report. A flag a picker never reads is not a quarantine.
+     */
+    status: varchar("status", { length: 20 }).default("active").notNull(),
+    statusNote: text("status_note"),
+    statusChangedAt: timestamp("status_changed_at", { withTimezone: true }),
+    statusChangedBy: uuid("status_changed_by").references(() => users.id, {
+      onDelete: "set null",
+    }),
+
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+    createdBy: uuid("created_by").references(() => users.id, { onDelete: "set null" }),
+    updatedBy: uuid("updated_by").references(() => users.id, { onDelete: "set null" }),
+  },
+  (t) => ({
+    /** 🔴 The key that makes one batch mean one thing. */
+    itemBatchUnique: uniqueIndex("stock_batches_item_batch_unique").on(
+      t.tenantId,
+      t.stockItemId,
+      t.batchNo,
+    ),
+    expiryIdx: index("stock_batches_expiry_idx")
+      .on(t.tenantId, t.expiryDate)
+      .where(sql`${t.expiryDate} IS NOT NULL AND ${t.status} IN ('active', 'quarantined')`),
+    statusIdx: index("stock_batches_status_idx").on(t.tenantId, t.status),
+  }),
+);
+
+/**
+ * 🔴 ONE ROW PER PHYSICAL UNIT, AND IT ANSWERS "WHERE IS IT".
+ *
+ * A serial number on a movement says where a unit went once. This says
+ * where it is now, who has it, when it shipped and when its warranty
+ * ends — every question an installer standing in front of a dead
+ * inverter is asked, and none of which a movement ledger can answer
+ * without replaying itself.
+ *
+ * ⚠️ MAINTAINED FROM THE LEDGER BY TRIGGER, never written by hand — the
+ * same discipline as `stock_balances`. Dropped entirely, it could be
+ * rebuilt by replaying `stock_movements`.
+ */
+export const stockSerials = pgTable(
+  "stock_serials",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    tenantId: uuid("tenant_id")
+      .notNull()
+      .references(() => tenants.id, { onDelete: "cascade" }),
+    stockItemId: uuid("stock_item_id").notNull(),
+
+    serialNo: varchar("serial_no", { length: 120 }).notNull(),
+    batchId: uuid("batch_id").references(() => stockBatches.id, {
+      onDelete: "set null",
+    }),
+
+    status: varchar("status", { length: 20 }).default("in_stock").notNull(),
+
+    warehouseId: uuid("warehouse_id").references(() => warehouses.id, {
+      onDelete: "set null",
+    }),
+    companyId: uuid("company_id"),
+
+    receivedAt: timestamp("received_at", { withTimezone: true }),
+    dispatchedAt: timestamp("dispatched_at", { withTimezone: true }),
+    /** ⚠️ Warranty runs from DISPATCH, not from receipt into our store. */
+    warrantyMonths: integer("warranty_months"),
+    warrantyUntil: date("warranty_until", { mode: "string" }),
+
+    lastMovementId: uuid("last_movement_id"),
+    notes: text("notes"),
+
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (t) => ({
+    /** 🔴 One serial, one unit, once. */
+    serialUnique: uniqueIndex("stock_serials_unique").on(
+      t.tenantId,
+      t.stockItemId,
+      t.serialNo,
+    ),
+    statusIdx: index("stock_serials_status_idx").on(t.tenantId, t.status),
+    companyIdx: index("stock_serials_company_idx")
+      .on(t.tenantId, t.companyId)
+      .where(sql`${t.companyId} IS NOT NULL`),
+    warrantyIdx: index("stock_serials_warranty_idx")
+      .on(t.tenantId, t.warrantyUntil)
+      .where(sql`${t.warrantyUntil} IS NOT NULL`),
+  }),
+);
+
+/**
+ * ⭐ A SALES RETURN IS THREE SEPARATE FACTS, AND MOST SOFTWARE MERGES
+ *    THEM INTO ONE.
+ *
+ *   1. Goods physically arrived back        → a stock movement
+ *   2. The customer owes less               → a credit note, s.34
+ *   3. Some of what came back is unsaleable → a different warehouse
+ *
+ * 🔴 MERGING (1) AND (3) IS THE EXPENSIVE ONE. Damaged goods put back
+ *    into a selling warehouse are goods the next customer receives.
+ */
+export const goodsReturns = pgTable(
+  "goods_returns",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    tenantId: uuid("tenant_id")
+      .notNull()
+      .references(() => tenants.id, { onDelete: "cascade" }),
+
+    returnNo: varchar("return_no", { length: 40 }).notNull(),
+    returnDate: date("return_date", { mode: "string" }).notNull(),
+
+    companyId: uuid("company_id"),
+    /** Nullable — goods come back before anybody finds the paperwork. */
+    invoiceId: uuid("invoice_id"),
+    creditNoteId: uuid("credit_note_id"),
+
+    reason: varchar("reason", { length: 40 }).default("other").notNull(),
+    status: varchar("status", { length: 20 }).default("draft").notNull(),
+
+    /**
+     * ⭐ SECTION 34(2). After this date the credit note can still be
+     * issued and the customer still owes less — but the GST on the
+     * original sale is no longer recoverable. Stored so the screen can
+     * count down to it rather than discover it afterwards.
+     */
+    taxAdjustmentDeadline: date("tax_adjustment_deadline", { mode: "string" }),
+
+    inwardChallanNo: varchar("inward_challan_no", { length: 40 }),
+    ewayBillNo: varchar("eway_bill_no", { length: 20 }),
+
+    notes: text("notes"),
+
+    receivedAt: timestamp("received_at", { withTimezone: true }),
+    receivedBy: uuid("received_by").references(() => users.id, { onDelete: "set null" }),
+
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+    createdBy: uuid("created_by").references(() => users.id, { onDelete: "set null" }),
+    updatedBy: uuid("updated_by").references(() => users.id, { onDelete: "set null" }),
+  },
+  (t) => ({
+    noUnique: uniqueIndex("goods_returns_no_unique").on(t.tenantId, t.returnNo),
+    invoiceIdx: index("goods_returns_invoice_idx")
+      .on(t.tenantId, t.invoiceId)
+      .where(sql`${t.invoiceId} IS NOT NULL`),
+    statusIdx: index("goods_returns_status_idx").on(t.tenantId, t.status, t.returnDate),
+    deadlineIdx: index("goods_returns_deadline_idx")
+      .on(t.tenantId, t.taxAdjustmentDeadline)
+      .where(
+        sql`${t.status} IN ('draft', 'received') AND ${t.taxAdjustmentDeadline} IS NOT NULL`,
+      ),
+  }),
+);
+
+export const goodsReturnLines = pgTable(
+  "goods_return_lines",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    tenantId: uuid("tenant_id")
+      .notNull()
+      .references(() => tenants.id, { onDelete: "cascade" }),
+    goodsReturnId: uuid("goods_return_id")
+      .notNull()
+      .references(() => goodsReturns.id, { onDelete: "cascade" }),
+
+    lineNo: integer("line_no").notNull(),
+    stockItemId: uuid("stock_item_id"),
+    description: text("description").notNull(),
+
+    /**
+     * 🔴 A RETURNED BATCH KEEPS ITS ORIGINAL EXPIRY. Whoever is at the
+     * door will type today plus the shelf life, which resets the clock
+     * on stock that has already spent nine months at a customer — and
+     * the one-expiry-per-batch trigger is what refuses it.
+     */
+    batchNo: varchar("batch_no", { length: 100 }),
+    serialNo: varchar("serial_no", { length: 120 }),
+
+    quantity: numeric("quantity", { precision: 18, scale: 3 }).notNull(),
+    uom: varchar("uom", { length: 20 }).default("nos").notNull(),
+
+    /** ⭐ The field the whole table exists for. */
+    condition: varchar("condition", { length: 20 }).default("saleable").notNull(),
+
+    warehouseId: uuid("warehouse_id").references(() => warehouses.id, {
+      onDelete: "restrict",
+    }),
+    movementId: uuid("movement_id"),
+
+    taxableValueMinor: bigint("taxable_value_minor", { mode: "bigint" })
+      .default(sql`0`)
+      .notNull(),
+    taxRateBps: integer("tax_rate_bps").default(0).notNull(),
+    taxValueMinor: bigint("tax_value_minor", { mode: "bigint" })
+      .default(sql`0`)
+      .notNull(),
+
+    /** ⭐ s.17(5)(h) — what has to be given back if this is destroyed. */
+    itcReversalMinor: bigint("itc_reversal_minor", { mode: "bigint" })
+      .default(sql`0`)
+      .notNull(),
+
+    notes: text("notes"),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (t) => ({
+    lineUnique: uniqueIndex("goods_return_lines_no_unique").on(
+      t.tenantId,
+      t.goodsReturnId,
+      t.lineNo,
+    ),
+    itemIdx: index("goods_return_lines_item_idx").on(t.tenantId, t.stockItemId),
+  }),
+);
+
+/**
+ * 🔴 SECTION 17(5)(h): input tax credit is NOT available on goods
+ *    "lost, stolen, destroyed, written off or disposed of by way of gift
+ *    or free samples".
+ *
+ * ⚠️ SO A STOCK WRITE-OFF IS TWO ENTRIES, NOT ONE. The stock leaves,
+ * AND the credit claimed when it was bought is reversed. Software that
+ * does only the first produces books that balance and a GST position
+ * that does not — found at an assessment, with interest.
+ */
+export const stockWriteOffs = pgTable(
+  "stock_write_offs",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    tenantId: uuid("tenant_id")
+      .notNull()
+      .references(() => tenants.id, { onDelete: "cascade" }),
+
+    movementId: uuid("movement_id"),
+    stockItemId: uuid("stock_item_id").notNull(),
+    batchId: uuid("batch_id").references(() => stockBatches.id, {
+      onDelete: "restrict",
+    }),
+    warehouseId: uuid("warehouse_id").references(() => warehouses.id, {
+      onDelete: "restrict",
+    }),
+
+    writeOffDate: date("write_off_date", { mode: "string" }).notNull(),
+    quantity: numeric("quantity", { precision: 18, scale: 3 }).notNull(),
+    reason: varchar("reason", { length: 20 }).notNull(),
+
+    costMinor: bigint("cost_minor", { mode: "bigint" }).default(sql`0`).notNull(),
+    itcRateBps: integer("itc_rate_bps").default(0).notNull(),
+    itcReversalMinor: bigint("itc_reversal_minor", { mode: "bigint" })
+      .default(sql`0`)
+      .notNull(),
+    /** The GSTR-3B period the reversal is declared in — "2026-08". */
+    reversalPeriod: varchar("reversal_period", { length: 7 }),
+
+    /** 🔴 Required when the reversal is zero. A zero is either correct
+     *  or it is the mistake this table exists to catch, and the row
+     *  cannot tell you which without a sentence. */
+    itcNote: text("itc_note"),
+
+    approvedBy: uuid("approved_by").references(() => users.id, { onDelete: "set null" }),
+    notes: text("notes"),
+
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    createdBy: uuid("created_by").references(() => users.id, { onDelete: "set null" }),
+  },
+  (t) => ({
+    periodIdx: index("stock_write_offs_period_idx").on(t.tenantId, t.reversalPeriod),
+    itemIdx: index("stock_write_offs_item_idx").on(
+      t.tenantId,
+      t.stockItemId,
+      t.writeOffDate,
+    ),
+  }),
+);
+
+export const stockBatchesRelations = relations(stockBatches, ({ one, many }) => ({
+  tenant: one(tenants, { fields: [stockBatches.tenantId], references: [tenants.id] }),
+  serials: many(stockSerials),
+}));
+
+export const stockSerialsRelations = relations(stockSerials, ({ one }) => ({
+  batch: one(stockBatches, {
+    fields: [stockSerials.batchId],
+    references: [stockBatches.id],
+  }),
+  warehouse: one(warehouses, {
+    fields: [stockSerials.warehouseId],
+    references: [warehouses.id],
+  }),
+}));
+
+export const goodsReturnsRelations = relations(goodsReturns, ({ one, many }) => ({
+  tenant: one(tenants, { fields: [goodsReturns.tenantId], references: [tenants.id] }),
+  lines: many(goodsReturnLines),
+}));
+
+export const goodsReturnLinesRelations = relations(goodsReturnLines, ({ one }) => ({
+  goodsReturn: one(goodsReturns, {
+    fields: [goodsReturnLines.goodsReturnId],
+    references: [goodsReturns.id],
+  }),
+}));
+
+export type StockBatchRow = typeof stockBatches.$inferSelect;
+export type NewStockBatchRow = typeof stockBatches.$inferInsert;
+export type StockSerialRow = typeof stockSerials.$inferSelect;
+export type GoodsReturnRow = typeof goodsReturns.$inferSelect;
+export type GoodsReturnLineRow = typeof goodsReturnLines.$inferSelect;
+export type StockWriteOffRow = typeof stockWriteOffs.$inferSelect;
+
+/* ------------------------------------------------------------------ */
+/* ⭐⭐ TRANSFERS AND LANDED COST — SQL 0056 · v1.5.0-alpha             */
+/* ------------------------------------------------------------------ */
+
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 A TRANSFER WAS TWO INDEPENDENT MOVEMENTS AND NOTHING JOINED THEM
+ * ══════════════════════════════════════════════════════════════════════
+ * `transfer_out` and `transfer_in` have existed since 0029 and
+ * `postMovement()` posts one at a time. So moving 100 bags meant two
+ * unrelated rows — and either the stock existed at the destination
+ * before the lorry did, or it vanished off the balance sheet for three
+ * days. Both look fine.
+ *
+ * ⭐ `transitWarehouseId` IS THE COLUMN THIS TABLE EXISTS FOR. The
+ * `transit` warehouse type has been in the enum since 0029 and nothing
+ * ever used it.
+ *
+ * 🔴 AND `isTaxableSupply` IS DECIDED BY THE GSTINS, NOT THE STATES.
+ * Section 25(4) makes each registration a distinct person; Schedule I
+ * para 2 makes a supply between them taxable without consideration.
+ */
+export const stockTransfers = pgTable(
+  "stock_transfers",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    tenantId: uuid("tenant_id")
+      .notNull()
+      .references(() => tenants.id, { onDelete: "cascade" }),
+
+    transferNo: varchar("transfer_no", { length: 40 }).notNull(),
+    transferDate: date("transfer_date", { mode: "string" }).notNull(),
+
+    fromWarehouseId: uuid("from_warehouse_id")
+      .notNull()
+      .references(() => warehouses.id, { onDelete: "restrict" }),
+    toWarehouseId: uuid("to_warehouse_id")
+      .notNull()
+      .references(() => warehouses.id, { onDelete: "restrict" }),
+    /** ⭐ Where the goods live while they are on the lorry. */
+    transitWarehouseId: uuid("transit_warehouse_id").references(() => warehouses.id, {
+      onDelete: "restrict",
+    }),
+
+    /** 🔴 Captured at dispatch, never joined at read time. */
+    fromGstin: varchar("from_gstin", { length: 15 }),
+    toGstin: varchar("to_gstin", { length: 15 }),
+    fromStateCode: varchar("from_state_code", { length: 2 }),
+    toStateCode: varchar("to_state_code", { length: 2 }),
+
+    isTaxableSupply: boolean("is_taxable_supply").default(false).notNull(),
+    documentType: varchar("document_type", { length: 20 })
+      .default("delivery_challan")
+      .notNull(),
+    documentNo: varchar("document_no", { length: 40 }),
+    invoiceId: uuid("invoice_id"),
+
+    taxableValueMinor: bigint("taxable_value_minor", { mode: "bigint" })
+      .default(sql`0`)
+      .notNull(),
+    cgstMinor: bigint("cgst_minor", { mode: "bigint" }).default(sql`0`).notNull(),
+    sgstMinor: bigint("sgst_minor", { mode: "bigint" }).default(sql`0`).notNull(),
+    igstMinor: bigint("igst_minor", { mode: "bigint" }).default(sql`0`).notNull(),
+    cessMinor: bigint("cess_minor", { mode: "bigint" }).default(sql`0`).notNull(),
+
+    ewayBillNo: varchar("eway_bill_no", { length: 20 }),
+    transporterName: varchar("transporter_name", { length: 255 }),
+    vehicleNo: varchar("vehicle_no", { length: 20 }),
+    distanceKm: integer("distance_km"),
+
+    status: varchar("status", { length: 20 }).default("draft").notNull(),
+
+    dispatchedAt: timestamp("dispatched_at", { withTimezone: true }),
+    dispatchedBy: uuid("dispatched_by").references(() => users.id, {
+      onDelete: "set null",
+    }),
+    receivedAt: timestamp("received_at", { withTimezone: true }),
+    receivedBy: uuid("received_by").references(() => users.id, { onDelete: "set null" }),
+
+    cancelledAt: timestamp("cancelled_at", { withTimezone: true }),
+    cancelledBy: uuid("cancelled_by").references(() => users.id, {
+      onDelete: "set null",
+    }),
+    cancelReason: text("cancel_reason"),
+
+    notes: text("notes"),
+
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+    createdBy: uuid("created_by").references(() => users.id, { onDelete: "set null" }),
+    updatedBy: uuid("updated_by").references(() => users.id, { onDelete: "set null" }),
+  },
+  (t) => ({
+    noUnique: uniqueIndex("stock_transfers_no_unique").on(t.tenantId, t.transferNo),
+    /** ⭐ The Monday query: what left and never arrived. */
+    inTransitIdx: index("stock_transfers_in_transit_idx")
+      .on(t.tenantId, t.dispatchedAt)
+      .where(sql`${t.status} = 'dispatched'`),
+    routeIdx: index("stock_transfers_route_idx").on(
+      t.tenantId,
+      t.fromWarehouseId,
+      t.toWarehouseId,
+      t.transferDate,
+    ),
+  }),
+);
+
+export const stockTransferLines = pgTable(
+  "stock_transfer_lines",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    tenantId: uuid("tenant_id")
+      .notNull()
+      .references(() => tenants.id, { onDelete: "cascade" }),
+    transferId: uuid("transfer_id")
+      .notNull()
+      .references(() => stockTransfers.id, { onDelete: "cascade" }),
+
+    lineNo: integer("line_no").notNull(),
+    stockItemId: uuid("stock_item_id").notNull(),
+    batchNo: varchar("batch_no", { length: 100 }),
+    serialNo: varchar("serial_no", { length: 120 }),
+
+    qtyDispatched: numeric("qty_dispatched", { precision: 18, scale: 3 }).notNull(),
+    /**
+     * ⭐ NULL UNTIL SOMEBODY COUNTS IT AT THE OTHER END — deliberately
+     * not defaulted to the dispatched quantity, because a default of
+     * "however many we sent" is a receipt nobody performed.
+     */
+    qtyReceived: numeric("qty_received", { precision: 18, scale: 3 }),
+
+    unitCostMinor: bigint("unit_cost_minor", { mode: "bigint" })
+      .default(sql`0`)
+      .notNull(),
+    taxableValueMinor: bigint("taxable_value_minor", { mode: "bigint" })
+      .default(sql`0`)
+      .notNull(),
+    taxRateBps: integer("tax_rate_bps").default(0).notNull(),
+
+    varianceMovementId: uuid("variance_movement_id"),
+    varianceNote: text("variance_note"),
+
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (t) => ({
+    lineUnique: uniqueIndex("stock_transfer_lines_no_unique").on(
+      t.tenantId,
+      t.transferId,
+      t.lineNo,
+    ),
+    itemIdx: index("stock_transfer_lines_item_idx").on(t.tenantId, t.stockItemId),
+    varianceIdx: index("stock_transfer_lines_variance_idx")
+      .on(t.tenantId, t.transferId)
+      .where(
+        sql`${t.qtyReceived} IS NOT NULL AND ${t.qtyReceived} < ${t.qtyDispatched} AND ${t.varianceMovementId} IS NULL`,
+      ),
+  }),
+);
+
+/**
+ * 🔴 Ind AS 2 — cost of purchase is the price plus duties and taxes
+ *    "OTHER THAN THOSE SUBSEQUENTLY RECOVERABLE", plus transport and
+ *    handling directly attributable to acquisition.
+ *
+ * ⚠️ `isRecoverable` splits two charges on ONE bill of entry: basic
+ * customs duty is a cost, IGST on imports is a credit. Capitalising the
+ * IGST inflates stock AND loses the credit, and the balance sheet still
+ * balances.
+ */
+export const landedCosts = pgTable(
+  "landed_costs",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    tenantId: uuid("tenant_id")
+      .notNull()
+      .references(() => tenants.id, { onDelete: "cascade" }),
+
+    purchaseInvoiceId: uuid("purchase_invoice_id"),
+    referenceNo: varchar("reference_no", { length: 60 }),
+
+    costType: varchar("cost_type", { length: 30 }).notNull(),
+    description: text("description"),
+
+    vendorId: uuid("vendor_id"),
+    vendorInvoiceNo: varchar("vendor_invoice_no", { length: 60 }),
+    costDate: date("cost_date", { mode: "string" }).notNull(),
+
+    amountMinor: bigint("amount_minor", { mode: "bigint" }).notNull(),
+
+    /** 🔴 Recoverable means it is a credit, not a cost. */
+    isRecoverable: boolean("is_recoverable").default(false).notNull(),
+
+    /** ⚠️ Freight by weight; value is the default and it is wrong for freight. */
+    apportionBasis: varchar("apportion_basis", { length: 20 })
+      .default("value")
+      .notNull(),
+
+    status: varchar("status", { length: 20 }).default("draft").notNull(),
+    appliedAt: timestamp("applied_at", { withTimezone: true }),
+    appliedBy: uuid("applied_by").references(() => users.id, { onDelete: "set null" }),
+
+    notes: text("notes"),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+    createdBy: uuid("created_by").references(() => users.id, { onDelete: "set null" }),
+  },
+  (t) => ({
+    invoiceIdx: index("landed_costs_invoice_idx").on(t.tenantId, t.purchaseInvoiceId),
+    statusIdx: index("landed_costs_status_idx").on(t.tenantId, t.status, t.costDate),
+  }),
+);
+
+/**
+ * ⭐ WHERE EACH RUPEE ENDED UP — and it is split between stock and cost
+ *   of sales, because the freight bill arrives after the goods and some
+ *   of them are already sold.
+ *
+ * 🔴 Adding the whole charge to what is left overstates closing stock
+ *    AND overstates the margin already reported. Two errors in opposite
+ *    directions, and the total is right, so nothing looks odd.
+ */
+export const landedCostAllocations = pgTable(
+  "landed_cost_allocations",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    tenantId: uuid("tenant_id")
+      .notNull()
+      .references(() => tenants.id, { onDelete: "cascade" }),
+    landedCostId: uuid("landed_cost_id")
+      .notNull()
+      .references(() => landedCosts.id, { onDelete: "cascade" }),
+
+    purchaseLineId: uuid("purchase_line_id"),
+    stockItemId: uuid("stock_item_id"),
+    batchNo: varchar("batch_no", { length: 100 }),
+
+    basisAmount: numeric("basis_amount", { precision: 18, scale: 3 })
+      .default(sql`0`)
+      .notNull(),
+    allocatedMinor: bigint("allocated_minor", { mode: "bigint" })
+      .default(sql`0`)
+      .notNull(),
+
+    /** ⭐ These two always add up to `allocatedMinor` — enforced by CHECK. */
+    toInventoryMinor: bigint("to_inventory_minor", { mode: "bigint" })
+      .default(sql`0`)
+      .notNull(),
+    toCogsMinor: bigint("to_cogs_minor", { mode: "bigint" })
+      .default(sql`0`)
+      .notNull(),
+
+    qtyReceived: numeric("qty_received", { precision: 18, scale: 3 })
+      .default(sql`0`)
+      .notNull(),
+    qtyStillOnHand: numeric("qty_still_on_hand", { precision: 18, scale: 3 })
+      .default(sql`0`)
+      .notNull(),
+
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (t) => ({
+    costIdx: index("landed_cost_allocations_cost_idx").on(t.tenantId, t.landedCostId),
+    itemIdx: index("landed_cost_allocations_item_idx").on(t.tenantId, t.stockItemId),
+  }),
+);
+
+export const stockTransfersRelations = relations(stockTransfers, ({ one, many }) => ({
+  tenant: one(tenants, { fields: [stockTransfers.tenantId], references: [tenants.id] }),
+  lines: many(stockTransferLines),
+}));
+
+export const stockTransferLinesRelations = relations(stockTransferLines, ({ one }) => ({
+  transfer: one(stockTransfers, {
+    fields: [stockTransferLines.transferId],
+    references: [stockTransfers.id],
+  }),
+}));
+
+export const landedCostsRelations = relations(landedCosts, ({ one, many }) => ({
+  tenant: one(tenants, { fields: [landedCosts.tenantId], references: [tenants.id] }),
+  allocations: many(landedCostAllocations),
+}));
+
+export const landedCostAllocationsRelations = relations(
+  landedCostAllocations,
+  ({ one }) => ({
+    cost: one(landedCosts, {
+      fields: [landedCostAllocations.landedCostId],
+      references: [landedCosts.id],
+    }),
+  }),
+);
+
+export type StockTransferRow = typeof stockTransfers.$inferSelect;
+export type StockTransferLineRow = typeof stockTransferLines.$inferSelect;
+export type LandedCostRow = typeof landedCosts.$inferSelect;
+export type LandedCostAllocationRow = typeof landedCostAllocations.$inferSelect;

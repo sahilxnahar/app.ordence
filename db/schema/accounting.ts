@@ -44,6 +44,7 @@ import {
   date,
   index,
   uniqueIndex,
+  bigint,
 } from "drizzle-orm/pg-core";
 import { relations, sql } from "drizzle-orm";
 import { tenants, users } from "./core";
@@ -499,3 +500,106 @@ export const salesPostingAccounts = pgTable(
 );
 
 export type SalesPostingAccount = typeof salesPostingAccounts.$inferSelect;
+
+/* ------------------------------------------------------------------ */
+/* ⭐ TIME & BILLING — Phase 63                                         */
+/* ------------------------------------------------------------------ */
+
+/**
+ * ⚠️ EFFECTIVE-DATED AND NEVER OVERWRITTEN. Work done in March bills at
+ * March's rate even when the invoice is raised in September. Updating a
+ * rate in place silently re-prices every unbilled hour ever worked.
+ */
+export const billingRates = pgTable(
+  "billing_rates",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    tenantId: uuid("tenant_id")
+      .notNull()
+      .references(() => tenants.id, { onDelete: "cascade" }),
+
+    /** NULL means "any". Most specific wins — see `lib/billing/time.ts`. */
+    userId: uuid("user_id").references(() => users.id, { onDelete: "cascade" }),
+    roleName: varchar("role_name", { length: 60 }),
+    companyId: uuid("company_id"),
+
+    rateMinor: bigint("rate_minor", { mode: "bigint" }).notNull(),
+    currency: varchar("currency", { length: 3 }).default("INR").notNull(),
+
+    /** ⚠️ Half-open: [from, to). */
+    effectiveFrom: date("effective_from", { mode: "string" }).notNull(),
+    effectiveTo: date("effective_to", { mode: "string" }),
+
+    note: text("note"),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+    createdBy: uuid("created_by").references(() => users.id, { onDelete: "set null" }),
+    updatedBy: uuid("updated_by").references(() => users.id, { onDelete: "set null" }),
+  },
+  (t) => ({
+    lookupIdx: index("billing_rates_lookup_idx").on(t.tenantId, t.effectiveFrom),
+    userIdx: index("billing_rates_user_idx").on(t.tenantId, t.userId),
+    companyIdx: index("billing_rates_company_idx").on(t.tenantId, t.companyId),
+  }),
+);
+
+/**
+ * 🔴 DURATION IS WHOLE MINUTES, AS AN INTEGER. Never hours as a decimal —
+ * a timesheet is hundreds of additions and `0.1 + 0.1 + 0.1` is not 0.3.
+ */
+export const timeEntries = pgTable(
+  "time_entries",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    tenantId: uuid("tenant_id")
+      .notNull()
+      .references(() => tenants.id, { onDelete: "cascade" }),
+
+    userId: uuid("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "restrict" }),
+    companyId: uuid("company_id"),
+
+    /**
+     * ⭐ One column for what a law firm calls a matter, a CA calls an
+     * engagement and a consultancy calls a project. One concept, three
+     * words.
+     */
+    subjectType: varchar("subject_type", { length: 40 }),
+    subjectId: uuid("subject_id"),
+    subjectLabel: varchar("subject_label", { length: 255 }),
+
+    entryDate: date("entry_date", { mode: "string" }).notNull(),
+    minutes: integer("minutes").notNull(),
+    /** The rounded, billable figure. Stored, not derived. */
+    billableMinutes: integer("billable_minutes").default(0).notNull(),
+    isBillable: boolean("is_billable").default(true).notNull(),
+
+    /** ⚠️ Copied onto the entry so the hour carries its own price. */
+    rateMinor: bigint("rate_minor", { mode: "bigint" }).default(sql`0`).notNull(),
+    valueMinor: bigint("value_minor", { mode: "bigint" }).default(sql`0`).notNull(),
+
+    /** 🔴 The client reads this line on the bill. */
+    narrative: text("narrative"),
+
+    status: varchar("status", { length: 20 }).default("draft").notNull(),
+    invoiceId: uuid("invoice_id"),
+
+    approvedAt: timestamp("approved_at", { withTimezone: true }),
+    approvedBy: uuid("approved_by").references(() => users.id, { onDelete: "set null" }),
+
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+    createdBy: uuid("created_by").references(() => users.id, { onDelete: "set null" }),
+    updatedBy: uuid("updated_by").references(() => users.id, { onDelete: "set null" }),
+  },
+  (t) => ({
+    unbilledIdx: index("time_entries_unbilled_idx").on(t.tenantId, t.companyId, t.status),
+    userIdx: index("time_entries_user_idx").on(t.tenantId, t.userId, t.entryDate),
+    subjectIdx: index("time_entries_subject_idx").on(t.tenantId, t.subjectType, t.subjectId),
+    invoiceIdx: index("time_entries_invoice_idx").on(t.tenantId, t.invoiceId),
+  }),
+);
+
+export type BillingRate = typeof billingRates.$inferSelect;
+export type TimeEntry = typeof timeEntries.$inferSelect;

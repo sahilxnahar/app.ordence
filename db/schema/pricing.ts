@@ -57,6 +57,7 @@ import {
 } from "drizzle-orm/pg-core";
 import { relations, sql } from "drizzle-orm";
 import { tenants } from "./core";
+import { users } from "./core";
 import { companies } from "./crm";
 
 /* ------------------------------------------------------------------ */
@@ -160,6 +161,15 @@ export const rateCards = pgTable(
     daysOfWeek: varchar("days_of_week", { length: 7 }),
 
     currency: varchar("currency", { length: 3 }).default("INR").notNull(),
+
+    /**
+     * ⭐ THE PRICE BELOW WHICH THIS CARD MUST NOT SELL — SQL 0057.
+     *
+     * 🔴 NULLABLE, DELIBERATELY. A card with no floor is not "a floor of
+     * zero"; it is a card nobody has set a floor on, and those two must
+     * not look the same on a screen meant to prompt somebody.
+     */
+    floorPriceMinor: bigint("floor_price_minor", { mode: "bigint" }),
 
     /** Used when there are no slabs at all. */
     baseAmountMinor: bigint("base_amount_minor", { mode: "bigint" })
@@ -536,3 +546,234 @@ export const rateQuotesRelations = relations(rateQuotes, ({ one }) => ({
     references: [rateCards.id],
   }),
 }));
+
+/* ------------------------------------------------------------------ */
+/* ⭐⭐ FLOOR PRICE + POST-SUPPLY DISCOUNTS — SQL 0057 · v1.6.0-alpha   */
+/* ------------------------------------------------------------------ */
+
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 SECTION 15(3)(b) — THE REBATE THAT CANNOT TAKE THE TAX BACK
+ * ══════════════════════════════════════════════════════════════════════
+ * A discount given AFTER the supply reduces the taxable value only if it
+ * was established under an agreement made **at or before that supply**,
+ * is linked to specific invoices, and the recipient has reversed the
+ * input tax credit.
+ *
+ * ⚠️ So a year-end volume rebate agreed in December cannot reduce the
+ * GST on April's sales. The credit note is legal; the tax is gone. And
+ * trading businesses give exactly those rebates, agreed at the end of
+ * the year they relate to.
+ *
+ * ⭐ `agreementDate` is therefore a recorded fact rather than something
+ * reconstructed from an email thread two years later.
+ */
+export const priceAgreements = pgTable(
+  "price_agreements",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    tenantId: uuid("tenant_id")
+      .notNull()
+      .references(() => tenants.id, { onDelete: "cascade" }),
+
+    companyId: uuid("company_id")
+      .notNull()
+      .references(() => companies.id, { onDelete: "restrict" }),
+    referenceNo: varchar("reference_no", { length: 60 }).notNull(),
+    title: varchar("title", { length: 255 }).notNull(),
+
+    /** 🔴 The column everything turns on. */
+    agreementDate: date("agreement_date", { mode: "string" }).notNull(),
+
+    effectiveFrom: date("effective_from", { mode: "string" }).notNull(),
+    effectiveTo: date("effective_to", { mode: "string" }),
+
+    discountKind: varchar("discount_kind", { length: 30 })
+      .default("turnover_rebate")
+      .notNull(),
+    /**
+     * ⭐ Rebate bands as JSON, deliberately NOT a second slab table.
+     * `rate_slabs` prices a SALE; this describes a rebate measured on a
+     * period's turnover. Sharing the table would put two unrelated
+     * meanings in one place and force the pricing resolver to learn to
+     * ignore half its own rows.
+     */
+    slabs: jsonb("slabs")
+      .$type<{ fromTurnoverMinor: string; rateBps: number }[]>()
+      .default(sql`'[]'::jsonb`)
+      .notNull(),
+
+    documentUrl: text("document_url"),
+    notes: text("notes"),
+    status: varchar("status", { length: 20 }).default("active").notNull(),
+
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+    createdBy: uuid("created_by").references(() => users.id, { onDelete: "set null" }),
+    updatedBy: uuid("updated_by").references(() => users.id, { onDelete: "set null" }),
+  },
+  (t) => ({
+    refUnique: uniqueIndex("price_agreements_ref_unique").on(t.tenantId, t.referenceNo),
+    companyIdx: index("price_agreements_company_idx").on(
+      t.tenantId,
+      t.companyId,
+      t.effectiveFrom,
+    ),
+  }),
+);
+
+export const postSupplyDiscounts = pgTable(
+  "post_supply_discounts",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    tenantId: uuid("tenant_id")
+      .notNull()
+      .references(() => tenants.id, { onDelete: "cascade" }),
+
+    companyId: uuid("company_id")
+      .notNull()
+      .references(() => companies.id, { onDelete: "restrict" }),
+    agreementId: uuid("agreement_id").references(() => priceAgreements.id, {
+      onDelete: "restrict",
+    }),
+
+    referenceNo: varchar("reference_no", { length: 60 }).notNull(),
+    periodFrom: date("period_from", { mode: "string" }).notNull(),
+    periodTo: date("period_to", { mode: "string" }).notNull(),
+    computedOn: date("computed_on", { mode: "string" }).notNull(),
+
+    turnoverMinor: bigint("turnover_minor", { mode: "bigint" })
+      .default(sql`0`)
+      .notNull(),
+    discountMinor: bigint("discount_minor", { mode: "bigint" })
+      .default(sql`0`)
+      .notNull(),
+    taxAtStakeMinor: bigint("tax_at_stake_minor", { mode: "bigint" })
+      .default(sql`0`)
+      .notNull(),
+
+    /**
+     * 🔴 THE VERDICT, STORED. It is a conclusion about facts as they
+     * stood on a date — re-deriving it next year against an agreement
+     * somebody has since edited would give a different answer to the one
+     * that was acted on.
+     */
+    reducesTax: boolean("reduces_tax").default(false).notNull(),
+    verdictReason: text("verdict_reason").notNull(),
+
+    /**
+     * ⚠️ Circular 212/6/2024 required a certificate proving this. It was
+     * WITHDRAWN by Circular 253/10/2025 on 1 October 2025 — but
+     * s.15(3)(b)(ii) itself was not amended, so the reversal still has
+     * to have happened. Only the paperwork requirement went.
+     */
+    recipientReversalConfirmed: boolean("recipient_reversal_confirmed")
+      .default(false)
+      .notNull(),
+    recipientReversalNote: text("recipient_reversal_note"),
+
+    creditNoteId: uuid("credit_note_id"),
+    status: varchar("status", { length: 20 }).default("draft").notNull(),
+
+    notes: text("notes"),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+    createdBy: uuid("created_by").references(() => users.id, { onDelete: "set null" }),
+  },
+  (t) => ({
+    refUnique: uniqueIndex("post_supply_discounts_ref_unique").on(
+      t.tenantId,
+      t.referenceNo,
+    ),
+    companyIdx: index("post_supply_discounts_company_idx").on(
+      t.tenantId,
+      t.companyId,
+      t.periodTo,
+    ),
+    /** ⭐ The year-end query: rebates whose tax was lost. */
+    lostTaxIdx: index("post_supply_discounts_lost_tax_idx")
+      .on(t.tenantId, t.computedOn)
+      .where(sql`${t.reducesTax} = false AND ${t.status} <> 'cancelled'`),
+  }),
+);
+
+/**
+ * 🔴 "SPECIFICALLY LINKED TO RELEVANT INVOICES" IS NOT DECORATION.
+ *
+ * A rebate computed on a period's turnover and credited as one lump is
+ * exactly what s.15(3)(b)(i) refuses — and it is also the only way the
+ * recipient can work out how much credit to reverse. Software that
+ * stores a rebate as a single figure cannot produce that linkage
+ * afterwards, because the apportionment was never done.
+ */
+export const postSupplyDiscountInvoices = pgTable(
+  "post_supply_discount_invoices",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    tenantId: uuid("tenant_id")
+      .notNull()
+      .references(() => tenants.id, { onDelete: "cascade" }),
+    discountId: uuid("discount_id")
+      .notNull()
+      .references(() => postSupplyDiscounts.id, { onDelete: "cascade" }),
+    invoiceId: uuid("invoice_id").notNull(),
+
+    /** Captured, so an invoice renumbered later cannot rewrite history. */
+    invoiceNumber: varchar("invoice_number", { length: 60 }),
+    invoiceDate: date("invoice_date", { mode: "string" }),
+    invoiceTaxableMinor: bigint("invoice_taxable_minor", { mode: "bigint" })
+      .default(sql`0`)
+      .notNull(),
+
+    allocatedMinor: bigint("allocated_minor", { mode: "bigint" })
+      .default(sql`0`)
+      .notNull(),
+    taxRateBps: integer("tax_rate_bps").default(0).notNull(),
+    taxAllocatedMinor: bigint("tax_allocated_minor", { mode: "bigint" })
+      .default(sql`0`)
+      .notNull(),
+
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (t) => ({
+    linkUnique: uniqueIndex("post_supply_discount_invoices_unique").on(
+      t.tenantId,
+      t.discountId,
+      t.invoiceId,
+    ),
+    invoiceIdx: index("post_supply_discount_invoices_invoice_idx").on(
+      t.tenantId,
+      t.invoiceId,
+    ),
+  }),
+);
+
+export const priceAgreementsRelations = relations(priceAgreements, ({ one, many }) => ({
+  tenant: one(tenants, { fields: [priceAgreements.tenantId], references: [tenants.id] }),
+  discounts: many(postSupplyDiscounts),
+}));
+
+export const postSupplyDiscountsRelations = relations(
+  postSupplyDiscounts,
+  ({ one, many }) => ({
+    agreement: one(priceAgreements, {
+      fields: [postSupplyDiscounts.agreementId],
+      references: [priceAgreements.id],
+    }),
+    invoices: many(postSupplyDiscountInvoices),
+  }),
+);
+
+export const postSupplyDiscountInvoicesRelations = relations(
+  postSupplyDiscountInvoices,
+  ({ one }) => ({
+    discount: one(postSupplyDiscounts, {
+      fields: [postSupplyDiscountInvoices.discountId],
+      references: [postSupplyDiscounts.id],
+    }),
+  }),
+);
+
+export type PriceAgreementRow = typeof priceAgreements.$inferSelect;
+export type PostSupplyDiscountRow = typeof postSupplyDiscounts.$inferSelect;
+export type PostSupplyDiscountInvoiceRow = typeof postSupplyDiscountInvoices.$inferSelect;

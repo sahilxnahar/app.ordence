@@ -631,3 +631,248 @@ export type GstRegistrationType = (typeof gstRegistrationTypeEnum.enumValues)[nu
 export type GstSupplyType = (typeof gstSupplyTypeEnum.enumValues)[number];
 export type HsnSacKind = (typeof hsnSacKindEnum.enumValues)[number];
 export type GstPartyType = (typeof gstPartyTypeEnum.enumValues)[number];
+
+/* ------------------------------------------------------------------ */
+/* ⭐⭐ E-WAY BILL — Rule 138 · SQL 0054 · v1.3.0-alpha                 */
+/* ------------------------------------------------------------------ */
+
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 ORDENCE PREPARES AN E-WAY BILL. IT DOES NOT GENERATE ONE.
+ * ══════════════════════════════════════════════════════════════════════
+ * There are no GSP credentials — the same block that stops GSTR-1
+ * filing. So `status = 'prepared'` is never rendered as anything that
+ * looks like coverage, and `ewb_no` is the number a human brings back
+ * from the portal.
+ *
+ * ⚠️ Inventing an integration that cannot be tested would produce a
+ * screen that LOOKS like it raised an e-way bill and did not — and
+ * somebody would dispatch on the strength of it.
+ */
+export const ewayBills = pgTable(
+  "eway_bills",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    tenantId: uuid("tenant_id")
+      .notNull()
+      .references(() => tenants.id, { onDelete: "cascade" }),
+
+    documentType: varchar("document_type", { length: 20 }).notNull(),
+    documentNo: varchar("document_no", { length: 40 }).notNull(),
+    documentDate: date("document_date", { mode: "string" }).notNull(),
+    invoiceId: uuid("invoice_id"),
+
+    supplierGstin: varchar("supplier_gstin", { length: 15 }),
+    supplierLegalName: varchar("supplier_legal_name", { length: 255 }),
+    fromStateCode: varchar("from_state_code", { length: 2 }).notNull(),
+    fromPlace: varchar("from_place", { length: 255 }),
+    fromPincode: varchar("from_pincode", { length: 6 }).notNull(),
+
+    recipientGstin: varchar("recipient_gstin", { length: 15 }),
+    recipientLegalName: varchar("recipient_legal_name", { length: 255 }),
+    toStateCode: varchar("to_state_code", { length: 2 }).notNull(),
+    toPlace: varchar("to_place", { length: 255 }),
+    toPincode: varchar("to_pincode", { length: 6 }).notNull(),
+
+    transactionType: varchar("transaction_type", { length: 30 })
+      .notNull()
+      .default("regular"),
+    supplyType: varchar("supply_type", { length: 10 }).notNull().default("outward"),
+    subSupplyType: varchar("sub_supply_type", { length: 30 })
+      .notNull()
+      .default("supply"),
+
+    /**
+     * 🔴 THE THRESHOLD FIGURE, AND IT IS NOT THE INVOICE TOTAL.
+     * Explanation 2 to Rule 138(1) — includes tax, excludes exempt
+     * supply on a mixed document. Computed by `lib/gst/eway.ts` and
+     * stored, because what was declared must not change when somebody
+     * later edits the invoice.
+     */
+    taxableValueMinor: bigint("taxable_value_minor", { mode: "bigint" })
+      .notNull()
+      .default(0n),
+    taxValueMinor: bigint("tax_value_minor", { mode: "bigint" }).notNull().default(0n),
+    exemptValueMinor: bigint("exempt_value_minor", { mode: "bigint" })
+      .notNull()
+      .default(0n),
+    consignmentValueMinor: bigint("consignment_value_minor", { mode: "bigint" })
+      .notNull()
+      .default(0n),
+
+    transportMode: varchar("transport_mode", { length: 10 }),
+    transporterGstin: varchar("transporter_gstin", { length: 15 }),
+    transporterName: varchar("transporter_name", { length: 255 }),
+    transporterDocNo: varchar("transporter_doc_no", { length: 40 }),
+    transporterDocDate: date("transporter_doc_date", { mode: "string" }),
+    /** ⚠️ A CACHE OF THE LATEST LEG. The record is `eway_bill_vehicles`. */
+    vehicleNo: varchar("vehicle_no", { length: 20 }),
+    vehicleType: varchar("vehicle_type", { length: 10 }).notNull().default("regular"),
+
+    distanceKm: integer("distance_km").notNull().default(0),
+
+    ewbNo: varchar("ewb_no", { length: 20 }),
+    generatedAt: timestamp("generated_at", { withTimezone: true }),
+    /** 🔴 Counted from the FIRST Part B entry, never from Part A. */
+    validFrom: timestamp("valid_from", { withTimezone: true }),
+    validUntil: timestamp("valid_until", { withTimezone: true }),
+
+    /**
+     * ⚠️ `generatedAt` SURVIVES EVERY EXTENSION. The 360-day ceiling runs
+     * from original generation; overwriting it would let the ceiling
+     * slide forward forever.
+     */
+    extensionCount: integer("extension_count").notNull().default(0),
+    lastExtendedAt: timestamp("last_extended_at", { withTimezone: true }),
+
+    status: varchar("status", { length: 20 }).notNull().default("prepared"),
+
+    cancelledAt: timestamp("cancelled_at", { withTimezone: true }),
+    cancelledBy: uuid("cancelled_by").references(() => users.id, {
+      onDelete: "set null",
+    }),
+    cancelReason: text("cancel_reason"),
+
+    notes: text("notes"),
+
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+    createdBy: uuid("created_by").references(() => users.id, { onDelete: "set null" }),
+    updatedBy: uuid("updated_by").references(() => users.id, { onDelete: "set null" }),
+  },
+  (t) => ({
+    /** 🔴 One portal number, one row. Two rows sharing it means two
+     *  consignments each believe they are covered and one is not. */
+    numberUnique: uniqueIndex("eway_bills_number_unique")
+      .on(t.tenantId, t.ewbNo)
+      .where(sql`${t.ewbNo} IS NOT NULL`),
+    /** 🔴 One LIVE e-way bill per source document. */
+    oneLivePerDocument: uniqueIndex("eway_bills_one_live_per_document")
+      .on(t.tenantId, t.documentType, t.documentNo)
+      .where(sql`${t.status} IN ('prepared', 'active')`),
+    expiryIdx: index("eway_bills_expiry_idx")
+      .on(t.tenantId, t.validUntil)
+      .where(sql`${t.status} = 'active'`),
+    invoiceIdx: index("eway_bills_invoice_idx")
+      .on(t.tenantId, t.invoiceId)
+      .where(sql`${t.invoiceId} IS NOT NULL`),
+    statusIdx: index("eway_bills_status_idx").on(t.tenantId, t.status, t.documentDate),
+  }),
+);
+
+/**
+ * 🔴 EVERY VEHICLE THE GOODS EVER SAT IN, NOT JUST THE CURRENT ONE.
+ *
+ * Transshipment is normal. If `vehicle_no` were simply UPDATEd, then at
+ * a check two states later the record says the goods were always on the
+ * second lorry — and the first leg, which actually happened, has no
+ * record at all. An officer's question is "where has this been".
+ */
+export const ewayBillVehicles = pgTable(
+  "eway_bill_vehicles",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    tenantId: uuid("tenant_id")
+      .notNull()
+      .references(() => tenants.id, { onDelete: "cascade" }),
+    ewayBillId: uuid("eway_bill_id")
+      .notNull()
+      .references(() => ewayBills.id, { onDelete: "cascade" }),
+
+    legNo: integer("leg_no").notNull(),
+    transportMode: varchar("transport_mode", { length: 10 }).notNull(),
+    vehicleNo: varchar("vehicle_no", { length: 20 }),
+    transporterDocNo: varchar("transporter_doc_no", { length: 40 }),
+    transporterDocDate: date("transporter_doc_date", { mode: "string" }),
+
+    fromPlace: varchar("from_place", { length: 255 }),
+    fromStateCode: varchar("from_state_code", { length: 2 }),
+
+    /** ⭐ On leg 1, this is the instant that starts the validity clock. */
+    enteredAt: timestamp("entered_at", { withTimezone: true }).notNull().defaultNow(),
+    reasonCode: varchar("reason_code", { length: 20 }),
+    reasonNote: text("reason_note"),
+
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    createdBy: uuid("created_by").references(() => users.id, { onDelete: "set null" }),
+  },
+  (t) => ({
+    legUnique: uniqueIndex("eway_vehicles_leg_unique").on(
+      t.tenantId,
+      t.ewayBillId,
+      t.legNo,
+    ),
+    billIdx: index("eway_vehicles_bill_idx").on(t.tenantId, t.ewayBillId, t.legNo),
+  }),
+);
+
+/**
+ * ⚠️ COPIED FROM THE DOCUMENT, NOT JOINED TO IT AT READ TIME — the same
+ * rule Rule 46 already forces on the tax invoice. What was declared to
+ * the Government on the day of movement must not change because somebody
+ * later corrected an HSN code on a stock item.
+ */
+export const ewayBillItems = pgTable(
+  "eway_bill_items",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    tenantId: uuid("tenant_id")
+      .notNull()
+      .references(() => tenants.id, { onDelete: "cascade" }),
+    ewayBillId: uuid("eway_bill_id")
+      .notNull()
+      .references(() => ewayBills.id, { onDelete: "cascade" }),
+
+    lineNo: integer("line_no").notNull(),
+    productName: varchar("product_name", { length: 255 }).notNull(),
+    description: text("description"),
+    hsnCode: varchar("hsn_code", { length: 10 }).notNull(),
+    quantity: varchar("quantity", { length: 24 }).notNull().default("0"),
+    uqc: varchar("uqc", { length: 10 }).notNull().default("NOS"),
+
+    taxableValueMinor: bigint("taxable_value_minor", { mode: "bigint" })
+      .notNull()
+      .default(0n),
+    cgstRateBps: integer("cgst_rate_bps").notNull().default(0),
+    sgstRateBps: integer("sgst_rate_bps").notNull().default(0),
+    igstRateBps: integer("igst_rate_bps").notNull().default(0),
+    cessRateBps: integer("cess_rate_bps").notNull().default(0),
+
+    /** ⚠️ An exempt line still travels; it just does not count to ₹50,000. */
+    isExempt: boolean("is_exempt").notNull().default(false),
+
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    lineUnique: uniqueIndex("eway_items_line_unique").on(
+      t.tenantId,
+      t.ewayBillId,
+      t.lineNo,
+    ),
+  }),
+);
+
+export const ewayBillsRelations = relations(ewayBills, ({ one, many }) => ({
+  tenant: one(tenants, { fields: [ewayBills.tenantId], references: [tenants.id] }),
+  vehicles: many(ewayBillVehicles),
+  items: many(ewayBillItems),
+}));
+
+export const ewayBillVehiclesRelations = relations(ewayBillVehicles, ({ one }) => ({
+  bill: one(ewayBills, {
+    fields: [ewayBillVehicles.ewayBillId],
+    references: [ewayBills.id],
+  }),
+}));
+
+export const ewayBillItemsRelations = relations(ewayBillItems, ({ one }) => ({
+  bill: one(ewayBills, {
+    fields: [ewayBillItems.ewayBillId],
+    references: [ewayBills.id],
+  }),
+}));
+
+export type EwayBillRow = typeof ewayBills.$inferSelect;
+export type NewEwayBillRow = typeof ewayBills.$inferInsert;
+export type EwayBillVehicleRow = typeof ewayBillVehicles.$inferSelect;
+export type EwayBillItemRow = typeof ewayBillItems.$inferSelect;
