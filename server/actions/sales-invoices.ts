@@ -34,6 +34,7 @@ import {
   salesCreditNoteLines,
 } from "@/db/schema/sales-invoices";
 import { companies } from "@/db/schema/crm";
+import { gstRegistrations } from "@/db/schema/gst";
 import { salesOrders } from "@/db/schema/orders";
 import { requirePermission, writeAudit } from "@/server/audit";
 import { guardSalesWrite, toSalesActionError } from "@/server/sales/guards";
@@ -47,7 +48,7 @@ import {
 import { customerPosition, runningBalance } from "@/lib/receivables/customer-ledger";
 import { buildGstr1, type Gstr1Return } from "@/lib/gstr1/build";
 import { checkRule46, type Rule46Finding } from "@/lib/gst/invoice-fields";
-import { buildInvoice, billableQty, fromQtyMinor } from "@/lib/invoicing/build";
+import { buildInvoice, billableQty, fromQtyMinor, toQtyMinor } from "@/lib/invoicing/build";
 import { taxKindFor } from "@/lib/gst/place-of-supply";
 import {
   allocateReceiptSchema,
@@ -70,6 +71,8 @@ import {
   type CreditableInvoiceLine,
   type CreditLineFinding,
 } from "@/lib/invoicing/credit-note";
+import { rupeesInWords } from "@/lib/invoicing/amount-in-words";
+import { copyLabelsFor, printGaps, type PostalAddress, type PrintFinding } from "@/lib/invoicing/print";
 import { serializeAmount, toBigIntAmount } from "@/lib/billing/money";
 import type { ActionResult } from "@/lib/validators/crm";
 
@@ -2313,5 +2316,277 @@ export async function discardCreditNoteDraft(
     return { ok: true, data: { id: data.creditNoteId } };
   } catch (err) {
     return toSalesActionError(err, "discardCreditNoteDraft");
+  }
+}
+
+/* ================================================================== */
+/* ⭐ THE PRINTED DOCUMENT — Phase 55                                   */
+/* ================================================================== */
+
+type PrintedParty = {
+  legalName: string | null;
+  tradeName: string | null;
+  gstin: string | null;
+  stateCode: string | null;
+  address: PostalAddress;
+};
+
+/**
+ * ⭐ ONE INVOICE, SHAPED FOR PAPER.
+ *
+ * ⚠️ IT IS A SEPARATE ACTION FROM `getInvoiceDetail`, AND NOT A FLAG ON
+ * IT. The screen needs a Rule 46 report and editable state; the paper
+ * needs the supplier's registered address, the amount in words and the
+ * copy labels, and needs none of the report. One function serving both
+ * would grow a `forPrint` branch that eventually diverges — and the
+ * branch nobody exercises is the one that ships wrong.
+ *
+ * ⚠️ THE SUPPLIER IS READ FROM THE REGISTRATION FROZEN ON THE INVOICE,
+ * not from today's settings. `supplierRegistrationId` was captured when
+ * the invoice was raised. Registrations get surrendered, migrated and
+ * re-addressed; reprinting a two-year-old invoice must reproduce the
+ * document the customer holds, not a new one wearing the same number.
+ */
+export async function getInvoiceForPrint(input: unknown): Promise<
+  ActionResult<{
+    invoice: {
+      id: string;
+      invoiceNumber: string;
+      invoiceDate: string;
+      dueDate: string | null;
+      status: string;
+      supplyType: string;
+      placeOfSupplyCode: string | null;
+      isInterState: boolean;
+      isUnionTerritory: boolean;
+      isReverseCharge: boolean;
+      taxableValueMinor: string;
+      cgstMinor: string;
+      sgstMinor: string;
+      igstMinor: string;
+      cessMinor: string;
+      roundOffMinor: string;
+      totalMinor: string;
+      receivedMinor: string;
+      outstandingMinor: string;
+      amountInWords: string;
+      notes: string | null;
+      terms: string | null;
+    };
+    supplier: PrintedParty;
+    recipient: PrintedParty;
+    lines: {
+      id: string;
+      lineNo: number;
+      description: string;
+      hsnSacCode: string | null;
+      quantity: string;
+      uom: string;
+      taxRateBps: number | null;
+      unitPriceMinor: string;
+      discountMinor: string;
+      taxableValueMinor: string;
+      cgstMinor: string;
+      sgstMinor: string;
+      igstMinor: string;
+      lineTotalMinor: string;
+    }[];
+    /** ⭐ HSN summary — Rule 46(g) and the table GSTR-1 reconciles against. */
+    hsnSummary: {
+      hsnSacCode: string;
+      uom: string;
+      quantity: string;
+      taxableValueMinor: string;
+      taxAmountMinor: string;
+    }[];
+    copies: readonly string[];
+    gaps: PrintFinding[];
+  }>
+> {
+  try {
+    const data = issueInvoiceSchema.parse(input);
+    const ctx = await requirePermission("sales.invoices.read", {
+      type: "sales_invoice",
+      id: data.invoiceId,
+    });
+
+    const result = await withTenant(ctx.tenant.id, async (tx) => {
+      const [inv] = await tx
+        .select()
+        .from(salesInvoices)
+        .where(
+          and(eq(salesInvoices.tenantId, ctx.tenant.id), eq(salesInvoices.id, data.invoiceId)),
+        )
+        .limit(1);
+
+      if (!inv) throw new Error("That invoice no longer exists.");
+
+      let supplier: PrintedParty = {
+        legalName: null,
+        tradeName: null,
+        gstin: inv.supplierGstin,
+        stateCode: inv.supplierStateCode,
+        address: {},
+      };
+
+      if (inv.supplierRegistrationId) {
+        const [reg] = await tx
+          .select({
+            legalName: gstRegistrations.legalName,
+            tradeName: gstRegistrations.tradeName,
+            address: gstRegistrations.address,
+          })
+          .from(gstRegistrations)
+          .where(
+            and(
+              eq(gstRegistrations.tenantId, ctx.tenant.id),
+              eq(gstRegistrations.id, inv.supplierRegistrationId),
+            ),
+          )
+          .limit(1);
+
+        if (reg) {
+          supplier = {
+            legalName: reg.legalName,
+            tradeName: reg.tradeName,
+            gstin: inv.supplierGstin,
+            stateCode: inv.supplierStateCode,
+            address: (reg.address ?? {}) as PostalAddress,
+          };
+        }
+      }
+
+      const lines = await tx
+        .select()
+        .from(salesInvoiceLines)
+        .where(
+          and(
+            eq(salesInvoiceLines.tenantId, ctx.tenant.id),
+            eq(salesInvoiceLines.invoiceId, inv.id),
+          ),
+        )
+        .orderBy(salesInvoiceLines.lineNo);
+
+      /**
+       * ⚠️ THE HSN SUMMARY IS BUILT HERE, NOT IN THE PAGE. It has to be
+       * the same grouping GSTR-1 uses, and a page that groups it its own
+       * way produces an invoice whose summary disagrees with the return
+       * filed against it.
+       *
+       * ⚠️ GROUPED BY CODE **AND** UNIT. Two lines under one HSN in
+       * different units cannot have their quantities added — 3 bags and
+       * 3 tonnes is not 6 of anything.
+       */
+      const summary = new Map<
+        string,
+        {
+          hsnSacCode: string;
+          uom: string;
+          qtyMinor: bigint;
+          taxableValueMinor: bigint;
+          taxAmountMinor: bigint;
+        }
+      >();
+
+      for (const l of lines) {
+        const code = l.hsnSacCode ?? "—";
+        const key = `${code}|${l.uom}`;
+        const entry = summary.get(key) ?? {
+          hsnSacCode: code,
+          uom: l.uom,
+          qtyMinor: 0n,
+          taxableValueMinor: 0n,
+          taxAmountMinor: 0n,
+        };
+        entry.qtyMinor += toQtyMinor(String(l.quantity));
+        entry.taxableValueMinor += toBigIntAmount(l.taxableValueMinor);
+        entry.taxAmountMinor +=
+          toBigIntAmount(l.cgstMinor) +
+          toBigIntAmount(l.sgstMinor) +
+          toBigIntAmount(l.igstMinor) +
+          toBigIntAmount(l.cessMinor);
+        summary.set(key, entry);
+      }
+
+      const total = toBigIntAmount(inv.totalMinor);
+      const received = toBigIntAmount(inv.receivedMinor);
+
+      return {
+        invoice: {
+          id: inv.id,
+          invoiceNumber: inv.invoiceNumber,
+          invoiceDate: String(inv.invoiceDate),
+          dueDate: inv.dueDate ? String(inv.dueDate) : null,
+          status: inv.status,
+          supplyType: inv.supplyType,
+          placeOfSupplyCode: inv.placeOfSupplyCode,
+          isInterState: inv.isInterState,
+          isUnionTerritory: inv.isUnionTerritory,
+          isReverseCharge: inv.isReverseCharge,
+          taxableValueMinor: serializeAmount(toBigIntAmount(inv.taxableValueMinor)),
+          cgstMinor: serializeAmount(toBigIntAmount(inv.cgstMinor)),
+          sgstMinor: serializeAmount(toBigIntAmount(inv.sgstMinor)),
+          igstMinor: serializeAmount(toBigIntAmount(inv.igstMinor)),
+          cessMinor: serializeAmount(toBigIntAmount(inv.cessMinor)),
+          roundOffMinor: serializeAmount(toBigIntAmount(inv.roundOffMinor)),
+          totalMinor: serializeAmount(total),
+          receivedMinor: serializeAmount(received),
+          outstandingMinor: serializeAmount(total - received),
+          /** ⭐ The tie-breaker when the figure is smudged or altered. */
+          amountInWords: rupeesInWords(total),
+          notes: inv.notes,
+          terms: inv.terms,
+        },
+        supplier,
+        recipient: {
+          legalName: inv.customerLegalName,
+          tradeName: null,
+          gstin: inv.customerGstin,
+          stateCode: null,
+          address: (inv.customerAddress ?? {}) as PostalAddress,
+        },
+        lines: lines.map((l) => ({
+          id: l.id,
+          lineNo: l.lineNo,
+          description: l.description,
+          hsnSacCode: l.hsnSacCode,
+          quantity: String(l.quantity),
+          uom: l.uom,
+          taxRateBps: l.taxRateBps,
+          unitPriceMinor: serializeAmount(toBigIntAmount(l.unitPriceMinor)),
+          discountMinor: serializeAmount(toBigIntAmount(l.discountMinor)),
+          taxableValueMinor: serializeAmount(toBigIntAmount(l.taxableValueMinor)),
+          cgstMinor: serializeAmount(toBigIntAmount(l.cgstMinor)),
+          sgstMinor: serializeAmount(toBigIntAmount(l.sgstMinor)),
+          igstMinor: serializeAmount(toBigIntAmount(l.igstMinor)),
+          lineTotalMinor: serializeAmount(toBigIntAmount(l.lineTotalMinor)),
+        })),
+        hsnSummary: [...summary.values()].map((e) => ({
+          hsnSacCode: e.hsnSacCode,
+          uom: e.uom,
+          quantity: fromQtyMinor(e.qtyMinor),
+          taxableValueMinor: serializeAmount(e.taxableValueMinor),
+          taxAmountMinor: serializeAmount(e.taxAmountMinor),
+        })),
+        copies: copyLabelsFor(inv.supplyType),
+        gaps: printGaps({
+          /**
+           * ⚠️ BOTH ARE HARD-CODED FALSE AND THAT IS THE HONEST ANSWER.
+           * Neither field is captured anywhere in the product yet. When
+           * they are, this becomes a real read — and until then the
+           * printed document says so out loud rather than quietly
+           * omitting the row.
+           */
+          hasDeliveryAddress: false,
+          hasSignatory: false,
+          supplierGstin: inv.supplierGstin,
+          supplierLegalName: supplier.legalName,
+        }),
+      };
+    });
+
+    return { ok: true, data: result };
+  } catch (err) {
+    return toSalesActionError(err, "getInvoiceForPrint");
   }
 }

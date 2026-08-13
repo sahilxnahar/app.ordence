@@ -183,6 +183,22 @@ export default async function InvoiceDetailPage({
            * teaches the wrong habit on the invoice where it is cheapest
            * to learn.
            */}
+          {/**
+           * ⭐ THE DOCUMENT ITSELF — v0.97.0.
+           *
+           * ⚠️ OFFERED ON A DRAFT TOO, unlike the credit route. People
+           * print a draft to check it before issuing, and refusing that
+           * just means somebody screenshots this screen instead. The
+           * sheet carries a DRAFT watermark and says NOT YET ISSUED
+           * where the number goes, so it cannot be mistaken for the real
+           * document lying next to it on a desk.
+           */}
+          <Link
+            href={`/invoices/${invoice.id}/print`}
+            className="inline-block text-sm underline underline-offset-4"
+          >
+            Print / Save as PDF
+          </Link>
           {invoice.status !== "draft" && invoice.status !== "cancelled" && (
             <Link
               href={`/invoices/${invoice.id}/credit`}

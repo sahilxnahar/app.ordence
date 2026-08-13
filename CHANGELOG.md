@@ -1,3 +1,18 @@
+# v0.97.0-alpha — THE PRINTED INVOICE
+
+**Repo: `app.ordence`** · **No SQL** · **No new Railway variables**
+
+- **`/invoices/[id]/print`** — the document itself. A4, one sheet per
+  Rule 48(1) copy (three for goods, two for services), selectable text.
+- **`lib/invoicing/amount-in-words.ts`** — Indian grouping. One Lakh, not
+  One Hundred Thousand. `bigint`, exact past `MAX_SAFE_INTEGER`.
+- **HSN/SAC summary** built server-side, grouped by code **and** unit.
+- **Rule 46(o) and 46(q) rows print blank rather than being omitted.**
+- Supplier read from the **registration frozen on the invoice**, not from
+  today's settings.
+- **No server-side PDF engine.** The browser is the renderer; see the note
+  at the top of `lib/invoicing/print.ts`.
+
 # v0.96.0-alpha — CREDIT NOTES, ON A SCREEN
 
 **Repo: `app.ordence`** · **No SQL** · **No new Railway variables**
