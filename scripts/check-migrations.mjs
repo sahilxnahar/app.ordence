@@ -64,6 +64,17 @@ const KNOWN_GAPS = new Map([
    * The batch went out as 0063 instead.
    */
   [62, "retired — 0062_security_batches.sql superseded, number not reused"],
+  /**
+   * ⭐ 0072 IS RETIRED FOR THE SAME REASON, AND THE GATE CAUGHT IT THE
+   * SAME WAY. `0072_quick_flows.sql` was superseded and sits in
+   * `_superseded/`. v1.21.0 tried to reuse the number for the period
+   * lock; this check refused, and the file went out as 0073 instead.
+   *
+   * ⚠️ That is twice now that reusing a retired number has been the
+   * obvious thing to do and twice that it would have produced a
+   * migration log which cannot be replayed from scratch.
+   */
+  [72, "retired — 0072_quick_flows.sql superseded, number not reused"],
 ]);
 
 /* ------------------------------------------------------------------ */

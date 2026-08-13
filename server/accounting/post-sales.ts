@@ -32,7 +32,7 @@ import "server-only";
  * needed to correct one.
  */
 
-import { and, eq, inArray } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import { withTenant } from "@/db";
 import { transactions, journalEntries, salesPostingAccounts } from "@/db/schema/accounting";
 import { formatMoneyPlain } from "@/lib/billing/money";
@@ -129,7 +129,14 @@ export type PostOutcome =
    * `already_posted` would tell the person their clean count had been
    * done before, which is both untrue and alarming.
    */
-  | { posted: false; reason: "nothing_to_post" };
+  | { posted: false; reason: "nothing_to_post" }
+  /**
+   * ⭐ ADDED IN v1.21.0. The document belongs in a month that has been
+   * closed. Reported as its own outcome rather than as a failure,
+   * because it is a policy answer and not a fault: the remedy is to
+   * reopen the period deliberately or to date the document correctly.
+   */
+  | { posted: false; reason: "period_closed"; period: string };
 
 /** The tenant's role → ledger map. */
 async function loadRoleMap(tx: Tx, tenantId: string): Promise<Map<PostingRole, string>> {
@@ -190,6 +197,24 @@ async function writePosting(
     .limit(1);
 
   if (existing) return { posted: false, reason: "already_posted" };
+
+  /**
+   * 🔴🔴 THE PERIOD LOCK, CHECKED HERE AND ENFORCED BY 0072'S TRIGGER.
+   *
+   * ⚠️ `isDateLocked` HAS EXISTED SINCE 0005 AND NOTHING HAS EVER CALLED
+   * IT. A month could be closed on screen and postings kept landing in
+   * it, silently, for as long as anybody kept posting. That is worse
+   * than having no period close at all, because closing a period is a
+   * statement made to an auditor that the numbers are final.
+   *
+   * ⭐ THIS CHECK PRODUCES A SENTENCE. The trigger is what makes it true
+   * for the import, the support fix and the API route that have not been
+   * written yet.
+   */
+  const lockedIn = await closedPeriodFor(tx, args.tenantId, args.transactionDate);
+  if (lockedIn) {
+    return { posted: false, reason: "period_closed", period: lockedIn };
+  }
 
   const roleMap = await loadRoleMap(tx, args.tenantId);
   const missing = rolesUsed(args.legs).filter((r) => !roleMap.has(r));
@@ -1081,4 +1106,31 @@ export async function postStockCount(
     counterpartyId: null,
     counterpartyName: null,
   });
+}
+
+/**
+ * ⚠️ RETURNS THE PERIOD'S NAME RATHER THAN A BOOLEAN, because "you
+ * cannot post this" is useless and "March 2026 is closed" is actionable.
+ *
+ * ⭐ `closing` DELIBERATELY PERMITS POSTINGS. That is the state where
+ * somebody is doing the month-end work and still needs to post the
+ * adjustments that finish it. Locking at `closing` would make it
+ * impossible to close a month at all, which is the kind of rule that
+ * gets switched off rather than fixed.
+ */
+async function closedPeriodFor(
+  tx: Tx,
+  tenantId: string,
+  onDate: string,
+): Promise<string | null> {
+  const rows = await tx.execute(sql`
+    SELECT name FROM financial_periods
+     WHERE tenant_id = ${tenantId}::uuid
+       AND ${onDate}::date BETWEEN start_date AND end_date
+       AND status IN ('closed', 'locked')
+     LIMIT 1
+  `);
+  const first =
+    (Array.isArray(rows) ? rows[0] : (rows as { rows?: unknown[] }).rows?.[0]) ?? null;
+  return first ? String((first as { name?: string }).name ?? "that period") : null;
 }

@@ -233,6 +233,24 @@ export const warehouses = pgTable(
      */
     allowNegativeStock: boolean("allow_negative_stock").default(false).notNull(),
 
+    /**
+     * ⭐ WHO THIS IS NORMALLY BOUGHT FROM. Added in 0072.
+     *
+     * ⚠️ A reorder list that says "order 200 bags" and not who from is a
+     * list somebody has to research before acting on, which means a list
+     * nobody acts on.
+     */
+    preferredVendorId: uuid("preferred_vendor_id"),
+    /**
+     * ⭐ THE BASELINE FOR AGEING. Added in 0072.
+     *
+     * ⚠️ An item that has NEVER moved has no rows in the movement table
+     * at all, so "nothing has moved since" cannot be computed from
+     * movements alone. It would either be invisible or look infinitely
+     * old, and both are wrong.
+     */
+    firstStockedOn: date("first_stocked_on"),
+
     isActive: boolean("is_active").default(true).notNull(),
     notes: text("notes"),
 
