@@ -169,6 +169,28 @@ export default async function InvoiceDetailPage({
               outstandingMinor={invoice.outstandingMinor}
             />
           )}
+          {/**
+           * ⭐ THE ONLY LAWFUL CORRECTION TO AN ISSUED INVOICE.
+           *
+           * ⚠️ IT IS A LINK, NOT A BUTTON THAT ACTS. Choosing which
+           * lines come back and on what statutory ground is a form, and
+           * a one-click "credit this invoice" would make the full
+           * reversal the default outcome of a mis-click on a document
+           * the customer is holding.
+           *
+           * ⚠️ AND IT IS ABSENT ON A DRAFT rather than disabled. A draft
+           * is corrected by editing it — offering the credit route
+           * teaches the wrong habit on the invoice where it is cheapest
+           * to learn.
+           */}
+          {invoice.status !== "draft" && invoice.status !== "cancelled" && (
+            <Link
+              href={`/invoices/${invoice.id}/credit`}
+              className="inline-block text-sm underline underline-offset-4"
+            >
+              Raise a credit note against this invoice
+            </Link>
+          )}
         </CardContent>
       </Card>
 

@@ -231,6 +231,25 @@ export const issueCreditNoteSchema = z.object({
 });
 
 /**
+ * Discard a credit-note DRAFT.
+ *
+ * ⚠️ NO REASON IS REQUIRED, AND THAT IS DELIBERATE. A draft is a working
+ * paper nobody outside the workspace has seen; demanding a written
+ * justification to abandon one teaches people to type "test" into audit
+ * fields, which is how the reason on a document that MATTERS stops being
+ * read. `cancelInvoiceSchema` requires a reason because that document
+ * left the building. This one never did.
+ *
+ * ⚠️ THERE IS NO SCHEMA FOR CANCELLING AN *ISSUED* CREDIT NOTE, AND
+ * THERE SHOULD NOT BE. The customer holds it and has already reversed
+ * input credit against it; the correction for a wrong credit note is a
+ * fresh document, not an eraser.
+ */
+export const discardCreditNoteSchema = z.object({
+  creditNoteId: uuidSchema,
+});
+
+/**
  * A GSTR-1 period.
  *
  * ⚠️ A MONTH, NOT AN ARBITRARY RANGE. GSTR-1 is filed for a calendar

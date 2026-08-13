@@ -97,7 +97,17 @@ const sentryBuildOptions = {
   silent: !process.env.SENTRY_AUTH_TOKEN,
 
   widenClientFileUpload: false,
-  disableLogger: true,
+
+  /**
+   * ⚠️ WAS `disableLogger: true` — THE SDK DEPRECATED IT AND SAID SO ON
+   * EVERY BUILD. A deprecation warning that is left in place stops being
+   * read, and then the one that matters is in the same list.
+   *
+   * Same effect: strip the SDK's debug logging out of the browser
+   * bundle. Nobody debugging Ordence reads Sentry's own console noise,
+   * and it is dead weight on every page load.
+   */
+  webpack: { treeshake: { removeDebugLogging: true } },
 
   /**
    * ⭐ Routes browser events through your own domain, so an ad-blocker

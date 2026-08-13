@@ -22,7 +22,7 @@
  * default outcome of a mis-click. Two actions, two permissions.
  */
 
-import { and, desc, eq, inArray, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, notInArray, sql } from "drizzle-orm";
 import { revalidatePath } from "next/cache";
 import { withTenant } from "@/db";
 import {
@@ -59,8 +59,17 @@ import {
   statementSchema,
   raiseCreditNoteSchema,
   issueCreditNoteSchema,
+  discardCreditNoteSchema,
   gstr1PeriodSchema,
 } from "@/lib/validators/sales-invoices";
+import {
+  assessCreditLines,
+  assessCreditHeadroom,
+  headroomMinor,
+  remainingCreditableQty,
+  type CreditableInvoiceLine,
+  type CreditLineFinding,
+} from "@/lib/invoicing/credit-note";
 import { serializeAmount, toBigIntAmount } from "@/lib/billing/money";
 import type { ActionResult } from "@/lib/validators/crm";
 
@@ -890,6 +899,117 @@ export async function getCustomerStatement(input: unknown): Promise<
  *    every path. Over-crediting is a refund of tax never collected, and
  *    it reaches GSTR-1 as a negative supply.
  */
+/**
+ * ⚠️ A LOCAL ALIAS, MATCHING `server/credit/position.ts`. The
+ * transaction type is derived from `withTenant` rather than named
+ * separately, so it cannot drift away from what `withTenant` actually
+ * hands its callback.
+ */
+type Tx = Parameters<Parameters<typeof withTenant>[1]>[0];
+
+/**
+ * ⭐ WHAT IS STILL CREDITABLE ON AN INVOICE — lines and total.
+ *
+ * ⚠️ NOT EXPORTED, AND IT TAKES A `tx`. Both facts follow from the same
+ * rule: this file is `"use server"`, so every export is a
+ * browser-reachable RPC endpoint. A function taking a transaction cannot
+ * be one. The exported read is `getCreditNoteContext` below, which opens
+ * its own scope after checking a permission.
+ *
+ * ⚠️ IT SHARES THE CALLER'S TRANSACTION rather than opening its own. The
+ * guard and the insert have to see one consistent picture; reading the
+ * credited quantities outside the transaction that writes the new ones
+ * is the race that lets two people credit the same goods.
+ */
+async function loadCreditableState(
+  tx: Tx,
+  tenantId: string,
+  invoiceId: string,
+): Promise<{
+  lines: CreditableInvoiceLine[];
+  issuedCreditTotalMinor: bigint;
+}> {
+  const invoiceLines = await tx
+    .select()
+    .from(salesInvoiceLines)
+    .where(
+      and(
+        eq(salesInvoiceLines.tenantId, tenantId),
+        eq(salesInvoiceLines.invoiceId, invoiceId),
+      ),
+    )
+    .orderBy(salesInvoiceLines.lineNo);
+
+  /**
+   * ⚠️ `notInArray('draft', 'cancelled')` — THE SAME EXCLUSION THE
+   * TRIGGER USES, and it must stay the same. A draft that consumed
+   * headroom would let one person's abandoned working paper block
+   * another person's lawful credit note, with nothing on either screen
+   * explaining why.
+   */
+  const consuming = notInArray(salesCreditNotes.status, ["draft", "cancelled"]);
+
+  const creditedRows = await tx
+    .select({
+      invoiceLineId: salesCreditNoteLines.invoiceLineId,
+      qty: sql<string>`coalesce(sum(${salesCreditNoteLines.quantity}), 0)::text`,
+    })
+    .from(salesCreditNoteLines)
+    .innerJoin(salesCreditNotes, eq(salesCreditNoteLines.creditNoteId, salesCreditNotes.id))
+    .where(
+      and(
+        eq(salesCreditNoteLines.tenantId, tenantId),
+        eq(salesCreditNotes.tenantId, tenantId),
+        eq(salesCreditNotes.invoiceId, invoiceId),
+        consuming,
+      ),
+    )
+    .groupBy(salesCreditNoteLines.invoiceLineId);
+
+  const [totalRow] = await tx
+    .select({
+      total: sql<string>`coalesce(sum(${salesCreditNotes.totalMinor}), 0)::text`,
+    })
+    .from(salesCreditNotes)
+    .where(
+      and(
+        eq(salesCreditNotes.tenantId, tenantId),
+        eq(salesCreditNotes.invoiceId, invoiceId),
+        consuming,
+      ),
+    );
+
+  const creditedByLine = new Map<string, string>();
+  for (const r of creditedRows) {
+    if (r.invoiceLineId) creditedByLine.set(r.invoiceLineId, String(r.qty));
+  }
+
+  return {
+    lines: invoiceLines.map((l) => ({
+      id: l.id,
+      lineNo: l.lineNo,
+      description: l.description,
+      hsnSacCode: l.hsnSacCode,
+      uom: l.uom,
+      taxRateBps: l.taxRateBps,
+      unitPriceMinor: toBigIntAmount(l.unitPriceMinor),
+      quantity: String(l.quantity),
+      quantityCreditedIssued: creditedByLine.get(l.id) ?? "0.000",
+    })),
+    issuedCreditTotalMinor: toBigIntAmount(totalRow?.total ?? "0"),
+  };
+}
+
+/**
+ * ⚠️ ONE MESSAGE FROM MANY FINDINGS, AND IT NAMES EVERY LINE.
+ * Reporting only the first failure turns fixing a five-line return into
+ * five round trips, each ending in a refusal that looks like a new
+ * problem.
+ */
+function creditLineRefusal(findings: readonly CreditLineFinding[]): string {
+  return findings.map((f) => f.message).join(" ");
+}
+
 export async function raiseCreditNote(
   input: unknown,
 ): Promise<ActionResult<{ id: string }>> {
@@ -929,6 +1049,29 @@ export async function raiseCreditNote(
           );
         }
 
+        /**
+         * 🔴 THE LINE CEILING — ADDED IN v0.96.0, AND IT CLOSES A REAL
+         *    HOLE. `sales_credit_note_within_invoice()` compares
+         *    DOCUMENT TOTALS. Crediting 100 units of a 10-unit line at
+         *    ₹0.01 each passes it: the total is small, the quantity is
+         *    absurd, and the HSN summary of GSTR-1 carries the absurd
+         *    figure. A trigger cannot see this without a join the
+         *    trigger has no business doing.
+         *
+         * ⚠️ CHECKED AT RAISE *AND* AT ISSUE. Here it is the fast fail
+         * that tells someone while the form is still open. At issue it
+         * is the one that counts, because another credit note may have
+         * been issued in between.
+         */
+        const state = await loadCreditableState(tx, ctx.tenant.id, invoice.id);
+        const lineFindings = assessCreditLines({
+          invoiceLines: state.lines,
+          proposed: data.lines,
+        });
+        if (lineFindings.length > 0) {
+          throw new Error(creditLineRefusal(lineFindings));
+        }
+
         const built = buildInvoice({
           orderLines: data.lines.map((l, i) => ({
             id: `cn-${i}`,
@@ -948,6 +1091,27 @@ export async function raiseCreditNote(
           taxKind: invoice.isInterState ? "igst" : "cgst_sgst",
           placeOfSupplyCode: invoice.placeOfSupplyCode ?? "27",
         });
+
+        /**
+         * ⚠️ THE DOCUMENT CEILING IS PREDICTED HERE AND ENFORCED BY THE
+         * TRIGGER AT ISSUE. A draft that could never be issued is a trap
+         * — somebody fills in five lines, presses Issue, and only then
+         * learns the invoice had ₹200 of headroom left. Refusing now
+         * costs one message; refusing later costs the work.
+         */
+        const room = headroomMinor({
+          invoiceTotalMinor: toBigIntAmount(invoice.totalMinor),
+          issuedCreditTotalMinor: state.issuedCreditTotalMinor,
+        });
+        const verdict = assessCreditHeadroom({
+          noteTotalMinor: built.tax.amountPayableMinor,
+          headroomMinor: room,
+        });
+        if (!verdict.ok) {
+          throw new Error(
+            `Invoice ${invoice.invoiceNumber} has ${serializeAmount(room)} paise of credit left on it and this note comes to ${serializeAmount(built.tax.amountPayableMinor)}. A credit note can only reverse what was actually billed.`,
+          );
+        }
 
         const [created] = await tx
           .insert(salesCreditNotes)
@@ -1072,6 +1236,60 @@ export async function issueCreditNote(
           );
         }
 
+        /**
+         * 🔴 THE LINE CEILING, RE-CHECKED AT THE MOMENT THAT COUNTS.
+         *
+         * ⚠️ THE CHECK AT RAISE IS NOT ENOUGH AND WAS NEVER MEANT TO BE.
+         * Two drafts can each be raised legitimately against the same
+         * ten units. The first to be issued consumes them; the second
+         * must be refused here, or the same goods come back twice.
+         *
+         * This is exactly why the document ceiling lives in a trigger:
+         * the check has to run against the state at WRITE time, not at
+         * form time.
+         */
+        const state = await loadCreditableState(tx, ctx.tenant.id, note.invoiceId);
+        const noteLines = await tx
+          .select({
+            invoiceLineId: salesCreditNoteLines.invoiceLineId,
+            quantity: salesCreditNoteLines.quantity,
+          })
+          .from(salesCreditNoteLines)
+          .where(
+            and(
+              eq(salesCreditNoteLines.tenantId, ctx.tenant.id),
+              eq(salesCreditNoteLines.creditNoteId, data.creditNoteId),
+            ),
+          );
+
+        const lineFindings = assessCreditLines({
+          invoiceLines: state.lines,
+          proposed: noteLines.map((l) => ({
+            invoiceLineId: l.invoiceLineId,
+            quantity: String(l.quantity),
+          })),
+        });
+        if (lineFindings.length > 0) {
+          throw new Error(creditLineRefusal(lineFindings));
+        }
+
+        /**
+         * 🔴 COUNTS ISSUED NOTES ONLY — FIXED IN v0.96.0.
+         *
+         * ⚠️ IT USED TO COUNT EVERY ROW IN THE YEAR, DRAFTS INCLUDED,
+         * and that broke the one thing the series exists to guarantee.
+         * Five open drafts made the FIRST issued note `CN/00006`, and
+         * Rule 46(b) — applied to credit notes by Rule 53 — requires the
+         * series to be CONSECUTIVE. A series starting at six is a
+         * question an auditor is entitled to ask and nobody can answer
+         * three years later.
+         *
+         * ⚠️ AND IT MADE DISCARDING A DRAFT UNSAFE. If a discarded draft
+         * left the table the count would shrink, the next issue would
+         * reuse a number, and `sales_credit_notes_number_tenant_key`
+         * would refuse it — a legitimate credit note failing because
+         * somebody tidied up.
+         */
         const [row] = await tx
           .select({ count: sql<number>`count(*)::int` })
           .from(salesCreditNotes)
@@ -1079,6 +1297,7 @@ export async function issueCreditNote(
             and(
               eq(salesCreditNotes.tenantId, ctx.tenant.id),
               eq(salesCreditNotes.financialYear, note.financialYear),
+              notInArray(salesCreditNotes.status, ["draft", "cancelled"]),
             ),
           );
 
@@ -1628,5 +1847,471 @@ export async function settleInvoice(input: {
     return { ok: true, data: { receiptId: receipt.data.id } };
   } catch (err) {
     return toSalesActionError(err, "settleInvoice");
+  }
+}
+
+/* ================================================================== */
+/* ⭐ CREDIT-NOTE READS — Phase 54, the screens                         */
+/* ================================================================== */
+
+/**
+ * Everything the "raise a credit note" form needs, in one call.
+ *
+ * ⚠️ THE FORM DOES NOT GET TO ASK FOR THE INVOICE AND THE HEADROOM
+ * SEPARATELY. Two calls means two moments, and between them another
+ * credit note can be issued — so the screen would show a total from one
+ * instant and a remaining figure from another, which is how a person
+ * ends up typing a number the server then refuses.
+ *
+ * ⚠️ GATED ON `sales.invoices.read`, NOT on a write permission. Looking
+ * at what is creditable changes nothing. The refusal belongs at raise.
+ */
+export async function getCreditNoteContext(input: unknown): Promise<
+  ActionResult<{
+    invoice: {
+      id: string;
+      invoiceNumber: string;
+      invoiceDate: string;
+      status: string;
+      customerLegalName: string | null;
+      customerGstin: string | null;
+      placeOfSupplyCode: string | null;
+      isInterState: boolean;
+      isUnionTerritory: boolean;
+      totalMinor: string;
+    };
+    /** ⭐ `remainingQty` is the figure the form limits against. */
+    lines: {
+      id: string;
+      lineNo: number;
+      description: string;
+      hsnSacCode: string | null;
+      uom: string;
+      taxRateBps: number | null;
+      unitPriceMinor: string;
+      quantity: string;
+      quantityCreditedIssued: string;
+      remainingQty: string;
+    }[];
+    headroomMinor: string;
+    issuedCreditTotalMinor: string;
+    notes: {
+      id: string;
+      creditNoteNumber: string;
+      noteDate: string;
+      status: string;
+      reasonCode: string;
+      reason: string;
+      totalMinor: string;
+    }[];
+  }>
+> {
+  try {
+    const data = issueInvoiceSchema.parse(input);
+    const ctx = await requirePermission("sales.invoices.read", {
+      type: "sales_invoice",
+      id: data.invoiceId,
+    });
+
+    const result = await withTenant(ctx.tenant.id, async (tx) => {
+      const [inv] = await tx
+        .select()
+        .from(salesInvoices)
+        .where(
+          and(eq(salesInvoices.tenantId, ctx.tenant.id), eq(salesInvoices.id, data.invoiceId)),
+        )
+        .limit(1);
+
+      if (!inv) throw new Error("That invoice no longer exists.");
+
+      const state = await loadCreditableState(tx, ctx.tenant.id, inv.id);
+
+      const notes = await tx
+        .select({
+          id: salesCreditNotes.id,
+          creditNoteNumber: salesCreditNotes.creditNoteNumber,
+          noteDate: salesCreditNotes.noteDate,
+          status: salesCreditNotes.status,
+          reasonCode: salesCreditNotes.reasonCode,
+          reason: salesCreditNotes.reason,
+          totalMinor: salesCreditNotes.totalMinor,
+        })
+        .from(salesCreditNotes)
+        .where(
+          and(
+            eq(salesCreditNotes.tenantId, ctx.tenant.id),
+            eq(salesCreditNotes.invoiceId, inv.id),
+          ),
+        )
+        .orderBy(desc(salesCreditNotes.noteDate), desc(salesCreditNotes.createdAt));
+
+      const room = headroomMinor({
+        invoiceTotalMinor: toBigIntAmount(inv.totalMinor),
+        issuedCreditTotalMinor: state.issuedCreditTotalMinor,
+      });
+
+      return {
+        invoice: {
+          id: inv.id,
+          invoiceNumber: inv.invoiceNumber,
+          invoiceDate: String(inv.invoiceDate),
+          status: inv.status,
+          customerLegalName: inv.customerLegalName,
+          customerGstin: inv.customerGstin,
+          placeOfSupplyCode: inv.placeOfSupplyCode,
+          isInterState: inv.isInterState,
+          isUnionTerritory: inv.isUnionTerritory,
+          totalMinor: serializeAmount(toBigIntAmount(inv.totalMinor)),
+        },
+        lines: state.lines.map((l) => ({
+          id: l.id,
+          lineNo: l.lineNo,
+          description: l.description,
+          hsnSacCode: l.hsnSacCode,
+          uom: l.uom,
+          taxRateBps: l.taxRateBps,
+          unitPriceMinor: serializeAmount(l.unitPriceMinor),
+          quantity: l.quantity,
+          quantityCreditedIssued: l.quantityCreditedIssued,
+          remainingQty: remainingCreditableQty(l),
+        })),
+        headroomMinor: serializeAmount(room),
+        issuedCreditTotalMinor: serializeAmount(state.issuedCreditTotalMinor),
+        notes: notes.map((n) => ({
+          id: n.id,
+          creditNoteNumber: n.creditNoteNumber,
+          noteDate: String(n.noteDate),
+          status: n.status,
+          reasonCode: n.reasonCode,
+          reason: n.reason,
+          totalMinor: serializeAmount(toBigIntAmount(n.totalMinor)),
+        })),
+      };
+    });
+
+    return { ok: true, data: result };
+  } catch (err) {
+    return toSalesActionError(err, "getCreditNoteContext");
+  }
+}
+
+/**
+ * One credit note, with its lines and the invoice it reverses.
+ */
+export async function getCreditNoteDetail(input: unknown): Promise<
+  ActionResult<{
+    note: {
+      id: string;
+      creditNoteNumber: string;
+      noteDate: string;
+      status: string;
+      reasonCode: string;
+      reason: string;
+      invoiceId: string;
+      invoiceNumber: string;
+      customerLegalName: string | null;
+      customerGstin: string | null;
+      placeOfSupplyCode: string | null;
+      isInterState: boolean;
+      taxableValueMinor: string;
+      cgstMinor: string;
+      sgstMinor: string;
+      igstMinor: string;
+      cessMinor: string;
+      roundOffMinor: string;
+      totalMinor: string;
+    };
+    lines: {
+      id: string;
+      lineNo: number;
+      description: string;
+      hsnSacCode: string | null;
+      quantity: string;
+      uom: string;
+      taxRateBps: number | null;
+      unitPriceMinor: string;
+      taxableValueMinor: string;
+      cgstMinor: string;
+      sgstMinor: string;
+      igstMinor: string;
+      lineTotalMinor: string;
+    }[];
+  }>
+> {
+  try {
+    const data = issueCreditNoteSchema.parse(input);
+    const ctx = await requirePermission("sales.invoices.read", {
+      type: "sales_credit_note",
+      id: data.creditNoteId,
+    });
+
+    const result = await withTenant(ctx.tenant.id, async (tx) => {
+      const [note] = await tx
+        .select()
+        .from(salesCreditNotes)
+        .where(
+          and(
+            eq(salesCreditNotes.tenantId, ctx.tenant.id),
+            eq(salesCreditNotes.id, data.creditNoteId),
+          ),
+        )
+        .limit(1);
+
+      if (!note) throw new Error("That credit note no longer exists.");
+
+      /**
+       * ⚠️ THE INVOICE NUMBER IS LOOKED UP, NOT COPIED ONTO THE NOTE.
+       * A draft invoice carries a placeholder number that becomes a real
+       * one at issue; a credit note can only be raised against an issued
+       * invoice, so the number is stable by the time it is read — but
+       * reading it live means the two documents can never disagree.
+       */
+      const [inv] = await tx
+        .select({
+          invoiceNumber: salesInvoices.invoiceNumber,
+        })
+        .from(salesInvoices)
+        .where(
+          and(eq(salesInvoices.tenantId, ctx.tenant.id), eq(salesInvoices.id, note.invoiceId)),
+        )
+        .limit(1);
+
+      const lines = await tx
+        .select()
+        .from(salesCreditNoteLines)
+        .where(
+          and(
+            eq(salesCreditNoteLines.tenantId, ctx.tenant.id),
+            eq(salesCreditNoteLines.creditNoteId, note.id),
+          ),
+        )
+        .orderBy(salesCreditNoteLines.lineNo);
+
+      return {
+        note: {
+          id: note.id,
+          creditNoteNumber: note.creditNoteNumber,
+          noteDate: String(note.noteDate),
+          status: note.status,
+          reasonCode: note.reasonCode,
+          reason: note.reason,
+          invoiceId: note.invoiceId,
+          invoiceNumber: inv?.invoiceNumber ?? "—",
+          customerLegalName: note.customerLegalName,
+          customerGstin: note.customerGstin,
+          placeOfSupplyCode: note.placeOfSupplyCode,
+          isInterState: note.isInterState,
+          taxableValueMinor: serializeAmount(toBigIntAmount(note.taxableValueMinor)),
+          cgstMinor: serializeAmount(toBigIntAmount(note.cgstMinor)),
+          sgstMinor: serializeAmount(toBigIntAmount(note.sgstMinor)),
+          igstMinor: serializeAmount(toBigIntAmount(note.igstMinor)),
+          cessMinor: serializeAmount(toBigIntAmount(note.cessMinor)),
+          roundOffMinor: serializeAmount(toBigIntAmount(note.roundOffMinor)),
+          totalMinor: serializeAmount(toBigIntAmount(note.totalMinor)),
+        },
+        lines: lines.map((l) => ({
+          id: l.id,
+          lineNo: l.lineNo,
+          description: l.description,
+          hsnSacCode: l.hsnSacCode,
+          quantity: String(l.quantity),
+          uom: l.uom,
+          taxRateBps: l.taxRateBps,
+          unitPriceMinor: serializeAmount(toBigIntAmount(l.unitPriceMinor)),
+          taxableValueMinor: serializeAmount(toBigIntAmount(l.taxableValueMinor)),
+          cgstMinor: serializeAmount(toBigIntAmount(l.cgstMinor)),
+          sgstMinor: serializeAmount(toBigIntAmount(l.sgstMinor)),
+          igstMinor: serializeAmount(toBigIntAmount(l.igstMinor)),
+          lineTotalMinor: serializeAmount(toBigIntAmount(l.lineTotalMinor)),
+        })),
+      };
+    });
+
+    return { ok: true, data: result };
+  } catch (err) {
+    return toSalesActionError(err, "getCreditNoteDetail");
+  }
+}
+
+/**
+ * The credit-note register.
+ *
+ * ⚠️ IT LEADS WITH THE ISSUED VALUE, NOT A COUNT. Twelve credit notes
+ * could be ₹1,200 of returns or ₹12 lakh of them, and only one of those
+ * is worth a conversation. Drafts are counted separately and never added
+ * into the value — nothing has been reversed until a note is issued.
+ */
+export async function listCreditNotes(input?: { limit?: number }): Promise<
+  ActionResult<{
+    rows: {
+      id: string;
+      creditNoteNumber: string;
+      noteDate: string;
+      status: string;
+      reasonCode: string;
+      invoiceId: string;
+      invoiceNumber: string;
+      customerLegalName: string | null;
+      totalMinor: string;
+    }[];
+    summary: { issuedValueMinor: string; issuedCount: number; draftCount: number };
+  }>
+> {
+  try {
+    /**
+     * ⚠️ NO RESOURCE ID — this is a register, not a document. Passing a
+     * placeholder id would put a resource on the audit line that nobody
+     * touched, and `listInvoices` above does the same thing for the same
+     * reason.
+     */
+    const ctx = await requirePermission("sales.invoices.read");
+    const limit = Math.min(Math.max(input?.limit ?? 100, 1), 500);
+
+    const result = await withTenant(ctx.tenant.id, async (tx) => {
+      const rows = await tx
+        .select({
+          id: salesCreditNotes.id,
+          creditNoteNumber: salesCreditNotes.creditNoteNumber,
+          noteDate: salesCreditNotes.noteDate,
+          status: salesCreditNotes.status,
+          reasonCode: salesCreditNotes.reasonCode,
+          invoiceId: salesCreditNotes.invoiceId,
+          invoiceNumber: salesInvoices.invoiceNumber,
+          customerLegalName: salesCreditNotes.customerLegalName,
+          totalMinor: salesCreditNotes.totalMinor,
+        })
+        .from(salesCreditNotes)
+        .leftJoin(
+          salesInvoices,
+          and(
+            eq(salesInvoices.id, salesCreditNotes.invoiceId),
+            eq(salesInvoices.tenantId, ctx.tenant.id),
+          ),
+        )
+        .where(eq(salesCreditNotes.tenantId, ctx.tenant.id))
+        .orderBy(desc(salesCreditNotes.noteDate), desc(salesCreditNotes.createdAt))
+        .limit(limit);
+
+      let issuedValueMinor = 0n;
+      let issuedCount = 0;
+      let draftCount = 0;
+      for (const r of rows) {
+        if (r.status === "draft") {
+          draftCount += 1;
+          continue;
+        }
+        if (r.status === "cancelled") continue;
+        issuedCount += 1;
+        issuedValueMinor += toBigIntAmount(r.totalMinor);
+      }
+
+      return {
+        rows: rows.map((r) => ({
+          id: r.id,
+          creditNoteNumber: r.creditNoteNumber,
+          noteDate: String(r.noteDate),
+          status: r.status,
+          reasonCode: r.reasonCode,
+          invoiceId: r.invoiceId,
+          invoiceNumber: r.invoiceNumber ?? "—",
+          customerLegalName: r.customerLegalName,
+          totalMinor: serializeAmount(toBigIntAmount(r.totalMinor)),
+        })),
+        summary: {
+          issuedValueMinor: serializeAmount(issuedValueMinor),
+          issuedCount,
+          draftCount,
+        },
+      };
+    });
+
+    return { ok: true, data: result };
+  } catch (err) {
+    return toSalesActionError(err, "listCreditNotes");
+  }
+}
+
+/**
+ * Discard a credit-note DRAFT.
+ *
+ * 🔴 IT SETS `cancelled`; IT DOES NOT DELETE THE ROW. A deleted draft
+ *    would be invisible to the numbering count, to the audit trail, and
+ *    to anyone asking why a figure on a reconciliation moved. Rows that
+ *    represent documents do not leave this database.
+ *
+ * ⚠️ IT REFUSES ON ANYTHING BUT A DRAFT, and the message says why rather
+ * than saying "not allowed". An issued credit note is held by the
+ * customer, who has already reversed input tax credit against it. The
+ * correction for a wrong credit note is another document, not an eraser.
+ *
+ * ⚠️ GATED ON `sales.invoices.issue`, NOT `create`. Whoever can abandon
+ * a document in flight is making a decision about a document, not
+ * starting one — and `create` is the weaker of the two keys.
+ */
+export async function discardCreditNoteDraft(
+  input: unknown,
+): Promise<ActionResult<{ id: string }>> {
+  try {
+    const data = discardCreditNoteSchema.parse(input);
+    const ctx = await guardSalesWrite({
+      operation: "invoices:issue",
+      feature: FEATURE_ORDERS,
+      permission: "sales.invoices.issue",
+      resource: { type: "sales_credit_note", id: data.creditNoteId },
+    });
+
+    await withTenant(
+      ctx.tenant.id,
+      async (tx) => {
+        const [note] = await tx
+          .select()
+          .from(salesCreditNotes)
+          .where(
+            and(
+              eq(salesCreditNotes.tenantId, ctx.tenant.id),
+              eq(salesCreditNotes.id, data.creditNoteId),
+            ),
+          )
+          .limit(1);
+
+        if (!note) throw new Error("That credit note no longer exists.");
+        if (note.status !== "draft") {
+          throw new Error(
+            `Credit note ${note.creditNoteNumber} has been issued. The customer holds it and has reversed input credit against it — it cannot be withdrawn, only corrected by a further document.`,
+          );
+        }
+
+        await tx
+          .update(salesCreditNotes)
+          .set({
+            status: "cancelled",
+            cancelledAt: new Date(),
+            cancelReason: "Draft discarded before issue.",
+            updatedBy: ctx.user.id,
+          })
+          .where(
+            and(
+              eq(salesCreditNotes.tenantId, ctx.tenant.id),
+              eq(salesCreditNotes.id, data.creditNoteId),
+            ),
+          );
+
+        await writeAudit(ctx, {
+          action: "update",
+          resourceType: "sales_credit_note",
+          resourceId: data.creditNoteId,
+          newValue: { status: "cancelled" },
+          reason: "Draft discarded before issue.",
+          severity: "info",
+        });
+      },
+      { impersonationId: ctx.impersonationId },
+    );
+
+    revalidatePath("/credit-notes");
+    revalidatePath("/invoices");
+    return { ok: true, data: { id: data.creditNoteId } };
+  } catch (err) {
+    return toSalesActionError(err, "discardCreditNoteDraft");
   }
 }

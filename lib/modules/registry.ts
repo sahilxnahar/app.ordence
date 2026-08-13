@@ -200,7 +200,7 @@ export const MODULE_REGISTRY: Readonly<Record<string, ModuleDescriptor>> =
       description: "Search across every record type.",
       group: "home",
       feature: null,
-      status: "live", // 🔴 /search does not exist — 404s today
+      status: "live",
       href: "/search",
     },
     assistant: {
@@ -266,7 +266,7 @@ export const MODULE_REGISTRY: Readonly<Record<string, ModuleDescriptor>> =
       description: "Pipeline and opportunity tracking.",
       group: "customers",
       feature: "crm.deals",
-      status: "live", // 🔴 /deals does not exist — 404s today
+      status: "live",
       href: "/deals",
     },
     engagements: {
@@ -395,7 +395,7 @@ export const MODULE_REGISTRY: Readonly<Record<string, ModuleDescriptor>> =
       description: "Court dates and the calendar around them.",
       group: "projects",
       feature: null,
-      status: "live", // 🔴 /calendar does not exist — 404s today
+      status: "live",
       href: "/calendar",
     },
 
@@ -407,7 +407,7 @@ export const MODULE_REGISTRY: Readonly<Record<string, ModuleDescriptor>> =
       description: "Budget against actual, by project.",
       group: "site",
       feature: "analytics.dashboard",
-      status: "live", // 🔴 /reports/cost does not exist — 404s today
+      status: "live",
       href: "/reports/cost",
     },
 
@@ -505,7 +505,7 @@ export const MODULE_REGISTRY: Readonly<Record<string, ModuleDescriptor>> =
       description: "Files attached to any record.",
       group: "money",
       feature: "storage.documents",
-      status: "live", // 🔴 /documents does not exist — 404s today
+      status: "live",
       href: "/documents",
     },
 
@@ -706,6 +706,19 @@ export const MODULE_REGISTRY: Readonly<Record<string, ModuleDescriptor>> =
       navId: "invoices", label: "Invoices",
       description: "Tax invoices raised, and what is still owed on them.",
       group: "money", feature: "sales.orders", status: "live", href: "/invoices",
+    },
+    /**
+     * ⚠️ ITS OWN ENTRY, NOT A TAB UNDER INVOICES. A credit note is a
+     * separate document with its own consecutive series (Rule 53) and
+     * its own GSTR-1 table (CDNR/CDNUR). Whoever is reconciling returns
+     * at month end is looking for reversals, not for the invoice they
+     * happen to hang off.
+     */
+    /** ⚠️ The key IS the navId — `module-registry.test.tsx` enforces it. */
+    "credit-notes": {
+      navId: "credit-notes", label: "Credit Notes",
+      description: "Reversals of issued invoices — returns, rate revisions, discounts.",
+      group: "money", feature: "sales.orders", status: "live", href: "/credit-notes",
     },
     purchases: {
       navId: "purchases", label: "Purchases",

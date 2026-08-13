@@ -1,3 +1,24 @@
+# v0.96.0-alpha — CREDIT NOTES, ON A SCREEN
+
+**Repo: `app.ordence`** · **No SQL** · **No new Railway variables**
+
+- **Credit-note UI.** `raiseCreditNote` and `issueCreditNote` have worked
+  since Phase 52 with nothing rendering them. A sales return could not be
+  processed by a human being. Three screens close that:
+  `/invoices/[id]/credit`, `/credit-notes`, `/credit-notes/[id]`.
+- **🔴 The line ceiling.** `sales_credit_note_within_invoice()` compares
+  DOCUMENT TOTALS, so crediting 100 units of a 10-unit line at ₹0.01 each
+  passed it. `assessCreditLines()` closes that, checked at raise AND at
+  issue.
+- **🔴 The credit-note series counted drafts.** Five open drafts made the
+  first issued note `CN/00006`. Rule 46(b) via Rule 53 requires the series
+  to be consecutive. Now counts issued notes only.
+- **`discardCreditNoteDraft`** — marks a draft cancelled, never deletes.
+- **Stale registry comments removed** — five `404s today` notes on routes
+  that have existed for versions.
+- **`disableLogger` → `webpack.treeshake.removeDebugLogging`** — the
+  Sentry SDK deprecated it and said so on every build.
+
 # Changelog
 
 ## v0.88.0-alpha — a published endpoint that took the tenant as a parameter
