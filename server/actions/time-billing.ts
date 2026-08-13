@@ -577,6 +577,28 @@ const billTimeSchema = z.object({
   /** SAC code for the service. 9982 = legal, 9982x = accounting/professional. */
   sacCode: z.string().trim().max(10).optional(),
   taxRateBps: z.number().int().min(0).max(10000).default(1800),
+  /**
+   * 🔴🔴 THE FIX FOR THE DEFECT THIS ACTION SHIPPED WITH IN v1.2.0.
+   *
+   * Until v1.8.0 this action charged `taxRateBps` forward on every
+   * invoice — defaulting to 18%, unconditionally. For a law firm that
+   * is wrong nearly every time: legal services by an advocate or a firm
+   * of advocates are exempt under Notification 12/2017 Sr. No. 45 or on
+   * **reverse charge** under Notification 13/2017 Sr. No. 2, where the
+   * CLIENT pays and the invoice carries no tax at all.
+   *
+   * ⚠️ Charging tax that was not chargeable is not a neutral error.
+   * s.76 makes every rupee collected as tax payable to the Government
+   * whether or not it was due, and the client cannot claim credit for it
+   * either — so the firm cannot keep it and the client cannot use it.
+   *
+   * ⭐ Passing a basis other than `forward_charge` FORCES the rate to
+   * zero. It is not a hint. A caller cannot ask for reverse charge and
+   * 18% in the same breath, because that combination is the bug.
+   */
+  chargeBasis: z
+    .enum(["forward_charge", "reverse_charge", "exempt", "export_zero_rated"])
+    .default("forward_charge"),
   placeOfSupplyCode: z.string().trim().length(2).optional(),
   isInterState: z.boolean().default(false),
   /**
@@ -615,6 +637,18 @@ export async function raiseInvoiceFromTime(input: unknown): Promise<
   try {
     const data = billTimeSchema.parse(input);
     const ctx = await requirePermission(WRITE);
+
+    /**
+     * 🔴 THE RATE IS DERIVED FROM THE BASIS, NEVER TAKEN ALONGSIDE IT.
+     *
+     * ⚠️ Only forward charge puts tax on the face of the invoice. Under
+     * reverse charge the recipient pays; under the Sr. No. 45 exemption
+     * nobody does; on an export it is zero-rated. All three carry a nil
+     * rate on the document, and letting a caller pass 1800 with
+     * `reverse_charge` would reproduce the exact defect this is fixing.
+     */
+    const effectiveRateBps = data.chargeBasis === "forward_charge" ? data.taxRateBps : 0;
+    const isReverseCharge = data.chargeBasis === "reverse_charge";
 
     const result = await withTenant(
       ctx.tenant.id,
@@ -741,7 +775,8 @@ export async function raiseInvoiceFromTime(input: unknown): Promise<
             qtyCancelled: "0.000",
             unitPriceMinor: l.valueMinor,
             discountMinor: 0n,
-            taxRateBps: data.taxRateBps,
+            /** 🔴 Derived from the charge basis — see effectiveRateBps above. */
+            taxRateBps: effectiveRateBps,
             cessRateBps: 0,
             /** SAC, not HSN — this is a service. */
             hsnSacCode: data.sacCode ?? "9982",
@@ -776,6 +811,17 @@ export async function raiseInvoiceFromTime(input: unknown): Promise<
             isUnionTerritory: false,
             /** 🔴 SERVICES, not goods — it changes the Rule 48 copy count. */
             supplyType: "services",
+            /**
+             * 🔴 RULE 46(p) — the invoice must state whether tax is
+             * payable on reverse charge. This is the flag that puts the
+             * declaration on the document and the supply into GSTR-1
+             * table 4B.
+             *
+             * ⚠️ Leaving a reverse-charge supply out of the return
+             * because no tax was charged on it is the most common way
+             * this goes wrong at the filing end.
+             */
+            isReverseCharge,
             subtotalMinor: built.tax.grossMinor,
             discountMinor: built.tax.discountMinor,
             taxableValueMinor: built.tax.taxableMinor,

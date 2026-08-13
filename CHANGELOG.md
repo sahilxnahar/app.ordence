@@ -1,3 +1,63 @@
+# v1.8.0-alpha — WHO PAYS THE GST ON A LAWYER'S BILL
+
+**Repo: `app.ordence`** · 🔴 **SQL: `0059`** · ⚠️ **No new variables**
+
+Legal, batch 2. This one corrects a defect Ordence has been shipping
+since v1.2.0.
+
+- 🔴🔴 **`raiseInvoiceFromTime` charged 18% forward on every invoice,
+  unconditionally.** For an advocate or a firm of advocates that is wrong
+  nearly every time. Legal services are **exempt** (Notification
+  12/2017-CT(R) Sr. No. 45) or on **reverse charge** (Notification
+  13/2017-CT(R) Sr. No. 2, the client pays and the invoice carries no
+  tax). Forward charge is the exception.
+- ⚠️ **And the error is not symmetrical.** Tax charged that was not
+  chargeable is money collected as tax — **s.76** requires it to be paid
+  to the Government whether or not it was due, and the client cannot
+  claim credit for it either. The firm cannot keep it and the client
+  cannot use it. The fix forces the rate to zero on anything but forward
+  charge: a caller cannot ask for reverse charge and 18% in one breath,
+  because that combination *is* the bug.
+- 🔴 **The ₹500 that costs ₹9,090.** Rule 33 takes a pure agent's
+  recovery out of the value of supply — but Explanation (d) allows only
+  "the actual amount incurred". Round a ₹50,000 court fee up to ₹50,500
+  and the exclusion is lost on the **whole ₹50,500**, not on the ₹500.
+  `matter_disbursements_pure_agent_is_at_actual` refuses the row. Not a
+  warning — a warning on this gets clicked through at 7pm.
+- 🔴 **Travel and courier cannot be pure agent recoveries.** The client
+  was never liable to the airline. That is the whole test, and it is the
+  second most common Rule 33 error after the markup.
+- 🔴 **The threshold that decides the exemption is the CLIENT's.** A
+  Mumbai firm billing a small business in Manipur applies ₹10 lakh, not
+  ₹20 lakh — the same turnover is exempt in one State and on reverse
+  charge in the other. Where published sources disagree about a State,
+  Ordence uses ₹20 lakh (the answer that never leaves tax uncollected)
+  and **says the figure must be confirmed by hand**.
+- ⭐ **One question is left open on purpose.** A senior advocate billing
+  another advocate or firm is genuinely unsettled. Ordence returns it
+  flagged as ARGUABLE with the reasoning, in red — and the firm can
+  record its own position, which the database will not store without a
+  written reason.
+- 🔴 **Kankariya, 20 December 2024.** A Lok Adalat award carries a full
+  refund under s.21 of the Legal Services Authorities Act. A mediated
+  settlement does **not** get that by extension — the Supreme Court held
+  the two cannot be equated — and gets whatever the State's own Court
+  Fees Act gives it. So the settlement **route** is recorded, and the
+  entitlement is returned as an opinion with its citation rather than a
+  promise.
+- ⭐ **NO COURT FEE RATES SHIP, AND A TEST ENFORCES THAT.** Court fees
+  are a State subject, amended on State budget cycles. A stale slab is
+  worse than an empty table: a plaint returned for deficit court fee
+  loses its filing date, and that can lose the limitation. The firm types
+  its own schedule once; Ordence does the arithmetic and shows the
+  working.
+- ⚠️ **What this does not do:** cause-list scraping, e-filing, bank
+  reconciliation, or a State's actual fee schedule.
+
+**90 new tests** (1,922 total). **36 constraint and trigger drills** fired
+against a real PostgreSQL 16 in both directions, plus RLS isolation
+across all six new tables as a non-superuser.
+
 # v1.7.0-alpha — THE DATE THAT ENDS A CLAIM
 
 **Repo: `app.ordence`** · 🔴 **SQL: `0058`** · ⚠️ **No new variables**

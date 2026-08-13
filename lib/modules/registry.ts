@@ -400,6 +400,37 @@ export const MODULE_REGISTRY: Readonly<Record<string, ModuleDescriptor>> =
       href: "/legal/client-account",
       industries: ["legal_advocate", "professional_services"],
     },
+    /**
+     * 🔴 UNDER `money`. A disbursement is a payment out that decides
+     * whether tax is due on the recovery — Rule 33 of the CGST Rules —
+     * so it belongs with the money, not with the matter it happens to
+     * sit on.
+     */
+    disbursements: {
+      navId: "disbursements",
+      label: "Disbursements",
+      description: "Court fees paid for clients, and the Rule 33 recovery at actual.",
+      group: "money",
+      feature: "sales.orders",
+      status: "live",
+      href: "/legal/disbursements",
+      industries: ["legal_advocate", "professional_services"],
+    },
+    /**
+     * ⭐ THE SCREEN THAT CORRECTS v1.2.0. `raiseInvoiceFromTime` charged
+     * 18% forward on every invoice; for an advocate the supply is
+     * exempt or on reverse charge nearly every time.
+     */
+    "fee-note": {
+      navId: "fee-note",
+      label: "Fee Note",
+      description: "Who pays the GST on a lawyer's bill, worked out before it is raised.",
+      group: "money",
+      feature: "sales.orders",
+      status: "live",
+      href: "/legal/fee-note",
+      industries: ["legal_advocate", "professional_services"],
+    },
     contracts: {
       navId: "contracts",
       label: "Contracts",

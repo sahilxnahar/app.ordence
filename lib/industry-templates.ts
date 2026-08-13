@@ -434,6 +434,14 @@ const LEGAL_TEMPLATE: IndustryTemplate = {
         { id: "contracts", label: "Contracts", href: "/assets?type=contract", icon: "file-text" },
         { id: "time", label: "Time & Billing", href: "/time", icon: "clock" },
         { id: "client-account", label: "Client Account", href: "/legal/client-account", icon: "landmark" },
+        /**
+         * ⭐ ADDED IN v1.8.0. The fee note is where the firm finds out
+         * that it should not be charging GST at all — and the
+         * disbursements screen is where a ₹500 rounding on a court fee
+         * stops being worth ₹9,090.
+         */
+        { id: "fee-note", label: "Fee Note", href: "/legal/fee-note", icon: "receipt" },
+        { id: "disbursements", label: "Disbursements", href: "/legal/disbursements", icon: "banknote" },
       ],
     },
     {

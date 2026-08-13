@@ -162,6 +162,7 @@ export * from "./inventory";
 // deed executed while the POA was live stays good afterwards (Phase 42)
 export * from "./land";
 export * from "./legal";
+export * from "./legal-billing";
 
 // ⭐ Running-account bills and contractor compliance — PORT WAVE B. The
 // densest money document a developer signs: gross certified, less everything
