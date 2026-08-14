@@ -51,10 +51,13 @@ import {
   type ModuleMatrix,
   type ModuleRow,
 } from "@/lib/platform/configuration";
+import type { EntitlementDiff } from "@/lib/platform/entitlement-diff";
 
 type SetResult =
   | { ok: true }
   | { ok: false; error: string; needsStepUp?: boolean };
+
+type PreviewResult = { ok: true; data: EntitlementDiff } | { ok: false; error: string };
 
 const MIN_REASON = 15;
 
@@ -81,6 +84,7 @@ export function ModuleSwitchboard({
   canWrite,
   onSet,
   onStepUp,
+  onPreview,
 }: {
   tenantId: string;
   matrix: ModuleMatrix;
@@ -94,17 +98,67 @@ export function ModuleSwitchboard({
   }) => Promise<SetResult>;
   /** Re-confirm identity. See the step-up caveat in `server/platform/guard.ts`. */
   onStepUp: () => Promise<{ ok: true }>;
+  /**
+   * ⭐⭐⭐ WHAT THIS TOGGLE ACTUALLY DOES, FETCHED WHEN THE PANEL OPENS.
+   *
+   * ══════════════════════════════════════════════════════════════════
+   * 🔴 THE SWITCHBOARD HAS ALWAYS WORKED AND HAS NEVER EXPLAINED ITSELF
+   * ══════════════════════════════════════════════════════════════════
+   * Every fact on the card above describes the STATE. None of them
+   * describes the CONSEQUENCE, and the consequence is the thing an
+   * operator hesitates over on a call: does the customer's data go
+   * away?
+   *
+   * ⚠️ IT DOES NOT, AND UNTIL NOW NOTHING ON THIS SCREEN SAID SO. An
+   * operator who knows an entitlement controls visibility rather than
+   * existence toggles confidently; one who does not, does not.
+   *
+   * ⭐ OPTIONAL, SO THE COMPONENT STILL RENDERS WITHOUT IT. A preview
+   * that fails must never be the reason a support engineer cannot fix
+   * a customer's access.
+   */
+  onPreview?: (input: {
+    tenantId: string;
+    featureKey: string;
+    direction: "enable" | "disable";
+  }) => Promise<PreviewResult>;
 }) {
   const router = useRouter();
   const [editing, setEditing] = useState<string | null>(null);
   const [reason, setReason] = useState("");
   const [expiresAt, setExpiresAt] = useState("");
+  const [preview, setPreview] = useState<EntitlementDiff | null>(null);
+  const [previewError, setPreviewError] = useState<string | null>(null);
   const [pending, startTransition] = useTransition();
 
   function close() {
     setEditing(null);
     setReason("");
     setExpiresAt("");
+    setPreview(null);
+    setPreviewError(null);
+  }
+
+  /**
+   * ⚠️ THE DIRECTION IS DERIVED FROM WHAT THE CUSTOMER CAN REACH TODAY,
+   * not from the plan. `effective` is what they see; `planDefault` is
+   * what they bought, and on an overridden workspace those disagree —
+   * which is exactly when somebody is looking at this screen.
+   */
+  function loadPreview(row: ModuleRow) {
+    if (!onPreview || !row.feature) return;
+    const featureKey = row.feature;
+    const direction = row.effective ? "disable" : "enable";
+    startTransition(async () => {
+      const result = await onPreview({ tenantId, featureKey, direction });
+      if (result.ok) {
+        setPreview(result.data);
+        setPreviewError(null);
+      } else {
+        setPreview(null);
+        setPreviewError(result.error);
+      }
+    });
   }
 
   function submit(row: ModuleRow, mode: "grant" | "revoke" | "clear") {
@@ -269,6 +323,63 @@ export function ModuleSwitchboard({
                       </p>
                     ) : isEditing ? (
                       <div className="space-y-2 rounded-md border border-border p-3">
+                        {/*
+                          ⭐⭐ THE PREVIEW, ABOVE THE REASON FIELD AND ABOVE
+                          THE BUTTONS. Below them it would be read after the
+                          decision, which is not a preview.
+                        */}
+                        {previewError ? (
+                          <p className="rounded border border-dashed p-2 text-xs text-muted-foreground">
+                            The preview could not be worked out ({previewError}). The
+                            toggle still works, and nothing about what it does has
+                            changed — you are just doing it without the explanation.
+                          </p>
+                        ) : preview ? (
+                          <div
+                            className="space-y-2 rounded border border-border bg-muted/40 p-2 text-xs"
+                            data-testid={`preview-${row.navId}`}
+                          >
+                            <p className="font-medium">{preview.headline}</p>
+
+                            {preview.gains.length > 0 ? (
+                              <p>
+                                Appears for {preview.affectedUsers} user
+                                {preview.affectedUsers === 1 ? "" : "s"}:{" "}
+                                {preview.gains.map((m) => m.label).join(", ")}
+                              </p>
+                            ) : null}
+
+                            {preview.hides.length > 0 ? (
+                              <p>
+                                Disappears from view for {preview.affectedUsers} user
+                                {preview.affectedUsers === 1 ? "" : "s"}:{" "}
+                                {preview.hides.map((m) => m.label).join(", ")}
+                              </p>
+                            ) : null}
+
+                            {/*
+                              🔴 THE SENTENCE THE WHOLE PREVIEW EXISTS FOR.
+                              Everybody says "your data is safe"; this says
+                              what actually happens to it.
+                            */}
+                            {preview.keepsNote ? (
+                              <p className="text-foreground">{preview.keepsNote}</p>
+                            ) : null}
+
+                            {preview.notes.map((n) => (
+                              <p key={n} className="text-muted-foreground">
+                                {n}
+                              </p>
+                            ))}
+
+                            {preview.blockers.map((b) => (
+                              <p key={b} className="text-destructive">
+                                {b}
+                              </p>
+                            ))}
+                          </div>
+                        ) : null}
+
                         <div className="space-y-1">
                           <Label htmlFor={`reason-${row.navId}`}>
                             Why? (goes to the customer&rsquo;s audit log)
@@ -308,7 +419,19 @@ export function ModuleSwitchboard({
                           {!row.effective ? (
                             <Button
                               size="sm"
-                              disabled={pending || reason.trim().length < MIN_REASON}
+                              /*
+                                🔴 A BLOCKER DISABLES THE BUTTON RATHER THAN
+                                LETTING THE SUBMIT FAIL. Enabling a module
+                                that is not built yet puts a menu item in
+                                front of a customer that goes nowhere, and
+                                everything else we told them is then in
+                                question.
+                              */
+                              disabled={
+                                pending ||
+                                reason.trim().length < MIN_REASON ||
+                                (preview?.blockers.length ?? 0) > 0
+                              }
                               onClick={() => submit(row, "grant")}
                             >
                               Switch on
@@ -358,6 +481,7 @@ export function ModuleSwitchboard({
                         onClick={() => {
                           close();
                           setEditing(row.navId);
+                          loadPreview(row);
                         }}
                       >
                         Change

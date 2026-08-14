@@ -336,6 +336,28 @@ export const platformImpersonationSessions = pgTable(
     actionCount: integer("action_count").default(0).notNull(),
     blockedActionCount: integer("blocked_action_count").default(0).notNull(),
 
+    /**
+     * ⭐ BREAK-GLASS ONLY, AND A CHECK CONSTRAINT MAKES IT MANDATORY
+     * THERE. This is the sentence the workspace owners read in the email
+     * telling them their data was opened without their permission, so it
+     * is written for them rather than for the log.
+     */
+    breakGlassReason: text("break_glass_reason"),
+
+    /**
+     * 🔴 THE DEBT. Until this is written the same operator cannot start
+     * another break-glass session. See `lib/platform/break-glass.ts` —
+     * this column is the only control in the whole path that costs
+     * anything on the day AFTER the decision, which is why it is the one
+     * that changes behaviour.
+     */
+    postIncidentNote: text("post_incident_note"),
+    postIncidentAt: timestamp("post_incident_at", { withTimezone: true }),
+    /** Not always the operator who went in. Somebody has to close it out. */
+    postIncidentBy: uuid("post_incident_by").references(() => platformStaff.id, {
+      onDelete: "set null",
+    }),
+
     createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
   },
   (t) => ({

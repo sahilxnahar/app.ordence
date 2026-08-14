@@ -61,7 +61,16 @@ const NAV = [
   // answers "find me Acme", this answers "who needs me today?" — see the
   // header of `app/platform/tenants/page.tsx`.
   { href: "/platform/tenants", label: "Needs attention" },
+  // ⭐ Health sits beside "Needs attention" and answers a different
+  // question: that page recomputes a score, this one lists the problems
+  // somebody still owes an answer for.
+  { href: "/platform/health", label: "Health" },
   { href: "/platform/observatory", label: "Observatory" },
+  // ⚠️ Approvals is high in the list on purpose. A queue nobody passes
+  // is a queue that expires, and an expired request is a customer
+  // waiting for something that quietly did not happen.
+  { href: "/platform/approvals", label: "Approvals" },
+  { href: "/platform/incidents", label: "Incidents" },
   { href: "/platform/provision", label: "Provision" },
   { href: "/platform/sessions", label: "Sessions" },
   { href: "/platform/search", label: "Search" },

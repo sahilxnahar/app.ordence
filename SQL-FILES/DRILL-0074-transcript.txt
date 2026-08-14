@@ -1,0 +1,95 @@
+Timing is off.
+--- ①a NEGATIVE: self-approval without the flag must be REFUSED
+psql:SQL-FILES/DRILL-0074-platform-control.sql:33: ERROR:  This request was made by the same operator who is approving it. That is allowed while Ordence has one operator, but it has to be recorded as a self-approval rather than passed off as a second pair of eyes.
+CONTEXT:  PL/pgSQL function ordence_guard_self_approval() line 7 at RAISE
+--- ①b NEGATIVE: self-approval flagged but only 5 minutes old must be REFUSED
+psql:SQL-FILES/DRILL-0074-platform-control.sql:45: ERROR:  A self-approval needs fifteen minutes between requesting and approving. 00:05:00 have passed. The wait is the entire control: it exists so the decision is made twice, by the same person, in two different moods.
+CONTEXT:  PL/pgSQL function ordence_guard_self_approval() line 14 at RAISE
+--- ①c POSITIVE: self-approval flagged, 20 minutes waited, must SUCCEED
+INSERT 0 1
+--- ①d POSITIVE: a DIFFERENT approver needs no wait and no flag
+INSERT 0 1
+--- ①e NEGATIVE: a three-character justification must be REFUSED
+psql:SQL-FILES/DRILL-0074-platform-control.sql:78: ERROR:  new row for relation "platform_approval_queue" violates check constraint "platform_approval_justification_real"
+DETAIL:  Failing row contains (981ae661-dd9b-45ce-b2a9-d0f19513c106, tenant.suspend, tenant, null, Acme (acme), null, {}, {}, 22222222-2222-2222-2222-222222222222, 2026-08-14 00:57:43.672185+00, fix, owner, pending, null, null, null, 2026-08-14 02:57:43.672185+00, null, null, f).
+--- ②a NEGATIVE: break-glass with a 19-character reason must be REFUSED
+psql:SQL-FILES/DRILL-0074-platform-control.sql:94: ERROR:  new row for relation "platform_impersonation_sessions" violates check constraint "platform_impersonation_break_glass_is_explained"
+DETAIL:  Failing row contains (3cbc2c14-75b2-41e8-bd73-c98cd1b21787, 11111111-1111-1111-1111-111111111111, acme, 22222222-2222-2222-2222-222222222222, user_x, ops@ordence.com, break_glass, read_only, null, invoicing has been down since 3am and nobody is answering, 2026-08-14 00:57:43.672517+00, 2026-08-14 01:12:43.672517+00, null, urgent, cannot wait, null, null, null).
+--- ②b POSITIVE: the same row with a real reason must SUCCEED
+INSERT 0 1
+--- ②c POSITIVE: a CONSENTED session needs no break-glass reason
+INSERT 0 1
+--- ③a POSITIVE: the first open event must SUCCEED
+BEGIN
+SET
+INSERT 0 1
+COMMIT
+--- ③b NEGATIVE: a SECOND open event for the same rule must be REFUSED
+BEGIN
+SET
+psql:SQL-FILES/DRILL-0074-platform-control.sql:152: ERROR:  duplicate key value violates unique constraint "tenant_health_one_open_per_rule"
+ROLLBACK
+--- ③c POSITIVE: a DIFFERENT rule for the same tenant must SUCCEED
+BEGIN
+SET
+INSERT 0 1
+COMMIT
+--- ③d NEGATIVE: resolving with a four-character note must be REFUSED
+    (a row count of 0 here would mean the statement never reached the CHECK)
+BEGIN
+SET
+psql:SQL-FILES/DRILL-0074-platform-control.sql:171: ERROR:  new row for relation "tenant_health_events" violates check constraint "tenant_health_resolution_is_explained"
+ROLLBACK
+--- ③e POSITIVE: resolving with a real note must SUCCEED — and must report UPDATE 1
+BEGIN
+SET
+UPDATE 1
+COMMIT
+--- ③f POSITIVE: with the first one CLOSED, the rule may open again
+BEGIN
+SET
+INSERT 0 1
+COMMIT
+--- ④a POSITIVE: the PLATFORM scope sees the health events
+BEGIN
+SET
+ platform_sees 
+---------------
+             3
+(1 row)
+
+COMMIT
+--- ④b NEGATIVE: a TENANT session sees NOTHING, not even its own
+BEGIN
+SET
+ tenant_sees 
+-------------
+           0
+(1 row)
+
+COMMIT
+--- ④c NEGATIVE: a tenant session cannot WRITE one either
+BEGIN
+SET
+psql:SQL-FILES/DRILL-0074-platform-control.sql:213: ERROR:  new row violates row-level security policy for table "tenant_health_events"
+ROLLBACK
+--- ④d POSITIVE: entitlement history is readable in platform scope
+BEGIN
+SET
+INSERT 0 1
+ platform_sees_history 
+-----------------------
+                     1
+(1 row)
+
+COMMIT
+--- ④e NEGATIVE: and invisible to the workspace it is about
+BEGIN
+SET
+ tenant_sees_history 
+---------------------
+                   0
+(1 row)
+
+COMMIT
+--- DRILL COMPLETE ---

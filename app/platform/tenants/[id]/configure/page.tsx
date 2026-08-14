@@ -42,6 +42,7 @@ import {
   setTenantIndustryAction,
 } from "@/server/platform/config-actions";
 import { recordStepUpAction } from "@/server/platform/actions";
+import { previewEntitlementChange } from "@/server/platform/control-actions";
 import { ModuleSwitchboard } from "@/components/platform/module-switchboard";
 import { PlanLimitsEditor } from "@/components/platform/plan-limits-editor";
 import { IndustryPicker } from "@/components/platform/industry-picker";
@@ -129,6 +130,14 @@ async function ConfigureBody({ tenantId }: { tenantId: string }) {
             canWrite={canOverride}
             onSet={setModuleEntitlementAction}
             onStepUp={recordStepUpAction}
+            /*
+              ⭐⭐⭐ THE GAP THIS SESSION CLOSED. Until now this screen
+              would happily turn a paying customer's module off and say
+              nothing at all about what happens to the eighteen hundred
+              records inside it. The operator's hesitation on that call is
+              the whole reason the preview exists.
+            */
+            onPreview={previewEntitlementChange}
           />
         </TabsContent>
 

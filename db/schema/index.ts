@@ -37,6 +37,7 @@ export * from "./clm";
 export * from "./accounting";
 export * from "./banking";
 export * from "./agents";
+export * from "./platform-control";
 
 // Granular authorization catalog & denial log
 export * from "./auth";

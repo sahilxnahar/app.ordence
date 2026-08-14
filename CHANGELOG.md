@@ -1,3 +1,134 @@
+# v1.22.0-alpha — THE PANEL THAT COULD RECORD EVERYTHING AND STOP NOTHING
+
+**Repo: `app.ordence`** · 🔴 **SQL: `0074` (run BEFORE the code push)** · ⚠️ **No new variables**
+
+Admin panel, part two. Five gaps closed in one session. Billing cockpit
+deferred at the owner's instruction, because it needs the LLP.
+
+- 🔴🔴 **`platform_action_log` HAS BEEN COMPLETE SINCE THE CONSOLE WAS
+  BUILT, AND NONE OF IT PREVENTS ANYTHING.** A log is written after the
+  thing happened. On the afternoon somebody has two tabs open and the
+  wrong workspace in the search box, it captures the mistake perfectly
+  and forty-three people still cannot work. Un-suspending is one click;
+  explaining twenty minutes of downtime to a customer is a relationship.
+  **That asymmetry is the whole argument for this release.**
+
+- ⭐⭐⭐ **THE APPROVAL QUEUE — SIX ACTIONS, NOT SIXTEEN.** Suspend,
+  terminate, change what a paying customer can use, read without
+  consent, raise an operator's grade, change a plan. Everything else
+  still executes immediately, and that is the hard part: a queue that
+  fires on routine work is a queue people learn to rubber-stamp, and a
+  rubber-stamped approval is worse than none because it looks like a
+  control in an audit. Provisioning, consented read-only impersonation
+  and overrides on trial workspaces are deliberately absent.
+- ⭐ **A WRAPPER, NOT A REWRITE.** `suspendTenant` is unchanged. The
+  queue intercepts the validated arguments, stores them, and hands the
+  identical arguments back to the identical function on approval. There
+  is no second code path that could drift.
+- ⭐⭐ **THE SINGLE-OPERATOR HATCH IS NAMED RATHER THAN HIDDEN.** Ordence
+  has one operator. A queue that cannot be cleared is a queue that gets
+  commented out at midnight, and then there is no control at all rather
+  than a weak one. So self-approval is allowed and costs fifteen
+  minutes, enforced by a database trigger rather than by the screen. It
+  is flagged in the row and in the log, and it disappears the day a
+  second operator exists.
+
+- ⭐⭐⭐ **THE TOGGLE NOW SAYS WHAT IT DOES BEFORE IT DOES IT.** The
+  switchboard has always worked and has never explained itself. Every
+  fact on it described the STATE; none described the CONSEQUENCE, which
+  is the thing an operator hesitates over on a call: does the customer's
+  data go away? **It does not, and now the screen says so in those
+  words.** An entitlement controls visibility, never existence.
+- 🔴 **AND THE FIRST VERSION OF THAT PREVIEW LIED.** It received an
+  empty record-count map, could not tell "not counted" from "zero", and
+  told the operator "there is no data in these modules yet" about a
+  workspace with eighteen hundred stock records — the exact sentence
+  they would have repeated to the customer. Fixed, and the fix is that
+  the preview now declines to give a number it does not have.
+- 🔴 **A SECOND ONE IN THE SAME FILE.** It passed an empty plan-feature
+  list, so `!planFeatures.includes(key)` was always true and it printed
+  "their plan does not include this, so this is effectively a discount"
+  on every enable, including ones the customer already pays for. It now
+  reads the effective tier, which is not the same as the recorded plan
+  for a trialing or lapsed workspace.
+- ⭐ **WRITE, THEN FRESH READ, THEN RECORD BOTH.** A toggle that fails
+  silently is worse than one that errors: it produces a ticket beginning
+  "I enabled it, it should be working", and the operator's own screen
+  agrees with the customer. Undo is a NEW history row, never a deletion.
+
+- ⭐⭐ **TENANT HEALTH — AND A CORRECTION TO MY OWN STATUS DOCUMENT.**
+  Doc 84 said Ordence had no health signal. That was wrong;
+  `evaluateHealth` has scored workspaces since v0.14.0 and two screens
+  call it. What was missing is PERSISTENCE and the three rules a
+  snapshot structurally cannot see: a fortnight-over-fortnight collapse
+  in engagement, an error rate against a workspace's OWN normal rather
+  than a platform threshold, and an integration that has quietly stopped
+  bringing anything in.
+- 🔴 **THE SWEEP IS THE HALF THAT MAKES IT REAL.** The table, the rules
+  and the screen were all written before anything CALLED the sweep —
+  the eighth time this codebase has produced a complete engine nothing
+  reaches. It now runs on read rather than on a schedule, because a
+  screen that depends on a healthy scheduler is silently empty on
+  exactly the morning the scheduler is what broke.
+- ⚠️ **SEAT AND STORAGE PRESSURE ARE DELIBERATELY NOT RAISED.** They are
+  sales signals that resolve themselves. Burying two rules that need a
+  phone call under paperwork about workspaces doing well is how both get
+  ignored.
+
+- ⭐⭐⭐ **BREAK-GLASS HAS A PROCEDURE, NOT JUST A MODE.** It was already
+  read-only, already fifteen minutes, already refused when consent
+  exists, already emailed to the workspace owners. **Every one of those
+  is paid once, by somebody who has already decided to reach for it, and
+  none of them costs anything the next day.**
+- 🔴 **SO THE CONTROL THAT CHANGES BEHAVIOUR IS A DEBT.** A break-glass
+  session leaves the operator owing a written note within 24 hours, and
+  until it is written THAT OPERATOR CANNOT BREAK GLASS AGAIN. It does
+  not block consented support access, and it must not — making the debt
+  block the path we want people on would push somebody towards the
+  unconsented one on the day their queue is long.
+- ⭐ **WITH THE ONE EXCEPTION THAT MAKES IT SAFE.** The debt becomes
+  blocking only an hour after the session closed, so an operator who
+  broke glass, found the problem was bigger than one workspace and needs
+  a second one right now is not stopped to write paperwork mid-incident.
+- ⭐ **AND A REASON WRITTEN FOR THE CUSTOMER, NOT THE LOG.** Fifty
+  characters minimum, refused if it repeats the internal justification
+  or is a bare ticket number, and printed verbatim in the email that
+  tells the workspace owners their data was read without permission.
+  Ordence's own owners are emailed too, within seconds — a control
+  everyone has to remember to check is a control nobody checks.
+
+- ⭐ **INCIDENT MODE.** At three in the morning nobody writes down what
+  they did. An incident is a name for a bad hour so the post-mortem
+  assembles itself from the log rather than from an argument a week
+  later about the order of events.
+
+- 🔴 **AND ONE MORE SELF-CORRECTION, CAUGHT BY A GATE.** `0074`
+  originally argued at the bottom of the file that RLS on the two new
+  tenant-carrying tables would be decoration, because they are only ever
+  reached through `withPlatformScope`. Every clause of that was true and
+  the conclusion was still wrong: **RLS that is not enabled is not a
+  policy evaluating to false, it is no policy, and Postgres returns
+  every row.** One tenant-side query joining `tenant_health_events` for
+  a plausible reason and a customer reads our private assessment of
+  their own churn risk. `npm run check:sql` refused the build.
+- ⚠️ **THE DRILL CAUGHT A FLAW IN ITSELF, TOO.** The UPDATE meant to be
+  refused by the resolution-note CHECK reported `UPDATE 0` and could
+  have been written down as a pass. It was not: RLS had hidden every row
+  from a session with no scope, so the statement never reached the
+  constraint. **The paired positive is what gave it away**, which is the
+  entire reason every refusal in this codebase is paired with one.
+
+**Gates:** all eight green — `tsc`, `check:boundaries`, `check:migrations`,
+`check:sql`, `check:posting`, `check:reachability`, `test:ui` (75 files, **2,704
+passing**, 57 new), `next build`. RLS drill run as non-superuser `app_user`:
+9 positives, 7 refusals, every refusal paired.
+
+**Deferred, at the owner's instruction:** the billing cockpit. It needs
+the LLP, `PLATFORM_GSTIN`, Razorpay and the GSP, and building the screen
+before the entity exists would produce a cockpit with no instruments.
+
+---
+
 # v1.16.0-alpha — THE FEATURE THE OWNER ASKED FOR, AND THE HALF THAT IS WORTH MORE
 
 **Repo: `app.ordence`** · 🔴 **SQL: `0068`** · ⚠️ **No new variables**

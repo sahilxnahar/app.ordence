@@ -51,10 +51,13 @@ import { withPlatformScope, withTenant } from "@/db";
 import { tenants, users } from "@/db/schema";
 import {
   platformImpersonationSessions,
+  platformStaff,
   tenantSupportConsents,
   type ImpersonationMode,
   type ImpersonationScope,
 } from "@/db/schema/platform";
+import { breakGlassReasonProblem } from "@/lib/platform/break-glass";
+import { breakGlassDebtBlock } from "./break-glass";
 import {
   expiryFor,
   isSessionLive,
@@ -215,6 +218,7 @@ export async function startImpersonation(
     };
   }
   const { tenantId, mode, justification, subjectUserId, confirmSlug } = parsed.data;
+  const breakGlassReason = parsed.data.breakGlassReason ?? "";
 
   // Break-glass is a different capability from consented impersonation,
   // and `support` grade does not hold it. Checked BEFORE anything else,
@@ -226,6 +230,28 @@ export async function startImpersonation(
 
   const now = new Date();
   const facts = await currentRequestFacts();
+
+  /* ---- ⭐⭐⭐ THE BREAK-GLASS PROCEDURE -------------------------- */
+  //
+  // 🔴 BOTH CHECKS RUN BEFORE ANYTHING IS READ OR WRITTEN, and both are
+  // pure verdicts computed in `lib/platform/break-glass.ts`.
+  //
+  // ⚠️ THE ORDER MATTERS. The debt is checked FIRST, because an operator
+  // who is blocked should be told that before they spend two minutes
+  // writing a reason that will be thrown away.
+  if (mode === "break_glass") {
+    const blocked = await breakGlassDebtBlock(operator.staff.id, now);
+    if (blocked) return { ok: false, error: blocked };
+
+    const reasonProblem = breakGlassReasonProblem(breakGlassReason, justification);
+    if (reasonProblem) {
+      return {
+        ok: false,
+        error: reasonProblem,
+        fieldErrors: { breakGlassReason: [reasonProblem] },
+      };
+    }
+  }
 
   /* ---- One live session per operator ---------------------------- */
   const existing = await getActiveImpersonation(operator);
@@ -355,6 +381,11 @@ export async function startImpersonation(
           scope,
           consentId: consent?.id ?? null,
           justification,
+          // ⚠️ NULL FOR CONSENTED MODES, and the CHECK constraint in 0074
+          // only demands it for break-glass. Writing an empty string here
+          // would satisfy nothing and would make "no reason given"
+          // indistinguishable from "not applicable".
+          breakGlassReason: mode === "break_glass" ? breakGlassReason.trim() : null,
           subjectUserId: subjectUserId ?? null,
           startedAt: now,
           expiresAt,
@@ -420,6 +451,7 @@ export async function startImpersonation(
     justification,
     expiresAt: started.expiresAt,
     sessionId: started.sessionId,
+    breakGlassReason: mode === "break_glass" ? breakGlassReason.trim() : null,
   });
 
   if (mode === "break_glass") {
@@ -433,7 +465,24 @@ export async function startImpersonation(
       ipAddress: facts.ipAddress,
       userAgent: facts.userAgent,
       reason: "BREAK-GLASS impersonation started with no tenant consent (read-only).",
-      detail: { operator: operator.email, justification },
+      detail: { operator: operator.email, justification, breakGlassReason: breakGlassReason.trim() },
+    });
+
+    // ⭐⭐ THE OWNERS OF THE PLATFORM ARE TOLD TOO, IMMEDIATELY.
+    //
+    // ⚠️ The customer already gets an email. Nobody on our side did,
+    // which meant the only way to learn that an engineer had opened a
+    // workspace without permission was to go and look at a screen. A
+    // control everyone has to remember to check is a control nobody
+    // checks. Best-effort, for the same reason the customer's email is:
+    // a mail outage must not keep an engineer out of a broken workspace.
+    await alertPlatformOwners({
+      operatorEmail: operator.email,
+      tenantName: started.tenantName,
+      reason: breakGlassReason.trim(),
+      justification,
+      sessionId: started.sessionId,
+      expiresAt: started.expiresAt,
     });
   }
 
@@ -755,6 +804,8 @@ async function notifyTenant(
     justification: string;
     expiresAt: Date;
     sessionId: string;
+    /** ⭐ Break-glass only. Written FOR this email, not for the log. */
+    breakGlassReason?: string | null;
   },
 ): Promise<void> {
   try {
@@ -791,8 +842,16 @@ async function notifyTenant(
       `<strong>Ends automatically:</strong> ${esc(details.expiresAt.toISOString())}<br/>` +
       `<strong>Reason given:</strong> ${esc(details.justification)}</p>` +
       (breakGlass
-        ? `<p>This was <strong>emergency access without your prior consent</strong>. ` +
-          `It is read-only: nothing in your workspace can be changed. If you did not ` +
+        ? // ⭐ THE REASON, VERBATIM, ABOVE THE FOLD. The whole argument for
+          // a separate 50-character field is that this paragraph exists and
+          // that a customer reads it. Printing the internal justification
+          // here instead would show them a ticket number.
+          `<p><strong>Why we could not wait for your permission:</strong><br/>${esc(
+            details.breakGlassReason ?? "No reason was recorded, which is itself a fault on our side.",
+          )}</p>` +
+          `<p>This was <strong>emergency access without your prior consent</strong>. ` +
+          `It is read-only: nothing in your workspace can be changed, and it ends ` +
+          `automatically after fifteen minutes. If you did not ` +
           `expect this, reply to this email immediately.</p>`
         : `<p>You can revoke support access at any time in Settings.</p>`);
 
@@ -818,6 +877,79 @@ async function notifyTenant(
     }
   } catch (err) {
     console.error("[platform] impersonation notification failed", err);
+  }
+}
+
+/**
+ * ⭐⭐ TELL OUR OWN OWNERS, WITHIN SECONDS.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * ⚠️ WHY THIS IS NOT A DASHBOARD CARD
+ * ══════════════════════════════════════════════════════════════════════
+ * A card on the observatory is seen by somebody who was already looking
+ * at the observatory. The event this exists for happens at eleven at
+ * night, and the person who most needs to know is not looking at a
+ * screen. So it is a push, out of band, to every owner-grade operator.
+ *
+ * 🔴 IT IS NOT SENT TO THE OPERATOR WHO DID IT. Their own copy tells
+ * them nothing they do not know and makes the alert look routine in
+ * everybody's inbox including theirs.
+ */
+async function alertPlatformOwners(details: {
+  operatorEmail: string;
+  tenantName: string;
+  reason: string;
+  justification: string;
+  sessionId: string;
+  expiresAt: Date;
+}): Promise<void> {
+  try {
+    const owners = await withPlatformScope(
+      "Platform console: owner alert recipients for break-glass",
+      async (db) =>
+        db
+          .select({ email: platformStaff.email })
+          .from(platformStaff)
+          .where(
+            and(
+              eq(platformStaff.grade, "owner"),
+              eq(platformStaff.status, "active"),
+              isNull(platformStaff.revokedAt),
+            ),
+          )
+          .limit(20),
+    );
+
+    const to = owners
+      .map((o) => o.email)
+      .filter((e) => e.toLowerCase() !== details.operatorEmail.toLowerCase());
+
+    if (to.length === 0) return;
+
+    const body =
+      `<p><strong>Break-glass access has been used.</strong></p>` +
+      `<p><strong>Operator:</strong> ${esc(details.operatorEmail)}<br/>` +
+      `<strong>Workspace:</strong> ${esc(details.tenantName)}<br/>` +
+      `<strong>Ends:</strong> ${esc(details.expiresAt.toISOString())}</p>` +
+      `<p><strong>Reason given to the customer:</strong><br/>${esc(details.reason)}</p>` +
+      `<p><strong>Internal justification:</strong><br/>${esc(details.justification)}</p>` +
+      `<p>The workspace owners have been emailed. The session is read-only and ` +
+      `expires on its own. A write-up is due within 24 hours, and until it is ` +
+      `written this operator cannot break glass again.</p>`;
+
+    await sendEmail({
+      to,
+      subject: `BREAK-GLASS: ${details.operatorEmail} opened ${details.tenantName}`,
+      html: body,
+      text: body.replace(/<[^>]+>/g, " "),
+      idempotencyKey: `breakglass-owner-${details.sessionId}`,
+      logContext: { sessionId: details.sessionId },
+    });
+  } catch (err) {
+    // ⚠️ SWALLOWED ON PURPOSE, AND THE SECURITY EVENT ABOVE IS ALREADY
+    // WRITTEN. An engineer must not be kept out of a broken workspace by
+    // our mail provider.
+    console.error("[platform] break-glass owner alert failed", err);
   }
 }
 

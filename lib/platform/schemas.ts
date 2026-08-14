@@ -115,6 +115,15 @@ export const startImpersonationSchema = z.object({
   /** Optional: whose view to reproduce. Read-only either way. */
   subjectUserId: uuidField.optional(),
   confirmSlug: z.string().trim().min(1, "Type the workspace address to confirm."),
+  /**
+   * ⭐ REQUIRED FOR `break_glass` AND MEANINGLESS OTHERWISE, which is why
+   * it is optional HERE and checked by `breakGlassReasonProblem` once the
+   * mode is known. A Zod refinement could express it, but the refusal
+   * sentences that field needs are three paragraphs of argument about
+   * ticket references and copy-pasted justifications, and they belong in
+   * `lib/platform/break-glass.ts` next to the rest of the procedure.
+   */
+  breakGlassReason: z.string().trim().max(4000).optional(),
 });
 
 export type StartImpersonationInput = z.infer<typeof startImpersonationSchema>;
