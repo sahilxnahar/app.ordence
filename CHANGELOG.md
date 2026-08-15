@@ -1,3 +1,57 @@
+# v1.46.0-alpha — EIGHT BATCHES IN ONE RUN
+
+**Repo: `app.ordence`** · 🔴 **SQL: `0082_leave_and_attendance.sql` (run BEFORE the code push)** · ⚠️ **No new variables**
+
+Eight file-disjoint tracks built concurrently, then one integration pass.
+Batches 39, 59, 153, 49, 46+47, 52, plus two engine fixes carried over
+from v1.44.0's found-not-fixed list. **25.5 of 128 batches.**
+
+- 🔴🔴 **BATCH 59 · PAYROLL PAID EVERY SALARIED PERSON A FULL MONTH,
+  ALWAYS.** `payroll-run-board.tsx` passed `attendance: []` hardcoded,
+  because there was no table to read from: `site_attendance` records
+  contract labour, who are on nobody's payroll. `0082` adds
+  `staff_attendance` and a leave ledger. **A balance is derived from
+  entries and never stored** — there is no `leave_balances` table and its
+  absence is the design. Accrual is **earned, not granted**: a full
+  year's entitlement appearing on 1 April for an October joiner is a
+  liability the business does not owe and discovers in March.
+- 🔴🔴 **A ONE-OWNER PLATFORM DEADLOCKED ITS OWN APPROVAL QUEUE THE DAY
+  IT HIRED.** `soleOperator` counted every operator grade; every policy
+  needs `owner`. Grant the first support engineer and the count becomes
+  2, so the owner is refused ("another operator can approve it") and that
+  operator is refused on grade. Nothing could be approved again.
+  `decideRequest`'s answer is now recomputed and the caller's ignored,
+  because a caller-supplied "am I alone" is a caller-supplied
+  authorisation decision.
+- 🔴 **A BILL WITH NO LINES REPORTED "the order, the receipt and the bill
+  agree on every line"** to the control that authorises paying a vendor,
+  and `purchase_invoices` carries its own header total, so it was payable
+  for real money nothing had checked. Now `unmatched`, which the payment
+  run already knows to stop on.
+- 🔴 **THE LAST-ADMIN GUARD COUNTED REMAINING OWNERS WITHOUT ASKING
+  WHETHER ANY OF THEM WAS STILL ON `PLATFORM_ADMIN_EMAILS`.** Access
+  needs both keys. The screen refused that case; a screen is a mistake
+  guard, not a boundary. The allowlist is now a term in the counting
+  query.
+- ⭐⭐ **BATCH 153 · A FIFTEENTH GATE THAT STANDS UP TWO LIVE TENANTS AND
+  TRIES TO READ ACROSS.** The four existing isolation controls check
+  facts, schema coverage, four representative shapes, and production with
+  a tenant id belonging to no workspace. None of them issues a real query
+  as tenant A for tenant B's rows. **It found Batch 59's leave tables
+  unprotected on its first run, unaided.**
+- ⭐⭐ **BATCH 49 · THE CASH-FLOW DOCTRINE GENERALISED.** Compute twice by
+  routes that share no ledger; when they disagree render no figure at
+  all. Applied to receivables and billing, which had no tie between the
+  ageing report and the books at all.
+- ⭐ **BATCH 52 · `statutory_rates` HAS BEEN EFFECTIVE-DATED SINCE BATCH
+  15 WITH NO WAY TO WRITE A SECOND ROW.** A Finance Act slab move was a
+  deploy or a psql prompt, and the obvious statement to type,
+  `UPDATE statutory_rates SET payload = ...`, silently restates every
+  payslip ever computed. Nothing errors and the employee finds out.
+- ⭐ **BATCH 39 · THE ITC REVERSAL SHOWS ITS WORKING**, and **BATCH 46+47
+  · offboarding and a configuration chain** so a customer's setting has
+  provenance rather than being the moment somebody typed it.
+- ⚠️ **Fifteen gates green. 114 test files, 3,848 passing (+276).**
 # v1.24.0-alpha — GSTR-3B, THE SET-OFF, AND WHAT YOU ACTUALLY OWE
 
 **Repo: `app.ordence`** · 🔴 **SQL: `0077` (run BEFORE the code push)** · ⚠️ **No new variables**
@@ -2913,3 +2967,79 @@ hundred and sold ten showed minus ten.
 `recordGoodsReceipt` and `runThreeWayMatch` still have no UI caller, and
 `recordPurchaseInvoice` has none either. The correctness half is done;
 the screens are the second half.
+
+## v1.44.0-alpha — four batches in one run (first parallel wave)
+
+Four file-disjoint tracks built concurrently by subagents, then one
+integration pass. Previous runs delivered one batch each.
+
+### Batch 38 second half — the purchase receipt screen
+`/purchases/orders/[id]` reaches `recordGoodsReceipt` (first path by
+which inventory can go UP) and `runThreeWayMatch` (first thing ever able
+to set `purchase_invoices.match_state`, which the payment run has read
+since v1.11.0).
+
+### Batch 37 — statement periods
+P&L, balance sheet and trial balance take a period, defaulting to the
+current Indian FY rather than since inception. 🔴 The balance sheet takes
+an "as at" and keeps `from: null`, because a from-date would filter out
+opening balances and every asset would vanish. `retainedResultToDate`
+added so the accounting identity still holds in year two.
+
+⚠️ Also fixed in passing: `app/(crm)/statements/page.tsx` was CRASHING on
+every load. `BigInt("1234.56")` throws, and the action produces decimal
+strings. Any tenant with one ledger row got an exception.
+
+### Batch 45 — canary probes
+`/api/cron/canary` attempts cross-tenant reads against real tenant ids on
+a schedule. 🔴 Refuses to report a pass when the connection bypasses RLS,
+returning 503 INCONCLUSIVE rather than a green tick that would be false
+assurance forever. Also detects the third bypass vector: a table owner is
+exempt from its own policies without FORCE.
+
+### Batch 35 — lead screens
+`/sales/leads/new` and `/sales/leads/[id]`. All 8 exports of
+`sales-leads.ts` now have callers; five had none.
+
+### check:links budget 10 → 8
+
+## v1.45.0-alpha — six batches in one run
+
+🔴 SQL: yes. `0081_audit_hash_chain.sql`.
+🔴 ORDER: run the SQL FIRST, then push the code. This is the OPPOSITE of
+0079 and 0080. The new writer inserts columns that raise 42703 on an
+unmigrated database, and `writeAudit`'s catch would swallow it — silently
+turning the audit trail off, which is the exact defect this hardens.
+
+### Three-way match was matching across purchase orders
+`runThreeWayMatch` joined bill lines to order lines on `lower(description)`
+tenant-wide, with no `po_id`. Now a LATERAL join restricted to the bill's
+own order, one row per bill line. A bill with no `po_id` returns
+`no_order` rather than a verdict about an order it never named.
+
+Also: `recomputeOrderStatus` compared totals across all lines, so an
+over-delivery on one line masked a shortfall on another.
+
+### Batch 57 — CSV import, the first data import of any kind
+Generic framework, two entities, own parser (BOM, CRLF, quoted newlines).
+Preview and commit share one code path with the mode branch below every
+decision. Failed rows download as a valid re-uploadable CSV.
+
+### Batch 65 — cash flow statement, indirect method
+Closing cash computed twice by two routes sharing no ledger. When they
+disagree it renders NO figure, including the true closing balance.
+
+### Statements now filter transaction status: posted + reversed
+🔴 "Posted only" would keep every correction and drop everything
+corrected, leaving turnover permanently lower in a statement that still
+balances.
+
+### Batch 42 — platform staff console
+`grantPlatformStaff`/`revokePlatformStaff` had zero callers; every grant
+was hand-written SQL.
+
+### Batch 44 — audit hash chaining (SQL 0081)
+### Batch 107 — employee self-service
+
+### check:guards TIER2 list gained `guardImport`
+The list was incomplete, not the code.

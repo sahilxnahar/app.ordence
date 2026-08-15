@@ -110,6 +110,23 @@ const TIER2 = [
    */
   "guardDynamicWrite",
   "guardGstWrite",
+  /**
+   * ⭐ ADDED v1.45.0. `guardImport` (server/actions/import.ts) is the
+   * same shape as its neighbours above: tenant context, then account
+   * access, then two entitlement checks, then
+   * `requirePermission(entity.createPermission)` — and
+   * `requirePermission(entity.updatePermission)` as well when the run
+   * may overwrite.
+   *
+   * ⚠️ IT WAS THE LIST THAT WAS INCOMPLETE, NOT THE CODE. Two agents
+   * working on unrelated batches both hit this in one run and both
+   * correctly diagnosed it as a checker limitation rather than a hole.
+   * The alternative fix — a second guard call at the export purely to
+   * satisfy the one-hop walk — would have added a duplicate context
+   * resolution on every import to make a script happy, which is how a
+   * gate teaches people to write code for the gate.
+   */
+  "guardImport",
   "guardPurchaseWrite",
   "guardReceivablesWrite",
   "guardSalesWrite",

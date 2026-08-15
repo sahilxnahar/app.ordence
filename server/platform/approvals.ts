@@ -37,15 +37,19 @@ import { platformApprovalQueue } from "@/db/schema/platform-control";
 import { tenants } from "@/db/schema/core";
 import {
   POLICY_BY_KIND,
+  enforcementReport,
   expiryFor,
+  gradeAtLeast,
   justificationProblem,
   mayApprove,
   mayReject,
   needsApproval,
   type ApprovalKind,
   type PlatformGrade,
+  type PolicyEnforcement,
 } from "@/lib/platform/approvals";
-import { recordPlatformAudit, type PlatformOperator } from "./guard";
+import { recordPlatformAudit, requireCapability, type PlatformOperator } from "./guard";
+import type { PlatformResult } from "@/lib/platform/schemas";
 
 /* ------------------------------------------------------------------ */
 /* THE REGISTRY                                                        */
@@ -72,6 +76,61 @@ export function registerApprovalExecutor(
   EXECUTORS.set(kind, executor);
 }
 
+/* ================================================================== */
+/* ⭐⭐⭐ WHAT IS ACTUALLY ENFORCED, AS OPPOSED TO WHAT IS LISTED       */
+/* ================================================================== */
+
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴🔴 SIX POLICIES WERE PUBLISHED. ONE WAS ENFORCED. THE SCREEN SAID
+ *      NOTHING ABOUT THE DIFFERENCE.
+ * ══════════════════════════════════════════════════════════════════════
+ * `app/platform/approvals/page.tsx` mapped straight over
+ * `APPROVAL_POLICIES` and printed all six under "What is held, and why".
+ * Every sentence was accurate about the CONSTANT. One of the six was
+ * accurate about the SYSTEM.
+ *
+ * ⚠️ A DEAD CONTROL IS WORSE THAN A MISSING ONE. A missing control
+ * produces a question — "so what stops somebody terminating a workspace
+ * by accident?" — and the question gets answered. A dead one answers it
+ * first, wrongly, and it is never asked again. The auditor reads the
+ * same screen and records the gap as covered.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * ⭐⭐ THE ONLY THING THIS FILE CONTRIBUTES IS THE LIVE REGISTRY
+ * ══════════════════════════════════════════════════════════════════════
+ * The rules — which kinds have a request path, why the others do not,
+ * and how those two facts combine into "enforced" — live in
+ * `lib/platform/approvals.ts` beside `mayApprove` and for the same
+ * reason the header there gives: they can be tested without a database,
+ * and the screen and the server cannot disagree about them.
+ *
+ * 🔴 WHAT CANNOT LIVE THERE IS WHICH EXECUTORS ARE REGISTERED. That is
+ * a runtime fact about this process, and it is deliberately OBSERVED
+ * rather than written down: the day somebody calls
+ * `registerApprovalExecutor` for a new kind, the screen stops calling it
+ * unwired with no second edit to remember. A hand-maintained copy of
+ * this list is exactly the artefact that produced the original bug.
+ */
+
+/**
+ * ⭐ THE GUARDED READ. `requireCapability` is on the export, in one
+ * line, because this list names every dangerous operation the platform
+ * can perform AND which of them are currently ungated — which is a map
+ * for an attacker as much as a status board for an operator.
+ */
+export async function getApprovalEnforcement(): Promise<
+  PlatformResult<readonly PolicyEnforcement[]>
+> {
+  await requireCapability("tenants:read");
+  // ⚠️ READ AT REQUEST TIME, NOT AT MODULE LOAD. Executors register
+  // themselves from `control-actions.ts` at import time, and a snapshot
+  // taken while this module's own body was still evaluating would be
+  // empty — the report would tell an operator nothing is enforced on
+  // every cold boot, which is its own kind of lie.
+  return { ok: true, data: enforcementReport([...EXECUTORS.keys()]) };
+}
+
 /* ------------------------------------------------------------------ */
 /* REQUEST                                                             */
 /* ------------------------------------------------------------------ */
@@ -95,6 +154,40 @@ export async function queueForApproval(args: {
   const policy = POLICY_BY_KIND[args.kind];
   if (!policy) {
     return { queued: false, error: "This action does not go through the queue." };
+  }
+
+  /**
+   * ══════════════════════════════════════════════════════════════════
+   * 🔴 REFUSED AT REQUEST TIME, NOT AT APPROVAL TIME
+   * ══════════════════════════════════════════════════════════════════
+   * `decideApproval` already refuses to approve a row whose executor is
+   * missing, and that check has to stay — a module can be removed while
+   * a request for it is still queued. But it is the WRONG PLACE to
+   * discover the problem for a kind that never had an executor at all.
+   *
+   * ⚠️ WITHOUT THIS THE SEQUENCE IS: an operator raises a request, is
+   * told "nothing has happened yet, it is waiting for approval", waits,
+   * finds an owner, the owner approves — and only then does anything
+   * say that this build cannot carry it out. Two people have now spent
+   * real time, the dangerous action is still not done, and the row sits
+   * in `pending` looking like a backlog rather than a bug.
+   *
+   * 🔴 IT ALSO CLOSES THE ONE WAY THIS QUEUE COULD FAKE ENFORCEMENT.
+   * A request path could be added for a policy with no executor, the
+   * screen would fill with pending rows, and every one of them would be
+   * theatre: the operation is not held pending approval, it is simply
+   * never performed. Refusing here means a policy is either enforceable
+   * end to end or visibly not offered, with no state in between.
+   */
+  if (!EXECUTORS.has(args.kind)) {
+    return {
+      queued: false,
+      error:
+        `Nothing in this build can carry out "${policy.label}", so there is no ` +
+        `point holding a request for it — it would wait, be approved, and then ` +
+        `refuse to run. Raise this with whoever owns the action rather than ` +
+        `queueing it.`,
+    };
   }
 
   const problem = justificationProblem(args.justification);
@@ -164,6 +257,13 @@ export async function decideApproval(args: {
   readonly approverGrade: PlatformGrade;
   readonly approve: boolean;
   readonly note: string;
+  /**
+   * ⚠️ ACCEPTED AND DELIBERATELY NOT TRUSTED. Kept on the signature so
+   * the existing caller still typechecks, and overridden below by a
+   * count taken from the request's own required grade — see the block
+   * above `mayApprove`. A caller-supplied "am I alone" is a caller-
+   * supplied authorisation decision, and this one was also wrong.
+   */
   readonly soleOperator: boolean;
   readonly now: Date;
 }): Promise<DecisionOutcome> {
@@ -255,6 +355,46 @@ export async function decideApproval(args: {
     };
   }
 
+  /**
+   * ══════════════════════════════════════════════════════════════════
+   * 🔴🔴 `soleOperator` IS RECOMPUTED HERE AND THE CALLER'S ANSWER IS
+   *      IGNORED, BECAUSE THE CALLER'S ANSWER DEADLOCKS THE QUEUE
+   * ══════════════════════════════════════════════════════════════════
+   * `decideRequest` passes `countActiveOperators() <= 1`. That counts
+   * every usable platform grant, of any grade. Every policy in
+   * `APPROVAL_POLICIES` needs `owner` to approve.
+   *
+   * ⚠️ SO THE DAY THE FIRST SUPPORT ENGINEER IS GRANTED ACCESS, a
+   * platform with exactly one owner reaches this state:
+   *
+   *   · the count is 2, so `soleOperator` is false, so the owner who
+   *     raised the request is refused with "there is another operator
+   *     who can approve it";
+   *   · that other operator is `support`, and `mayApprove` refuses them
+   *     on grade.
+   *
+   * 🔴 NOBODY CAN APPROVE ANYTHING. Every suspension request expires
+   * unapproved, four hours at a time, and the visible symptom is a
+   * refusal sentence that names an operator who cannot help. The
+   * predictable response is the one this whole mechanism was designed to
+   * avoid: somebody comments the queue out and suspends directly.
+   *
+   * ⭐ THE HONEST QUESTION IS "IS THERE SOMEBODY ELSE I COULD ASK", and
+   * that means an active grant, at or above THIS policy's approver
+   * grade, belonging to somebody who is not the requester. Anything
+   * looser either opens the self-approval hatch when a real second pair
+   * of eyes exists — the failure that matters — or shuts it when none
+   * does.
+   *
+   * ⚠️ COMPUTED FROM THE ROW, NOT FROM THE SESSION, so it is the same
+   * answer whoever is looking. `listPending` hands the identical number
+   * to the screen for exactly that reason.
+   */
+  const policyForRow = POLICY_BY_KIND[row.actionKind];
+  const otherEligible = policyForRow
+    ? await countEligibleApprovers(policyForRow.approverGrade, row.requestedBy)
+    : 0;
+
   // 🔴 THE PURE VERDICT DECIDES. Self-approval, grade and expiry are all
   // in `lib/platform/approvals.ts` so they can be tested without a
   // database and so the screen and the server cannot disagree.
@@ -267,7 +407,7 @@ export async function decideApproval(args: {
     status: row.status,
     expiresAt: row.expiresAt,
     now: args.now,
-    soleOperator: args.soleOperator,
+    soleOperator: otherEligible === 0,
   });
 
   if (!verdict.allowed) return { ok: false, error: verdict.reason };
@@ -351,7 +491,7 @@ export async function decideApproval(args: {
 /* ------------------------------------------------------------------ */
 
 export async function listPending(now: Date) {
-  return withPlatformScope("Platform console: approval queue", async (db) => {
+  const rows = await withPlatformScope("Platform console: approval queue", async (db) => {
     // ⭐ EXPIRE ON READ. A scheduled sweeper would be tidier and would
     // also mean a request could be approved in the window between
     // expiring and the sweep noticing.
@@ -371,6 +511,93 @@ export async function listPending(now: Date) {
       .orderBy(desc(platformApprovalQueue.requestedAt))
       .limit(100);
   });
+
+  /**
+   * ⭐⭐ THE SCREEN GETS THE SAME NUMBER THE SERVER WILL USE.
+   *
+   * ⚠️ `getApprovalQueue` returns ONE `soleOperator` for the whole list,
+   * derived from `countActiveOperators()`. That is wrong twice over: it
+   * ignores grade (see the long note in `decideApproval`) and it ignores
+   * WHO RAISED EACH ROW, which is the other half of the question. Two
+   * rows raised by two different people do not have the same answer, and
+   * a single flag cannot carry both.
+   *
+   * 🔴 A SCREEN THAT PREDICTS A DIFFERENT VERDICT FROM THE SERVER IS THE
+   * FAILURE THIS COMPONENT WAS BUILT TO AVOID — `approval-queue.tsx`
+   * runs `mayApprove` locally purely so the refusal is printed before
+   * the click. Feed it a different `soleOperator` and it prints a
+   * sentence the server does not agree with, which reads as a bug and
+   * gets routed around.
+   *
+   * ⚠️ ONE QUERY, NOT ONE PER ROW. The grants are read once and each row
+   * is scored against them in memory; a hundred queued rows must not be
+   * a hundred round trips on a screen somebody opens during an incident.
+   */
+  const grants = await activePlatformGrants();
+
+  return rows.map((row) => {
+    const policy = POLICY_BY_KIND[row.actionKind];
+    return {
+      ...row,
+      otherEligibleApprovers: policy
+        ? grants.filter(
+            (g) => g.id !== row.requestedBy && gradeAtLeast(g.grade, policy.approverGrade),
+          ).length
+        : 0,
+    };
+  });
+}
+
+/**
+ * ⚠️ THE THREE COLUMNS TOGETHER, exactly as `countActiveOperators` reads
+ * them, because a grant that is `active` with `expires_at` in the past is
+ * not somebody you can ask to approve anything — and the two functions
+ * disagreeing about what "usable" means would be worse than either being
+ * wrong on its own.
+ *
+ * ⭐ THE GRADE IS RETURNED RATHER THAN COMPARED IN SQL. Ranking grades in
+ * Postgres means either an ordered enum this schema does not have or a
+ * CASE expression that is a second copy of `GRADE_RANK`. `gradeAtLeast`
+ * is already the one definition the screen and the server share, so the
+ * comparison stays in TypeScript where there is exactly one of it.
+ */
+async function activePlatformGrants(): Promise<
+  ReadonlyArray<{ id: string; grade: PlatformGrade }>
+> {
+  return withPlatformScope("Platform console: usable platform grants", async (db) => {
+    const result = await db.execute(sql`
+      SELECT id::text AS id, grade::text AS grade
+        FROM platform_staff
+       WHERE status = 'active'
+         AND revoked_at IS NULL
+         AND (expires_at IS NULL OR expires_at > now())
+    `);
+    const raw = (Array.isArray(result) ? result : (result as { rows?: unknown[] }).rows) ?? [];
+    return (raw as Array<{ id?: string; grade?: string }>)
+      .filter((r): r is { id: string; grade: string } => Boolean(r.id && r.grade))
+      .map((r) => ({ id: r.id, grade: r.grade as PlatformGrade }));
+  });
+}
+
+/**
+ * ⭐ "IS THERE SOMEBODY ELSE I COULD ASK?" — the only question the
+ * self-approval hatch actually turns on.
+ *
+ * ⚠️ `excludeStaffId` IS THE REQUESTER, NEVER THE APPROVER. Excluding
+ * whoever happens to be looking would make the answer depend on who
+ * opened the screen, and a lone owner would see the hatch open for their
+ * colleague's request — which is not self-approval at all, it is a
+ * second pair of eyes, and it must not be flagged as one or the other by
+ * accident.
+ */
+export async function countEligibleApprovers(
+  requiredGrade: PlatformGrade,
+  excludeStaffId: string,
+): Promise<number> {
+  const grants = await activePlatformGrants();
+  return grants.filter(
+    (g) => g.id !== excludeStaffId && gradeAtLeast(g.grade, requiredGrade),
+  ).length;
 }
 
 /**

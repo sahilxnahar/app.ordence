@@ -25,7 +25,7 @@
 
 import { z } from "zod";
 import { revalidatePath } from "next/cache";
-import { and, desc, eq, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, sql } from "drizzle-orm";
 import { db, withTenant } from "@/db";
 import {
   plans,
@@ -70,6 +70,17 @@ import {
   SAAS_SAC_CODE,
 } from "@/lib/validators/billing";
 import { recordUserBillingAudit } from "@/server/billing/audit-billing";
+import {
+  serializeReconciliation,
+  type SerializedReconciliation,
+} from "@/lib/reconciliation/gate";
+import {
+  APPLIED_EVENT_STATUS,
+  BILLING_BREACH_CAUSES,
+  REVERSING_EVENT_TYPES,
+  SETTLING_EVENT_TYPES,
+  reconcileBillingHistory,
+} from "@/lib/reconciliation/billing";
 import type { ActionResult } from "@/lib/validators/crm";
 import type { UsageSummary } from "@/server/metering/query";
 
@@ -251,8 +262,58 @@ export async function getCurrentSubscription(): Promise<ActionResult<Subscriptio
   }
 }
 
-/** Invoice history, newest first. */
-export async function listInvoices(limit = 50): Promise<ActionResult<InvoiceView[]>> {
+/**
+ * ⭐ THE INVOICE HISTORY, WITH THE SETTLEMENT FIGURES GATED.
+ *
+ * 🔴 `amountPaidMinor` AND `amountPaidDisplay` ARE OPTIONAL ON THIS VIEW
+ * AND ARE **ABSENT** WHEN THE SETTLEMENT CHECK FAILS. Not zeroed, not
+ * flagged — absent, so a screen that ignores the reconciliation cannot
+ * print an unverified "received" figure by accident. See the same
+ * decision, argued at length, on `AgeingFigures` in
+ * `server/actions/receivables.ts`.
+ *
+ * ⚠️ THE INVOICE ITSELF IS NEVER WITHHELD. Number, date, status and
+ * total stay: each row is a GST tax invoice the customer's own auditor
+ * is entitled to, nothing disagrees with its total, and withholding a
+ * legal document over a discrepancy in a derived column would be the
+ * rule applied carelessly rather than precisely.
+ */
+export type InvoiceSettlementView = Omit<
+  InvoiceView,
+  "amountPaidMinor" | "amountPaidDisplay"
+> & {
+  amountPaidMinor?: string;
+  amountPaidDisplay?: string;
+};
+
+export type InvoiceHistoryResult = {
+  invoices: InvoiceSettlementView[];
+  reconciliation: SerializedReconciliation;
+  breachCauses: string[];
+};
+
+/**
+ * Invoice history, newest first — reconciled against the payment log.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 WHY THE RECONCILIATION SUMS EVERY INVOICE AND THE LIST DOES NOT
+ * ══════════════════════════════════════════════════════════════════════
+ * `limit` bounds the ROWS SHOWN. It must not bound the CHECK. A
+ * reconciliation over the most recent sixty invoices would silently pass
+ * on a workspace whose sixty-first invoice is the unapplied one, and it
+ * would start and stop failing as new invoices pushed old ones off the
+ * page — a gate whose verdict depends on a display parameter is a gate
+ * that can be turned off by paging.
+ *
+ * ⚠️ SO THERE ARE TWO QUERIES OVER `invoices` AND THEY ARE NOT
+ * REDUNDANT: one selects the page, the other aggregates the whole
+ * register. The independence that makes the check meaningful comes from
+ * the OTHER side — `payment_events`, which shares no row with `invoices`
+ * and is append-only — not from these two.
+ */
+export async function listInvoices(
+  limit = 50,
+): Promise<ActionResult<InvoiceHistoryResult>> {
   try {
     const ctx = await requirePermission("billing:read");
     const bounded = Math.min(Math.max(1, Math.trunc(limit)), 200);
@@ -265,7 +326,77 @@ export async function listInvoices(limit = 50): Promise<ActionResult<InvoiceView
         .orderBy(desc(invoices.createdAt))
         .limit(bounded);
 
-      return { ok: true as const, data: rows.map(toInvoiceView) };
+      const [register] = await tx
+        .select({
+          invoiceCount: sql<string>`COUNT(*)::text`,
+          paidMinor: sql<string>`COALESCE(SUM(${invoices.amountPaidMinor}), 0)::text`,
+        })
+        .from(invoices)
+        .where(eq(invoices.tenantId, ctx.tenant.id));
+
+      /**
+       * ⚠️ SIGNED IN SQL RATHER THAN SUMMED TWICE AND SUBTRACTED IN JS.
+       * A refund and a settlement are the same fact with opposite signs;
+       * splitting them into two aggregates and differencing them adds a
+       * step where a `null` from an empty set can become a `NaN`, and a
+       * `NaN` here would compare unequal to everything and fail the gate
+       * on a workspace with no refunds at all.
+       *
+       * ⚠️ AND `amount_minor` IS NULLABLE — the column is documented as
+       * "money moved by this event, IF any", and a
+       * `subscription_updated` event carries none. `COALESCE` inside the
+       * CASE, not around the SUM: without it one such row in the set
+       * turns the whole total to null.
+       */
+      const [log] = await tx
+        .select({
+          eventCount: sql<string>`COUNT(*)::text`,
+          paidMinor: sql<string>`COALESCE(SUM(
+            CASE
+              WHEN ${inArray(paymentEvents.eventType, [...SETTLING_EVENT_TYPES])}
+                THEN COALESCE(${paymentEvents.amountMinor}, 0)
+              WHEN ${inArray(paymentEvents.eventType, [...REVERSING_EVENT_TYPES])}
+                THEN -COALESCE(${paymentEvents.amountMinor}, 0)
+              ELSE 0
+            END), 0)::text`,
+        })
+        .from(paymentEvents)
+        .where(
+          and(
+            eq(paymentEvents.tenantId, ctx.tenant.id),
+            // Only events that name an invoice, and only ones that were
+            // actually applied. See `lib/reconciliation/billing.ts`.
+            sql`${paymentEvents.invoiceId} IS NOT NULL`,
+            eq(paymentEvents.status, APPLIED_EVENT_STATUS),
+          ),
+        );
+
+      const registerPaidMinor = toBigIntAmount(register?.paidMinor ?? "0");
+      const eventLogPaidMinor = toBigIntAmount(log?.paidMinor ?? "0");
+
+      const verdict = reconcileBillingHistory({
+        registerPaidMinor,
+        eventLogPaidMinor,
+        // Structural, never inferred from the amounts being equal.
+        hasBillingHistory:
+          Number(register?.invoiceCount ?? "0") > 0 ||
+          Number(log?.eventCount ?? "0") > 0,
+      });
+
+      const views = rows.map(toInvoiceView);
+
+      return {
+        ok: true as const,
+        data: {
+          reconciliation: serializeReconciliation(verdict),
+          breachCauses: verdict.renderable ? [] : [...BILLING_BREACH_CAUSES],
+          invoices: verdict.renderable
+            ? views
+            : // 🔴 The settlement columns are stripped, not blanked. See
+              // `InvoiceSettlementView`.
+              views.map(({ amountPaidMinor: _p, amountPaidDisplay: _d, ...rest }) => rest),
+        },
+      };
     });
   } catch (err) {
     return toActionError(err, "listInvoices");

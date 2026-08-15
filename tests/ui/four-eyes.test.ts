@@ -125,7 +125,14 @@ describe("the suspend button", () => {
    */
   it("means requestSuspend is reachable from the console", () => {
     const actions = read("server/platform/actions.ts");
-    expect(actions).toContain('import { requestSuspend } from "./control-actions"');
+    // ⚠️ PINS THE IMPORT, NOT THE IMPORT LINE. The first version pinned
+    // the exact single-specifier string and broke the moment
+    // `requestTermination` joined the same import, which is the queue
+    // GAINING a caller, the opposite of the defect this guards. Match the
+    // specifier inside whatever the braces hold.
+    expect(actions).toMatch(
+      /import\s*\{[^}]*\brequestSuspend\b[^}]*\}\s*from\s*"\.\/control-actions"/,
+    );
     const page = read("app/platform/tenants/[id]/page.tsx");
     expect(page).toContain("onSuspend={suspendTenantAction}");
   });
@@ -455,12 +462,18 @@ describe("the approvals screen and the code agree", () => {
   /**
    * 🔴 A DECORATIVE CONTROL IS WORSE THAN NO CONTROL, because it stops
    * you looking for the real one. Four of six policies still have no
-   * request path and no executor: `tenant.terminate`,
-   * `impersonate.break_glass`, `staff.elevate`, `tenant.plan_change`.
+   * request path and no executor: `impersonate.break_glass`,
+   * `staff.elevate`, `tenant.plan_change`.
    *
    * ⚠️ THIS TEST DOES NOT PRETEND THEY ARE FIXED. It pins the number
    * that IS wired, so the debt is a failing number rather than a
    * paragraph nobody re-reads. Raise it as each one is connected.
+   *
+   * ⭐ RAISED ONCE, HERE: `tenant.terminate` now has both a request path
+   * (`requestTermination`) and an executor, so it moved out of the
+   * unwired list. That is this pin working as designed, and the reason
+   * it names sets rather than counts, a count would have gone 1 → 2 with
+   * no evidence of WHICH one landed.
    */
   it("wires exactly the policies this version claims to wire", () => {
     const src = read("server/platform/control-actions.ts");
@@ -469,21 +482,16 @@ describe("the approvals screen and the code agree", () => {
       (m) => m[1],
     );
 
-    expect(new Set(queued)).toEqual(new Set(["tenant.suspend"]));
+    expect(new Set(queued)).toEqual(new Set(["tenant.suspend", "tenant.terminate"]));
     expect(new Set(executors)).toEqual(
-      new Set(["tenant.suspend", "entitlement.override_paid"]),
+      new Set(["tenant.suspend", "entitlement.override_paid", "tenant.terminate"]),
     );
 
     const unwired = APPROVAL_POLICIES.map((p) => p.kind).filter(
       (k) => !executors.includes(k),
     );
     expect(unwired.sort()).toEqual(
-      [
-        "impersonate.break_glass",
-        "staff.elevate",
-        "tenant.plan_change",
-        "tenant.terminate",
-      ].sort(),
+      ["impersonate.break_glass", "staff.elevate", "tenant.plan_change"].sort(),
     );
   });
 

@@ -39,9 +39,13 @@ import {
   reactivateTenantAction,
   startImpersonationAction,
   setTenantFlagAction,
+  requestTerminationAction,
+  cancelTerminationAction,
+  exportOffboardingSnapshotAction,
 } from "@/server/platform/actions";
 import { TenantActions } from "@/components/platform/tenant-actions";
 import { FlagEditor } from "@/components/platform/flag-editor";
+import { OffboardingPanel } from "@/components/platform/offboarding-panel";
 import {
   UsagePanel,
   InvoicePanel,
@@ -165,6 +169,36 @@ async function TenantDetailBody({ tenantId }: { tenantId: string }) {
               Nothing has been deleted.
             </p>
           ) : null}
+
+          {/*
+            ⭐⭐ THE SUSPENSION MESSAGE, RESOLVED THROUGH THE CHAIN —
+            BATCH 47. It was collected by the suspend form and dropped
+            into an audit blob nothing could read back. It now has a
+            global default, a plan-level variant and a per-workspace
+            override, and this is where an operator can see which of the
+            three is on file before they lock anybody out.
+
+            ⚠️ AND THE HONEST SENTENCE UNDERNEATH. The banner the
+            customer actually sees is built by `evaluateAccess()` in
+            `lib/billing/access-state.ts` and does not read this value.
+            Saying so here is the difference between a control and a
+            control-shaped text box.
+          */}
+          <div className="rounded-md border border-border p-3">
+            <p className="text-xs text-muted-foreground">
+              Customer-facing suspension message ·{" "}
+              <strong>{LAYER_WORDS[tenant.suspensionMessage.layer]}</strong>
+              {tenant.suspensionMessage.setByEmail
+                ? ` · set by ${tenant.suspensionMessage.setByEmail}`
+                : ""}
+            </p>
+            <p className="mt-1">{tenant.suspensionMessage.effective}</p>
+            <p className="mt-1 text-xs text-muted-foreground">
+              ⚠️ Not yet rendered to the customer: the lockout banner they see is a fixed
+              sentence in <code className="font-mono">lib/billing/access-state.ts</code>,
+              which does not consult this value. This is what is on file, not what they read.
+            </p>
+          </div>
         </CardContent>
       </Card>
 
@@ -188,6 +222,13 @@ async function TenantDetailBody({ tenantId }: { tenantId: string }) {
           <TabsTrigger value="flags">Feature flags</TabsTrigger>
           <TabsTrigger value="access">Support access</TabsTrigger>
           <TabsTrigger value="activity">Platform activity</TabsTrigger>
+          {/*
+            ⭐ ITS OWN TAB, LAST. Offboarding is the one thing on this
+            page that ends a customer relationship, and putting it beside
+            "Suspend" in the action bar would put the irreversible thing
+            one pixel from the reversible one.
+          */}
+          <TabsTrigger value="offboarding">Offboarding</TabsTrigger>
         </TabsList>
 
         <TabsContent value="overview">
@@ -395,10 +436,37 @@ async function TenantDetailBody({ tenantId }: { tenantId: string }) {
             )}
           </div>
         </TabsContent>
+
+        <TabsContent value="offboarding">
+          <OffboardingPanel
+            tenantId={tenant.id}
+            tenantSlug={tenant.slug}
+            tenantName={tenant.name}
+            status={tenant.status}
+            /*
+              ⚠️ `tenants:suspend`, because no `tenants:terminate`
+              capability exists — see the comment on
+              `scheduleTenantTermination`. It is the strictest gate
+              available: owner grade, and on the step-up list.
+            */
+            canTerminate={can("tenants:suspend")}
+            offboarding={tenant.offboarding}
+            onRequest={requestTerminationAction}
+            onCancel={cancelTerminationAction}
+            onExport={exportOffboardingSnapshotAction}
+          />
+        </TabsContent>
       </Tabs>
     </div>
   );
 }
+
+/** Which layer of the configuration chain a value came from, in words. */
+const LAYER_WORDS: Readonly<Record<"global" | "plan" | "tenant", string>> = {
+  global: "the global default",
+  plan: "this plan's version",
+  tenant: "written for this workspace",
+};
 
 function Fact({ label, value }: { label: string; value: string }) {
   return (

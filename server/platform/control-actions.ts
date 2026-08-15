@@ -34,7 +34,7 @@ import {
   registerApprovalExecutor,
   tenantLabel,
 } from "./approvals";
-import { suspendTenant } from "./tenants";
+import { suspendTenant, scheduleTenantTermination } from "./tenants";
 import { setTenantFlag, getTenantFlags } from "./flags";
 import { previewChange, verifyChange } from "@/lib/platform/entitlement-diff";
 import { MODULE_REGISTRY } from "@/lib/modules/registry";
@@ -65,6 +65,26 @@ registerApprovalExecutor("tenant.suspend", async (payload) => {
 
 registerApprovalExecutor("entitlement.override_paid", async (payload) => {
   const result = await setTenantFlag(payload);
+  return result.ok ? { ok: true } : { ok: false, error: result.error };
+});
+
+/**
+ * ⭐⭐⭐ BATCH 46 — TERMINATION. `tenant.terminate` HAS BEEN IN
+ * `APPROVAL_POLICIES` SINCE v1.22.0 WITH NOTHING REGISTERED AGAINST IT.
+ *
+ * ⚠️ THE EXECUTOR SCHEDULES. IT DOES NOT DELETE. Approving a termination
+ * writes a date, locks the workspace read-only and starts a cancel
+ * window — see the header of the offboarding section in `tenants.ts` for
+ * why the window, and not the confirmations, is the control that
+ * actually protects anybody.
+ *
+ * 🔴 AN APPROVED ROW WHOSE EXECUTOR IS MISSING CANNOT RUN — the queue
+ * says so and leaves the request pending. Registering this one is
+ * therefore the difference between "termination is not built" and
+ * "termination silently does nothing".
+ */
+registerApprovalExecutor("tenant.terminate", async (payload) => {
+  const result = await scheduleTenantTermination(payload);
   return result.ok ? { ok: true } : { ok: false, error: result.error };
 });
 
@@ -119,6 +139,115 @@ export async function requestSuspend(
 
   if (!outcome.queued) return { ok: false, error: outcome.error };
   revalidatePath("/platform/approvals");
+  return { ok: true, data: { note: outcome.note } };
+}
+
+/* ================================================================== */
+/* ②b TERMINATE, THROUGH THE SAME QUEUE — BATCH 46                     */
+/* ================================================================== */
+
+const requestTerminationSchema = z.object({
+  tenantId: z.string().uuid(),
+  /** ① The workspace address, typed. Catches the wrong-row mistake. */
+  confirmSlug: z.string().min(1),
+  /**
+   * ② A phrase nobody types by accident. The slug is on the screen and
+   * can be copied; this cannot, which is the entire difference between
+   * the two fields and the reason both exist.
+   */
+  confirmPhrase: z.string(),
+  /**
+   * ③ An acknowledgement, not a checkbox for its own sake: it is the one
+   * confirmation that asserts something about the WORLD rather than
+   * about the form — that the customer has been offered their data.
+   */
+  acknowledgeExport: z.literal(true, {
+    errorMap: () => ({
+      message:
+        "Confirm that this customer has been offered an export. Deleting a workspace whose owner never got their records back is a DPDP problem, not a support one.",
+    }),
+  }),
+  reason: z.string().min(20),
+  justification: z.string().min(20),
+});
+
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * ⭐ THREE CONFIRMATIONS, A SECOND APPROVER, AND STILL NOTHING HAPPENS
+ * ══════════════════════════════════════════════════════════════════════
+ * This queues. It does not schedule and it certainly does not delete.
+ * The operator's three confirmations buy them the right to ASK; the
+ * second owner's approval buys a date on the calendar; the cancel window
+ * runs from there.
+ *
+ * ⚠️ IT REUSES THE EXISTING QUEUE, DELIBERATELY. `tenant.terminate` is
+ * already declared in `lib/platform/approvals.ts` — owner grade, 24-hour
+ * request expiry, self-approval only while Ordence has one operator and
+ * only after fifteen minutes. Inventing a second approval mechanism for
+ * the most dangerous action in the console would mean the weakest one
+ * guards the worst thing.
+ */
+export async function requestTermination(
+  input: unknown,
+): Promise<PlatformResult<{ note: string }>> {
+  const operator = await requireCapability("tenants:suspend");
+  const parsed = requestTerminationSchema.safeParse(input);
+  if (!parsed.success) {
+    return {
+      ok: false,
+      error: "Check the form.",
+      fieldErrors: parsed.error.flatten().fieldErrors as Record<string, string[]>,
+    };
+  }
+
+  // ⚠️ CHECKED HERE AND AGAIN IN THE EXECUTOR. Here so the operator is
+  // told immediately; there because hours pass in between and the queue
+  // row is replayed by a different person.
+  if (parsed.data.confirmPhrase.trim() !== "DELETE ALL DATA") {
+    return {
+      ok: false,
+      error: "The confirmation phrase does not match.",
+      fieldErrors: { confirmPhrase: ["Type DELETE ALL DATA exactly."] },
+    };
+  }
+
+  const label = await tenantLabel(parsed.data.tenantId);
+  const now = new Date();
+
+  const outcome = await queueForApproval({
+    kind: "tenant.terminate",
+    operator,
+    targetType: "tenant",
+    targetId: parsed.data.tenantId,
+    targetLabel: label,
+    justification: parsed.data.justification,
+    proposedBefore: { status: "live" },
+    proposedAfter: {
+      status: "pending_deletion",
+      // ⭐ WHAT APPROVING WILL ACTUALLY DO, on the approver's screen.
+      // The queue renders `proposedAfter`, and an approver who reads
+      // "terminate" without reading "schedules, does not delete" will
+      // hesitate over the wrong thing.
+      effect: "Schedules a deletion and locks the workspace read-only. Cancellable until the scheduled moment. Nothing is deleted by approving.",
+      reason: parsed.data.reason,
+    },
+    // The validated arguments, replayed verbatim into
+    // `scheduleTenantTermination` on approval.
+    payload: {
+      tenantId: parsed.data.tenantId,
+      confirmSlug: parsed.data.confirmSlug,
+      confirmPhrase: parsed.data.confirmPhrase.trim(),
+      acknowledgeExport: true,
+      reason: parsed.data.reason,
+      requestedByEmail: operator.email,
+      requestedAt: now.toISOString(),
+    },
+    now,
+  });
+
+  if (!outcome.queued) return { ok: false, error: outcome.error };
+  revalidatePath("/platform/approvals");
+  revalidatePath(`/platform/tenants/${parsed.data.tenantId}`);
   return { ok: true, data: { note: outcome.note } };
 }
 

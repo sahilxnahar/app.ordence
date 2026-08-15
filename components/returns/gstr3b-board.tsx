@@ -28,6 +28,10 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
+import {
+  ItcReversalWorking,
+  type ComputedReversal,
+} from "@/components/gst/itc-reversal-working";
 
 export function rupees(minor: string): string {
   const value = BigInt(minor || "0");
@@ -95,6 +99,21 @@ export function Gstr3bBoard({
     itcReversedIgstMinor: string;
     itcReversedCgstMinor: string;
     itcReversedSgstMinor: string;
+    itcReversedCessMinor: string;
+    /**
+     * ⭐ WHAT THE ENGINE SAID, sent alongside what is actually going in
+     * the return. The server refuses a difference between the two
+     * without a written reason and records BOTH — see `prepareGstr3b`.
+     * Absent when the operator never ran the working, which the server
+     * treats as an override of "not computed" and also refuses silently
+     * to accept.
+     */
+    itcReversalComputedIgstMinor?: string;
+    itcReversalComputedCgstMinor?: string;
+    itcReversalComputedSgstMinor?: string;
+    itcReversalComputedCessMinor?: string;
+    itcReversalBasis?: string;
+    itcReversalOverrideReason?: string;
     interestMinor: string;
     lateFeeMinor: string;
   }) => Promise<Result<{ id: string; note: string }>>;
@@ -107,11 +126,57 @@ export function Gstr3bBoard({
   const [pending, startTransition] = useTransition();
   const [gstin, setGstin] = useState(defaultGstin);
   const [period, setPeriod] = useState(lastMonth());
-  const [reversals, setReversals] = useState({ igst: "", cgst: "", sgst: "" });
+  /**
+   * ⚠️ CESS IS A BOX HERE NOW AND WAS NOT BEFORE. The Rule 42 engine
+   * apportions four heads because the four are not in the same ratio as
+   * one another; a form with three boxes would drop a computed cess
+   * reversal on the floor, which is precisely the silent under-reversal
+   * this batch exists to stop.
+   */
+  const [reversals, setReversals] = useState({ igst: "", cgst: "", sgst: "", cess: "" });
+  /**
+   * ⭐ WHAT THE ENGINE COMPUTED, kept separately from what is in the
+   * boxes. Two fields rather than one because the whole point is that the
+   * pair can differ and the difference is what has to be explained —
+   * overwriting the computed figure with the operator's edit would leave
+   * nothing to compare against and nothing to record.
+   */
+  const [computed, setComputed] = useState<ComputedReversal | null>(null);
+  const [overrideReason, setOverrideReason] = useState("");
   const [extras, setExtras] = useState({ interest: "", lateFee: "" });
   const [open, setOpen] = useState<string | null>(null);
   const [arn, setArn] = useState("");
   const [reason, setReason] = useState("");
+
+  /**
+   * ⚠️ COMPARED HEAD BY HEAD IN PAISE, NEVER ON THE TOTAL AND NEVER AS A
+   * NUMBER. Two sets of four heads can sum to the same total and still be
+   * a different return — ₹1,000 moved from CGST to SGST files cleanly,
+   * balances, and reverses credit in the wrong pool. Comparing totals
+   * would let exactly that through without a reason.
+   */
+  const enteredHeadsMinor = [
+    toMinor(reversals.igst),
+    toMinor(reversals.cgst),
+    toMinor(reversals.sgst),
+    toMinor(reversals.cess),
+  ];
+  const computedHeadsMinor = computed
+    ? [computed.igstMinor, computed.cgstMinor, computed.sgstMinor, computed.cessMinor]
+    : null;
+  const enteredTotalMinor = enteredHeadsMinor
+    .reduce((sum, head) => sum + BigInt(head), 0n)
+    .toString();
+
+  /**
+   * 🔴 NO WORKING RUN AT ALL IS ALSO AN OVERRIDE, and treating it as
+   * anything else reopens the hole. If a non-zero reversal could be typed
+   * simply by never pressing "Compute", the reason would be optional in
+   * practice for everyone who wanted it to be.
+   */
+  const overrides = computedHeadsMinor
+    ? computedHeadsMinor.some((head, i) => BigInt(head) !== BigInt(enteredHeadsMinor[i] ?? "0"))
+    : BigInt(enteredTotalMinor) !== 0n;
 
   function act<T extends { note: string }>(p: Promise<Result<T>>) {
     startTransition(async () => {
@@ -141,11 +206,35 @@ export function Gstr3bBoard({
                 <Input id="gstin" value={gstin} onChange={(e) => setGstin(e.target.value.toUpperCase())} maxLength={15} />
               </Field>
               <Field id="period" label="Tax period" help="YYYY-MM">
-                <Input id="period" value={period} onChange={(e) => setPeriod(e.target.value)} placeholder="2026-07" />
+                {/*
+                  🔴 CHANGING THE MONTH DISCARDS THE COMPUTED REVERSAL AND
+                  THE FIGURES IN THE BOXES. July's Rule 42 answer attached
+                  to August's return is a perfectly-formed number for the
+                  wrong period: it reconciles to nothing, it files
+                  cleanly, and the only way anybody finds it is the
+                  demand. Keeping the boxes populated across a period
+                  change would make that the DEFAULT behaviour.
+                */}
+                <Input
+                  id="period"
+                  value={period}
+                  onChange={(e) => {
+                    setPeriod(e.target.value);
+                    setComputed(null);
+                    setReversals({ igst: "", cgst: "", sgst: "", cess: "" });
+                    setOverrideReason("");
+                  }}
+                  placeholder="2026-07"
+                />
               </Field>
               <div className="flex items-end">
                 <Button
-                  disabled={pending}
+                  disabled={pending || (overrides && overrideReason.trim().length < 20)}
+                  title={
+                    overrides && overrideReason.trim().length < 20
+                      ? "The reversal differs from the computed figure. Say why, in a sentence."
+                      : undefined
+                  }
                   onClick={() =>
                     act(
                       onPrepare({
@@ -154,6 +243,23 @@ export function Gstr3bBoard({
                         itcReversedIgstMinor: toMinor(reversals.igst),
                         itcReversedCgstMinor: toMinor(reversals.cgst),
                         itcReversedSgstMinor: toMinor(reversals.sgst),
+                        itcReversedCessMinor: toMinor(reversals.cess),
+                        // ⭐ BOTH NUMBERS CROSS THE WIRE. The server, not
+                        // this component, decides whether the difference
+                        // is permitted — a client-side check alone is a
+                        // suggestion, because the action is a URL.
+                        ...(computed
+                          ? {
+                              itcReversalComputedIgstMinor: computed.igstMinor,
+                              itcReversalComputedCgstMinor: computed.cgstMinor,
+                              itcReversalComputedSgstMinor: computed.sgstMinor,
+                              itcReversalComputedCessMinor: computed.cessMinor,
+                              itcReversalBasis: computed.basis,
+                            }
+                          : {}),
+                        ...(overrideReason.trim() === ""
+                          ? {}
+                          : { itcReversalOverrideReason: overrideReason.trim() }),
                         interestMinor: toMinor(extras.interest),
                         lateFeeMinor: toMinor(extras.lateFee),
                       }),
@@ -165,25 +271,58 @@ export function Gstr3bBoard({
               </div>
             </div>
 
-            <details className="rounded border p-3 text-xs">
+            <details className="rounded border p-3 text-xs" open>
               <summary className="cursor-pointer font-medium">
                 ITC reversals, interest and late fee
               </summary>
-              <p className="mt-2 text-muted-foreground">
-                🔴 <strong>Reversals are entered, not calculated.</strong> Apportioning credit
-                between taxable and exempt supplies under rules 42 and 43 depends on turnover
-                splits Ordence does not model, and a wrong reversal is a wrong return with
-                interest attached. Your accountant&apos;s figure goes here.
+
+              {/*
+                ⭐⭐ THE REVERSAL IS COMPUTED HERE NOW. It used to be three
+                empty boxes with a note saying Ordence does not model the
+                turnover splits. It does — `lib/purchases/itc.ts` decides
+                Section 17(5) line by line and `lib/purchases/apportionment.ts`
+                runs Rule 42 to the paisa — and the engines were simply not
+                wired to this form.
+              */}
+              <div className="mt-3">
+                <ItcReversalWorking
+                  taxPeriod={period}
+                  onUse={(next) => {
+                    setComputed(next);
+                    setReversals({
+                      igst: fromMinor(next.igstMinor),
+                      cgst: fromMinor(next.cgstMinor),
+                      sgst: fromMinor(next.sgstMinor),
+                      cess: fromMinor(next.cessMinor),
+                    });
+                    // A fresh computation retires the previous reason: it
+                    // explained a difference against a figure that no
+                    // longer exists.
+                    setOverrideReason("");
+                  }}
+                />
+              </div>
+
+              <p className="mt-3 text-muted-foreground">
+                The boxes below hold what actually goes in the return. They stay editable —
+                an accountant with a figure from their own working papers is a legitimate
+                case, and Rule 43 on capital goods bought in earlier periods is not in the
+                computed number. ⚠️ But a change has to be explained, and both figures are
+                kept with the return.
               </p>
+
               <div className="mt-3 grid gap-3 sm:grid-cols-3">
-                <Field id="rev-igst" label="IGST reversed (₹)">
+                <Field id="rev-igst" label="IGST reversed (₹)" help={computedHelp(computed?.igstMinor)}>
                   <Input id="rev-igst" value={reversals.igst} onChange={(e) => setReversals({ ...reversals, igst: e.target.value })} />
                 </Field>
-                <Field id="rev-cgst" label="CGST reversed (₹)">
+                <Field id="rev-cgst" label="CGST reversed (₹)" help={computedHelp(computed?.cgstMinor)}>
                   <Input id="rev-cgst" value={reversals.cgst} onChange={(e) => setReversals({ ...reversals, cgst: e.target.value })} />
                 </Field>
-                <Field id="rev-sgst" label="SGST reversed (₹)">
+                <Field id="rev-sgst" label="SGST reversed (₹)" help={computedHelp(computed?.sgstMinor)}>
                   <Input id="rev-sgst" value={reversals.sgst} onChange={(e) => setReversals({ ...reversals, sgst: e.target.value })} />
+                </Field>
+                <Field id="rev-cess" label="Cess reversed (₹)" help={computedHelp(computed?.cessMinor)}>
+                  <Input id="rev-cess" value={reversals.cess} onChange={(e) => setReversals({ ...reversals, cess: e.target.value })} />
                 </Field>
                 <Field id="interest" label="Interest (₹)" help="An expense, never creditable.">
                   <Input id="interest" value={extras.interest} onChange={(e) => setExtras({ ...extras, interest: e.target.value })} />
@@ -192,6 +331,48 @@ export function Gstr3bBoard({
                   <Input id="latefee" value={extras.lateFee} onChange={(e) => setExtras({ ...extras, lateFee: e.target.value })} />
                 </Field>
               </div>
+
+              {/*
+                🔴 THE OVERRIDE BOX APPEARS ONLY WHEN THERE IS SOMETHING TO
+                EXPLAIN, and it is not optional once it does. Silently
+                letting a typed figure replace a computed one is the
+                failure this batch removes: the return would carry the
+                accountant's number, the register would carry the
+                engine's, and nothing would record that they differed or
+                why.
+              */}
+              {overrides ? (
+                <div
+                  className="mt-3 space-y-2 rounded border border-amber-400 p-3"
+                  data-testid="reversal-override"
+                >
+                  <p className="text-amber-700 dark:text-amber-400">
+                    ⚠️ This differs from the computed reversal
+                    {computed
+                      ? `: computed ${rupees(
+                          (
+                            BigInt(computed.igstMinor) +
+                            BigInt(computed.cgstMinor) +
+                            BigInt(computed.sgstMinor) +
+                            BigInt(computed.cessMinor)
+                          ).toString(),
+                        )}, entered ${rupees(enteredTotalMinor)}`
+                      : " — no working was run for this period at all"}
+                    . Both figures and your reason are stored with the return.
+                  </p>
+                  <Textarea
+                    id="reversal-override-reason"
+                    rows={2}
+                    value={overrideReason}
+                    onChange={(e) => setOverrideReason(e.target.value)}
+                    placeholder="Why is the return carrying a different figure? e.g. Rule 43 slice on the 2024-25 chillers, per working paper WP-42."
+                  />
+                  <p className="text-muted-foreground">
+                    At least twenty characters. &quot;Adjustment&quot; is not a reason anybody
+                    can check three years from now.
+                  </p>
+                </div>
+              ) : null}
             </details>
           </CardContent>
         </Card>
@@ -354,6 +535,28 @@ export function Gstr3bBoard({
       ))}
     </div>
   );
+}
+
+/**
+ * Paise back to a rupee string for a form field.
+ *
+ * ⚠️ INTEGER DIVISION ON A BIGINT, NOT `Number(minor) / 100`. The round
+ * trip through a float is exact for small figures and stops being exact
+ * somewhere above ninety crore of credit — and the failure is a wrong
+ * reversal in the box, not an error anybody sees.
+ */
+function fromMinor(minor: string): string {
+  const value = BigInt(minor || "0");
+  const negative = value < 0n;
+  const abs = negative ? -value : value;
+  return `${negative ? "-" : ""}${abs / 100n}.${(abs % 100n).toString().padStart(2, "0")}`;
+}
+
+/** The engine's figure, shown under the box the operator may change. */
+function computedHelp(minor: string | undefined): string {
+  return minor === undefined
+    ? "No working run yet — compute the reversal above."
+    : `Computed: ${rupees(minor)}`;
 }
 
 /** ⚠️ Rupees to paise by string, never by multiplying a float. */

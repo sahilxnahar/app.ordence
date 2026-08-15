@@ -24,11 +24,30 @@
  * ⚠️ INTEREST SITS BESIDE THE BUCKETS, NEVER INSIDE THEM. Accrued interest
  * is not principal in arrears; adding it to a bucket would overstate the
  * arrears position to the one audience that checks.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴🔴🔴 v1.45.0 — AND THE PAGE NOW REFUSES TO PRINT A FIGURE THAT
+ *        DISAGREES WITH THE BOOKS
+ * ══════════════════════════════════════════════════════════════════════
+ * This screen's "In arrears" tile is described three cards below as "the
+ * number a bank asks for", and until this batch nothing had ever checked
+ * it against the ledger. `getAgeingReport` now reconciles the ageing
+ * total against the receivables control account and, when they disagree,
+ * returns NO `figures` object at all.
+ *
+ * ⚠️ SO THIS FILE CANNOT RENDER A BREACHED FIGURE EVEN BY MISTAKE. The
+ * numbers are structurally absent from the payload rather than present
+ * behind a boolean — a page that ignored the gate would fail to compile
+ * rather than quietly print an unverified total. That was chosen over
+ * the usual `if (!ok) return` shape precisely because this is the second
+ * of several screens that will consume this action, and the rule has to
+ * survive the ones nobody has written yet.
  */
 
 import { Suspense } from "react";
 import Link from "next/link";
 import { getAgeingReport } from "@/server/actions/receivables";
+import { ReconciliationNotice } from "@/components/reconciliation/reconciliation-notice";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 
@@ -76,11 +95,55 @@ async function AgeingBody() {
     );
   }
 
-  const { asOf, totals, totalMinor, overdueMinor, interestMinor, byProject, byBuyer } =
-    result.data;
+  const { asOf, figures, reconciliation, breachCauses } = result.data;
+
+  /**
+   * 🔴 THE BREACH PATH RETURNS THE BANNER AND NOTHING ELSE.
+   *
+   * ⚠️ NOT THE BANNER ABOVE THE TABLE. The tempting version keeps the
+   * ageing table and puts a red card over it, on the grounds that the
+   * user came here to see the numbers. It does not work: the banner is
+   * read once and the number is copied into a chase list, an escalation
+   * email and a lender's spreadsheet. Whoever receives those sees a
+   * figure with no banner attached to it at all.
+   *
+   * ⚠️ AND NOT THE CONTROL-ACCOUNT BALANCE EITHER, even though that one
+   * is a fact read straight off the ledger. Printing it here would put a
+   * true number under a heading that has just failed its own check, and
+   * the reader would take the heading as the assurance. `figures` is
+   * absent in this state, so neither is available to render — which is
+   * the point of the shape.
+   */
+  if (!figures) {
+    return (
+      <div className="space-y-6">
+        <ReconciliationNotice
+          reconciliation={reconciliation}
+          breachCauses={breachCauses}
+        />
+        <p className="text-xs text-muted-foreground">
+          The ageing report is built from the demand notices; the control
+          account is built from the journal. They are two independent routes to
+          one figure and they share no table — which is why their agreement
+          means something, and why their disagreement has to be resolved before
+          either can be used.
+        </p>
+      </div>
+    );
+  }
+
+  const { totals, totalMinor, overdueMinor, interestMinor, byProject, byBuyer } =
+    figures;
 
   return (
     <div className="space-y-6">
+      {/*
+        ⚠️ THE NOTICE SITS ABOVE THE FIGURES IN THE PASSING STATES TOO.
+        In `unconfigured` it is the only thing telling the reader that
+        the totals below have never been checked against anything — and
+        that sentence has to be seen before the numbers, not after them.
+      */}
+      <ReconciliationNotice reconciliation={reconciliation} />
       <div className="grid gap-4 sm:grid-cols-3">
         <Card>
           <CardHeader className="pb-2">
@@ -233,7 +296,11 @@ async function AgeingBody() {
         As at {asOf}. Buckets are computed by{" "}
         <code className="font-mono">lib/receivables/ageing.ts</code> — this page
         renders them and calculates nothing, so the figure here always matches
-        the figure in the export.
+        the figure in the export. The total is checked against the receivables
+        control account in the books before any of it is shown; when the two
+        disagree this page prints no figure at all, because a receivables total
+        that is nearly right is chased and lent against exactly like one that is
+        right.
       </p>
     </div>
   );

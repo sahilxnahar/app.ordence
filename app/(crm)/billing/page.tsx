@@ -59,6 +59,7 @@ import {
   listPaymentMethods,
 } from "@/server/actions/billing";
 import { checkAccess } from "@/server/billing/access";
+import { ReconciliationNotice } from "@/components/reconciliation/reconciliation-notice";
 import {
   INVOICE_STATUS_LABELS,
   SUBSCRIPTION_STATUS_HELP,
@@ -333,15 +334,48 @@ async function InvoicesPanel() {
     );
   }
 
-  const invoices = result.data;
+  const { invoices, reconciliation, breachCauses } = result.data;
+
+  /**
+   * 🔴 THE SETTLEMENT FIGURES ARE WITHHELD WHEN THE INVOICE REGISTER
+   *    DISAGREES WITH THE PAYMENT LOG.
+   *
+   * `listInvoices` strips `amountPaidMinor` from every row on a breach,
+   * so the "Received" column below has nothing to print — the numbers
+   * are structurally absent rather than hidden behind a flag this
+   * component is trusted to read.
+   *
+   * ⚠️ AND THE "STILL OWING" CARD GOES WITH THEM, WHICH IS THE POINT
+   * THAT MATTERS MOST HERE. That card is nothing but total minus
+   * received, it is the one thing on this page somebody ACTS on, and its
+   * standing copy asserts that "anything sitting here has genuinely not
+   * been collected". When the two sources disagree, that sentence is
+   * exactly what nobody can say — the whole question is whether money
+   * that arrived has been applied — so the card that says it must not
+   * render. Chasing a customer who has paid is the specific harm.
+   *
+   * ⚠️ THE INVOICE TABLE ITSELF STAYS. Number, date, status and total are
+   * the document, not a claim about settlement, and each row is a GST tax
+   * invoice the customer's auditor is entitled to. Withholding those
+   * would be the rule applied carelessly rather than precisely.
+   */
+  const settlementUsable = reconciliation.state !== "breached";
+
   // Oldest first: the one that has been outstanding longest is the one
   // about to become a collections problem.
-  const owing = invoices
-    .filter((i) => OWING.has(i.status))
-    .sort((a, b) => (a.dueAt ?? "").localeCompare(b.dueAt ?? ""));
+  const owing = settlementUsable
+    ? invoices
+        .filter((i) => OWING.has(i.status))
+        .sort((a, b) => (a.dueAt ?? "").localeCompare(b.dueAt ?? ""))
+    : [];
 
   return (
     <div className="space-y-4">
+      <ReconciliationNotice
+        reconciliation={reconciliation}
+        breachCauses={breachCauses}
+      />
+
       {owing.length > 0 && (
         <Card className="border-amber-400 dark:border-amber-700">
           <CardHeader>
@@ -367,7 +401,7 @@ async function InvoicesPanel() {
                     <span className="tabular-nums font-medium">
                       {i.totalDisplay || inr(i.totalMinor)}
                     </span>
-                    {i.amountPaidMinor !== "0" && (
+                    {i.amountPaidMinor && i.amountPaidMinor !== "0" && (
                       <span className="text-xs text-muted-foreground">
                         {i.amountPaidDisplay || inr(i.amountPaidMinor)} received
                       </span>
@@ -427,7 +461,12 @@ async function InvoicesPanel() {
                     <th className="px-4 py-2 font-medium">Due</th>
                     <th className="px-4 py-2 font-medium">Status</th>
                     <th className="px-4 py-2 text-right font-medium">Total</th>
-                    <th className="px-4 py-2 text-right font-medium">Received</th>
+                    {/* The settlement column disappears entirely rather
+                        than showing an em dash: a blank cell in a money
+                        column reads as zero received. */}
+                    {settlementUsable && (
+                      <th className="px-4 py-2 text-right font-medium">Received</th>
+                    )}
                   </tr>
                 </thead>
                 <tbody className="divide-y">
@@ -462,9 +501,11 @@ async function InvoicesPanel() {
                       <td className="px-4 py-2 text-right tabular-nums">
                         {i.totalDisplay || inr(i.totalMinor)}
                       </td>
-                      <td className="px-4 py-2 text-right tabular-nums text-muted-foreground">
-                        {i.amountPaidDisplay || inr(i.amountPaidMinor)}
-                      </td>
+                      {settlementUsable && (
+                        <td className="px-4 py-2 text-right tabular-nums text-muted-foreground">
+                          {i.amountPaidDisplay || inr(i.amountPaidMinor)}
+                        </td>
+                      )}
                     </tr>
                   ))}
                 </tbody>

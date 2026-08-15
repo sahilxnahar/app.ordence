@@ -39,6 +39,33 @@ export default async function PayrollPage() {
     <main className="mx-auto w-full max-w-5xl space-y-8 p-6">
       <div>
         <h1 className="text-2xl font-semibold">Payroll</h1>
+        {/*
+          ⭐ THE RATE TABLE IS REACHABLE FROM HERE, not only from setup.
+          Setup is a place somebody visits once. A statutory rate changes
+          every year and is corrected on the day somebody notices a
+          payslip is wrong, which is a day they are looking at runs.
+        */}
+        <div className="mt-1 flex gap-3 text-xs">
+          <Link href="/payroll/rates" className="underline">
+            Statutory rates
+          </Link>
+          <Link href="/payroll/setup" className="underline">
+            Setup
+          </Link>
+          <Link href="/payroll/employees" className="underline">
+            Employees
+          </Link>
+          {/*
+            ⭐ LEAVE IS REACHABLE FROM HERE BECAUSE ATTENDANCE IS WHAT
+            MAKES A PAYSLIP SHORT. The person who has to answer "why was
+            Ravi's December short two days" needs the register open beside
+            the run, and a leave section a navigation away would be
+            consulted after the wage bill was approved rather than before.
+          */}
+          <Link href="/payroll/leave" className="underline">
+            Leave &amp; attendance
+          </Link>
+        </div>
         <p className="mt-1 max-w-3xl text-sm text-muted-foreground">
           One run per month. It computes a payslip for everybody who was on the rolls during the
           period, somebody signs it off, and posting puts the gross into Salaries and Wages with

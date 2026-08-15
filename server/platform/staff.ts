@@ -34,11 +34,17 @@ import "server-only";
  * were ever staff.
  */
 
-import { and, desc, eq, gt, isNull, ne, or } from "drizzle-orm";
+import { and, desc, eq, gt, inArray, isNull, ne, or, sql } from "drizzle-orm";
 import { withPlatformScope } from "@/db";
+import { users } from "@/db/schema";
 import { platformStaff } from "@/db/schema/platform";
 import { getServerEnv } from "@/lib/env";
-import { parseAdminAllowlist, isAllowlisted, GRADE_LABELS } from "@/lib/platform/roles";
+import {
+  parseAdminAllowlist,
+  isAllowlisted,
+  GRADE_LABELS,
+  type PlatformGrade,
+} from "@/lib/platform/roles";
 import {
   grantPlatformStaffSchema,
   revokePlatformStaffSchema,
@@ -100,6 +106,251 @@ export async function listPlatformStaff(): Promise<PlatformResult<StaffRow[]>> {
       expired: Boolean(r.expiresAt && r.expiresAt.getTime() <= now.getTime()),
       allowlisted: isAllowlisted(r.email, allowlist),
     })),
+  };
+}
+
+/* ------------------------------------------------------------------ */
+/* THE DIRECTORY — everything the console screen needs, in one read    */
+/* ------------------------------------------------------------------ */
+
+/**
+ * One row of `platform_staff`, plus the three judgements the screen would
+ * otherwise have to re-derive (and eventually derive differently).
+ */
+export type StaffDirectoryRow = StaffRow & {
+  /** Active, not revoked, not expired. Only these people can sign in today. */
+  usable: boolean;
+  /** This is the operator reading the page. */
+  isSelf: boolean;
+  /**
+   * ⭐ THE LAST OWNER ROW THAT IS ACTIVE, UNREVOKED AND UNEXPIRED.
+   * Rendered as a disabled button and a sentence, so the operator learns
+   * the rule from the screen rather than from a red toast.
+   */
+  lastUsableOwner: boolean;
+  /**
+   * 🔴 REVOKING THIS ROW WOULD LEAVE NO OWNER WHO CAN ACTUALLY SIGN IN,
+   * and `revokePlatformStaff` refuses it — since v1.44.0 that refusal
+   * counts the allowlist too, so this is the flag that matches the
+   * engine. `lastUsableOwner` stays because it is the weaker fact and the
+   * screen states both: a row can be the last usable owner without being
+   * the last real one when a stale grant is keeping the count up.
+   */
+  lastRealOwner: boolean;
+};
+
+/**
+ * Somebody the console is permitted to grant access to — i.e. somebody
+ * who already holds KEY 1.
+ *
+ * ⚠️ THE FORM OFFERS A LIST RATHER THAN A FREE-TEXT EMAIL BOX ON PURPOSE.
+ * `grantPlatformStaff` refuses any email that is not in
+ * `PLATFORM_ADMIN_EMAILS`, so a free-text field is a field whose only
+ * possible values are already known to the server — and every other value
+ * is a round-trip that ends in a refusal the operator has to interpret.
+ */
+export type GrantCandidate = {
+  email: string;
+  /**
+   * ⭐ THE CLERK ID IS THE REAL IDENTITY AND IT IS THE FIELD MOST LIKELY
+   * TO BE WRONG. `platform_staff.clerk_user_id` is the join key; the
+   * email beside it is only a label. A mistyped id produces a row that
+   * grants KEY 2 to a stranger — harmless on its own, because that
+   * stranger's own email is not on the allowlist so KEY 1 still refuses,
+   * but it also means the person you meant to grant has nothing, and
+   * nobody finds out until they try to sign in during an incident.
+   *
+   * So the id is looked up rather than typed wherever it is knowable:
+   * from a previous grant for the same address, or from a workspace
+   * membership under that address. Null means "we have never seen this
+   * person" and the operator has to paste it from Clerk.
+   */
+  knownClerkUserId: string | null;
+  clerkIdSource: "previous_grant" | "workspace_membership" | null;
+  displayName: string | null;
+  /** An active, unexpired grant already exists — this would be a RENEWAL. */
+  hasUsableGrant: boolean;
+  currentGrade: PlatformGrade | null;
+  /** The operator's own address. The engine refuses self-grant and renewal. */
+  isSelf: boolean;
+};
+
+export type StaffDirectory = {
+  rows: StaffDirectoryRow[];
+  candidates: GrantCandidate[];
+  /**
+   * How many owner ROWS are live: active, unrevoked, unexpired, and
+   * nothing about the allowlist. Reported because the difference between
+   * this and the next number IS the drift — but it is not the number the
+   * refusal is made on.
+   */
+  usableOwners: number;
+  /**
+   * ══════════════════════════════════════════════════════════════════
+   * 🔴 THE NUMBER THAT ACTUALLY ANSWERS "CAN ANYBODY GET BACK IN?"
+   * ══════════════════════════════════════════════════════════════════
+   * Platform access needs BOTH keys. An owner row that is `active` but
+   * no longer in `PLATFORM_ADMIN_EMAILS` — precisely the stale grant
+   * this console paints red in the `On allowlist` column — cannot sign
+   * in, so it must not be what keeps a self-revocation permitted.
+   *
+   * ⚠️ THE ENGINE COUNTS THE SAME WAY SINCE v1.44.0, with the same
+   * `isAllowlisted` predicate `guard.ts` admits people with, so a curl
+   * request is refused exactly where this screen disables the button.
+   * The screen keeps its own number anyway: it is what lets the refusal
+   * be a stated sentence before the click rather than a red toast after
+   * it, and a mistake guard is not made redundant by the boundary
+   * arriving behind it.
+   */
+  usableAllowlistedOwners: number;
+  operator: {
+    clerkUserId: string;
+    email: string;
+    grade: PlatformGrade;
+    /** `staff:manage` — owner grade only. Controls are disabled, not hidden. */
+    canManage: boolean;
+  };
+  /** False when `PLATFORM_ADMIN_EMAILS` is empty, i.e. nobody can be granted. */
+  allowlistConfigured: boolean;
+};
+
+/**
+ * The whole staff screen in one read.
+ *
+ * ⚠️ ONE FUNCTION RATHER THAN FOUR because every part of it is derived
+ * from the same two facts — the table and the env allowlist — and a page
+ * that fetched them separately would render a list and a candidate set
+ * that disagree with each other about who currently holds access.
+ *
+ * Guarded by `staff:read`, which every grade holds: seeing who can cross
+ * a tenant boundary is not a privilege, it is the point of an access
+ * review. GRANTING is `staff:manage` and is checked again, inside
+ * `grantPlatformStaff`, where it belongs.
+ */
+export async function getStaffDirectory(): Promise<PlatformResult<StaffDirectory>> {
+  const operator = await requireCapability("staff:read");
+  const allowlist = parseAdminAllowlist(getServerEnv().PLATFORM_ADMIN_EMAILS);
+  const now = new Date();
+
+  const emails = [...allowlist];
+
+  const { staffRows, workspaceIdentities } = await withPlatformScope(
+    "Platform console: staff access review — grants, allowlist drift and grant candidates",
+    async (db) => {
+      const staff = await db
+        .select()
+        .from(platformStaff)
+        .orderBy(desc(platformStaff.grantedAt))
+        .limit(200);
+
+      /**
+       * ⚠️ SCOPED TO THE ALLOWLIST, NEVER THE WHOLE `users` TABLE. This
+       * is a cross-tenant read of customer workspace memberships, and
+       * the only reason it is defensible is that the `IN` list is our
+       * own staff addresses — a set fixed at deploy time. Widening it to
+       * "search users by email" would turn an access-review screen into
+       * a cross-tenant people-finder, which is what
+       * `search:directory` and its mandatory justification exist for.
+       */
+      if (emails.length === 0) return { staffRows: staff, workspaceIdentities: [] };
+
+      const identities = await db
+        .selectDistinct({
+          email: sql<string>`lower(${users.email})`,
+          clerkUserId: users.clerkUserId,
+          firstName: users.firstName,
+          lastName: users.lastName,
+        })
+        .from(users)
+        .where(and(inArray(sql`lower(${users.email})`, emails), isNull(users.deletedAt)))
+        .limit(200);
+
+      return { staffRows: staff, workspaceIdentities: identities };
+    },
+  );
+
+  const usable = (r: (typeof staffRows)[number]) =>
+    r.status === "active" &&
+    r.revokedAt === null &&
+    (r.expiresAt === null || r.expiresAt.getTime() > now.getTime());
+
+  const usableOwners = staffRows.filter((r) => r.grade === "owner" && usable(r)).length;
+  const usableAllowlistedOwners = staffRows.filter(
+    (r) => r.grade === "owner" && usable(r) && isAllowlisted(r.email, allowlist),
+  ).length;
+
+  const rows: StaffDirectoryRow[] = staffRows.map((r) => {
+    const live = usable(r);
+    const allowlisted = isAllowlisted(r.email, allowlist);
+    return {
+      id: r.id,
+      email: r.email,
+      displayName: r.displayName,
+      grade: r.grade,
+      gradeLabel: GRADE_LABELS[r.grade],
+      status: r.status,
+      grantedByEmail: r.grantedByEmail,
+      grantedAt: r.grantedAt.toISOString(),
+      expiresAt: r.expiresAt?.toISOString() ?? null,
+      expired: Boolean(r.expiresAt && r.expiresAt.getTime() <= now.getTime()),
+      allowlisted,
+      usable: live,
+      isSelf: r.clerkUserId === operator.clerkUserId,
+      lastUsableOwner: r.grade === "owner" && live && usableOwners === 1,
+      lastRealOwner:
+        r.grade === "owner" && live && allowlisted && usableAllowlistedOwners === 1,
+    };
+  });
+
+  /* ---- who this console is allowed to grant to ------------------- */
+  const identityByEmail = new Map(
+    workspaceIdentities.map((u) => [
+      u.email,
+      {
+        clerkUserId: u.clerkUserId,
+        name: [u.firstName, u.lastName].filter(Boolean).join(" ") || null,
+      },
+    ]),
+  );
+
+  const candidates: GrantCandidate[] = emails.map((email) => {
+    // The most recent row for this address wins — `staffRows` is already
+    // ordered by grant date descending, so `find` is the newest.
+    const existing = staffRows.find((r) => r.email.trim().toLowerCase() === email);
+    const identity = identityByEmail.get(email) ?? null;
+
+    return {
+      email,
+      knownClerkUserId: existing?.clerkUserId ?? identity?.clerkUserId ?? null,
+      clerkIdSource: existing
+        ? "previous_grant"
+        : identity
+          ? "workspace_membership"
+          : null,
+      displayName: existing?.displayName ?? identity?.name ?? null,
+      hasUsableGrant: Boolean(existing && usable(existing)),
+      currentGrade: existing && usable(existing) ? existing.grade : null,
+      isSelf:
+        email === operator.email.trim().toLowerCase() ||
+        existing?.clerkUserId === operator.clerkUserId,
+    };
+  });
+
+  return {
+    ok: true,
+    data: {
+      rows,
+      candidates,
+      usableOwners,
+      usableAllowlistedOwners,
+      operator: {
+        clerkUserId: operator.clerkUserId,
+        email: operator.email,
+        grade: operator.grade,
+        canManage: operator.capabilities.includes("staff:manage"),
+      },
+      allowlistConfigured: allowlist.size > 0,
+    },
   };
 }
 
@@ -262,22 +513,53 @@ export async function revokePlatformStaff(input: unknown): Promise<PlatformResul
        * counts REMAINING owners rather than refusing self-revocation.
        */
       if (target.grade === "owner") {
-        const remaining = await db
-          .select({ id: platformStaff.id })
-          .from(platformStaff)
-          .where(
-            and(
-              eq(platformStaff.grade, "owner"),
-              eq(platformStaff.status, "active"),
-              isNull(platformStaff.revokedAt),
-              ne(platformStaff.id, staffId),
-              or(
-                isNull(platformStaff.expiresAt),
-                gt(platformStaff.expiresAt, new Date()),
+        /**
+         * 🔴 A REMAINING OWNER ONLY COUNTS IF THEY HOLD BOTH KEYS.
+         *
+         * Until v1.44.0 this counted by grade, status, revocation and
+         * expiry and stopped there — it never asked whether the surviving
+         * owner's address was still in `PLATFORM_ADMIN_EMAILS`. But
+         * `guard.ts` admits nobody on the row alone, so an `active` owner
+         * whose address has dropped off the allowlist — the stale grant
+         * the console already paints red in `On allowlist` — SATISFIED
+         * this check while being unable to sign in.
+         *
+         * The lockout that produced: two owner rows, one of them stale,
+         * the real owner revokes themselves, the count sees a second
+         * owner and permits it, and the console is now unreachable by
+         * anybody. Recovery is a hand-written row in the production
+         * database — reached THROUGH the guard written to prevent it.
+         *
+         * ⚠️ THE ALLOWLIST TERM IS APPLIED HERE AND NOT IN SQL, so the
+         * refusal and the sign-in use one predicate. `guard.ts` decides
+         * KEY 1 with `isAllowlisted` over `parseAdminAllowlist`, which
+         * trim-and-lowercase both sides; a `lower(email) IN (…)` in this
+         * query would be a second normalisation of an address, and the
+         * day the two disagree is the day this refusal disagrees with who
+         * can actually get in.
+         *
+         * ⚠️ AND SO THERE IS NO `LIMIT 1`. The row the database would
+         * have stopped at may be exactly the stale one.
+         */
+        const allowlist = parseAdminAllowlist(getServerEnv().PLATFORM_ADMIN_EMAILS);
+        const remaining = (
+          await db
+            .select({ id: platformStaff.id, email: platformStaff.email })
+            .from(platformStaff)
+            .where(
+              and(
+                eq(platformStaff.grade, "owner"),
+                eq(platformStaff.status, "active"),
+                isNull(platformStaff.revokedAt),
+                ne(platformStaff.id, staffId),
+                or(
+                  isNull(platformStaff.expiresAt),
+                  gt(platformStaff.expiresAt, new Date()),
+                ),
               ),
-            ),
-          )
-          .limit(1);
+            )
+            .limit(200)
+        ).filter((r) => isAllowlisted(r.email, allowlist));
 
         if (remaining.length === 0) {
           return {
@@ -285,7 +567,10 @@ export async function revokePlatformStaff(input: unknown): Promise<PlatformResul
               "This is the last usable owner. Revoking it would lock the " +
               "console for everybody, including you, and the only way back " +
               "in would be a hand-written row in the production database. " +
-              "Grant somebody else owner grade first.",
+              "Grant somebody else owner grade first. An owner whose address " +
+              "is no longer in PLATFORM_ADMIN_EMAILS does not count here: " +
+              "that row holds the grant but not the config key, so it cannot " +
+              "sign in either.",
           } as const;
         }
       }

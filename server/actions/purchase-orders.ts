@@ -46,6 +46,12 @@ import {
 import { purchaseInvoices, purchaseInvoiceLines, vendors } from "@/db/schema/purchases";
 import { stockMovements } from "@/db/schema/inventory";
 import { requirePermission, writeAudit } from "@/server/audit";
+/**
+ * ⚠️ THE PURE EVALUATOR, NOT `checkPermission`. Used once, to decide
+ * whether the screen offers the match button. See `getPurchaseOrder` for
+ * why the logging version is the wrong tool for a UI question.
+ */
+import { evaluatePermission } from "@/lib/permissions";
 import { toSalesActionError } from "@/server/sales/guards";
 import { tryEmitAutomationEvent } from "@/server/automation/emit";
 import {
@@ -555,6 +561,58 @@ export async function runThreeWayMatch(
     const result = await withTenant(
       ctx.tenant.id,
       async (tx) => {
+        /**
+         * ══════════════════════════════════════════════════════════════
+         * 🔴🔴 THE BILL IS COMPARED TO ITS OWN ORDER AND TO NOTHING ELSE
+         * ══════════════════════════════════════════════════════════════
+         * This join used to reach every `purchase_order_lines` row in the
+         * TENANT whose description matched, with no `po_id` anywhere in
+         * it. Two orders for "OPC 53 grade cement" — which is what a
+         * builder's purchase ledger is made of — and a bill against the
+         * first was measured against the second's quantities and the
+         * second's agreed price. The verdict named a discrepancy that did
+         * not exist, or worse, cleared one that did because the OTHER
+         * order happened to cover the quantity.
+         *
+         * ⚠️ AND IT MULTIPLIED. A LEFT JOIN that matches three order lines
+         * returns three rows for one bill line, so one line produced three
+         * findings and its value landed in `netImpactMinor` three times.
+         * The number on the approval screen was not the money at stake, it
+         * was the money at stake times however many orders in the
+         * workspace happened to spell the item the same way.
+         *
+         * ⭐ `purchase_invoices.po_id` HAS EXISTED SINCE 0063 and is what
+         * `getPurchaseOrder` already lists the bills of. The match is the
+         * one place that ignored it.
+         *
+         * ⭐ LATERAL … LIMIT 1, SO ONE BILL LINE IS AT MOST ONE ROW.
+         * Restricting to `pi.po_id` alone is not enough: one order may
+         * legitimately carry the same description on two lines (two
+         * delivery dates, two rates). A plain join would still double the
+         * finding. The lateral picks the lowest line number, and the cost
+         * of that choice is visible — the second order line reads as
+         * un-invoiced on the order screen, which is a fact somebody can
+         * look at — where a doubled `netImpactMinor` is a wrong number
+         * nobody can see is wrong.
+         *
+         * 🔴 A BILL WITH NO `po_id` MATCHES NOTHING, DELIBERATELY.
+         * `pol.po_id = pi.po_id` is never true when `pi.po_id` is null, so
+         * every line comes back with a null order and `matchThreeWay`
+         * returns `no_order` — "there is no purchase order behind this
+         * bill … somebody still has to approve it on its own merits". That
+         * is the honest answer: a utility bill, a rent demand or a
+         * professional fee never had an order, and a three-way match
+         * needs three documents. The alternative — the old behaviour —
+         * was to compare a non-PO bill against every order in the tenant
+         * and print a verdict, which is a control saying "checked" about
+         * something it never checked.
+         *
+         * ⚠️ `pi.tenant_id = pil.tenant_id` IS ON THE JOIN even though
+         * `pi.id` is a primary key, because `pi.po_id` now decides what a
+         * bill is compared with, and a cross-tenant row reaching that
+         * comparison is the one bug in this file nobody would ever be
+         * shown.
+         */
         const lines = await tx.execute(sql`
           SELECT
             pil.id::text                       AS line_key,
@@ -568,18 +626,26 @@ export async function runThreeWayMatch(
           FROM purchase_invoice_lines pil
           JOIN purchase_invoices pi
             ON pi.id = pil.purchase_invoice_id
+           AND pi.tenant_id = pil.tenant_id
           -- ⚠️ LEFT JOINS THROUGHOUT. A bill line with no order behind it
           -- is a finding, not a row to drop: dropping it is how an
           -- unordered line gets silently approved.
-          LEFT JOIN purchase_order_lines pol
-            ON pol.tenant_id = pil.tenant_id
-           AND lower(pol.description) = lower(pil.description)
+          LEFT JOIN LATERAL (
+            SELECT pol.id, pol.ordered_qty, pol.unit_price_minor
+              FROM purchase_order_lines pol
+             WHERE pol.tenant_id = pil.tenant_id
+               -- 🔴 THE BILL'S OWN ORDER. Never the tenant's other orders.
+               AND pol.po_id = pi.po_id
+               AND lower(pol.description) = lower(pil.description)
+             ORDER BY pol.line_no, pol.id
+             LIMIT 1
+          ) pol ON TRUE
           LEFT JOIN goods_receipt_lines grl
-            ON grl.tenant_id = pol.tenant_id
+            ON grl.tenant_id = pil.tenant_id
            AND grl.po_line_id = pol.id
          WHERE pil.tenant_id = ${ctx.tenant.id}::uuid
            AND pil.purchase_invoice_id = ${invoiceId}::uuid
-         GROUP BY pil.id, pil.description, pol.ordered_qty,
+         GROUP BY pil.id, pil.description, pol.id, pol.ordered_qty,
                   pol.unit_price_minor, pil.quantity, pil.unit_price_minor
         `);
 
@@ -725,6 +791,306 @@ export async function getPurchaseOrders(): Promise<
 }
 
 /* ------------------------------------------------------------------ */
+/* ONE ORDER, WITH WHAT HAS ARRIVED AGAINST IT                         */
+/* ------------------------------------------------------------------ */
+
+/**
+ * ⭐ THOUSANDTHS ON THE WIRE, AS STRINGS, NOT NUMBERS.
+ *
+ * ⚠️ `orderedQty` is a bigint of thousandths. Serialising it as a
+ * JavaScript number survives every quantity anybody will ever type and
+ * then loses the last digit on the one that matters. Strings cross the
+ * boundary and the screen divides by a thousand with string arithmetic.
+ */
+export interface OrderLineRow {
+  readonly id: string;
+  readonly lineNo: number;
+  readonly description: string;
+  /** ⭐ Null for a service or a freight charge. See `recordGoodsReceipt`. */
+  readonly stockItemId: string | null;
+  readonly stockItemName: string | null;
+  readonly uom: string;
+  readonly orderedQty: string;
+  /** Accepted so far, summed over every receipt against this line. */
+  readonly receivedQty: string;
+  /** ⭐ Kept apart from accepted, everywhere, always. */
+  readonly rejectedQty: string;
+  readonly unitPriceMinor: string;
+}
+
+export interface ReceiptRow {
+  readonly id: string;
+  readonly grnNumber: string;
+  readonly receivedOn: string;
+  readonly status: string;
+  readonly challanNo: string | null;
+  readonly challanDate: string | null;
+  readonly rejectionReason: string | null;
+  readonly warehouseName: string | null;
+  readonly lines: number;
+}
+
+export interface BillRow {
+  readonly id: string;
+  readonly invoiceNumber: string;
+  readonly invoiceDate: string;
+  readonly totalMinor: string;
+  readonly status: string;
+  /** ⚠️ Null means nothing has ever checked it, not "checked and clean". */
+  readonly matchState: string | null;
+  readonly matchNote: string | null;
+}
+
+export interface OrderDetail {
+  readonly id: string;
+  readonly poNumber: string;
+  readonly vendorName: string;
+  readonly poDate: string;
+  readonly expectedOn: string | null;
+  readonly status: string;
+  readonly currency: string;
+  readonly subtotalMinor: string;
+  readonly taxMinor: string;
+  readonly totalMinor: string;
+  readonly notes: string | null;
+}
+
+/**
+ * ⭐⭐ THE READ THE RECEIPT SCREEN IS BUILT ON.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 IT IS GUARDED ON `RECEIVE`, NOT ON `ORDER`, AND THAT IS DELIBERATE
+ * ══════════════════════════════════════════════════════════════════════
+ * `getPurchaseOrders` — the list — is guarded on `ORDER`, because raising
+ * and approving orders is what that screen does. This one is different:
+ * the only write on this page is the goods receipt, and the person who
+ * takes delivery is a storekeeper, not an administrator.
+ *
+ * ⚠️ GUARDING IT ON `ORDER` WOULD HAVE LEFT `recordGoodsReceipt` EXACTLY
+ * AS UNREACHABLE AS IT WAS BEFORE. The storekeeper would hold the
+ * permission to post the receipt and be refused the only screen that
+ * offers it, so in practice the receipt would be booked by whoever holds
+ * `settings:update` — which is the administrator who also raised and
+ * approved the order. One hand writes all three documents and the
+ * three-way match proves nothing, which is the failure this whole file
+ * is arranged to prevent.
+ */
+export async function getPurchaseOrder(poId: unknown): Promise<
+  ActionResult<{
+    order: OrderDetail | null;
+    lines: readonly OrderLineRow[];
+    receipts: readonly ReceiptRow[];
+    bills: readonly BillRow[];
+    /** ⭐ May THIS viewer run the match? See below. */
+    canMatch: boolean;
+  }>
+> {
+  try {
+    // ⚠️ PARSED, NOT TRUSTED. This is a browser-reachable URL and the id
+    // is interpolated into SQL casts; a value that is not a uuid must be
+    // refused here rather than by Postgres three statements later.
+    const id = z.string().uuid().parse(poId);
+    const ctx = await requirePermission(RECEIVE);
+
+    return await withTenant(
+      ctx.tenant.id,
+      async (tx) => {
+        const [po] = await tx
+          .select({
+            id: purchaseOrders.id,
+            poNumber: purchaseOrders.poNumber,
+            poDate: purchaseOrders.poDate,
+            expectedOn: purchaseOrders.expectedOn,
+            status: purchaseOrders.status,
+            currency: purchaseOrders.currency,
+            subtotalMinor: purchaseOrders.subtotalMinor,
+            taxMinor: purchaseOrders.taxMinor,
+            totalMinor: purchaseOrders.totalMinor,
+            notes: purchaseOrders.notes,
+            vendorName: vendors.legalName,
+          })
+          .from(purchaseOrders)
+          .innerJoin(
+            vendors,
+            and(eq(vendors.id, purchaseOrders.vendorId), eq(vendors.tenantId, ctx.tenant.id)),
+          )
+          .where(and(eq(purchaseOrders.tenantId, ctx.tenant.id), eq(purchaseOrders.id, id)))
+          .limit(1);
+
+        /**
+         * ⚠️ A MISSING ORDER RETURNS `ok` WITH A NULL ORDER, NOT AN ERROR.
+         *
+         * 🔴 The screen has to tell "you may not read this" apart from
+         * "there is no such order", and it cannot if both arrive as
+         * `{ ok: false }`. Somebody with the wrong role would spend the
+         * afternoon hunting for a record that is sitting right there.
+         */
+        if (!po) {
+          return {
+            ok: true as const,
+            data: { order: null, lines: [], receipts: [], bills: [], canMatch: false },
+          };
+        }
+
+        /**
+         * ⭐ RECEIVED IS SUMMED FROM THE RECEIPT LINES, never stored on the
+         * order line.
+         *
+         * ⚠️ A running `received_qty` column on the order line is a second
+         * copy of a number the receipts already prove, and the two drift
+         * the first time a receipt is corrected. The sum cannot drift from
+         * the rows it is a sum of.
+         */
+        const lineRows = await tx.execute(sql`
+          SELECT pol.id::text                         AS id,
+                 pol.line_no                          AS line_no,
+                 pol.description                      AS description,
+                 pol.stock_item_id::text              AS stock_item_id,
+                 si.name                              AS stock_item_name,
+                 COALESCE(pol.uom, 'nos')             AS uom,
+                 pol.ordered_qty::text                AS ordered_qty,
+                 pol.unit_price_minor::text           AS unit_price_minor,
+                 COALESCE(SUM(grl.accepted_qty), 0)::text AS received_qty,
+                 COALESCE(SUM(grl.rejected_qty), 0)::text AS rejected_qty
+            FROM purchase_order_lines pol
+            LEFT JOIN stock_items si
+              ON si.id = pol.stock_item_id
+             AND si.tenant_id = pol.tenant_id
+            LEFT JOIN goods_receipt_lines grl
+              ON grl.tenant_id = pol.tenant_id
+             AND grl.po_line_id = pol.id
+           WHERE pol.tenant_id = ${ctx.tenant.id}::uuid
+             AND pol.po_id = ${id}::uuid
+           GROUP BY pol.id, pol.line_no, pol.description, pol.stock_item_id,
+                    si.name, pol.uom, pol.ordered_qty, pol.unit_price_minor
+           ORDER BY pol.line_no
+        `);
+
+        const receiptRows = await tx.execute(sql`
+          SELECT g.id::text            AS id,
+                 g.grn_number          AS grn_number,
+                 g.received_on::text   AS received_on,
+                 g.status              AS status,
+                 g.challan_no          AS challan_no,
+                 g.challan_date::text  AS challan_date,
+                 g.rejection_reason    AS rejection_reason,
+                 w.name                AS warehouse_name,
+                 (SELECT count(*) FROM goods_receipt_lines l
+                   WHERE l.grn_id = g.id)::int AS line_count
+            FROM goods_receipts g
+            LEFT JOIN warehouses w
+              ON w.id = g.warehouse_id
+             AND w.tenant_id = g.tenant_id
+           WHERE g.tenant_id = ${ctx.tenant.id}::uuid
+             AND g.po_id = ${id}::uuid
+           ORDER BY g.received_on DESC, g.grn_number DESC
+        `);
+
+        /**
+         * ⭐ THE BILLS AGAINST THIS ORDER, so the match has somewhere to be
+         * run from. `purchase_invoices.po_id` has existed since 0063.
+         *
+         * ⚠️ `status` IS AN ENUM AND IS CAST TO text. A pg enum arrives as
+         * an object through some drivers and as a string through others,
+         * and `String(...)` on the object form yields "[object Object]" in
+         * production and nothing suspicious in a test.
+         */
+        const billRows = await tx.execute(sql`
+          SELECT pi.id::text          AS id,
+                 pi.invoice_number    AS invoice_number,
+                 pi.invoice_date::text AS invoice_date,
+                 pi.total_minor::text AS total_minor,
+                 pi.status::text      AS status,
+                 pi.match_state       AS match_state,
+                 pi.match_note        AS match_note
+            FROM purchase_invoices pi
+           WHERE pi.tenant_id = ${ctx.tenant.id}::uuid
+             AND pi.po_id = ${id}::uuid
+           ORDER BY pi.invoice_date DESC, pi.invoice_number DESC
+        `);
+
+        /**
+         * 🔴 WHETHER THE MATCH BUTTON IS OFFERED IS ANSWERED HERE, PURELY.
+         *
+         * ⚠️ `checkPermission` WOULD HAVE BEEN THE OBVIOUS CALL AND IT
+         * WRITES A ROW TO `permission_denials` EVERY TIME IT SAYS NO. The
+         * storekeeper who legitimately cannot approve bills would log a
+         * denial on every page view, and `permission_denials` is read as a
+         * security signal — a cluster of them is how somebody probing for
+         * access is spotted. Filling it with the expected answer to a
+         * question nobody asked destroys the signal.
+         *
+         * ⭐ AND THE BUTTON BEING HIDDEN IS NOT THE CONTROL.
+         * `runThreeWayMatch` still calls `requirePermission(APPROVE)`
+         * itself; this only stops the screen offering what the server will
+         * refuse.
+         */
+        const canMatch = evaluatePermission(
+          { role: ctx.role, overrides: ctx.user.permissionOverrides },
+          APPROVE,
+        ).allowed;
+
+        return {
+          ok: true as const,
+          data: {
+            order: {
+              id: po.id,
+              poNumber: po.poNumber,
+              vendorName: po.vendorName,
+              poDate: po.poDate,
+              expectedOn: po.expectedOn ?? null,
+              status: po.status,
+              currency: po.currency,
+              subtotalMinor: po.subtotalMinor.toString(),
+              taxMinor: po.taxMinor.toString(),
+              totalMinor: po.totalMinor.toString(),
+              notes: po.notes ?? null,
+            },
+            lines: rowsOf<Record<string, unknown>>(lineRows).map((r) => ({
+              id: String(r.id),
+              lineNo: Number(r.line_no ?? 0),
+              description: String(r.description ?? ""),
+              stockItemId: r.stock_item_id === null ? null : String(r.stock_item_id),
+              stockItemName: r.stock_item_name === null ? null : String(r.stock_item_name),
+              uom: String(r.uom ?? "nos"),
+              orderedQty: String(r.ordered_qty ?? "0"),
+              receivedQty: String(r.received_qty ?? "0"),
+              rejectedQty: String(r.rejected_qty ?? "0"),
+              unitPriceMinor: String(r.unit_price_minor ?? "0"),
+            })),
+            receipts: rowsOf<Record<string, unknown>>(receiptRows).map((r) => ({
+              id: String(r.id),
+              grnNumber: String(r.grn_number),
+              receivedOn: String(r.received_on),
+              status: String(r.status),
+              challanNo: r.challan_no === null ? null : String(r.challan_no),
+              challanDate: r.challan_date === null ? null : String(r.challan_date),
+              rejectionReason:
+                r.rejection_reason === null ? null : String(r.rejection_reason),
+              warehouseName: r.warehouse_name === null ? null : String(r.warehouse_name),
+              lines: Number(r.line_count ?? 0),
+            })),
+            bills: rowsOf<Record<string, unknown>>(billRows).map((r) => ({
+              id: String(r.id),
+              invoiceNumber: String(r.invoice_number),
+              invoiceDate: String(r.invoice_date),
+              totalMinor: String(r.total_minor ?? "0"),
+              status: String(r.status ?? ""),
+              matchState: r.match_state === null ? null : String(r.match_state),
+              matchNote: r.match_note === null ? null : String(r.match_note),
+            })),
+            canMatch,
+          },
+        };
+      },
+      { impersonationId: ctx.impersonationId },
+    );
+  } catch (err) {
+    return toSalesActionError(err, "getPurchaseOrder");
+  }
+}
+
+/* ------------------------------------------------------------------ */
 /* PLUMBING                                                            */
 /* ------------------------------------------------------------------ */
 
@@ -743,6 +1109,28 @@ function rowsOf<T>(result: unknown): T[] {
  * ⚠️ A status somebody sets by hand is a status that disagrees with the
  * rows underneath it, and the disagreement is invisible until a report
  * says nine orders are outstanding and the warehouse says four.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴🔴 LINE BY LINE. THE TOTAL IS NOT THE TEST — IT NEVER WAS.
+ * ══════════════════════════════════════════════════════════════════════
+ * This compared `SUM(ordered)` against `SUM(accepted)` across the whole
+ * order, and a sum lets two lines cancel each other out. Order 100 bags
+ * of cement and 100 of sand; 120 bags of cement arrive and 80 of sand;
+ * the totals are 200 and 200, the order flips to `received`, and 20 bags
+ * of sand nobody ever delivered are closed and stop being chased. The
+ * over-delivery on one line PAID FOR the shortfall on the other.
+ *
+ * ⭐ IT IS THE SAME MISTAKE `lib/purchases/three-way.ts` REFUSES TO MAKE
+ * in its own headline comment — "two lines that are wrong in opposite
+ * directions net to a correct total". A file that matches bills line by
+ * line and closes orders on a total is arguing with itself.
+ *
+ * ⚠️ AND THE COUNTING NOW HAPPENS IN POSTGRES, NOT IN JAVASCRIPT.
+ * The old version pulled two quantity sums out as `Number(...)`, which is
+ * a float over `bigint` thousandths: an order of ten thousand tonnes,
+ * expressed in thousandths, is past the point where `Number` still tells
+ * the truth about its last digit. What crosses the boundary now is three
+ * counts of lines, which are small integers by construction.
  */
 async function recomputeOrderStatus(
   tx: Tx,
@@ -753,8 +1141,18 @@ async function recomputeOrderStatus(
 ): Promise<string> {
   const result = await tx.execute(sql`
     SELECT
-      COALESCE(SUM(pol.ordered_qty), 0)                       AS ordered,
-      COALESCE(SUM(recv.accepted), 0)                         AS accepted
+      count(*)::int AS line_count,
+      count(*) FILTER (WHERE COALESCE(recv.accepted, 0) > 0)::int
+        AS lines_started,
+      -- ⚠️ GREATER-OR-EQUAL RATHER THAN EQUAL, PER LINE. (No backticks in
+      -- here: this is a template literal and one would end the query.)
+      -- Over-delivery is common and a line that received 101 of 100 is not
+      -- still outstanding; it is complete, and the extra unit is a finding
+      -- for the three-way match rather than a reason to leave the order
+      -- open forever. What it must NOT do is let that extra unit count
+      -- towards a DIFFERENT line, which is exactly what summing did.
+      count(*) FILTER (WHERE COALESCE(recv.accepted, 0) >= pol.ordered_qty)::int
+        AS lines_complete
       FROM purchase_order_lines pol
       LEFT JOIN (
         SELECT grl.po_line_id, SUM(grl.accepted_qty) AS accepted
@@ -767,14 +1165,19 @@ async function recomputeOrderStatus(
   `);
 
   const row = rowsOf<Record<string, unknown>>(result)[0] ?? {};
-  const ordered = Number(row.ordered ?? 0);
-  const accepted = Number(row.accepted ?? 0);
+  const lineCount = Number(row.line_count ?? 0);
+  const linesStarted = Number(row.lines_started ?? 0);
+  const linesComplete = Number(row.lines_complete ?? 0);
 
-  // ⚠️ `>=` RATHER THAN `===`. Over-delivery is common and an order that
-  // received 101 of 100 is not still part received; it is received, and
-  // the extra unit is a finding for the three-way match rather than a
-  // reason to leave the order open forever.
-  const status = accepted <= 0 ? "approved" : accepted >= ordered ? "received" : "part_received";
+  // ⭐ EVERY line has to be complete before the order is. An order with no
+  // lines at all has nothing started and stays `approved`, which is the
+  // only answer that is not a claim about goods.
+  const status =
+    linesStarted === 0
+      ? "approved"
+      : linesComplete >= lineCount
+        ? "received"
+        : "part_received";
 
   await tx
     .update(purchaseOrders)
@@ -784,6 +1187,45 @@ async function recomputeOrderStatus(
   return status;
 }
 
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * ⭐⭐ THE NUMBER IS A HINT. THE UNIQUE INDEX IS THE GUARANTEE.
+ * ══════════════════════════════════════════════════════════════════════
+ * Both of these read `MAX(...) + 1` with nothing holding the row they
+ * read, so two receipts booked in the same second read the same maximum
+ * and propose the same number. That is not an oversight being ignored:
+ * `purchase_orders_number_unique (tenant_id, po_number)` and
+ * `goods_receipts_number_unique (tenant_id, grn_number)` — both in 0063 —
+ * are what actually decides. The second INSERT raises 23505, the WHOLE
+ * transaction rolls back, and nothing partial survives: no receipt row,
+ * no receipt lines, no stock movements, no order-status change. The
+ * storekeeper presses save again and reads the new maximum.
+ *
+ * 🔴 THE SAME REASONING AS `nextOrderNo` IN `server/actions/orders.ts`,
+ * ON PURPOSE. Two numbering schemes in one product where one takes a lock
+ * and one does not is a difference somebody has to hold in their head
+ * forever, and the first person to "make them consistent" will pick the
+ * wrong direction.
+ *
+ * ⚠️ WHY THE ADVISORY LOCK WAS REJECTED, since it is the obvious fix.
+ * `pg_advisory_xact_lock(hashtext(tenant || ':grn'))` would hand out
+ * numbers with no collisions — and would hold that lock until COMMIT,
+ * because an xact lock cannot be released earlier. `recordGoodsReceipt`
+ * does real work after the number is drawn: it writes the receipt, its
+ * lines, a stock movement per line, and recomputes the order status. So
+ * the lock would serialise the ENTIRE receipt path for a tenant, and a
+ * godown with four bays booking four lorries in would process them one
+ * after another to prevent a collision that the index already prevents.
+ * It buys a nicer error message for a rare loser and pays for it with
+ * throughput on every single receipt.
+ *
+ * ⚠️ THE COST OF THIS CHOICE, STATED PLAINLY: the loser of the race gets
+ * `toSalesActionError`'s generic "That record already exists.", which
+ * does not tell a storekeeper to simply try again. Naming
+ * `goods_receipts_number_unique` in `server/sales/guards.ts` — where
+ * `units_code_project_unique` and its siblings already are — is the fix
+ * for that, and it is a change to a different file.
+ */
 async function nextNumber(tx: Tx, tenantId: string): Promise<string> {
   const r = await tx.execute(sql`
     SELECT COALESCE(MAX(NULLIF(regexp_replace(po_number, '\\D', '', 'g'), '')::int), 0) + 1 AS next
@@ -793,6 +1235,9 @@ async function nextNumber(tx: Tx, tenantId: string): Promise<string> {
   return `PO-${String(n).padStart(5, "0")}`;
 }
 
+/** ⭐ A hint, exactly as `nextNumber` above. See the note there for why the
+ * advisory lock was rejected and what `goods_receipts_number_unique` does
+ * about the collision. */
 async function nextGrnNumber(tx: Tx, tenantId: string): Promise<string> {
   const r = await tx.execute(sql`
     SELECT COALESCE(MAX(NULLIF(regexp_replace(grn_number, '\\D', '', 'g'), '')::int), 0) + 1 AS next

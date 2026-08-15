@@ -46,9 +46,10 @@ import "server-only";
  * carried to the UI for exactly that sentence.
  */
 
-import { and, eq, isNull, inArray, sql, ne } from "drizzle-orm";
-import { withPlatformScope } from "@/db";
-import { tenants, users, documents, subscriptions, plans, grantsAccess } from "@/db/schema";
+import { and, desc, eq, isNull, inArray, sql, ne } from "drizzle-orm";
+import { z } from "zod";
+import { withPlatformScope, withTenant } from "@/db";
+import { tenants, users, documents, subscriptions, plans, grantsAccess, auditLogs } from "@/db/schema";
 import { platformTenantFlags } from "@/db/schema/platform";
 import {
   ENTITLEMENT_OVERRIDE_PREFIX,
@@ -79,6 +80,23 @@ import {
   isIndustryKey,
   type IndustryKey,
 } from "@/lib/industry-templates";
+import {
+  CONFIG_KEYS,
+  CONFIG_OVERRIDE_PREFIX,
+  configDefinition,
+  configKeyFromFlagKey,
+  configOverrideKeyFor,
+  diffConfigChange,
+  formatConfigValue,
+  isConfigKey,
+  parseConfigValue,
+  resolveConfig,
+  type ConfigDiff,
+  type ConfigKey,
+  type ConfigResolution,
+  type ConfigVersion,
+  type TenantOverrideInput,
+} from "@/lib/platform/config-chain";
 import { requireCapability, recordPlatformAudit, PlatformAccessError } from "./guard";
 import type { PlanTier } from "@/db/schema/core";
 import type { PlatformOperator } from "./guard";
@@ -151,6 +169,12 @@ export type WorkspaceConfiguration = {
   featureAllowed: Record<string, boolean>;
   /** Nav id → allowed. What `filterNavigationByEntitlement()` wants. */
   navAllowed: Record<string, boolean>;
+  /**
+   * ⭐ Every configuration key, resolved global → plan → override.
+   * Carried on this read so the plan form can say where its numbers came
+   * from without a second round trip.
+   */
+  configResolutions: readonly ConfigResolution[];
 };
 
 /**
@@ -229,23 +253,32 @@ export async function getWorkspaceConfiguration(
         .from(documents)
         .where(and(eq(documents.tenantId, tenantId), isNull(documents.deletedAt)));
 
-      const overrideRows = await tx
+      /*
+       * ⚠️ ONE READ FOR BOTH NAMESPACES — v1.43.0. This used to filter
+       * on `entitlement:%` in SQL. It now takes every row for the
+       * workspace and partitions in TypeScript, because Batch 47 added a
+       * `config:` namespace to the same table and two LIKE queries over
+       * the same index for the same page is a second round trip bought
+       * for nothing. The partition is by prefix, in one place, so a row
+       * can never be counted as both.
+       */
+      const flagRows = await tx
         .select()
         .from(platformTenantFlags)
-        .where(
-          and(
-            eq(platformTenantFlags.tenantId, tenantId),
-            sql`${platformTenantFlags.flagKey} LIKE ${ENTITLEMENT_OVERRIDE_PREFIX + "%"}`,
-          ),
-        );
+        .where(eq(platformTenantFlags.tenantId, tenantId));
 
-      return { tenant, subscription, seatRow, storageRow, overrideRows };
+      const overrideRows = flagRows.filter((r) =>
+        r.flagKey.startsWith(ENTITLEMENT_OVERRIDE_PREFIX),
+      );
+      const configRows = flagRows.filter((r) => r.flagKey.startsWith(CONFIG_OVERRIDE_PREFIX));
+
+      return { tenant, subscription, seatRow, storageRow, overrideRows, configRows };
     },
   );
 
   if (!snapshot) return { ok: false, error: "Workspace not found." };
 
-  const { tenant, subscription, seatRow, storageRow, overrideRows } = snapshot;
+  const { tenant, subscription, seatRow, storageRow, overrideRows, configRows } = snapshot;
   const now = Date.now();
 
   /*
@@ -293,6 +326,40 @@ export async function getWorkspaceConfiguration(
   // the two names is how somebody eventually passes the wrong one.
   const navAllowed = featureAllowed;
 
+  /*
+   * ⭐ THE CHAIN, RESOLVED ON THE SAME PASS — BATCH 47.
+   *
+   * ⚠️ AGAINST `governingTier`, NOT `tenants.plan_tier`. The header of
+   * this file explains why the subscription is the authority where there
+   * is one; a chain that resolved plan-level defaults from the cached
+   * column would quote a ceiling the customer is not actually on.
+   *
+   * ⚠️ EXPIRY IS DELIBERATELY NOT APPLIED HERE, unlike the entitlement
+   * overrides above. See `setConfigOverride`: a config override never
+   * gets an expiry, because a storage ceiling that silently collapses at
+   * midnight is a support ticket nobody can trace.
+   */
+  const configOverrides: Partial<Record<ConfigKey, TenantOverrideInput>> = {};
+  for (const row of configRows) {
+    const key = configKeyFromFlagKey(row.flagKey);
+    if (!key) continue;
+    configOverrides[key] = {
+      present: true,
+      raw: (row.value as { value?: unknown } | null)?.value,
+      reason: row.reason,
+      setByEmail: row.setByEmail,
+      setAt: row.updatedAt.toISOString(),
+    };
+  }
+
+  const configResolutions = CONFIG_KEYS.map((key) =>
+    resolveConfig({
+      key,
+      planTier: governingTier,
+      override: configOverrides[key] ?? { present: false },
+    }),
+  );
+
   const rawIndustry = tenant.settings?.industry;
   const industryWasUnrecognised = rawIndustry !== undefined && !isIndustryKey(rawIndustry);
   const template = resolveIndustryTemplate(rawIndustry);
@@ -333,6 +400,7 @@ export async function getWorkspaceConfiguration(
       matrix,
       featureAllowed,
       navAllowed,
+      configResolutions,
     },
   };
 }
@@ -512,6 +580,400 @@ export async function setModuleEntitlement(
 }
 
 /* ------------------------------------------------------------------ */
+/* G · THE CONFIGURATION CHAIN — READ                                  */
+/* ------------------------------------------------------------------ */
+
+export type ConfigChainView = {
+  tenantId: string;
+  slug: string;
+  name: string;
+  planTier: PlanTier;
+  /** ⚠️ True when the tier the chain resolves against is the subscription's. */
+  subscriptionIsAuthority: boolean;
+  resolutions: readonly ConfigResolution[];
+  /**
+   * 🔴 THE ONE PLACE THE CHAIN CAN DISAGREE WITH REALITY.
+   *
+   * `limits.storage_mb` is enforced from `tenants.storage_limit_mb`,
+   * because that is the column the upload path reads. Every workspace
+   * that existed before this batch has a column value and NO override
+   * row, so the chain would resolve to the plan's number while the
+   * product enforces the column's. Saying "they agree" would be a lie
+   * an operator only discovers when a customer hits a ceiling nobody
+   * could see. So the disagreement is carried to the screen, and the
+   * first save through the plan form reconciles it.
+   */
+  storageColumnMb: number;
+  storageColumnDisagrees: boolean;
+};
+
+export async function getConfigChain(
+  tenantId: string,
+): Promise<ConfigResult<ConfigChainView>> {
+  // ⚠️ The guard is `getWorkspaceConfiguration`'s — `tenants:read` — and
+  // it runs before anything below. The tier is taken from there too so
+  // the chain resolves against the SAME governing tier the module matrix
+  // does; two answers to "what plan are they on" on one screen is how a
+  // support call becomes an argument about which panel is right.
+  const current = await getWorkspaceConfiguration(tenantId);
+  if (!current.ok) return current;
+
+  const resolutions = current.data.configResolutions;
+  const storage = resolutions.find((r) => r.key === "limits.storage_mb");
+
+  return {
+    ok: true,
+    data: {
+      tenantId,
+      slug: current.data.slug,
+      name: current.data.name,
+      planTier: current.data.planTier,
+      subscriptionIsAuthority: current.data.subscriptionIsAuthority,
+      resolutions,
+      storageColumnMb: current.data.storageLimitMb,
+      storageColumnDisagrees: storage?.effective !== current.data.storageLimitMb,
+    },
+  };
+}
+
+/**
+ * ⚠️ DEFINED HERE RATHER THAN IN `lib/platform/schemas.ts` because the
+ * shape belongs to the two functions below and nothing else posts it.
+ * The catalogue it validates against is in
+ * `lib/platform/config-chain.ts`, so a key removed from the catalogue
+ * stops validating here on the same deploy.
+ */
+const configOverrideSchema = z.object({
+  tenantId: z.string().uuid(),
+  key: z.string().refine(isConfigKey, "Unknown setting."),
+  mode: z.enum(["set", "clear"]),
+  /** Absent for `clear`. Validated against the key's own type. */
+  value: z.string().max(2000).optional(),
+  reason: z
+    .string()
+    .trim()
+    .min(
+      20,
+      "Describe why, in at least 20 characters — this is written to the customer's own audit log.",
+    )
+    .max(1000),
+});
+
+/**
+ * ⭐⭐⭐ THE DIFF PREVIEW, ON THE SERVER.
+ *
+ * ⚠️ THE SCREEN COMPUTES THE SAME SENTENCE FROM THE SAME PURE FUNCTION,
+ * AND THIS ONE STILL EXISTS. Not because the client might lie — it can
+ * lie about anything and `setConfigOverride` re-resolves regardless —
+ * but because the client's copy of the plan tier and the current
+ * override is as old as the page. An operator who spent four minutes
+ * writing a reason is previewing against a workspace that may have been
+ * upgraded in the meantime.
+ */
+export async function previewConfigOverride(
+  input: unknown,
+): Promise<ConfigResult<ConfigDiff>> {
+  await requireCapability("tenants:read");
+
+  const parsed = configOverrideSchema
+    .omit({ reason: true })
+    .safeParse(input);
+  if (!parsed.success) {
+    return {
+      ok: false,
+      error: "Check the form.",
+      fieldErrors: parsed.error.flatten().fieldErrors as Record<string, string[]>,
+    };
+  }
+
+  const chain = await getConfigChain(parsed.data.tenantId);
+  if (!chain.ok) return chain;
+
+  return buildDiff(chain.data, parsed.data.key as ConfigKey, parsed.data.mode, parsed.data.value);
+}
+
+function buildDiff(
+  chain: ConfigChainView,
+  key: ConfigKey,
+  mode: "set" | "clear",
+  value: string | undefined,
+): ConfigResult<ConfigDiff> {
+  const before = chain.resolutions.find((r) => r.key === key);
+  if (!before) return { ok: false, error: "Unknown setting." };
+
+  // ⚠️ Found by name, not by position. The layer order is meaningful and
+  // fixed, but reading it back by index couples this function to the
+  // array's shape, and the one thing worse than a wrong diff is a diff
+  // that silently compares the plan layer to itself.
+  const tenantLayer = before.layers.find((l) => l.layer === "tenant");
+
+  const beforeOverride: TenantOverrideInput = tenantLayer?.present
+    ? {
+        present: true,
+        raw: tenantLayer.value,
+        reason: tenantLayer.reason ?? null,
+        setByEmail: tenantLayer.setByEmail ?? null,
+        setAt: tenantLayer.setAt ?? null,
+      }
+    : { present: false };
+
+  let afterOverride: TenantOverrideInput = { present: false };
+  if (mode === "set") {
+    const candidate = parseConfigValue(key, value ?? "");
+    if (!candidate.ok) {
+      return { ok: false, error: candidate.error, fieldErrors: { value: [candidate.error] } };
+    }
+    afterOverride = {
+      present: true,
+      raw: candidate.value,
+      reason: null,
+      setByEmail: null,
+      setAt: null,
+    };
+  }
+
+  return {
+    ok: true,
+    data: diffConfigChange({
+      key,
+      planTier: chain.planTier,
+      // ⭐ THE NAME, NOT THE UUID. "Effective value for 3f2a-… changes"
+      // is a sentence nobody can check against the customer they have on
+      // the phone.
+      tenantLabel: chain.name,
+      before: beforeOverride,
+      after: afterOverride,
+    }),
+  };
+}
+
+/* ------------------------------------------------------------------ */
+/* G · THE CONFIGURATION CHAIN — WRITE                                 */
+/* ------------------------------------------------------------------ */
+
+/**
+ * ⭐⭐⭐ THE ONE WRITE. TYPED, VERSIONED, WITH AN ACTOR.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * WHAT "VERSIONED" MEANS HERE, EXACTLY
+ * ══════════════════════════════════════════════════════════════════════
+ * The `platform_tenant_flags` row is the CURRENT version and carries the
+ * actor who last set it (`set_by_email`, `updated_at`). The HISTORY is
+ * the customer's own `audit_logs`: append-only, with `old_value`,
+ * `new_value`, the actor's email and the reason, read back by
+ * `listConfigVersions` below.
+ *
+ * 🔴 THERE IS NO SEPARATE VERSION TABLE, and that is the same decision
+ * `guard.ts` argues for at length: a history split across two tables
+ * cannot prove anything, because a reader has to trust both are
+ * complete. It also means the customer can see their own configuration
+ * history, which — for a value that decides what they are told when we
+ * lock them out — they are entitled to.
+ *
+ * ⚠️ THE AUDIT ROW RECORDS THE EFFECTIVE VALUES, NOT THE RAW OVERRIDE.
+ * "override removed" tells a reviewer nothing; "effective storage
+ * ceiling went from 8192 MB to 2048 MB" tells them what the customer
+ * felt.
+ */
+export async function setConfigOverride(
+  input: unknown,
+): Promise<ConfigResult<ConfigDiff>> {
+  const gate = await capabilityOrStepUp("tenants:configure");
+  if (!gate.ok) return gate.result;
+  const operator = gate.operator;
+
+  const parsed = configOverrideSchema.safeParse(input);
+  if (!parsed.success) {
+    return {
+      ok: false,
+      error: "Check the form.",
+      fieldErrors: parsed.error.flatten().fieldErrors as Record<string, string[]>,
+    };
+  }
+  const { tenantId, mode, reason } = parsed.data;
+  const key = parsed.data.key as ConfigKey;
+
+  const chain = await getConfigChain(tenantId);
+  if (!chain.ok) return chain;
+
+  // Recomputed from the state as it is NOW, not from whatever the form
+  // was rendered against. The operator approved a sentence; what gets
+  // written has to be what is actually true at the moment of the write.
+  const diff = buildDiff(chain.data, key, mode, parsed.data.value);
+  if (!diff.ok) return diff;
+
+  const flagKey = configOverrideKeyFor(key);
+
+  await withPlatformScope(
+    `Platform console: ${mode} config ${key} on tenant ${tenantId} — ${reason.slice(0, 80)}`,
+    async (tx) => {
+      if (mode === "clear") {
+        /*
+         * ⭐ DELETE, NOT "WRITE THE PLAN'S CURRENT ANSWER". Identical
+         * today, wrong tomorrow: a row asserting today's plan value
+         * keeps asserting it after the customer upgrades, and the
+         * upgrade they paid for silently does nothing. Absence is the
+         * only value that means "the plan decides". Same argument as
+         * `setModuleEntitlement`.
+         */
+        await tx
+          .delete(platformTenantFlags)
+          .where(
+            and(
+              eq(platformTenantFlags.tenantId, tenantId),
+              eq(platformTenantFlags.flagKey, flagKey),
+            ),
+          );
+        return;
+      }
+
+      await tx
+        .insert(platformTenantFlags)
+        .values({
+          tenantId,
+          flagKey,
+          // ⚠️ `enabled` IS MEANINGLESS FOR A CONFIG ROW and is set true
+          // so the row reads as live to anything scanning the table.
+          // The VALUE is in `value`, and `false` here would look like a
+          // switched-off setting rather than a stored number.
+          enabled: true,
+          value: { value: diff.data.to },
+          reason,
+          expiresAt: null,
+          setByStaffId: operator.staff.id,
+          setByEmail: operator.email,
+        })
+        .onConflictDoUpdate({
+          target: [platformTenantFlags.tenantId, platformTenantFlags.flagKey],
+          set: {
+            enabled: true,
+            value: { value: diff.data.to },
+            reason,
+            expiresAt: null,
+            setByStaffId: operator.staff.id,
+            setByEmail: operator.email,
+            updatedAt: new Date(),
+          },
+        });
+    },
+  );
+
+  /*
+   * ⚠️ THE COLUMN AND THE CHAIN ARE RECONCILED IN THE SAME BREATH FOR
+   * THE ONE KEY THAT HAS A COLUMN. `tenants.storage_limit_mb` is what
+   * the upload path enforces; a chain that resolved to 8192 while the
+   * product enforced 2048 would be a configuration screen that lies,
+   * which is worse than not having one.
+   */
+  if (key === "limits.storage_mb" && typeof diff.data.to === "number") {
+    const enforced = diff.data.to;
+    await withPlatformScope(
+      `Platform console: reconcile enforced storage ceiling for tenant ${tenantId}`,
+      async (tx) => {
+        await tx
+          .update(tenants)
+          .set({ storageLimitMb: enforced, updatedAt: new Date() })
+          .where(eq(tenants.id, tenantId));
+      },
+    );
+  }
+
+  await recordPlatformAudit({
+    operator,
+    tenantId,
+    action: "config_change",
+    resourceType: "tenant_config_override",
+    resourceId: key,
+    oldValue: { effective: diff.data.from, layer: diff.data.fromLayer },
+    newValue: { effective: diff.data.to, layer: diff.data.toLayer },
+    // A configuration value that decides a ceiling or what a locked-out
+    // customer is told is not routine, and `notice` would bury it under
+    // every console read.
+    severity: "warning",
+    reason,
+    metadata: {
+      configKey: key,
+      label: diff.data.label,
+      mode,
+      effectiveChanged: diff.data.changed,
+      sentence: diff.data.sentence,
+      provenanceNote: diff.data.note,
+      planTier: chain.data.planTier,
+    },
+  });
+
+  return { ok: true, data: diff.data };
+}
+
+/**
+ * The history of one workspace's configuration, read back out of the
+ * customer's OWN audit log.
+ *
+ * ⚠️ READ THROUGH `withTenant`, NOT THE PLATFORM CONNECTION. The
+ * `audit_logs` policy is `tenant_id = app_current_tenant_id()`, so the
+ * platform connection sees nothing there and has to ask as the tenant.
+ * That is the policy working correctly rather than an obstacle to route
+ * around — the same pattern `readPreviousStatus()` uses in `tenants.ts`.
+ *
+ * Fails SOFT: an unreadable history returns empty and says so through
+ * the caller rather than taking the configuration screen down. The
+ * screen labels it, because empty and unknown are not the same thing.
+ */
+export async function listConfigVersions(
+  tenantId: string,
+): Promise<ConfigResult<{ versions: ConfigVersion[]; readable: boolean }>> {
+  await requireCapability("tenants:read");
+
+  try {
+    const rows = await withTenant(tenantId, async (tx) =>
+      tx
+        .select({
+          resourceId: auditLogs.resourceId,
+          oldValue: auditLogs.oldValue,
+          newValue: auditLogs.newValue,
+          actorEmail: auditLogs.actorEmail,
+          createdAt: auditLogs.createdAt,
+          reason: auditLogs.reason,
+        })
+        .from(auditLogs)
+        .where(
+          and(
+            eq(auditLogs.tenantId, tenantId),
+            eq(auditLogs.resourceType, "tenant_config_override"),
+          ),
+        )
+        .orderBy(desc(auditLogs.createdAt))
+        .limit(50),
+    );
+
+    const versions: ConfigVersion[] = [];
+    for (const row of rows) {
+      const key = row.resourceId;
+      if (!isConfigKey(key)) continue;
+      const from = (row.oldValue as { effective?: unknown } | null)?.effective;
+      const to = (row.newValue as { effective?: unknown } | null)?.effective;
+      versions.push({
+        key,
+        at: row.createdAt.toISOString(),
+        actorEmail: row.actorEmail,
+        fromFormatted:
+          typeof from === "number" || typeof from === "string"
+            ? formatConfigValue(key, from)
+            : null,
+        toFormatted:
+          typeof to === "number" || typeof to === "string" ? formatConfigValue(key, to) : null,
+        reason: row.reason,
+      });
+    }
+
+    return { ok: true, data: { versions, readable: true } };
+  } catch (err) {
+    console.error("[platform] configuration history could not be read", err);
+    return { ok: true, data: { versions: [], readable: false } };
+  }
+}
+
+/* ------------------------------------------------------------------ */
 /* D · WRITE — PLAN AND LIMITS                                         */
 /* ------------------------------------------------------------------ */
 
@@ -564,6 +1026,37 @@ export async function setPlanAndLimits(
     };
   }
 
+  /*
+   * ══════════════════════════════════════════════════════════════════
+   * ⭐⭐⭐ THE STORAGE FIELD NOW WRITES THROUGH THE CHAIN — BATCH 47
+   * ══════════════════════════════════════════════════════════════════
+   * Until this batch the number typed here went straight into a column
+   * and left no trace of WHERE IT CAME FROM. Six months later "why is
+   * this workspace on 8192?" had three candidate answers — the plan, a
+   * promise in a sales call, a typo — and no way to tell them apart, so
+   * nobody dared move it.
+   *
+   * ⭐ SO THE TYPED NUMBER IS RESOLVED AGAINST THE PLAN IT IS BEING SET
+   * ALONGSIDE. Equal to the plan's ceiling → the override is DELETED, so
+   * the workspace follows the tier and a later upgrade actually lifts
+   * it. Different → an override row is written with this operator's name
+   * and this reason, and the chain can say which layer the number came
+   * from.
+   *
+   * ⚠️ THE COLUMN IS STILL WRITTEN, IN THE SAME TRANSACTION. It is what
+   * the upload path enforces; the chain describes it. Splitting them
+   * across two statements is how they drift, so they do not.
+   *
+   * ⚠️ AND IT IS RESOLVED AGAINST THE *NEW* TIER, not the current one.
+   * An operator moving basic → advanced and leaving the ceiling at the
+   * advanced default is expressing "give them the plan's number", and
+   * pinning an override there would freeze them out of the next change.
+   */
+  const storageDef = configDefinition("limits.storage_mb");
+  const planStorage = storageDef.planDefaults[planTier] ?? storageDef.globalDefault;
+  const storageIsPlanDefault = storageLimitMb === planStorage;
+  const storageFlagKey = configOverrideKeyFor("limits.storage_mb");
+
   await withPlatformScope(
     `Platform console: set plan/limits on tenant ${tenantId} — ${reason.slice(0, 80)}`,
     async (tx) => {
@@ -571,6 +1064,43 @@ export async function setPlanAndLimits(
         .update(tenants)
         .set({ planTier, seatLimit, storageLimitMb, updatedAt: new Date() })
         .where(eq(tenants.id, tenantId));
+
+      if (storageIsPlanDefault) {
+        await tx
+          .delete(platformTenantFlags)
+          .where(
+            and(
+              eq(platformTenantFlags.tenantId, tenantId),
+              eq(platformTenantFlags.flagKey, storageFlagKey),
+            ),
+          );
+        return;
+      }
+
+      await tx
+        .insert(platformTenantFlags)
+        .values({
+          tenantId,
+          flagKey: storageFlagKey,
+          enabled: true,
+          value: { value: storageLimitMb },
+          reason,
+          expiresAt: null,
+          setByStaffId: operator.staff.id,
+          setByEmail: operator.email,
+        })
+        .onConflictDoUpdate({
+          target: [platformTenantFlags.tenantId, platformTenantFlags.flagKey],
+          set: {
+            enabled: true,
+            value: { value: storageLimitMb },
+            reason,
+            expiresAt: null,
+            setByStaffId: operator.staff.id,
+            setByEmail: operator.email,
+            updatedAt: new Date(),
+          },
+        });
     },
   );
 
@@ -601,6 +1131,15 @@ export async function setPlanAndLimits(
        */
       subscriptionIsAuthority: current.data.subscriptionIsAuthority,
       subscriptionStatus: current.data.subscriptionStatus,
+      /*
+       * ⭐ WHICH LAYER THE STORAGE CEILING NOW COMES FROM. A reviewer
+       * reading this row later can tell "they were given the advanced
+       * plan's ceiling" from "somebody pinned this workspace to 8192",
+       * which is exactly the question the old audit row could not
+       * answer.
+       */
+      storageLayer: storageIsPlanDefault ? "plan" : "tenant",
+      storagePlanDefaultMb: planStorage,
     },
   });
 

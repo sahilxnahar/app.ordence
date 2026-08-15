@@ -81,6 +81,21 @@ export default async function AttentionPage({
           </Link>
           .
         </p>
+        {/*
+          ⚠️ LINKED FROM HERE BECAUSE `app/platform/layout.tsx` — where
+          the console's nav lives — is not owned by this batch. A screen
+          nobody can reach is the eighth complete engine this codebase
+          has shipped with no caller, which is why
+          `scripts/check-reachability.mjs` exists. One link now; the nav
+          entry belongs in whichever batch owns the layout.
+        */}
+        <p className="mt-1 text-sm text-muted-foreground">
+          Limits, messages and windows resolve through the{" "}
+          <Link href="/platform/config" className="underline">
+            configuration chain
+          </Link>
+          .
+        </p>
       </div>
 
       <Suspense fallback={<div className="h-64 animate-pulse rounded-md bg-muted" />}>

@@ -49,6 +49,7 @@ import {
   tierLabel,
   type LimitPressure,
 } from "@/lib/platform/configuration";
+import { configDefinition } from "@/lib/platform/config-chain";
 import type { PlanTier } from "@/db/schema/core";
 
 type SetResult =
@@ -105,6 +106,14 @@ export function PlanLimitsEditor({
   const preview = previewTierChange(planTier, tier, {
     subscriptionGrantsAccess,
   });
+
+  // The chain's plan layer for the tier CURRENTLY SELECTED in the form,
+  // not the tier the workspace is on — the two differ exactly while
+  // somebody is moving a customer between plans, which is when the
+  // question "is this number the plan's or ours?" actually matters.
+  const storageDef = configDefinition("limits.storage_mb");
+  const planStorageMb = Number(storageDef.planDefaults[tier] ?? storageDef.globalDefault);
+  const storageIsPlanDefault = nextStorage === planStorageMb;
 
   function save() {
     startTransition(async () => {
@@ -217,7 +226,7 @@ export function PlanLimitsEditor({
                 value={storageLimit}
                 onChange={(e) => setStorageLimit(e.target.value)}
                 aria-invalid={storageOverCommit}
-                aria-describedby="storage-limit-help"
+                aria-describedby="storage-limit-help storage-limit-chain"
               />
               <p
                 id="storage-limit-help"
@@ -230,6 +239,41 @@ export function PlanLimitsEditor({
                 {storageOverCommit
                   ? `${storage.used} MB is already stored. Nothing is deleted — new uploads are blocked.`
                   : `${storage.used} MB stored right now.`}
+              </p>
+              {/*
+                ══════════════════════════════════════════════════════
+                ⭐⭐ THIS FIELD USED TO BE A NUMBER WITH NO PROVENANCE
+                ══════════════════════════════════════════════════════
+                It wrote straight into a column. Six months later "why is
+                this workspace on 8192?" had three candidate answers —
+                the plan, a promise in a sales call, a typo — and no way
+                to tell them apart, so nobody dared move it.
+
+                ⭐ NOW IT SAYS WHICH LAYER THE TYPED NUMBER WILL LAND IN,
+                BEFORE THE SAVE. Equal to the chosen plan's ceiling, and
+                the workspace override is REMOVED so a later upgrade
+                actually lifts them; different, and an override is
+                written with this operator's name against it.
+
+                ⚠️ COMPUTED FROM THE SAME PURE CATALOGUE THE SERVER
+                RESOLVES WITH. A second copy of the plan ceilings in this
+                file would disagree with the server on the first price
+                change, and the field would be lying with confidence.
+              */}
+              <p id="storage-limit-chain" className="text-xs text-muted-foreground">
+                {storageIsPlanDefault ? (
+                  <>
+                    This is the <strong>{tierLabel(tier)}</strong> plan&rsquo;s ceiling.
+                    Saving removes any workspace override, so a later plan change moves them
+                    with it.
+                  </>
+                ) : (
+                  <>
+                    <strong>Above or below the {tierLabel(tier)} plan&rsquo;s{" "}
+                    {planStorageMb} MB.</strong> Saving writes a workspace override in your
+                    name, and this workspace stops following the plan&rsquo;s ceiling.
+                  </>
+                )}
               </p>
             </div>
           </div>

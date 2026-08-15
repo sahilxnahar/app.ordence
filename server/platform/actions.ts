@@ -32,14 +32,20 @@
  */
 
 import { revalidatePath } from "next/cache";
-import { requestSuspend } from "./control-actions";
+import { requestSuspend, requestTermination } from "./control-actions";
 import { suspendTenantSchema } from "@/lib/platform/schemas";
 
 import {
   listTenants as listTenantsImpl,
   getTenantDetail as getTenantDetailImpl,
   reactivateTenant as reactivateTenantImpl,
+  cancelTenantTermination as cancelTenantTerminationImpl,
+  exportOffboardingSnapshot as exportOffboardingSnapshotImpl,
 } from "./tenants";
+import {
+  previewConfigOverride as previewConfigOverrideImpl,
+  setConfigOverride as setConfigOverrideImpl,
+} from "./configuration";
 import {
   startImpersonation as startImpersonationImpl,
   stopImpersonation as stopImpersonationImpl,
@@ -64,7 +70,7 @@ import {
   updateUserStatus as updateUserStatusImpl,
   updateUserRole as updateUserRoleImpl,
 } from "./users";
-import { requirePlatformAdmin, recordStepUp } from "./guard";
+import { requirePlatformAdmin, recordStepUp, PlatformAccessError } from "./guard";
 
 /* ------------------------------------------------------------------ */
 /* TENANTS                                                             */
@@ -129,6 +135,77 @@ export async function suspendTenantAction(input: unknown) {
 export async function reactivateTenantAction(input: unknown) {
   const result = await reactivateTenantImpl(input);
   if (result.ok) revalidatePath("/platform");
+  return result;
+}
+
+/* ------------------------------------------------------------------ */
+/* OFFBOARDING — BATCH 46                                              */
+/* ------------------------------------------------------------------ */
+
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * ⚠️ THREE ENDPOINTS, AND NOT A FOURTH
+ * ══════════════════════════════════════════════════════════════════════
+ * Request, cancel, export. `scheduleTenantTermination` is deliberately
+ * NOT wrapped here: it is reachable only through the approval executor
+ * registered in `control-actions.ts`, exactly as `suspendTenant` is.
+ * Publishing it as a server action would put a stable action id on the
+ * function that locks a workspace and starts the clock, reachable by
+ * POST from any page, with the approval queue routed around entirely.
+ *
+ * ⭐ NOTE THE ASYMMETRY BETWEEN THE THREE. Requesting a termination goes
+ * through a queue and a second owner. Cancelling one is a single call
+ * with a reason. That is not an oversight — stopping a destructive
+ * action must always be cheaper than starting one, or the controls
+ * protect the wrong direction.
+ */
+export async function requestTerminationAction(input: unknown) {
+  const result = await requestTermination(input);
+  if (result.ok) {
+    revalidatePath("/platform");
+    revalidatePath("/platform/approvals");
+  }
+  return result;
+}
+
+export async function cancelTerminationAction(input: unknown) {
+  const result = await cancelTenantTerminationImpl(input);
+  if (result.ok) {
+    revalidatePath("/platform");
+    revalidatePath("/platform/tenants");
+  }
+  return result;
+}
+
+export async function exportOffboardingSnapshotAction(input: unknown) {
+  return exportOffboardingSnapshotImpl(input);
+}
+
+/* ------------------------------------------------------------------ */
+/* THE CONFIGURATION CHAIN — BATCH 47                                  */
+/* ------------------------------------------------------------------ */
+
+/**
+ * ⚠️ THE PREVIEW IS A SEPARATE ENDPOINT FROM THE SAVE, and it is
+ * gated separately too — `tenants:read` to see what a change would do,
+ * `tenants:configure` to make it. A support engineer who can read a
+ * workspace should be able to answer "what would happen if we raised
+ * their ceiling?" without holding the capability to raise it.
+ */
+export async function previewConfigOverrideAction(input: unknown) {
+  return previewConfigOverrideImpl(input);
+}
+
+export async function setConfigOverrideAction(input: unknown) {
+  const result = await setConfigOverrideImpl(input);
+  if (result.ok && typeof input === "object" && input !== null) {
+    const tenantId = (input as { tenantId?: string }).tenantId;
+    if (tenantId) {
+      revalidatePath(`/platform/tenants/${tenantId}/configure`);
+      revalidatePath(`/platform/tenants/${tenantId}`);
+    }
+    revalidatePath("/platform/config");
+  }
   return result;
 }
 
@@ -226,16 +303,65 @@ export async function listPlatformStaffAction() {
   return listPlatformStaffImpl();
 }
 
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * ⭐ THE ONE THING THESE TWO WRAPPERS DECIDE, AND WHY IT IS NOT A CHECK
+ * ══════════════════════════════════════════════════════════════════════
+ * `staff:manage` is on `STEP_UP_CAPABILITIES`, so `requireCapability()`
+ * inside the implementation THROWS `PlatformAccessError("step_up_
+ * required")` when the operator has not proved a second factor recently.
+ * Next.js redacts a thrown server-action error in production and hands
+ * the browser a digest — so the operator, whose problem has a
+ * thirty-second remedy sitting on the same screen, is told "an
+ * unexpected error occurred" and reloads the page, losing the reason
+ * they had just typed.
+ *
+ * ⚠️ THIS IS NOT THE WRAPPER DOING AUTHORISATION. The check already ran,
+ * in `grantPlatformStaff`/`revokePlatformStaff`, and it already refused.
+ * Nothing here can make a refusal into a permission — the only thing
+ * that changes is whether the refusal arrives as data the form can
+ * render. Same argument, same shape, as `capabilityOrStepUp` in
+ * `server/platform/configuration.ts`, which is where this pattern was
+ * settled.
+ *
+ * ⚠️ AND ONLY THAT ONE CODE IS CAUGHT. `capability_denied` and
+ * `not_platform_staff` keep throwing, deliberately: `PlatformAccessError`
+ * exists to make those two indistinguishable from each other, and
+ * turning either into a specific message here would hand a prober the
+ * difference between "you are not staff" and "your grade is too low".
+ */
+async function stepUpAware<T>(
+  run: () => Promise<T>,
+): Promise<T | { ok: false; error: string; needsStepUp: true }> {
+  try {
+    return await run();
+  } catch (error) {
+    if (error instanceof PlatformAccessError && error.code === "step_up_required") {
+      return {
+        ok: false,
+        error:
+          "Confirm your identity before changing who holds platform access, then try again.",
+        needsStepUp: true,
+      };
+    }
+    throw error;
+  }
+}
+
 export async function grantPlatformStaffAction(input: unknown) {
-  const result = await grantPlatformStaffImpl(input);
-  if (result.ok) revalidatePath("/platform/staff");
-  return result;
+  return stepUpAware(async () => {
+    const result = await grantPlatformStaffImpl(input);
+    if (result.ok) revalidatePath("/platform/staff");
+    return result;
+  });
 }
 
 export async function revokePlatformStaffAction(input: unknown) {
-  const result = await revokePlatformStaffImpl(input);
-  if (result.ok) revalidatePath("/platform/staff");
-  return result;
+  return stepUpAware(async () => {
+    const result = await revokePlatformStaffImpl(input);
+    if (result.ok) revalidatePath("/platform/staff");
+    return result;
+  });
 }
 
 /* ------------------------------------------------------------------ */

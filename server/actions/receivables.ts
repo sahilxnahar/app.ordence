@@ -78,17 +78,38 @@ import { withTenant } from "@/db";
 import { postDemandNotice, postBookingReceipt } from "@/server/accounting/post-sales";
 import { demandNotices, receipts } from "@/db/schema/receivables";
 import { bookings } from "@/db/schema/sales";
-import { and, eq } from "drizzle-orm";
+import { and, eq, inArray, isNull, lte, sql } from "drizzle-orm";
 import {
   dunningPolicies,
   receivablePolicies,
 } from "@/db/schema/receivables";
+import {
+  journalEntries,
+  ledgers,
+  salesPostingAccounts,
+  transactions,
+} from "@/db/schema/accounting";
 import { ageReceivables } from "@/lib/receivables/ageing";
 import { assessInterestRate } from "@/lib/receivables/interest";
 import { ladderSchedule } from "@/lib/receivables/dunning";
 import { renderDemandNotice, normaliseLanguage } from "@/lib/receivables/templates";
 import { toCivilDay } from "@/lib/gst/constants";
 import { serializeAmount } from "@/lib/billing/money";
+import { toMinorUnits } from "@/lib/validators/accounting";
+import {
+  serializeReconciliation,
+  type SerializedReconciliation,
+} from "@/lib/reconciliation/gate";
+import {
+  AGEING_BREACH_CAUSES,
+  COLLECTION_ROLES,
+  LEDGER_TRANSACTION_STATUSES,
+  RECEIVABLE_CONTROL_ROLE,
+  STATEMENT_BREACH_CAUSES,
+  reconcileAgeingReport,
+  reconcileStatement,
+  type ControlAccountFacts,
+} from "@/lib/reconciliation/receivables";
 import type { ActionResult } from "@/lib/validators/crm";
 
 const FEATURE = "sales.receivables" as const;
@@ -110,6 +131,183 @@ async function letterhead(): Promise<{ developerName: string; contactLine: strin
 
 function today(): string {
   return toCivilDay(new Date());
+}
+
+/* ================================================================== */
+/* ⭐⭐⭐ THE LEDGER SIDE OF THE RECONCILIATION GATE                    */
+/* ================================================================== */
+
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴🔴🔴 WHY THIS QUERY EXISTS INSTEAD OF REUSING THE TRIAL BALANCE
+ * ══════════════════════════════════════════════════════════════════════
+ * `lib/reconciliation/gate.ts` states the rule this whole batch is
+ * built on: the gate compares two INDEPENDENT computations. A check that
+ * reads the same query twice proves only that the query is deterministic.
+ *
+ * The report side of every check below is built from `demand_notices`
+ * and `receipts` by `lib/receivables/*`. This function is the OTHER
+ * side, and it touches none of those tables — it starts from the
+ * tenant's own posting-role map, walks to the ledger, and sums
+ * `journal_entries`. The two paths share no row, no table and no
+ * function. That is what makes agreement between them evidence rather
+ * than tautology.
+ *
+ * ⚠️ AND IT IS DELIBERATELY NOT A CALL INTO `server/actions/
+ * accounting.ts`. `ledgerBalances` there is private to a `"use server"`
+ * module; reaching for it would mean exporting it, which would publish
+ * a new RPC endpoint, and one action file calling another's exports
+ * couples two public surfaces so that a permission change on one
+ * silently re-guards the other.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * ⚠️ THE JOIN SHAPE IS COPIED FROM `ledgerBalances` ON PURPOSE
+ * ══════════════════════════════════════════════════════════════════════
+ * The date and status predicates sit in the JOIN's `ON` clause AND the
+ * `transactions.id IS NOT NULL` guard sits inside the `CASE`. Both
+ * halves are load-bearing and each one alone is a different bug:
+ *
+ *   • move the predicates to `WHERE` and the LEFT JOIN collapses to an
+ *     inner join — a control account with no activity in range vanishes
+ *     entirely, `configured` still reads true, and the gate reconciles
+ *     the ageing total against a row that was silently dropped;
+ *   • leave them only in `ON` and they filter NOTHING, because
+ *     `journal_entries.amount` is still populated for an out-of-range
+ *     entry whose transaction join did not match. Out-of-period money is
+ *     counted anyway, silently, and the gate then fires on healthy data.
+ *
+ * ⚠️ THE DATE IS `transaction_date`, NOT `created_at`. A back-dated
+ * journal posted in June for a March demand belongs in March. Filtering
+ * on the insert timestamp would put the ledger side on a different
+ * calendar from the document side and produce a phantom breach every
+ * time somebody posted a backlog.
+ */
+type RoleLedgerTotals = {
+  /**
+   * 🔴 STRUCTURAL. True when at least one of the requested roles is
+   * mapped to a live ledger — NEVER inferred from an amount. See design
+   * point ④ in `lib/reconciliation/gate.ts`: `0n === 0n` on an unmapped
+   * role is an unconfigured workspace, not a passing check.
+   */
+  configured: boolean;
+  /** "Sundry debtors (1210)", for the breach sentence. */
+  label: string;
+  /** Debit-positive: `debits − credits`. The ledger convention. */
+  balanceMinor: bigint;
+  /** Debits alone. Used for "money that arrived" — see the statement. */
+  debitMinor: bigint;
+};
+
+async function roleLedgerTotals(
+  tenantId: string,
+  roles: readonly string[],
+  window: {
+    /** Inclusive. Cumulative from inception to this civil day. */
+    to: string;
+    /**
+     * When set, only entries carrying this booking as their counterparty.
+     * `writePropertyPosting` stamps every property leg with
+     * `counterparty_type = 'booking'` and the booking id, which is the
+     * only per-buyer slice of the ledger that exists — there is no
+     * project column on a journal entry.
+     */
+    bookingId?: string;
+  },
+): Promise<RoleLedgerTotals> {
+  const entryFilters = [
+    eq(journalEntries.ledgerId, ledgers.id),
+    eq(journalEntries.tenantId, tenantId),
+    ...(window.bookingId
+      ? [
+          eq(journalEntries.counterpartyType, "booking"),
+          eq(journalEntries.counterpartyId, window.bookingId),
+        ]
+      : []),
+  ];
+
+  const inPeriod = and(
+    eq(transactions.id, journalEntries.transactionId),
+    // Tenant-scoped on every join. A missing predicate here is the exact
+    // bug that reconciles one workspace's report against another's books.
+    eq(transactions.tenantId, tenantId),
+    inArray(transactions.status, [...LEDGER_TRANSACTION_STATUSES]),
+    lte(transactions.transactionDate, window.to),
+  );
+
+  const rows = await withTenant(tenantId, (tx) =>
+    tx
+      .select({
+        code: ledgers.code,
+        name: ledgers.name,
+        totalDebit: sql<string>`COALESCE(SUM(CASE WHEN ${transactions.id} IS NOT NULL AND ${journalEntries.entryType} = 'debit'  THEN ${journalEntries.amount} ELSE 0 END), 0)::text`,
+        totalCredit: sql<string>`COALESCE(SUM(CASE WHEN ${transactions.id} IS NOT NULL AND ${journalEntries.entryType} = 'credit' THEN ${journalEntries.amount} ELSE 0 END), 0)::text`,
+      })
+      .from(salesPostingAccounts)
+      /**
+       * ⚠️ AN INNER JOIN TO `ledgers`, AND THE `deleted_at` FILTER IS THE
+       * REASON. A ledger soft-deleted while a posting role still points
+       * at it is a real state — the FK is `ON DELETE RESTRICT`, which
+       * stops a hard delete and says nothing about a soft one. Treating
+       * that role as UNMAPPED is the safe reading: the workspace is then
+       * "unconfigured", the figures show with an explicit note that
+       * nothing checked them, and nobody is handed a green tick earned
+       * by summing a deleted account's entries.
+       */
+      .innerJoin(
+        ledgers,
+        and(
+          eq(ledgers.id, salesPostingAccounts.ledgerId),
+          eq(ledgers.tenantId, tenantId),
+          isNull(ledgers.deletedAt),
+        ),
+      )
+      .leftJoin(journalEntries, and(...entryFilters))
+      .leftJoin(transactions, inPeriod)
+      .where(
+        and(
+          eq(salesPostingAccounts.tenantId, tenantId),
+          inArray(salesPostingAccounts.role, [...roles]),
+        ),
+      )
+      .groupBy(ledgers.id, ledgers.code, ledgers.name),
+  );
+
+  let debitMinor = 0n;
+  let creditMinor = 0n;
+  for (const r of rows) {
+    /**
+     * ⚠️ THE DECIMAL STRING GOES STRAIGHT TO BIGINT PAISE, with no
+     * `Number` in the middle. Postgres already returns an exact
+     * 2-decimal string; a float round trip can only lose information,
+     * and a gate whose own arithmetic drifts would report breaches it
+     * created itself. Money is never a float here.
+     */
+    debitMinor += toMinorUnits(r.totalDebit);
+    creditMinor += toMinorUnits(r.totalCredit);
+  }
+
+  return {
+    configured: rows.length > 0,
+    label:
+      rows.length === 0
+        ? "not mapped"
+        : rows.map((r) => `${r.name} (${r.code})`).join(", "),
+    balanceMinor: debitMinor - creditMinor,
+    debitMinor,
+  };
+}
+
+/** The receivables control account, as the gate needs it. */
+async function receivableControl(
+  tenantId: string,
+  window: { to: string; bookingId?: string },
+): Promise<ControlAccountFacts> {
+  const totals = await roleLedgerTotals(tenantId, [RECEIVABLE_CONTROL_ROLE], window);
+  return {
+    configured: totals.configured,
+    label: totals.label,
+    balanceMinor: totals.balanceMinor,
+  };
 }
 
 /* ================================================================== */
@@ -1066,21 +1264,69 @@ export async function getDunningHistory(
 /* REPORTS                                                             */
 /* ================================================================== */
 
-export async function getAgeingReport(input: unknown): Promise<
-  ActionResult<{
-    asOf: string;
-    totals: Record<string, string>;
-    totalMinor: string;
-    overdueMinor: string;
-    interestMinor: string;
-    byProject: Array<{ key: string; label: string; overdueMinor: string; demandCount: number }>;
-    byBuyer: Array<{ key: string; label: string; overdueMinor: string; oldestDaysOverdue: number }>;
-  }>
-> {
+/**
+ * ⭐ THE FIGURES, AS A SEPARATE OBJECT — AND THAT SHAPE IS THE POINT.
+ *
+ * 🔴 `figures` IS OPTIONAL AND IS **ABSENT** WHEN THE REPORT DOES NOT
+ * RECONCILE. Not zeroed, not flagged, not accompanied by a boolean the
+ * page is trusted to check — absent. The alternative shape, where every
+ * total is always present alongside `reconciliation.renderable`, puts
+ * the whole rule in the hands of one `if` on one screen, and the second
+ * screen to consume this action is the one that forgets it. Making the
+ * numbers structurally unavailable means a page that ignores the gate
+ * does not render a wrong figure, it fails to compile.
+ */
+export type AgeingFigures = {
+  totals: Record<string, string>;
+  totalMinor: string;
+  overdueMinor: string;
+  interestMinor: string;
+  byProject: Array<{ key: string; label: string; overdueMinor: string; demandCount: number }>;
+  byBuyer: Array<{ key: string; label: string; overdueMinor: string; oldestDaysOverdue: number }>;
+};
+
+export type AgeingReportResult = {
+  asOf: string;
+  /** 🔴 Absent when `reconciliation.renderable` is false. See above. */
+  figures?: AgeingFigures;
+  reconciliation: SerializedReconciliation;
+  /** Named causes for the breach. Empty unless there is one. */
+  breachCauses: string[];
+};
+
+/**
+ * ⭐⭐⭐ THE AGEING REPORT, OR THE REASON THERE ISN'T ONE.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 IT RECONCILES TO THE BOOKS BEFORE IT WILL PRODUCE A NUMBER
+ * ══════════════════════════════════════════════════════════════════════
+ * This report's total is the number a developer reads before deciding
+ * who to chase, and it is the number a lender asks for before releasing
+ * a construction tranche. It has never, until now, been checked against
+ * anything. It is built from `demand_notices`; the books are built from
+ * `journal_entries`; and three routine operations — withdrawing a
+ * demand, superseding a demand, bouncing a receipt — move one without
+ * moving the other. See `lib/reconciliation/receivables.ts` for the
+ * identity and for the full list.
+ *
+ * ⚠️ THE GATE ALWAYS RUNS ON THE **WORKSPACE-WIDE** TOTAL, even when the
+ * caller asked for one project. A journal entry carries a booking as its
+ * counterparty and has no project column, so a per-project slice of the
+ * control account does not exist to compare against. Reconciling the
+ * whole set and then displaying a slice of it is the honest option — you
+ * cannot publish an extract of a book that does not foot — and the
+ * alternative, skipping the check whenever a filter is applied, would
+ * switch the gate off at exactly the moment somebody is drilling into a
+ * figure they already distrust.
+ */
+export async function getAgeingReport(
+  input: unknown,
+): Promise<ActionResult<AgeingReportResult>> {
   try {
     const data = ageingQuerySchema.parse(input);
     const ctx = await requirePermission("receivables:read");
     const asOf = data.asOf ?? today();
+    const filtered = Boolean(data.projectId || data.bookingId);
 
     const rows = await ageingRows(ctx.tenant.id, {
       projectId: data.projectId,
@@ -1089,28 +1335,78 @@ export async function getAgeingReport(input: unknown): Promise<
     });
     const report = ageReceivables(rows, asOf);
 
+    /**
+     * ⚠️ THE UNFILTERED SET IS LOADED AGAIN ONLY WHEN A FILTER WAS
+     * APPLIED. On the common path — the receivables screen, no filter —
+     * the rows already in hand ARE the workspace-wide set, and querying
+     * them a second time would cost a scan to obtain a value we hold.
+     * It would also not make the check any more independent: the
+     * independence comes from the LEDGER side, which shares no table
+     * with either copy.
+     */
+    const workspaceTotalMinor = filtered
+      ? ageReceivables(await ageingRows(ctx.tenant.id, { asOf }), asOf).totalMinor
+      : report.totalMinor;
+
+    const control = await receivableControl(ctx.tenant.id, { to: asOf });
+
+    const verdict = reconcileAgeingReport({
+      ageingTotalMinor: workspaceTotalMinor,
+      control,
+      showsInterest: true,
+      asOf,
+      today: today(),
+    });
+
+    const reconciliation = serializeReconciliation(verdict);
+
+    /**
+     * 🔴 NO FIGURES AT ALL WHEN IT DOES NOT RECONCILE — not the ageing
+     * total, not the buckets, and not the control-account balance
+     * either, even though that one is a fact read straight off the
+     * ledger. `lib/accounting/cash-flow.ts` settled this argument for
+     * the cash flow statement and the reasoning transfers unchanged: a
+     * true figure printed under a heading that has just failed its own
+     * consistency check is read as verified, because the reader takes
+     * the heading to mean somebody checked. The gap itself IS returned,
+     * inside the reconciliation, because it is a diagnostic rather than
+     * a report figure — "your books are out by ₹14,500.00" sends
+     * somebody to the right transaction where "reconciliation failed"
+     * sends them to support.
+     */
+    if (!verdict.renderable) {
+      return {
+        ok: true,
+        data: { asOf: report.asOf, reconciliation, breachCauses: [...AGEING_BREACH_CAUSES] },
+      };
+    }
+
     return {
       ok: true,
       data: {
         asOf: report.asOf,
-        totals: Object.fromEntries(
-          Object.entries(report.totals).map(([k, v]) => [k, serializeAmount(v)]),
-        ),
-        totalMinor: serializeAmount(report.totalMinor),
-        overdueMinor: serializeAmount(report.overdueMinor),
-        interestMinor: serializeAmount(report.interestMinor),
-        byProject: report.byProject.map((g) => ({
-          key: g.key,
-          label: g.label,
-          overdueMinor: serializeAmount(g.overdueMinor),
-          demandCount: g.demandCount,
-        })),
-        byBuyer: report.byBuyer.map((g) => ({
-          key: g.key,
-          label: g.label,
-          overdueMinor: serializeAmount(g.overdueMinor),
-          oldestDaysOverdue: g.oldestDaysOverdue,
-        })),
+        reconciliation,
+        breachCauses: [],
+        figures: {
+          totals: Object.fromEntries(
+            Object.entries(report.totals).map(([k, v]) => [k, serializeAmount(v)]),
+          ),
+          totalMinor: serializeAmount(report.totalMinor),
+          overdueMinor: serializeAmount(report.overdueMinor),
+          interestMinor: serializeAmount(report.interestMinor),
+          byProject: report.byProject.map((g) => ({
+            key: g.key,
+            label: g.label,
+            overdueMinor: serializeAmount(g.overdueMinor),
+            demandCount: g.demandCount,
+          })),
+          byBuyer: report.byBuyer.map((g) => ({
+            key: g.key,
+            label: g.label,
+            overdueMinor: serializeAmount(g.overdueMinor),
+            oldestDaysOverdue: g.oldestDaysOverdue,
+          })),
+        },
       },
     };
   } catch (err) {
@@ -1125,18 +1421,63 @@ export async function getAgeingReport(input: unknown): Promise<
  * that a split can be EXPLAINED, and the narrative carries the sentence
  * recorded when each payment was applied.
  */
-export async function getStatementOfAccount(input: unknown): Promise<
-  ActionResult<{
-    asOf: string;
-    demandedMinor: string;
-    receivedMinor: string;
-    outstandingMinor: string;
-    interestOutstandingMinor: string;
-    creditMinor: string;
-    payableTodayMinor: string;
-    narrative: string[];
-  }>
-> {
+export type StatementFigures = {
+  demandedMinor: string;
+  receivedMinor: string;
+  outstandingMinor: string;
+  interestOutstandingMinor: string;
+  creditMinor: string;
+  payableTodayMinor: string;
+  /**
+   * 🔴 THE NARRATIVE LIVES INSIDE `figures`, NOT BESIDE IT. Every line of
+   * it quotes a rupee amount — "Received ₹2,00,000, outstanding ₹50,000".
+   * Returning the prose while withholding the totals would hand over
+   * exactly the numbers the gate refused, in sentences, and prose reads
+   * as MORE authoritative than a table because somebody appears to have
+   * written it.
+   */
+  narrative: string[];
+};
+
+export type StatementResult = {
+  asOf: string;
+  /** 🔴 Absent when the statement does not reconcile. See `AgeingFigures`. */
+  figures?: StatementFigures;
+  reconciliation: SerializedReconciliation;
+  breachCauses: string[];
+};
+
+/**
+ * ⭐ THE DOCUMENT A BUYER IS HANDED.
+ *
+ * Returns the narrative as well as the figures: the whole requirement is
+ * that a split can be EXPLAINED, and the narrative carries the sentence
+ * recorded when each payment was applied.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴🔴 AND IT NOW RECONCILES TO THIS BUYER'S LINE IN THE BOOKS FIRST
+ * ══════════════════════════════════════════════════════════════════════
+ * `buildStatement` already refuses to produce a statement that does not
+ * foot — but that check is INTERNAL. It proves the document is
+ * consistent with itself, which a document assembled from one table
+ * always is. It cannot see that the developer's own ledger says this
+ * buyer paid ₹2 lakh less, because a cheque bounced and no reversing
+ * entry was ever posted.
+ *
+ * ⚠️ THIS IS THE HIGHEST-COST DOCUMENT IN THE STACK TO GET WRONG. It
+ * leaves the building. A buyer keeps it, and produces it in a consumer
+ * forum when the developer's ledger says something different — at which
+ * point the developer is explaining, under oath, why their own two
+ * systems disagreed and nobody noticed.
+ *
+ * Two checks rather than one combined figure, because "still owes" and
+ * "has paid" fail for different reasons, are fixed by different people,
+ * and a single combined check is satisfied by an error in each direction
+ * cancelling out — the one case where BOTH halves are wrong.
+ */
+export async function getStatementOfAccount(
+  input: unknown,
+): Promise<ActionResult<StatementResult>> {
   try {
     const data = statementQuerySchema.parse(input);
     const ctx = await requirePermission("receivables:read");
@@ -1149,19 +1490,67 @@ export async function getStatementOfAccount(input: unknown): Promise<
     });
     if (!statement) return receivablesFail("That booking does not exist.");
 
+    /**
+     * ⚠️ BOTH LEDGER FIGURES ARE SLICED BY THE BOOKING COUNTERPARTY, which
+     * `writePropertyPosting` stamps onto every leg it writes. It is the
+     * only per-buyer view of the ledger that exists, and it is the reason
+     * a per-booking check is possible at all while a per-project one is
+     * not.
+     */
+    const [control, collections] = await Promise.all([
+      receivableControl(ctx.tenant.id, { to: asOf, bookingId: data.bookingId }),
+      roleLedgerTotals(ctx.tenant.id, COLLECTION_ROLES, {
+        to: asOf,
+        bookingId: data.bookingId,
+      }),
+    ]);
+
+    const verdict = reconcileStatement({
+      outstandingMinor: statement.totals.outstandingMinor,
+      receivedMinor: statement.totals.receivedMinor,
+      tdsCreditMinor: statement.totals.tdsCreditMinor,
+      control,
+      // Debits only. A refund CREDITS the bank against the same booking
+      // and is a separate fact on a separate date — netting it off would
+      // make a refunded booking look like one that never paid. See
+      // `lib/reconciliation/receivables.ts`.
+      collectionDebitsMinor: collections.debitMinor,
+      collectionsConfigured: collections.configured,
+      collectionsLabel: collections.label,
+    });
+
+    const reconciliation = serializeReconciliation(verdict);
+
+    // 🔴 No totals and no narrative when it does not reconcile. See
+    // `StatementFigures` for why the prose goes with the numbers.
+    if (!verdict.renderable) {
+      return {
+        ok: true,
+        data: {
+          asOf: statement.asOf,
+          reconciliation,
+          breachCauses: [...STATEMENT_BREACH_CAUSES],
+        },
+      };
+    }
+
     return {
       ok: true,
       data: {
         asOf: statement.asOf,
-        demandedMinor: serializeAmount(statement.totals.demandedMinor),
-        receivedMinor: serializeAmount(statement.totals.receivedMinor),
-        outstandingMinor: serializeAmount(statement.totals.outstandingMinor),
-        interestOutstandingMinor: serializeAmount(
-          statement.totals.interestOutstandingMinor,
-        ),
-        creditMinor: serializeAmount(statement.totals.creditMinor),
-        payableTodayMinor: serializeAmount(statement.totals.payableTodayMinor),
-        narrative: statement.narrative,
+        reconciliation,
+        breachCauses: [],
+        figures: {
+          demandedMinor: serializeAmount(statement.totals.demandedMinor),
+          receivedMinor: serializeAmount(statement.totals.receivedMinor),
+          outstandingMinor: serializeAmount(statement.totals.outstandingMinor),
+          interestOutstandingMinor: serializeAmount(
+            statement.totals.interestOutstandingMinor,
+          ),
+          creditMinor: serializeAmount(statement.totals.creditMinor),
+          payableTodayMinor: serializeAmount(statement.totals.payableTodayMinor),
+          narrative: statement.narrative,
+        },
       },
     };
   } catch (err) {

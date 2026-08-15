@@ -173,9 +173,15 @@ describe("check:links", () => {
    * ⭐ THE BUDGET IS THE BACKLOG. It went 12 → 11 with `/sales`, and
    * 11 → 10 here. The mechanism gets deleted when it reaches zero.
    */
-  it("no longer lists /orders/:id, and the budget fell to 10", () => {
+  /**
+   * ⚠️ ASSERTS A CEILING, NOT AN EXACT VALUE, and the difference matters.
+   * The first version pinned `toBe(10)` and failed the moment two more
+   * dead links were fixed in the same run. A test that breaks when the
+   * backlog SHRINKS trains people to edit the test rather than read it.
+   */
+  it("no longer lists /orders/:id, and the budget only goes down", () => {
     expect(GATE).not.toContain('["/orders/:id"');
     const m = /const KNOWN_DEAD_MAX = (\d+);/.exec(GATE);
-    expect(Number(m![1])).toBe(10);
+    expect(Number(m![1])).toBeLessThanOrEqual(10);
   });
 });

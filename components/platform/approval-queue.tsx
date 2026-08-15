@@ -45,6 +45,30 @@ export type ApprovalRowView = {
   decisionNote: string | null;
   executionError: string | null;
   proposedAfter: Record<string, unknown> | null;
+  /**
+   * ══════════════════════════════════════════════════════════════════
+   * ⭐⭐ HOW MANY OTHER PEOPLE COULD DECIDE THIS ONE. PER ROW.
+   * ══════════════════════════════════════════════════════════════════
+   * This replaced a single `soleOperator` prop for the whole list, which
+   * was wrong in two ways at once and produced a screen that predicted a
+   * different verdict from the server.
+   *
+   * ⚠️ IT IGNORED GRADE. Every policy needs `owner`. The flag came from
+   * a count of every usable grant, so the first support engineer to be
+   * given access flipped it to false for the only owner — who was then
+   * told "there is another operator who can approve it" about somebody
+   * `mayApprove` refuses on grade. Nothing could be approved by anyone.
+   *
+   * ⚠️ IT IGNORED THE REQUESTER. "Am I the only one?" has a different
+   * answer for a row I raised than for a row somebody else raised, and
+   * one flag for the list cannot carry both.
+   *
+   * 🔴 `listPending` computes this server-side from the row's own
+   * required grade, and `decideApproval` recomputes it the same way at
+   * decision time. The number this screen reasons about is the number
+   * the server will act on.
+   */
+  otherEligibleApprovers: number;
 };
 
 type Result = { ok: true; data: { note: string } } | { ok: false; error: string };
@@ -53,13 +77,11 @@ export function ApprovalQueue({
   rows,
   myStaffId,
   myGrade,
-  soleOperator,
   onDecide,
 }: {
   rows: ApprovalRowView[];
   myStaffId: string;
   myGrade: "support" | "engineer" | "owner";
-  soleOperator: boolean;
   onDecide: (input: {
     requestId: string;
     approve: boolean;
@@ -99,11 +121,20 @@ export function ApprovalQueue({
         </h2>
 
         {pendingRows.length === 0 ? (
+          /*
+            🔴 THIS COPY LISTED FOUR THINGS THE QUEUE CATCHES. It catches
+            one. "Deletion, plan changes and paid overrides" all still
+            execute the moment they are clicked, and telling an operator
+            otherwise on the screen whose job is to be honest about
+            approvals is how somebody stops checking. The list of what is
+            and is not held now lives below, generated from the running
+            registry, and this sentence stops trying to duplicate it.
+          */
           <p className="text-sm text-muted-foreground">
-            Nothing is waiting. That is the normal state — the queue only
-            catches suspension, deletion, plan changes and paid overrides, so
-            a busy queue means something unusual is happening rather than that
-            the tool is working.
+            Nothing is waiting. That is the normal state — only the actions
+            marked Enforced below reach this queue, so a busy queue means
+            something unusual is happening rather than that the tool is
+            working.
           </p>
         ) : null}
 
@@ -118,7 +149,10 @@ export function ApprovalQueue({
             status: row.status,
             expiresAt: new Date(row.expiresAt),
             now,
-            soleOperator,
+            // ⚠️ THE ROW'S OWN ANSWER. See the field's comment: a
+            // list-wide flag was both grade-blind and requester-blind,
+            // and the screen and the server disagreed because of it.
+            soleOperator: row.otherEligibleApprovers === 0,
           });
 
           const mine = row.requestedBy === myStaffId;

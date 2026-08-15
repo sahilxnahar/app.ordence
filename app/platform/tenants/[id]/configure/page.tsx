@@ -35,17 +35,26 @@ import { Suspense } from "react";
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { getPlatformOperator } from "@/server/platform/guard";
-import { getWorkspaceConfiguration } from "@/server/platform/configuration";
+import {
+  getWorkspaceConfiguration,
+  getConfigChain,
+  listConfigVersions,
+} from "@/server/platform/configuration";
 import {
   setModuleEntitlementAction,
   setPlanAndLimitsAction,
   setTenantIndustryAction,
 } from "@/server/platform/config-actions";
-import { recordStepUpAction } from "@/server/platform/actions";
+import {
+  recordStepUpAction,
+  previewConfigOverrideAction,
+  setConfigOverrideAction,
+} from "@/server/platform/actions";
 import { previewEntitlementChange } from "@/server/platform/control-actions";
 import { ModuleSwitchboard } from "@/components/platform/module-switchboard";
 import { PlanLimitsEditor } from "@/components/platform/plan-limits-editor";
 import { IndustryPicker } from "@/components/platform/industry-picker";
+import { ConfigChainPanel } from "@/components/platform/config-chain-panel";
 import { Badge } from "@/components/ui/badge";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 
@@ -84,6 +93,15 @@ async function ConfigureBody({ tenantId }: { tenantId: string }) {
   const canOverride = can("entitlements:override");
   const canConfigure = can("tenants:configure");
 
+  // ⚠️ Both are already-guarded reads (`tenants:read`), and the history
+  // one fails SOFT: it returns `readable: false` rather than throwing,
+  // so an unreadable audit log costs this page a panel rather than the
+  // whole screen. The panel says "unknown", not "empty".
+  const [chainResult, versionsResult] = await Promise.all([
+    getConfigChain(config.tenantId),
+    listConfigVersions(config.tenantId),
+  ]);
+
   return (
     <div className="space-y-6">
       <div className="flex flex-wrap items-start gap-3">
@@ -121,6 +139,7 @@ async function ConfigureBody({ tenantId }: { tenantId: string }) {
           <TabsTrigger value="modules">Modules</TabsTrigger>
           <TabsTrigger value="plan">Plan &amp; limits</TabsTrigger>
           <TabsTrigger value="industry">Industry</TabsTrigger>
+          <TabsTrigger value="chain">Configuration</TabsTrigger>
         </TabsList>
 
         <TabsContent value="modules">
@@ -168,6 +187,47 @@ async function ConfigureBody({ tenantId }: { tenantId: string }) {
             onApply={setTenantIndustryAction}
             onStepUp={recordStepUpAction}
           />
+        </TabsContent>
+
+        <TabsContent value="chain">
+          {chainResult.ok ? (
+            <ConfigChainPanel
+              tenantId={config.tenantId}
+              tenantName={config.name}
+              planTier={chainResult.data.planTier}
+              storageColumnMb={chainResult.data.storageColumnMb}
+              storageColumnDisagrees={chainResult.data.storageColumnDisagrees}
+              rows={chainResult.data.resolutions.map((r) => ({
+                key: r.key,
+                label: r.definition.label,
+                description: r.definition.description,
+                type: r.definition.type,
+                consumers: r.definition.consumers,
+                layers: r.layers.map((l) => ({
+                  layer: l.layer,
+                  label: l.label,
+                  present: l.present,
+                  value: l.value,
+                  formatted: l.formatted,
+                  reason: l.reason ?? null,
+                  setByEmail: l.setByEmail ?? null,
+                  setAt: l.setAt ?? null,
+                })),
+                effective: r.effective,
+                effectiveFormatted: r.effectiveFormatted,
+                effectiveLayer: r.effectiveLayer,
+                invalidOverride: r.invalidOverride,
+              }))}
+              versions={versionsResult.ok ? versionsResult.data.versions : []}
+              versionsReadable={versionsResult.ok ? versionsResult.data.readable : false}
+              canWrite={canConfigure}
+              onPreview={previewConfigOverrideAction}
+              onSave={setConfigOverrideAction}
+              onStepUp={recordStepUpAction}
+            />
+          ) : (
+            <p className="text-sm text-destructive">{chainResult.error}</p>
+          )}
         </TabsContent>
       </Tabs>
     </div>

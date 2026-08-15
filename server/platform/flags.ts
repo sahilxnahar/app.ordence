@@ -195,7 +195,30 @@ export async function isTenantFlagEnabled(
   }
 }
 
-/** Every live flag for a tenant, for the tenant's own app to read once. */
+/**
+ * Every live flag for a tenant, for the tenant's own app to read once.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * ⚠️ THIS SET IS NOT ONLY FLAGS, AND CALLERS MUST NOT TREAT IT AS ONE
+ * ══════════════════════════════════════════════════════════════════════
+ * `platform_tenant_flags` now carries FOUR namespaces, all of them rows
+ * in this one table under one RLS policy:
+ *
+ *   (no prefix)     the catalogue in `lib/platform/flags-catalog.ts`
+ *   `entitlement:`  module overrides — `lib/entitlements/overrides.ts`
+ *   `config:`       the configuration chain — `lib/platform/config-chain.ts`
+ *   `lifecycle:`    the offboarding record — `server/platform/tenants.ts`
+ *
+ * The namespaces are kept apart so a beta flag can never collide with a
+ * feature key and become a free upgrade nobody invoices, and so a
+ * scheduled deletion is never mistaken for a toggle.
+ *
+ * ⚠️ SO `getTenantFlags()` RETURNS PREFIXED KEYS TOO — it always has;
+ * `applyEntitlementChange` relies on `entitlement:` appearing here. Every
+ * caller asks `has(someKnownKey)`, which is safe. What is NOT safe is
+ * iterating this set and treating each member as a catalogue flag: use
+ * `isFlagKey()` first, exactly as `isTenantFlagEnabled` above does.
+ */
 export async function getTenantFlags(tenantId: string): Promise<Set<string>> {
   const now = new Date();
   try {

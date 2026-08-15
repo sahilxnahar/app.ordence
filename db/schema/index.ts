@@ -377,6 +377,20 @@ export * from "./patterns";
 export * from "./payroll";
 
 /**
+ * ⭐⭐⭐ LEAVE AND STAFF ATTENDANCE — Batch 59 (SQL 0082).
+ *
+ * ⚠️ EXPORTED AFTER `./payroll`, WHICH IT REFERENCES. `leave_ledger`,
+ * `leave_requests` and `staff_attendance` all hang off `employees`, and
+ * the dependency runs one way only.
+ *
+ * 🔴 `staff_attendance` IS THE TABLE THE PAYROLL RUN BOARD HAS BEEN
+ * PASSING `attendance: []` IN PLACE OF. It is NOT `site_attendance` from
+ * `./labour` — that one records punches for contract labour who are on
+ * nobody's payroll.
+ */
+export * from "./leave";
+
+/**
  * ⭐⭐⭐ THE MONTHLY RETURN — Batch 16 (SQL 0077).
  *
  * 🔴 One row per GSTIN per period, not per tenant. A business registered

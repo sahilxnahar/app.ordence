@@ -260,6 +260,52 @@ export const PERMISSION_CATALOG = {
   "payroll.approve": "Sign off a computed payroll run, freezing its payslips",
   "payroll.post": "Post an approved payroll run to the ledger",
 
+  /* ── ⭐⭐ LEAVE AND STAFF ATTENDANCE — v1.46.0, batch 59 ─────────
+   *
+   * ══════════════════════════════════════════════════════════════════
+   * 🔴 FIVE KEYS, AND THE FIRST SEPARATION IS FROM PAYROLL ITSELF
+   * ══════════════════════════════════════════════════════════════════
+   * The obvious shortcut is to gate leave on `payroll.manage`. It is
+   * wrong, and it is wrong in the direction that leaks: a line manager
+   * approving three days off would then hold the key that reads
+   * everybody's salary. Leave administration is done by people all over
+   * an organisation; payroll is done by two of them.
+   *
+   * ⚠️ `leave.read` IS THE WHOLE REGISTER AND `leave.request` IS ONLY
+   * YOUR OWN. That split is not politeness. Who took sick leave, how
+   * often, and in which weeks is an inference about somebody's health;
+   * who took four weeks in December is an inference about their
+   * religion. A key that publishes that to the whole workspace by
+   * default is the same mistake `payroll.read` deliberately avoids.
+   *
+   * 🔴 `leave.approve` IS SEPARATE FROM `leave.manage` ON PURPOSE, and
+   * it is the same argument as `payroll.approve` versus
+   * `payroll.manage`. `leave.manage` can write an `adjustment` entry
+   * that credits days out of nothing. If it also approved requests, one
+   * person could grant themselves a balance and then approve their own
+   * absence against it, and both halves would look entirely ordinary in
+   * the ledger.
+   *
+   * ⭐ AND `attendance.record` IS SEPARATE AGAIN, because an attendance
+   * row is the only thing in this module that moves MONEY. Marking
+   * somebody absent is a decision to dock their pay; configuring a leave
+   * type is not. Folding the two together means everybody who can rename
+   * "Casual Leave" can also make somebody's December salary short.
+   *
+   * ⚠️ NONE OF THESE IS IN A DEFAULT ROLE TEMPLATE EXCEPT
+   * `leave.request`, which every employee needs to apply for their own
+   * leave and which shows them nobody else's balance.
+   */
+  "leave.read":
+    "See the whole leave register — everybody's balances, applications and absences",
+  "leave.request":
+    "Apply for your own leave and see your own balance. Shows nobody else's.",
+  "leave.approve": "Approve or reject somebody else's leave application",
+  "leave.manage":
+    "Configure leave types, leave years and holidays, run the accrual, and adjust a balance",
+  "attendance.record":
+    "Record staff attendance, which is what creates loss of pay on a payslip",
+
   /* ── ⭐ CONTRACTING — v0.69.0 ────────────────────────────────────
    *
    * ══════════════════════════════════════════════════════════════════
@@ -1267,6 +1313,10 @@ export const ROLE_TEMPLATES: Readonly<Record<SystemRole, RoleTemplate>> = {
       "workflows:read", "workflows:runs_read", "workflows:approve",
       "views:read", "views:create", "views:update", "views:delete",
       "views:read_all_records",
+      // ⭐ v1.46.0. Counsel is an employee too, and applying for your own
+      // leave is not a legal-execution right. `leave.read` — the whole
+      // register — is deliberately not here.
+      "leave.request",
     ],
   },
 
@@ -1289,6 +1339,18 @@ export const ROLE_TEMPLATES: Readonly<Record<SystemRole, RoleTemplate>> = {
        * who did it.
        */
       "documents:create",
+      /**
+       * ⭐ v1.46.0 — APPLYING FOR YOUR OWN LEAVE IS ORDINARY DAILY WORK.
+       *
+       * ⚠️ AND IT IS THE ONLY LEAVE KEY HERE. `leave.read` is the whole
+       * register — everybody's balances, everybody's sick days — and a
+       * key a `member` holds by default publishes an inference about
+       * every colleague's health to the sales floor, which is the same
+       * argument that keeps `payroll.read` out of this template.
+       * `leave.request` shows the holder their own balance and nobody
+       * else's, enforced in the WHERE clause rather than by a key.
+       */
+      "leave.request",
       // ⚠️ THE SALES EXECUTIVE. Reads inventory, works the pipeline,
       // holds a unit, creates and advances a booking.
       //

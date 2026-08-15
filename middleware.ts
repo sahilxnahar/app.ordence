@@ -143,6 +143,22 @@ const isPublicRoute = createRouteMatcher([
   // Same authentication model — bearer secret, no Clerk cookie.
   "/api/workers/ai-monitors",
   // ══════════════════════════════════════════════════════════════
+  // ⭐⭐ THE ISOLATION CANARY (Batch 45)
+  //
+  // A scheduler has no browser cookie. Without this entry the canary
+  // is an orphan: present, correct, and refused with 401 on every run
+  // — which is the one failure mode this repository has shipped most
+  // often, and the one a probe can least afford, because a probe that
+  // never runs is indistinguishable from a probe that always passes.
+  //
+  // "Public" does NOT mean unauthenticated. `/api/cron/canary`
+  // compares every request against CRON_SECRET in constant time and
+  // returns 503 when no secret is configured, so an unauthenticated
+  // caller never learns a tenant id. Read the header of
+  // app/api/cron/canary/route.ts.
+  // ══════════════════════════════════════════════════════════════
+  "/api/cron/canary",
+  // ══════════════════════════════════════════════════════════════
   // TELEMETRY INGEST (Phase 19)
   //
   // Deliberately public. Core Web Vitals fire during and before page

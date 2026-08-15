@@ -28,10 +28,39 @@ import { Ban, KeyRound, Play, RotateCcw } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Select } from "@/components/ui/select";
 import { Label } from "@/components/ui/label";
+import { Textarea } from "@/components/ui/textarea";
 import { DangerDialog } from "./danger-dialog";
 import { MIN_JUSTIFICATION_LENGTH } from "@/lib/platform/impersonation-policy";
 
 type ActionResult = { ok: true } | { ok: false; error: string };
+
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴🔴 A QUEUED ACTION IS NOT A COMPLETED ACTION, AND `ok: true` MEANT
+ *      BOTH
+ * ══════════════════════════════════════════════════════════════════════
+ * `requestSuspend` does not suspend anything. It writes a row to the
+ * approval queue and returns `ok: true` with a sentence that begins
+ * "Nothing has happened yet." The server got this exactly right.
+ *
+ * ⚠️ THIS COMPONENT THREW THE SENTENCE AWAY AND SAID "Done." The
+ * operator closed the dialog believing a live workspace was locked, and
+ * the two ways that goes are both bad: they tell the customer it is done
+ * and it is not, or they walk away from an incident they think they have
+ * contained. Nothing on the screen contradicted them — the tenant row
+ * still said `active`, which reads as a stale page.
+ *
+ * 🔴 THE TYPE WAS THE ROOT CAUSE. `ActionResult` was `{ ok: true }` with
+ * no payload, so the note was not merely ignored — it was unreachable.
+ * A shape that cannot express "accepted but not performed" forces every
+ * caller to guess, and the cheerful guess is the one that gets written.
+ *
+ * ⭐ SO THE QUEUED PATH HAS ITS OWN RETURN TYPE. `data.note` is required,
+ * not optional, which means a future caller cannot forget to render it.
+ */
+type QueuedResult =
+  | { ok: true; data: { note: string } }
+  | { ok: false; error: string };
 
 export type TenantActionsProps = {
   tenantId: string;
@@ -43,11 +72,14 @@ export type TenantActionsProps = {
   canSuspend: boolean;
   canImpersonate: boolean;
   canBreakGlass: boolean;
+  /** ⚠️ Returns a QUEUE RECEIPT, not a completed suspension. */
   onSuspend: (input: {
     tenantId: string;
     confirmSlug: string;
     reason: string;
-  }) => Promise<ActionResult>;
+    /** ⭐ The tenant layer of `suspension.customer_message`. See below. */
+    customerMessage?: string;
+  }) => Promise<QueuedResult>;
   onReactivate: (input: { tenantId: string; reason: string }) => Promise<ActionResult>;
   onImpersonate: (input: {
     tenantId: string;
@@ -82,6 +114,18 @@ export function TenantActions(props: TenantActionsProps) {
   // because most sessions are about a broken workspace and pre-selecting
   // somebody would put a name in the evidence that nobody chose.
   const [subjectUserId, setSubjectUserId] = useState("");
+  /**
+   * ⭐⭐ THE RECEIPT STAYS ON THE SCREEN AFTER THE DIALOG CLOSES.
+   *
+   * ⚠️ A TOAST IS THE WRONG CARRIER FOR "nothing happened yet". It
+   * fades in four seconds, it is easy to miss behind a dialog closing,
+   * and what the operator is left looking at is a tenant row that still
+   * says `active` — which reads as a stale page rather than as the
+   * truth. The sentence has to outlive the animation.
+   */
+  const [queuedNote, setQueuedNote] = useState<string | null>(null);
+  /** Blank means "use the plan's sentence", never "use an empty one". */
+  const [customerMessage, setCustomerMessage] = useState("");
 
   const suspended = props.status === "suspended";
 
@@ -92,6 +136,41 @@ export function TenantActions(props: TenantActionsProps) {
       if (result.ok) {
         setOpen(null);
         toast.success("Done.");
+        router.refresh();
+      } else {
+        setError(result.error);
+      }
+    });
+  }
+
+  /**
+   * 🔴 A SEPARATE RUNNER FOR THE QUEUED PATH, DELIBERATELY NOT A FLAG ON
+   * `run`.
+   *
+   * ⚠️ `run` SAYS "Done." AND THAT IS CORRECT FOR REACTIVATE AND FOR
+   * IMPERSONATE — both of those really have happened by the time they
+   * return. The bug was one function serving both meanings, so the
+   * cheerful wording leaked onto the one action that had not happened.
+   * Two runners means the compiler decides which sentence you get,
+   * rather than whoever edits this file next.
+   *
+   * ⭐ THE SERVER'S OWN WORDS ARE SHOWN VERBATIM. `queueForApproval`
+   * writes the note — what is waiting, why it is held, and when the
+   * request expires — and a summary written here would drift from it and
+   * would drop the expiry, which is the part that matters at 2am.
+   */
+  function runQueued(fn: () => Promise<QueuedResult>) {
+    setError(null);
+    setQueuedNote(null);
+    startTransition(async () => {
+      const result = await fn();
+      if (result.ok) {
+        setOpen(null);
+        setQueuedNote(result.data.note);
+        // ⚠️ NOT `toast.success`. Green with a tick is read as "it
+        // worked", and the whole point of this branch is that it has not
+        // worked yet. `toast.info` plus the persistent block below.
+        toast.info(result.data.note);
         router.refresh();
       } else {
         setError(result.error);
@@ -168,16 +247,87 @@ export function TenantActions(props: TenantActionsProps) {
         actionLabel="Send for approval"
         pending={pending}
         error={error}
+        /*
+          ══════════════════════════════════════════════════════════════
+          ⭐⭐ THE CUSTOMER-FACING MESSAGE, COLLECTED AT LAST — BATCH 47
+          ══════════════════════════════════════════════════════════════
+          `suspendTenantSchema` has carried `customerMessage` since
+          v0.14.0 and NO SCREEN HAS EVER COLLECTED IT. The field existed,
+          the plumbing existed all the way to the audit row, and the only
+          way to populate it was to call the server action by hand.
+
+          ⭐ It now writes the tenant layer of
+          `suspension.customer_message` in the configuration chain —
+          typed, capped, versioned, with this operator's name on it — and
+          leaving it blank falls back to the plan's sentence rather than
+          to nothing.
+
+          ⚠️ AND THE HONEST LINE UNDERNEATH, because the alternative is
+          an operator carefully writing a sentence for a customer who
+          will never see it: the lockout banner is still a fixed string
+          in `lib/billing/access-state.ts`.
+        */
+        extra={
+          <div className="space-y-1">
+            <Label htmlFor="suspend-customer-message">
+              What should this customer be told? (optional)
+            </Label>
+            <Textarea
+              id="suspend-customer-message"
+              rows={2}
+              maxLength={500}
+              value={customerMessage}
+              onChange={(e) => setCustomerMessage(e.target.value)}
+              placeholder="Left blank, they get their plan's standard suspension sentence."
+            />
+            <p className="text-xs text-muted-foreground">
+              Stored as this workspace&rsquo;s override for{" "}
+              <code className="font-mono">suspension.customer_message</code>, separately from
+              the internal reason below. ⚠️ It is not rendered to them yet — the lockout
+              banner is a fixed sentence in <code className="font-mono">access-state.ts</code>.
+            </p>
+          </div>
+        }
         onConfirm={({ confirmValue, justification }) =>
-          run(() =>
+          runQueued(() =>
             props.onSuspend({
               tenantId: props.tenantId,
               confirmSlug: confirmValue,
               reason: justification,
+              // Omitted entirely when blank: the schema treats an empty
+              // string as absent, and sending "" would overwrite a
+              // message somebody wrote earlier with nothing.
+              ...(customerMessage.trim() ? { customerMessage: customerMessage.trim() } : {}),
             }),
           )
         }
       />
+
+      {/*
+        ⭐⭐ THE ONE THING THE OPERATOR MUST NOT MISREAD, RENDERED AS A
+        BLOCK RATHER THAN A NOTIFICATION.
+        ⚠️ IT SAYS "still running" IN ITS OWN WORDS AS WELL AS QUOTING
+        THE SERVER, because the server's sentence explains the queue and
+        this one answers the question actually in the operator's head:
+        "is the customer locked out right now?" No.
+      */}
+      {queuedNote ? (
+        <div
+          className="w-full rounded border border-amber-400 p-3 text-xs"
+          role="status"
+          data-testid="suspend-queued-notice"
+        >
+          <span className="font-medium">
+            {props.tenantName} has NOT been suspended. It is still running
+            normally and its users are unaffected.{" "}
+          </span>
+          {queuedNote}{" "}
+          <a className="underline" href="/platform/approvals">
+            Open the approvals queue
+          </a>
+          .
+        </div>
+      ) : null}
 
       {/* ---- REACTIVATE ---- */}
       <DangerDialog

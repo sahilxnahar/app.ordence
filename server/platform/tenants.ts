@@ -41,7 +41,18 @@ import {
   reactivateTenantSchema,
   type PlatformResult,
 } from "@/lib/platform/schemas";
+import {
+  configOverrideKeyFor,
+  resolveConfig,
+  type TenantOverrideInput,
+} from "@/lib/platform/config-chain";
+import {
+  exportTenantData,
+  serialiseExport,
+  exportFileName,
+} from "@/server/backup/export";
 import { requireCapability, recordPlatformAudit, type PlatformOperator } from "./guard";
+import { getConfigChain } from "./configuration";
 import type { PlanTier } from "@/db/schema/core";
 
 /* ------------------------------------------------------------------ */
@@ -115,6 +126,22 @@ export type TenantDetail = TenantSummary & {
     expiresAt: string | null;
     setByEmail: string | null;
   }>;
+  /**
+   * ⭐ The effective customer-facing suspension message, resolved global
+   * → plan → workspace override.
+   *
+   * ⚠️ `layer` MATTERS ON THE SCREEN. "This is the global default" and
+   * "somebody wrote this for this customer" are different facts, and an
+   * operator about to lock a workspace out needs to know which one they
+   * are looking at.
+   */
+  suspensionMessage: {
+    effective: string;
+    layer: "global" | "plan" | "tenant";
+    setByEmail: string | null;
+  };
+  /** Null unless a termination has been scheduled or cancelled. */
+  offboarding: OffboardingView | null;
   recentImpersonations: Array<{
     id: string;
     actorEmail: string;
@@ -706,13 +733,70 @@ export async function getTenantDetail(
               cancellationReason: subscription.cancellationReason,
             }
           : null,
-        flags: flagRows.map((f) => ({
-          key: f.flagKey,
-          enabled: f.enabled,
-          reason: f.reason,
-          expiresAt: f.expiresAt?.toISOString() ?? null,
-          setByEmail: f.setByEmail,
-        })),
+        /*
+         * ⚠️ FILTERED, BECAUSE THIS TABLE NOW HOLDS FOUR NAMESPACES.
+         * `platform_tenant_flags` carries flags, `entitlement:`
+         * overrides, `config:` values and the `lifecycle:` offboarding
+         * record. Listing all four under a heading that says "feature
+         * flags" would put a scheduled deletion in a list of beta
+         * toggles, where nobody would read it as one.
+         */
+        flags: flagRows
+          .filter((f) => !f.flagKey.includes(":"))
+          .map((f) => ({
+            key: f.flagKey,
+            enabled: f.enabled,
+            reason: f.reason,
+            expiresAt: f.expiresAt?.toISOString() ?? null,
+            setByEmail: f.setByEmail,
+          })),
+        /*
+         * ⭐ WHAT THIS CUSTOMER WOULD BE TOLD, resolved through the
+         * chain from the rows already in hand. See the caveat carried
+         * on the field itself: the customer's own banner does not read
+         * this yet.
+         */
+        suspensionMessage: (() => {
+          const row = flagRows.find(
+            (f) => f.flagKey === configOverrideKeyFor("suspension.customer_message"),
+          );
+          const override: TenantOverrideInput = row
+            ? {
+                present: true,
+                raw: (row.value as { value?: unknown } | null)?.value,
+                reason: row.reason,
+                setByEmail: row.setByEmail,
+                setAt: row.updatedAt.toISOString(),
+              }
+            : { present: false };
+          const resolved = resolveConfig({
+            key: "suspension.customer_message",
+            // ⚠️ The cached column, not the subscription's tier. This
+            // page reports `tenants.plan_tier` throughout and a message
+            // resolved against a different tier than the plan shown
+            // beside it would be unexplainable on a support call.
+            planTier: tenant.planTier,
+            override,
+          });
+          return {
+            effective: String(resolved.effective),
+            layer: resolved.effectiveLayer,
+            setByEmail: row?.setByEmail ?? null,
+          };
+        })(),
+        /*
+         * ⭐ Derived from the same rows, at the same `now` the health
+         * verdict used. A countdown computed from a second clock read
+         * can disagree with the badge beside it by a minute, which is
+         * exactly the sort of thing that makes an operator distrust the
+         * screen at the moment they most need to believe it.
+         */
+        offboarding: (() => {
+          const row = flagRows.find((f) => f.flagKey === OFFBOARDING_FLAG_KEY);
+          const value = row?.value as unknown as Partial<OffboardingRecord> | null;
+          if (!value || typeof value.scheduledFor !== "string") return null;
+          return offboardingView(value as OffboardingRecord, now);
+        })(),
         recentImpersonations: sessionRows.map((s) => ({
           id: s.id,
           actorEmail: s.actorEmail,
@@ -806,11 +890,83 @@ export async function suspendTenant(input: unknown): Promise<PlatformResult<void
         .set({ status: "suspended", updatedAt: new Date() })
         .where(eq(tenants.id, tenantId));
 
+      /*
+       * ══════════════════════════════════════════════════════════════
+       * ⭐⭐ THE CUSTOMER-FACING MESSAGE NOW HAS SOMEWHERE TO LIVE
+       * ══════════════════════════════════════════════════════════════
+       * `customerMessage` has been collected by `suspendTenantSchema`
+       * since v0.14.0 and its only destination was an audit metadata
+       * blob. Nothing could read it back, so a field the operator was
+       * asked to write carefully was, in effect, a comment.
+       *
+       * ⭐ It is now the TENANT LAYER of `suspension.customer_message`
+       * in the configuration chain: typed, capped at 500 characters,
+       * carrying this operator's name, resolvable against a global
+       * default and a plan-level one, and readable by
+       * `getTenantDetail` so the console can show exactly what is on
+       * file for this customer.
+       *
+       * ⚠️ AND HERE IS WHAT IT STILL DOES NOT DO, SAID PLAINLY: the
+       * lockout banner the customer actually sees is built by
+       * `evaluateAccess()` in `lib/billing/access-state.ts`, which
+       * returns a fixed sentence and does not consult this value. That
+       * file is not owned by this batch. The console says so next to
+       * the field rather than letting an operator believe they have
+       * written something the customer will read.
+       */
+      if (customerMessage) {
+        await db
+          .insert(platformTenantFlags)
+          .values({
+            tenantId,
+            flagKey: configOverrideKeyFor("suspension.customer_message"),
+            enabled: true,
+            value: { value: customerMessage },
+            reason,
+            expiresAt: null,
+            setByStaffId: operator.staff.id,
+            setByEmail: operator.email,
+          })
+          .onConflictDoUpdate({
+            target: [platformTenantFlags.tenantId, platformTenantFlags.flagKey],
+            set: {
+              enabled: true,
+              value: { value: customerMessage },
+              reason,
+              setByStaffId: operator.staff.id,
+              setByEmail: operator.email,
+              updatedAt: new Date(),
+            },
+          });
+      }
+
       return { previousStatus: tenant.status, slug: tenant.slug } as const;
     },
   );
 
   if (outcome.error) return { ok: false, error: outcome.error };
+
+  /*
+   * ⚠️ A SECOND AUDIT ROW, WITH THE RESOURCE TYPE THE CONFIGURATION
+   * HISTORY READS. `listConfigVersions` selects on
+   * `tenant_config_override`; folding this change into the suspension
+   * row would leave the customer's message history with a hole in it
+   * exactly where the message was most likely to have been set.
+   */
+  if (customerMessage) {
+    await recordPlatformAudit({
+      operator,
+      tenantId,
+      action: "config_change",
+      resourceType: "tenant_config_override",
+      resourceId: "suspension.customer_message",
+      oldValue: null,
+      newValue: { effective: customerMessage, layer: "tenant" },
+      severity: "warning",
+      reason: `Set while suspending this workspace: ${reason}`,
+      metadata: { configKey: "suspension.customer_message", setDuring: "suspension" },
+    });
+  }
 
   // ⭐ The audit row is where `previousStatus` lives, and `audit_logs` is
   // append-only, so the record of what to restore cannot be edited by
@@ -889,6 +1045,661 @@ export async function reactivateTenant(input: unknown): Promise<PlatformResult<v
   });
 
   return { ok: true, data: undefined };
+}
+
+/* ================================================================== */
+/* ⭐⭐⭐ OFFBOARDING — BATCH 46                                        */
+/* ================================================================== */
+
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴🔴 WHAT THIS IS, AND — MORE IMPORTANTLY — WHAT IT IS NOT
+ * ══════════════════════════════════════════════════════════════════════
+ * Ordence could suspend a customer and could not offboard one. There was
+ * no code path anywhere in this repository that terminated a workspace,
+ * which `lib/platform/roles.ts` already says out loud in the comment that
+ * put provisioning on the step-up list. So a customer who left stayed a
+ * customer forever, in every report, on a public hostname.
+ *
+ * ⚠️ THIS BATCH DOES NOT DELETE ANYTHING. Read that again before
+ * changing anything below. What it builds is the RECORD and the WINDOW:
+ *
+ *   ① a request that carries three separate confirmations,
+ *   ② a SECOND APPROVER, through the queue that already exists,
+ *   ③ a scheduled moment, written down, some hours in the future,
+ *   ④ a cancel that actually works and restores the previous status,
+ *   ⑤ an export the departing customer is entitled to,
+ *   ⑥ a retention countdown after the scheduled moment.
+ *
+ * 🔴 NOTHING RUNS STEP ⑦. There is no cron, no queue worker and no
+ * scheduled function in this build that reads a due termination and
+ * deletes a workspace. `offboardingView()` returns `executorPresent:
+ * false` and the panel says so in as many words, because a screen that
+ * shows a countdown to a deletion that will never happen is worse than
+ * no screen: an operator tells a customer "your data is gone on the
+ * 14th", and it is not.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * ⭐ WHY THE 24-HOUR WINDOW IS THE WHOLE POINT
+ * ══════════════════════════════════════════════════════════════════════
+ * Three confirmations and a second approver still add up to a button
+ * that deletes a company the moment it is pressed. Every one of those
+ * controls is spent BEFORE the irreversible thing happens; none of them
+ * helps the person who realises, forty minutes later, that they had two
+ * tabs open. The window is the only control that is still available
+ * AFTER the mistake has been made, and it is the reason this is
+ * survivable at all.
+ *
+ * ⚠️ SO THE WINDOW IS DATA, NOT A CONSTANT. It comes from the
+ * configuration chain (`offboarding.cancel_window_hours`), it is frozen
+ * onto the record at approval time so a later config change cannot
+ * shorten a window a customer was already promised, and the cancel
+ * checks the frozen value.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * ⚠️ WHERE THE RECORD LIVES, AND WHY IT IS NOT A NEW TABLE
+ * ══════════════════════════════════════════════════════════════════════
+ * This batch ships with NO MIGRATION, so a `tenant_offboarding` table
+ * was not available. The record goes into `platform_tenant_flags` under
+ * a fourth namespace, `lifecycle:` — the same table, the same RLS
+ * policy, and the same reasoning `lib/entitlements/overrides.ts` gives
+ * for keeping `entitlement:` apart from the flag catalogue.
+ *
+ * That table is a genuinely reasonable home: it is platform-owned,
+ * tenant-scoped, has a jsonb payload column, carries the acting staff
+ * member and their email, and the customer's own connection may READ it
+ * — which, for the record of their own deletion, they are entitled to.
+ *
+ * ⚠️ WHAT IT COSTS, STATED PLAINLY: there is one row per workspace, so
+ * the record is CURRENT-STATE ONLY. The history of a cancelled-then-
+ * re-requested termination lives in `audit_logs`, not here. A dedicated
+ * table with one row per attempt would be better and is the first thing
+ * to build when a migration is available.
+ */
+
+/** The fourth namespace in `platform_tenant_flags`. */
+const OFFBOARDING_FLAG_KEY = "lifecycle:offboarding";
+
+/**
+ * ⚠️ TYPED AS A LITERAL, NOT AS A FREE STRING, and re-checked on the
+ * server. This is the second of the three confirmations and its whole
+ * job is to be impossible to produce by muscle memory.
+ */
+const TERMINATION_PHRASE = "DELETE ALL DATA";
+
+export type OffboardingRecord = {
+  /** `scheduled` while it is live; `cancelled` once it has been pulled. */
+  stage: "scheduled" | "cancelled";
+  requestedByEmail: string;
+  requestedAt: string;
+  approvedByEmail: string;
+  approvedAt: string;
+  /** ⭐ The moment the deletion becomes due. Frozen at approval. */
+  scheduledFor: string;
+  /** Frozen too, so the screen can say "you had 24 hours" truthfully. */
+  cancelWindowHours: number;
+  retentionDays: number;
+  retentionEndsAt: string;
+  /** Restored verbatim on cancel. Never assumed to be `active`. */
+  previousStatus: "pending" | "active" | "suspended" | "archived";
+  reason: string;
+  exportedAt?: string;
+  exportRowCount?: number;
+  exportFailures?: string[];
+  cancelledAt?: string;
+  cancelledByEmail?: string;
+  cancelReason?: string;
+};
+
+export type OffboardingView = OffboardingRecord & {
+  /**
+   * Derived from the clock, never stored. A stored phase is a phase that
+   * is wrong exactly when somebody is looking at it — the same argument
+   * `isTenantFlagEnabled` makes about applying expiry in the query
+   * rather than in a job.
+   */
+  phase: "cancel_window" | "retention" | "deletion_due" | "cancelled";
+  minutesLeftInWindow: number;
+  daysLeftInRetention: number;
+  cancellable: boolean;
+  /**
+   * 🔴 FALSE, AND HARDCODED FALSE ON PURPOSE. Nothing in this build
+   * executes a due termination. Flip this only in the commit that adds
+   * the executor, and the panel's wording changes with it.
+   */
+  executorPresent: false;
+};
+
+/** Pure. `now` is an argument so the screen and a test can agree. */
+export function offboardingView(record: OffboardingRecord, now: Date): OffboardingView {
+  const scheduledFor = new Date(record.scheduledFor).getTime();
+  const retentionEndsAt = new Date(record.retentionEndsAt).getTime();
+  const t = now.getTime();
+
+  const phase: OffboardingView["phase"] =
+    record.stage === "cancelled"
+      ? "cancelled"
+      : t < scheduledFor
+        ? "cancel_window"
+        : t < retentionEndsAt
+          ? "retention"
+          : "deletion_due";
+
+  return {
+    ...record,
+    phase,
+    minutesLeftInWindow: Math.max(0, Math.ceil((scheduledFor - t) / 60_000)),
+    daysLeftInRetention: Math.max(0, Math.ceil((retentionEndsAt - t) / 86_400_000)),
+    /*
+     * ⚠️ CANCELLABLE FOR AS LONG AS NOTHING HAS BEEN DELETED, WHICH IS
+     * FOREVER IN THIS BUILD — and that is not the window being fake, it
+     * is the window being honest about the executor that does not exist.
+     * Refusing to cancel a "missed" termination would strand a workspace
+     * in `pending_deletion` with no way back and nothing to have caused
+     * it. The phase above still says whether the window was missed, and
+     * the audit row records that it was cancelled late.
+     */
+    cancellable: record.stage === "scheduled",
+    executorPresent: false,
+  };
+}
+
+/** Read the current record, or null. Never throws — a broken row reads as absent. */
+async function readOffboarding(tenantId: string): Promise<OffboardingRecord | null> {
+  try {
+    const [row] = await withPlatformScope(
+      `Platform console: read offboarding record for tenant ${tenantId}`,
+      async (db) =>
+        db
+          .select()
+          .from(platformTenantFlags)
+          .where(
+            and(
+              eq(platformTenantFlags.tenantId, tenantId),
+              eq(platformTenantFlags.flagKey, OFFBOARDING_FLAG_KEY),
+            ),
+          )
+          .limit(1),
+    );
+    if (!row) return null;
+    const value = row.value as unknown as Partial<OffboardingRecord> | null;
+    if (!value || typeof value.scheduledFor !== "string") return null;
+    return value as OffboardingRecord;
+  } catch (err) {
+    console.error("[platform] offboarding record could not be read", { tenantId, err });
+    return null;
+  }
+}
+
+async function writeOffboarding(args: {
+  tenantId: string;
+  record: OffboardingRecord;
+  operator: PlatformOperator;
+  justification: string;
+}): Promise<void> {
+  await withPlatformScope(
+    `Platform console: record offboarding state ${args.record.stage} for tenant ${args.tenantId}`,
+    async (db) => {
+      await db
+        .insert(platformTenantFlags)
+        .values({
+          tenantId: args.tenantId,
+          flagKey: OFFBOARDING_FLAG_KEY,
+          // Live while scheduled, off once cancelled. The ROW is never
+          // deleted: the evidence that a termination was requested and
+          // pulled is the most interesting thing on the workspace.
+          enabled: args.record.stage === "scheduled",
+          value: args.record as unknown as Record<string, unknown>,
+          reason: args.justification,
+          // ⚠️ NEVER AN EXPIRY. A record that expires is a scheduled
+          // deletion that quietly stops existing on the day it matters.
+          expiresAt: null,
+          setByStaffId: args.operator.staff.id,
+          setByEmail: args.operator.email,
+        })
+        .onConflictDoUpdate({
+          target: [platformTenantFlags.tenantId, platformTenantFlags.flagKey],
+          set: {
+            enabled: args.record.stage === "scheduled",
+            value: args.record as unknown as Record<string, unknown>,
+            reason: args.justification,
+            expiresAt: null,
+            setByStaffId: args.operator.staff.id,
+            setByEmail: args.operator.email,
+            updatedAt: new Date(),
+          },
+        });
+    },
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* SCHEDULE — the approval executor                                    */
+/* ------------------------------------------------------------------ */
+
+const scheduleTerminationSchema = z.object({
+  tenantId: z.string().uuid(),
+  /** ① The workspace address, typed. */
+  confirmSlug: z.string().trim().min(1),
+  /** ② A phrase that cannot be produced by muscle memory. */
+  confirmPhrase: z.string().trim(),
+  /** ③ An explicit acknowledgement that the export was offered. */
+  acknowledgeExport: z.literal(true),
+  reason: z.string().trim().min(20).max(1000),
+  requestedByEmail: z.string().email(),
+  requestedAt: z.string(),
+});
+
+/**
+ * ⭐⭐⭐ APPROVAL PUTS A DATE ON THE CALENDAR. IT DOES NOT DELETE.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * ⚠️ THE GUARD IS HERE, AT THE FUNCTION, AND IT IS `tenants:suspend`
+ * ══════════════════════════════════════════════════════════════════════
+ * This is reachable only through the approval executor registered in
+ * `control-actions.ts` — exactly like `suspendTenant`, and for the same
+ * reason: one door with two locks. The capability check still lives at
+ * the top of the function, because the function is what an executor
+ * calls and a guard at the caller is a guard somebody eventually calls
+ * around.
+ *
+ * 🔴 IT IS `tenants:suspend` AND NOT A `tenants:terminate` CAPABILITY
+ * BECAUSE NO SUCH CAPABILITY EXISTS AND `lib/platform/roles.ts` IS NOT
+ * OWNED BY THIS BATCH. `tenants:suspend` is the strictest gate
+ * available: owner grade only, and on `STEP_UP_CAPABILITIES`, so a
+ * lifted cookie with no fresh second factor cannot reach it. Adding
+ * `tenants:terminate` is the right follow-up and is listed in the batch
+ * report.
+ */
+export async function scheduleTenantTermination(
+  input: unknown,
+): Promise<PlatformResult<{ scheduledFor: string; note: string }>> {
+  const operator = await requireCapability("tenants:suspend");
+
+  const parsed = scheduleTerminationSchema.safeParse(input);
+  if (!parsed.success) {
+    return {
+      ok: false,
+      error:
+        "The stored request is not a complete termination request. Nothing has been changed; raise it again.",
+    };
+  }
+  const { tenantId, confirmSlug, confirmPhrase, reason, requestedByEmail, requestedAt } =
+    parsed.data;
+
+  /*
+   * ⚠️ THE THREE CONFIRMATIONS ARE CHECKED AGAIN HERE, hours after they
+   * were typed. Not paranoia about the queue row — it is validated on
+   * the way in — but because the SLUG can change between request and
+   * approval. A workspace that was renamed is a workspace where the
+   * approver may be looking at a different customer than the requester
+   * was, and that is precisely the mistake the typed slug exists to
+   * catch.
+   */
+  if (confirmPhrase !== TERMINATION_PHRASE) {
+    return { ok: false, error: "The confirmation phrase does not match." };
+  }
+
+  const now = new Date();
+
+  // The window and the retention come from the configuration chain, so
+  // an enterprise customer's longer window is a property of their plan
+  // rather than a number somebody remembered.
+  const chain = await getConfigChain(tenantId);
+  if (!chain.ok) return { ok: false, error: chain.error };
+
+  const windowHours = Number(
+    chain.data.resolutions.find((r) => r.key === "offboarding.cancel_window_hours")?.effective ??
+      24,
+  );
+  const retentionDays = Number(
+    chain.data.resolutions.find((r) => r.key === "offboarding.retention_days")?.effective ?? 30,
+  );
+
+  const scheduledFor = new Date(now.getTime() + windowHours * 3_600_000);
+  const retentionEndsAt = new Date(scheduledFor.getTime() + retentionDays * 86_400_000);
+
+  const outcome = await withPlatformScope(
+    `Platform console: schedule termination of tenant ${tenantId} — ${reason.slice(0, 80)}`,
+    async (db) => {
+      const [tenant] = await db
+        .select()
+        .from(tenants)
+        .where(eq(tenants.id, tenantId))
+        .limit(1);
+
+      if (!tenant) return { error: "Workspace not found." } as const;
+      if (tenant.slug !== confirmSlug.trim()) {
+        return {
+          error:
+            "This workspace's address has changed since the request was raised. Nothing has been scheduled — raise it again against the current address.",
+        } as const;
+      }
+      if (tenant.status === "pending_deletion") {
+        return { error: "A termination is already scheduled for this workspace." } as const;
+      }
+
+      /*
+       * ⭐ `pending_deletion` IS THE GRACE STAGE, AND IT ALREADY WORKS.
+       * `evaluateAccess()` maps it to `locked` with `canExport: true` —
+       * the customer cannot use the product and can still take their
+       * data out. Nothing new had to be built for the read-only grace
+       * period; it was already the meaning of this status.
+       */
+      await db
+        .update(tenants)
+        .set({ status: "pending_deletion", updatedAt: new Date() })
+        .where(eq(tenants.id, tenantId));
+
+      return { previousStatus: tenant.status, slug: tenant.slug, name: tenant.name } as const;
+    },
+  );
+
+  if (outcome.error) return { ok: false, error: outcome.error };
+
+  const record: OffboardingRecord = {
+    stage: "scheduled",
+    requestedByEmail,
+    requestedAt,
+    approvedByEmail: operator.email,
+    approvedAt: now.toISOString(),
+    scheduledFor: scheduledFor.toISOString(),
+    cancelWindowHours: windowHours,
+    retentionDays,
+    retentionEndsAt: retentionEndsAt.toISOString(),
+    previousStatus: outcome.previousStatus as OffboardingRecord["previousStatus"],
+    reason,
+  };
+
+  await writeOffboarding({ tenantId, record, operator, justification: reason });
+
+  await recordPlatformAudit({
+    operator,
+    tenantId,
+    action: "config_change",
+    resourceType: "tenant_termination",
+    resourceId: tenantId,
+    oldValue: { status: outcome.previousStatus },
+    newValue: { status: "pending_deletion", scheduledFor: record.scheduledFor },
+    severity: "critical",
+    reason,
+    metadata: {
+      slug: outcome.slug,
+      requestedByEmail,
+      approvedByEmail: operator.email,
+      cancelWindowHours: windowHours,
+      retentionDays,
+      retentionEndsAt: record.retentionEndsAt,
+      // ⚠️ SAID IN THE AUDIT ROW TOO, not only on the screen. Somebody
+      // reading this trail in a year must not conclude from a
+      // "termination" row that data was destroyed on that date.
+      dataDeleted: false,
+      executorPresent: false,
+      note: "Scheduled only. No process in this build carries out a due termination.",
+    },
+  });
+
+  return {
+    ok: true,
+    data: {
+      scheduledFor: record.scheduledFor,
+      note: `${outcome.name} is locked and read-only. Deletion is scheduled for ${record.scheduledFor}, and it can be cancelled at any time until then. Nothing has been deleted, and nothing in this build deletes it.`,
+    },
+  };
+}
+
+/* ------------------------------------------------------------------ */
+/* CANCEL — the control that has to actually work                      */
+/* ------------------------------------------------------------------ */
+
+const cancelTerminationSchema = z.object({
+  tenantId: z.string().uuid(),
+  reason: z.string().trim().min(15).max(1000),
+});
+
+/**
+ * ⭐⭐⭐ THE CANCEL. NO SECOND APPROVER, NO TYPED SLUG, NO CEREMONY.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 STOPPING A DESTRUCTIVE ACTION MUST BE EASIER THAN STARTING ONE
+ * ══════════════════════════════════════════════════════════════════════
+ * Every control on the request path exists to slow somebody down.
+ * Applying any of them here would be exactly backwards: the person
+ * cancelling has realised a mistake, is probably on the phone to the
+ * customer, and every extra field is a minute the workspace stays
+ * locked. Symmetry between "delete" and "do not delete" is a design
+ * error that reads as rigour.
+ *
+ * ⚠️ IT RESTORES THE STATUS THE WORKSPACE HELD, from the frozen record —
+ * not `active`. Blindly setting `active` would silently complete the
+ * onboarding of a workspace that was `pending`, and would un-suspend one
+ * that was suspended for abuse. Same rule as `reactivateTenant`.
+ */
+export async function cancelTenantTermination(
+  input: unknown,
+): Promise<PlatformResult<{ note: string }>> {
+  const operator = await requireCapability("tenants:suspend");
+
+  const parsed = cancelTerminationSchema.safeParse(input);
+  if (!parsed.success) {
+    return {
+      ok: false,
+      error: "A reason of at least fifteen characters is required.",
+      fieldErrors: parsed.error.flatten().fieldErrors as Record<string, string[]>,
+    };
+  }
+  const { tenantId, reason } = parsed.data;
+  const now = new Date();
+
+  const record = await readOffboarding(tenantId);
+  if (!record) {
+    return { ok: false, error: "No termination is scheduled for this workspace." };
+  }
+  if (record.stage !== "scheduled") {
+    return { ok: false, error: "That termination has already been cancelled." };
+  }
+
+  const view = offboardingView(record, now);
+  const lateCancel = view.phase !== "cancel_window";
+
+  const outcome = await withPlatformScope(
+    `Platform console: cancel scheduled termination of tenant ${tenantId} — ${reason.slice(0, 80)}`,
+    async (db) => {
+      const [tenant] = await db
+        .select({ status: tenants.status, name: tenants.name })
+        .from(tenants)
+        .where(eq(tenants.id, tenantId))
+        .limit(1);
+
+      if (!tenant) return { error: "Workspace not found." } as const;
+
+      await db
+        .update(tenants)
+        .set({ status: record.previousStatus, updatedAt: new Date() })
+        .where(eq(tenants.id, tenantId));
+
+      return { name: tenant.name, wasStatus: tenant.status } as const;
+    },
+  );
+
+  if (outcome.error) return { ok: false, error: outcome.error };
+
+  await writeOffboarding({
+    tenantId,
+    record: {
+      ...record,
+      stage: "cancelled",
+      cancelledAt: now.toISOString(),
+      cancelledByEmail: operator.email,
+      cancelReason: reason,
+    },
+    operator,
+    justification: reason,
+  });
+
+  await recordPlatformAudit({
+    operator,
+    tenantId,
+    action: "config_change",
+    resourceType: "tenant_termination",
+    resourceId: tenantId,
+    oldValue: { status: outcome.wasStatus, scheduledFor: record.scheduledFor },
+    newValue: { status: record.previousStatus, cancelled: true },
+    severity: "critical",
+    reason,
+    metadata: {
+      cancelledByEmail: operator.email,
+      // ⚠️ RECORDED SEPARATELY. A cancel inside the window is the control
+      // working; a cancel after it is a workspace that sat in
+      // `pending_deletion` past its date because nothing runs the job.
+      // A reviewer counting the second kind is counting how badly the
+      // missing executor is needed.
+      insideCancelWindow: !lateCancel,
+      scheduledFor: record.scheduledFor,
+      dataDeleted: false,
+    },
+  });
+
+  return {
+    ok: true,
+    data: {
+      note: lateCancel
+        ? `${outcome.name} is back to ${record.previousStatus}. The scheduled moment had already passed — nothing had run, because no process in this build carries out a due termination.`
+        : `${outcome.name} is back to ${record.previousStatus}. Cancelled with ${view.minutesLeftInWindow} minutes of the window left.`,
+    },
+  };
+}
+
+/* ------------------------------------------------------------------ */
+/* EXPORT — what the departing customer is owed                        */
+/* ------------------------------------------------------------------ */
+
+const exportSnapshotSchema = z.object({ tenantId: z.string().uuid() });
+
+/**
+ * ⚠️ ~8 MB OF JSON. Above that the file is not returned through the
+ * server action and the manifest is, with a sentence saying so. A server
+ * action response is buffered in memory on both ends; a 200 MB string
+ * does not fail politely, it takes the console down for everybody at the
+ * moment somebody is trying to help a customer leave.
+ */
+const MAX_INLINE_EXPORT_BYTES = 8_000_000;
+
+/**
+ * ⭐⭐ THE EXPORT STEP, AND IT REALLY RUNS.
+ *
+ * `server/backup/export.ts` has been able to serialise a whole workspace
+ * since Phase 12 and nothing on the console had ever called it. This is
+ * the call: it reads through `withTenant`, so the customer's own RLS
+ * decides what comes out, and it records the row counts onto the
+ * offboarding record as a RECEIPT — the count is the evidence that the
+ * export was produced before the deletion date, which is the fact a
+ * DPDP complaint six months later turns on.
+ *
+ * ⚠️ GUARDED WITH `tenants:suspend`, NOT `tenants:read`. Every other
+ * console read is metadata about the commercial relationship; this one
+ * returns the customer's actual records. It belongs with the strictest
+ * gate available — owner grade and a fresh second factor — and it is
+ * audited as an `export` against the customer's own log so they can see
+ * that we took a copy.
+ */
+export async function exportOffboardingSnapshot(
+  input: unknown,
+): Promise<
+  PlatformResult<{
+    fileName: string;
+    rowCount: number;
+    failures: string[];
+    /** Null when the extract was too large to hand back inline. */
+    file: string | null;
+    note: string;
+  }>
+> {
+  const operator = await requireCapability("tenants:suspend");
+
+  const parsed = exportSnapshotSchema.safeParse(input);
+  if (!parsed.success) return { ok: false, error: "Check the form." };
+  const { tenantId } = parsed.data;
+
+  const [tenant] = await withPlatformScope(
+    `Platform console: read workspace name for offboarding export ${tenantId}`,
+    async (db) =>
+      db
+        .select({ name: tenants.name, slug: tenants.slug })
+        .from(tenants)
+        .where(eq(tenants.id, tenantId))
+        .limit(1),
+  );
+
+  if (!tenant) return { ok: false, error: "Workspace not found." };
+
+  const now = new Date();
+  const exported = await exportTenantData(tenantId, tenant.name);
+  const rowCount = Object.values(exported.manifest.counts).reduce((a, b) => a + b, 0);
+  const failures = exported.manifest.failures.map((f) => `${f.table}: ${f.reason}`);
+
+  const serialised = serialiseExport(exported);
+  const tooLarge = serialised.length > MAX_INLINE_EXPORT_BYTES;
+
+  // The receipt goes onto the offboarding record when there is one. An
+  // export taken before a termination is requested is still a valid
+  // export; it simply has nowhere to be a receipt for yet.
+  const record = await readOffboarding(tenantId);
+  if (record) {
+    await writeOffboarding({
+      tenantId,
+      record: {
+        ...record,
+        exportedAt: now.toISOString(),
+        exportRowCount: rowCount,
+        exportFailures: failures,
+      },
+      operator,
+      justification: record.reason,
+    });
+  }
+
+  await recordPlatformAudit({
+    operator,
+    tenantId,
+    action: "export",
+    resourceType: "tenant_offboarding_export",
+    resourceId: tenantId,
+    severity: "critical",
+    reason:
+      "Platform staff produced a full export of this workspace's records as part of offboarding.",
+    metadata: {
+      rowCount,
+      tables: Object.keys(exported.manifest.counts).length,
+      failures,
+      deliveredInline: !tooLarge,
+    },
+  });
+
+  return {
+    ok: true,
+    data: {
+      fileName: exportFileName(tenant.name, now),
+      rowCount,
+      failures,
+      file: tooLarge ? null : serialised,
+      note: tooLarge
+        ? `${rowCount} rows were read and the extract is too large to download from this screen. The counts are recorded on the offboarding record; produce the file from the backup tooling.`
+        : `${rowCount} rows across ${Object.keys(exported.manifest.counts).length} tables.${
+            failures.length > 0
+              ? ` ${failures.length} table(s) failed and are listed in the file — the rest is complete.`
+              : ""
+          }`,
+    },
+  };
+}
+
+/** The record plus everything derived from the clock, for the panel. */
+export async function getOffboarding(
+  tenantId: string,
+): Promise<OffboardingView | null> {
+  const record = await readOffboarding(tenantId);
+  return record ? offboardingView(record, new Date()) : null;
 }
 
 /**

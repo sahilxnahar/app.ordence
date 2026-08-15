@@ -71,6 +71,11 @@ const NAV = [
   // waiting for something that quietly did not happen.
   { href: "/platform/approvals", label: "Approvals" },
   { href: "/platform/incidents", label: "Incidents" },
+  // ⭐ The isolation canary. Linked rather than left as a URL somebody
+  // has to know, because the screen exists to be opened by whoever was
+  // just paged by `/api/cron/canary` — and a person being paged at 3am
+  // does not remember paths.
+  { href: "/platform/canary", label: "Canary" },
   { href: "/platform/provision", label: "Provision" },
   { href: "/platform/sessions", label: "Sessions" },
   { href: "/platform/search", label: "Search" },

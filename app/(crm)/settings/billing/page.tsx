@@ -31,6 +31,7 @@ import { Suspense } from "react";
 import { CreditCard, FileText, Users, Gauge } from "lucide-react";
 
 import { getCurrentSubscription, listInvoices } from "@/server/actions/billing";
+import { ReconciliationNotice } from "@/components/reconciliation/reconciliation-notice";
 import { getSeatUsage } from "@/server/actions/team";
 import { checkAccess } from "@/server/billing/access";
 import { getEntitlementSummary } from "@/server/entitlements";
@@ -225,6 +226,13 @@ async function SeatsPanel() {
 /* INVOICES                                                            */
 /* ------------------------------------------------------------------ */
 
+/**
+ * ⚠️ THE SETTLEMENT CHECK IS SURFACED HERE TOO, EVEN THOUGH THIS PANEL
+ * PRINTS NO "RECEIVED" COLUMN. It prints the invoice STATUS, and "Paid"
+ * is a settlement claim in one word — the shortest and most trusted form
+ * of the very figure the gate is checking. A screen that shows the claim
+ * without the check is the screen the claim gets read off.
+ */
 async function InvoicesPanel() {
   const result = await listInvoices(24);
 
@@ -232,7 +240,20 @@ async function InvoicesPanel() {
     return <PanelError title="Invoices" message={result.error} />;
   }
 
-  if (result.data.length === 0) {
+  const { invoices: invoiceRows, reconciliation, breachCauses } = result.data;
+
+  if (reconciliation.state === "breached") {
+    return (
+      <Panel title="Invoices" icon={<FileText className="h-4 w-4" />}>
+        <ReconciliationNotice
+          reconciliation={reconciliation}
+          breachCauses={breachCauses}
+        />
+      </Panel>
+    );
+  }
+
+  if (invoiceRows.length === 0) {
     return (
       <Panel title="Invoices" icon={<FileText className="h-4 w-4" />}>
         <p className="text-sm text-muted-foreground">
@@ -260,7 +281,7 @@ async function InvoicesPanel() {
             </tr>
           </thead>
           <tbody>
-            {result.data.map((invoice) => (
+            {invoiceRows.map((invoice) => (
               <tr key={invoice.id} className="border-b last:border-0">
                 <td className="py-2 pr-4 font-medium">{invoice.invoiceNumber}</td>
                 <td className="py-2 pr-4 text-muted-foreground">

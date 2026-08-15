@@ -203,11 +203,48 @@ export function matchThreeWay(
     }
   }
 
+  /**
+   * ══════════════════════════════════════════════════════════════════
+   * 🔴 A BILL WITH NO LINES IS NOT A MATCH. IT IS A BILL NOBODY CHECKED.
+   * ══════════════════════════════════════════════════════════════════
+   * `matched` is a positive assertion — three documents were compared
+   * line by line and every line agreed — and with no lines nothing was
+   * compared at all. The empty case used to fall through to it, because
+   * `findings.length === 0` is equally true of "nothing was wrong" and
+   * "there was nothing to look at". So a bill whose lines failed to
+   * import, or were deleted, or were never entered, reported "the order,
+   * the receipt and the bill agree on every line" to the control that
+   * authorises paying a vendor — and `purchase_invoices` carries its own
+   * header total, so that bill is payable for real money it was never
+   * checked for.
+   *
+   * ⚠️ `unmatched` RATHER THAN A FIFTH WORD. 0063's CHECK admits four
+   * states and adding one is a migration; more to the point, the rest of
+   * the product already knows what to do with this one — the payment run
+   * drops `unmatched` bills and `assessPayableBills` blocks them with a
+   * stated reason. Between the four available words, "cannot be checked"
+   * belongs with the one that stops, never with the one that clears.
+   */
+  if (lines.length === 0) {
+    return {
+      state: "unmatched",
+      findings: [],
+      netImpactMinor: 0n,
+      note: null,
+      headline:
+        "This bill has no lines, so there is nothing for the order and the receipt to be compared against. Nothing has been checked — find out whether the lines were ever entered before this is paid.",
+    };
+  }
+
   // ⭐ A bill with no order behind it at all is a state of its own, not a
   // failure. Petty cash, a utility bill, a professional fee: none of them
   // start with a purchase order, and reporting them as unmatched would
   // train people to ignore the word.
-  const everyLineOrderless = lines.length > 0 && lines.every((l) => l.orderedQty === null);
+  //
+  // ⚠️ NO LENGTH TERM: `every` is true of an empty array, and the empty
+  // bill — which is not "orderless", it is unexamined — has already
+  // returned above.
+  const everyLineOrderless = lines.every((l) => l.orderedQty === null);
   if (everyLineOrderless) {
     return {
       state: "no_order",

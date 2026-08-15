@@ -26,6 +26,10 @@ const TABS = [
   // live and is reached from the main navigation; this tab is where the
   // shapes are inspected. Two routes, two questions.
   { href: "/settings/objects", label: "Custom objects" },
+  // ⭐ Batch 57. Under Settings rather than on each list page: one screen
+  // with an entity picker is what keeps "add an importable entity" a
+  // table entry in `lib/import/entities.ts` instead of a new page.
+  { href: "/settings/import", label: "Import" },
   { href: "/settings/support-access", label: "Support access" },
   { href: "/settings/recovery", label: "Recycle bin" },
 ];

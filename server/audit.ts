@@ -16,11 +16,35 @@ import "server-only";
  * level and already under RLS. Phase 5 adds `metadata` and `severity` to it
  * rather than creating a second table — an audit trail split across two tables
  * cannot prove anything, because you would have to trust that both were complete.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * ⭐ AND SINCE v1.38.0, TAMPER-EVIDENT — SQL-FILES/0081_audit_hash_chain.sql
+ * ══════════════════════════════════════════════════════════════════════
+ * "Append-only at the database level" was always a statement about the
+ * APPLICATION. The trigger and the RLS policy both live inside Postgres,
+ * so both are available to anybody who reaches Postgres with owner
+ * rights: disable the trigger, edit the row, re-enable it, three
+ * statements and no trace anywhere.
+ *
+ * Every row this file writes now carries a per-tenant hash chain, so
+ * that edit is DETECTABLE. The full design — why the chain covers the
+ * previous row's hash rather than just the row, why it is per tenant,
+ * what happens under concurrency, why nothing is backfilled, and the
+ * long list of what it deliberately does NOT prove — is in
+ * `lib/audit/chain.ts`. What belongs HERE is the writer and the
+ * degradation rule, below.
  */
 
 import { headers } from "next/headers";
+import { and, desc, eq, isNotNull } from "drizzle-orm";
 import { db, withTenant } from "@/db";
 import { auditLogs, permissionDenials } from "@/db/schema";
+import {
+  chainScopeFor,
+  nextChainLink,
+  type AuditChainHead,
+  type AuditChainLink,
+} from "@/lib/audit/chain";
 import { DANGEROUS_PERMISSIONS, type PermissionKey } from "@/db/schema/auth";
 import {
   evaluatePermission,
@@ -89,6 +113,224 @@ async function getRequestFacts(): Promise<RequestFacts> {
 }
 
 /* ------------------------------------------------------------------ */
+/* THE CHAINED APPEND                                                  */
+/* ------------------------------------------------------------------ */
+
+/**
+ * The columns of `audit_logs` that go into `content_hash`.
+ *
+ * ⚠️ ANY COLUMN NOT IN THIS SHAPE IS OUTSIDE THE CHAIN AND CAN BE
+ * REWRITTEN WITHOUT DETECTION. That is a real hole and it is named
+ * rather than hidden: `id` and `created_at` are the two deliberate
+ * omissions on the row itself — `id` because it is a surrogate that
+ * proves nothing about the event, and `created_at` because it is
+ * INCLUDED (see below) precisely so a backdated row is caught.
+ *
+ * 🔴 IF YOU ADD A COLUMN TO `audit_logs`, ADD IT HERE. A new column that
+ * carries meaning and is not hashed is a place to put the thing you
+ * later want to change quietly. The 0081 header says the same, because
+ * the person adding a column reads the schema, not this file.
+ */
+type AuditRowContent = Record<string, unknown>;
+
+const MAX_CHAIN_ATTEMPTS = 4;
+
+/**
+ * Append one row to a tenant's audit chain.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * ⚠️ CONCURRENCY: OPTIMISTIC, NOT LOCKED. WHAT THAT BUYS AND COSTS.
+ * ══════════════════════════════════════════════════════════════════════
+ * Read the head, compute `seq = head + 1` and `prev_hash = head.rowHash`,
+ * INSERT. Two writes racing in one tenant both read the same head and
+ * both try the same sequence number; the partial UNIQUE index from 0081
+ * gives the loser `23505` and this function retries against the new
+ * head. Nothing is locked, and nothing is held across the hashing.
+ *
+ * The alternative was `pg_advisory_xact_lock(tenant)`, which serialises
+ * audit writes per tenant. It is simpler to reason about, and it makes
+ * the audit write a thing that can BLOCK — on a request path, a blocked
+ * audit write is a blocked request, and the queue forms exactly when the
+ * workspace is busiest, which is exactly when the audit trail matters
+ * most. Retrying costs a round trip in a race; blocking costs the
+ * request.
+ *
+ * 🔴 WHAT THIS GUARANTEES: within one tenant, `chain_seq` is dense and
+ * total, and each row's `prev_hash` is the `row_hash` of the row before
+ * it. No two rows can occupy one position.
+ *
+ * 🔴 WHAT IT DOES NOT: `chain_seq` IS AN APPEND ORDER, NOT A CLOCK.
+ * Under a race the writer that reached the index first gets the lower
+ * number even if its event happened microseconds later. Anything that
+ * needs real ordering must read `created_at` and accept its resolution.
+ * And no ordering here says anything about an action that was never
+ * audited at all — see the note in `lib/audit/chain.ts`.
+ *
+ * ⚠️ EACH ATTEMPT IS ITS OWN TRANSACTION, because it must be: a 23505
+ * aborts the transaction it happened in, so a retry inside the same one
+ * would fail with `current transaction is aborted`. That is also why the
+ * retry re-READS the head rather than incrementing the number it had —
+ * the row that beat us may not be the only one that landed.
+ *
+ * Returns the row it wrote, or null if it exhausted its attempts.
+ */
+async function appendChainedAuditRow(
+  tenantId: string,
+  content: AuditRowContent,
+  impersonationId: string | null,
+): Promise<AuditChainLink | null> {
+  const scope = chainScopeFor(tenantId);
+
+  for (let attempt = 1; attempt <= MAX_CHAIN_ATTEMPTS; attempt++) {
+    try {
+      return await withTenant(
+        tenantId,
+        async (tx) => {
+          /**
+           * ⭐ THE HEAD READ IS TENANT-SCOPED BY RLS, NOT BY THIS `WHERE`.
+           * `audit_logs_tenant_isolation` already restricts it; the
+           * predicate is here so the intent is readable and so the
+           * partial index is used. It is also the sentence that explains
+           * why the chain CANNOT be global: a global chain would need
+           * this read to return another tenant's row, and the policy
+           * refuses. See constraint 2 in `lib/audit/chain.ts`.
+           */
+          const [row] = await tx
+            .select({ chainSeq: auditLogs.chainSeq, rowHash: auditLogs.rowHash })
+            .from(auditLogs)
+            .where(and(eq(auditLogs.tenantId, tenantId), isNotNull(auditLogs.chainSeq)))
+            .orderBy(desc(auditLogs.chainSeq))
+            .limit(1);
+
+          const head: AuditChainHead =
+            row?.chainSeq != null && row.rowHash != null
+              ? { chainSeq: row.chainSeq, rowHash: row.rowHash }
+              : null;
+
+          const link = nextChainLink({ scope, head, content });
+
+          await tx.insert(auditLogs).values({
+            ...(content as typeof auditLogs.$inferInsert),
+            chainSeq: link.chainSeq,
+            prevHash: link.prevHash,
+            contentHash: link.contentHash,
+            rowHash: link.rowHash,
+          });
+
+          return link;
+        },
+        { impersonationId },
+      );
+    } catch (err) {
+      if (!isChainRace(err) || attempt === MAX_CHAIN_ATTEMPTS) throw err;
+      // Lost the race. Fall through and re-read the head.
+    }
+  }
+
+  return null;
+}
+
+/**
+ * ⚠️ THE NARROWEST POSSIBLE TEST FOR "SOMEBODY ELSE TOOK THAT POSITION".
+ *
+ * Retrying on any error would retry a malformed row four times and take
+ * four times as long to lose it. `23505` alone is still too broad —
+ * `audit_logs` has a primary key, and a uuid collision retried is a uuid
+ * collision retried — so the constraint name has to match too. The two
+ * names come straight from 0081 section 3.
+ */
+function isChainRace(err: unknown): boolean {
+  const e = err as { code?: unknown; constraint?: unknown; message?: unknown };
+  const code = typeof e?.code === "string" ? e.code : "";
+  const text = `${typeof e?.constraint === "string" ? e.constraint : ""} ${
+    typeof e?.message === "string" ? e.message : ""
+  }`;
+  return (
+    (code === "23505" || text.includes("duplicate key")) &&
+    (text.includes("audit_logs_chain_tenant_seq_uq") ||
+      text.includes("audit_logs_chain_platform_seq_uq"))
+  );
+}
+
+/**
+ * The degraded write: the same row, with no chain columns at all.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 CONSTRAINT 5 — HASHING FAILURE IS **NOT** FATAL, AND HERE IS WHY
+ * ══════════════════════════════════════════════════════════════════════
+ * The tempting rule is "if it cannot be chained, refuse the write" —
+ * better no evidence than untrustworthy evidence. It is wrong here, for
+ * a reason specific to what this function is:
+ *
+ *   ⭐ THE AUDIT WRITE DESCRIBES AN OPERATION THAT ALREADY HAPPENED. By
+ *   the time `writeAudit()` runs, the invoice is posted and the
+ *   permission is granted. Refusing to record it does not undo it; it
+ *   produces a system where the act took place and NOTHING SAYS SO.
+ *   Compare the two failures honestly:
+ *
+ *     row written, unchained → the event is in the trail, flagged as
+ *                              not attested, and the verifier reports
+ *                              exactly how many such rows exist and
+ *                              when they were written.
+ *     row not written        → the event is nowhere. No flag, no count,
+ *                              nothing to notice.
+ *
+ *   The first is strictly more information than the second, and the
+ *   second is indistinguishable from the action never happening — which
+ *   is the state an attacker WANTS. A rule that discards audit rows when
+ *   the chain is under stress hands them a denial-of-audit: make the
+ *   chain fail and the record disappears.
+ *
+ * ⚠️ THIS IS THE SAME REASONING THE TELEMETRY WRITERS USE, AND IT IS NOT
+ * THE SAME CONCLUSION. `app/api/telemetry/route.ts`, `lib/telemetry/
+ * report.ts` and `server/security/record.ts` swallow 42501 silently
+ * because telemetry must never break the request it describes — and 0079
+ * found they had been silently discarding every attributed row for
+ * months, because a swallowed failure that logs nothing is a failure
+ * nobody learns about. So this path swallows the WRITE failure and
+ * SHOUTS about it: a distinct `[AUDIT CHAIN DEGRADED]` line, a NULL
+ * chain the verifier counts, and a `writeAudit` catch that already logs
+ * loudly. The lesson from 0079 is not "never swallow" — it is "never
+ * swallow quietly".
+ *
+ * 🔴 AND THE HOLE THIS LEAVES, SAID PLAINLY: an attacker who can force
+ * sustained contention or repeated failures on one tenant's chain can
+ * cause rows to be written unchained, and unchained rows are not
+ * attested. They cannot make rows VANISH, and they cannot make the
+ * degradation invisible — section 2 of VERIFY-0081 counts unchained rows
+ * per tenant and timestamps the most recent one, so a burst of them is
+ * itself the signal. That is the trade, and it is deliberate.
+ */
+async function appendUnchainedAuditRow(
+  tenantId: string,
+  content: AuditRowContent,
+  impersonationId: string | null,
+  cause: unknown,
+): Promise<void> {
+  console.error("[AUDIT CHAIN DEGRADED]", {
+    tenantId,
+    action: content.action,
+    resourceType: content.resourceType,
+    note:
+      "Row written OUTSIDE the hash chain. It is in the trail but not attested. " +
+      "VERIFY-0081 section 2 counts these per tenant.",
+    error: cause instanceof Error ? cause.message : String(cause),
+  });
+
+  await withTenant(
+    tenantId,
+    async (tx) => {
+      // ⚠️ NO CHAIN COLUMNS AT ALL, not "some of them". The 0081
+      // all-or-nothing CHECK refuses a half-hashed row, because a
+      // half-hashed row is unfalsifiable: it lets somebody blank a hash
+      // and claim the row predates the chain.
+      await tx.insert(auditLogs).values(content as typeof auditLogs.$inferInsert);
+    },
+    { impersonationId },
+  );
+}
+
+/* ------------------------------------------------------------------ */
 /* AUDIT WRITER                                                        */
 /* ------------------------------------------------------------------ */
 
@@ -139,6 +381,25 @@ export async function writeAudit(
 
     /**
      * ══════════════════════════════════════════════════════════════
+     * ⚠️ `createdAt` IS SET HERE, NOT LEFT TO `DEFAULT now()`
+     * ══════════════════════════════════════════════════════════════
+     * It is one of the hashed fields, and the hash is computed in this
+     * process. If the column were left to the database default, the
+     * value hashed and the value stored would be different by the
+     * round-trip time, and every single row would fail content
+     * verification — a verifier that reports 100% tampering is a
+     * verifier that gets switched off on day one.
+     *
+     * ⚠️ THE COST: the timestamp is now the APPLICATION's clock, not
+     * the database's, so it inherits whatever skew the runtime has.
+     * That is the honest trade for being able to attest it at all, and
+     * it is worth saying that `created_at` was never a trustworthy
+     * ordering — `chain_seq` is the order that can be proved.
+     */
+    const createdAt = new Date();
+
+    /**
+     * ══════════════════════════════════════════════════════════════
      * 🔴 THIS MUST RUN INSIDE `withTenant()`. IT DID NOT, UNTIL NOW.
      * ══════════════════════════════════════════════════════════════
      * `audit_logs` is under RLS with `ENABLE` + `FORCE` and a policy
@@ -172,37 +433,72 @@ export async function writeAudit(
      * works" was never actually tested end to end — only its
      * immutability was.
      */
-    await withTenant(
-      ctx.tenant.id,
-      async (tx) => {
-        await tx.insert(auditLogs).values({
-          tenantId: ctx.tenant.id,
-          actorUserId: ctx.user.id,
-          actorClerkId: ctx.clerkUserId,
-          actorEmail: ctx.user.email,
-          actorRole: ctx.role,
-          action: entry.action,
-          resourceType: entry.resourceType,
-          resourceId: entry.resourceId ?? null,
-          oldValue: entry.oldValue ?? null,
-          newValue: entry.newValue ?? null,
-          metadata: entry.metadata ?? {},
-          severity: entry.severity ?? "info",
-          reason: entry.reason ?? null,
+    /**
+     * ⭐ THE HASHED CONTENT AND THE INSERTED ROW ARE ONE OBJECT.
+     *
+     * Not two. The obvious shape — build the row, then build a separate
+     * "what to hash" object from the same fields — is how a column comes
+     * to be written but not hashed: somebody adds a field to the insert
+     * and not to the digest, and the row is silently outside the
+     * protection while looking exactly like every attested row.
+     * `appendChainedAuditRow()` hashes this object and inserts THIS
+     * object, so the two cannot drift.
+     */
+    const content = {
+      tenantId: ctx.tenant.id,
+      actorUserId: ctx.user.id,
+      actorClerkId: ctx.clerkUserId,
+      actorEmail: ctx.user.email,
+      actorRole: ctx.role,
+      action: entry.action,
+      resourceType: entry.resourceType,
+      resourceId: entry.resourceId ?? null,
+      oldValue: entry.oldValue ?? null,
+      newValue: entry.newValue ?? null,
+      metadata: entry.metadata ?? {},
+      severity: entry.severity ?? "info",
+      reason: entry.reason ?? null,
+      impersonationId,
+      ipAddress: facts.ipAddress,
+      userAgent: facts.userAgent,
+      country: facts.country,
+      requestId: facts.requestId,
+      createdAt,
+    };
+
+    // ⚠️ The impersonation marker is set on the audit transaction too. It
+    // changes nothing here — the DELETE guard only refuses DELETEs and
+    // this is an INSERT — but a transaction that writes the evidence of
+    // an impersonated action should not be the one place in the request
+    // where the session is invisible to the database.
+    try {
+      const link = await appendChainedAuditRow(ctx.tenant.id, content, impersonationId);
+      if (link === null) {
+        // Exhausted its retries against a genuinely hot chain. Degrade
+        // rather than lose the row — see `appendUnchainedAuditRow()`.
+        await appendUnchainedAuditRow(
+          ctx.tenant.id,
+          content,
           impersonationId,
-          ipAddress: facts.ipAddress,
-          userAgent: facts.userAgent,
-          country: facts.country,
-          requestId: facts.requestId,
-        });
-      },
-      // ⚠️ The marker is set on the audit transaction too. It changes
-      // nothing here — the DELETE guard only refuses DELETEs and this
-      // is an INSERT — but a transaction that writes the evidence of an
-      // impersonated action should not be the one place in the request
-      // where the session is invisible to the database.
-      { impersonationId },
-    );
+          new Error(`Lost ${MAX_CHAIN_ATTEMPTS} races for the chain head.`),
+        );
+      }
+    } catch (chainErr) {
+      /**
+       * 🔴 THE INNER CATCH IS THE POINT OF CONSTRAINT 5. Anything that
+       * broke the chained path — the head read, the hash, a constraint,
+       * a column that does not exist because 0081 has not been applied
+       * — must not cost us the audit row. Falling back writes the same
+       * content unchained and shouts about it.
+       *
+       * ⚠️ IF THE FALLBACK ALSO FAILS, the outer catch below logs
+       * `[AUDIT WRITE FAILED]` and the operation still proceeds. That
+       * is the pre-existing contract of this function and 0081 does not
+       * change it: an audit failure must never roll back the user's
+       * work.
+       */
+      await appendUnchainedAuditRow(ctx.tenant.id, content, impersonationId, chainErr);
+    }
   } catch (err) {
     console.error("[AUDIT WRITE FAILED]", {
       tenantId: ctx.tenant.id,
@@ -219,9 +515,19 @@ export async function writeSystemAudit(
   entry: AuditEntry & { actorLabel?: string },
 ): Promise<void> {
   try {
-    // Same RLS requirement as `writeAudit` above — see the block there.
-    await withTenant(tenantId, async (tx) => {
-      await tx.insert(auditLogs).values({
+    /**
+     * ⭐ THE SAME CHAIN, THE SAME TENANT, NOT A SEPARATE ONE.
+     *
+     * A background job's rows go into the workspace's one chain
+     * alongside the interactive ones. A second chain per tenant for
+     * "system" writes would be the same mistake as a second audit table:
+     * you would have to trust that both were complete, and the ordering
+     * between them would be unprovable — which is exactly the gap
+     * somebody would use to slip a row in.
+     *
+     * Same RLS requirement as `writeAudit` above — see the block there.
+     */
+    const content = {
       tenantId,
       actorEmail: entry.actorLabel ?? "system",
       actorRole: "system",
@@ -233,8 +539,26 @@ export async function writeSystemAudit(
       metadata: entry.metadata ?? {},
       severity: entry.severity ?? "info",
       reason: entry.reason ?? null,
-      });
-    });
+      // Hashed, so it must be ours rather than `DEFAULT now()` — the
+      // reasoning is on `writeAudit`'s `createdAt`.
+      createdAt: new Date(),
+    };
+
+    try {
+      const link = await appendChainedAuditRow(tenantId, content, null);
+      if (link === null) {
+        await appendUnchainedAuditRow(
+          tenantId,
+          content,
+          null,
+          new Error(`Lost ${MAX_CHAIN_ATTEMPTS} races for the chain head.`),
+        );
+      }
+    } catch (chainErr) {
+      // Constraint 5 again: a background job's audit row is still an
+      // audit row, and losing it is worse than not attesting it.
+      await appendUnchainedAuditRow(tenantId, content, null, chainErr);
+    }
   } catch (err) {
     console.error("[SYSTEM AUDIT WRITE FAILED]", err);
   }
@@ -370,8 +694,11 @@ export type AuditLogRow = {
 
 /** Recent audit entries for this tenant. Requires `audit:read`. */
 export async function getRecentAuditLogs(limit = 50): Promise<AuditLogRow[]> {
+  // ⚠️ `eq` and `desc` used to be pulled in with a dynamic `import()`
+  // here. They are module-level imports now because the chain writer
+  // above needs them anyway, and a local binding that shadows a
+  // module-level one of the same name is a trap for the next reader.
   const ctx = await requirePermission("audit:read");
-  const { eq, desc } = await import("drizzle-orm");
 
   const rows = await withTenant(ctx.tenant.id, (tx) =>
     tx

@@ -24,9 +24,16 @@
 
 import { z } from "zod";
 import { revalidatePath } from "next/cache";
-import { and, eq, isNull, sql, desc } from "drizzle-orm";
+import { and, eq, gte, inArray, isNull, lte, sql, desc } from "drizzle-orm";
 import { db, withTenant } from "@/db";
-import { ledgers, transactions, journalEntries, auditLogs } from "@/db/schema";
+import {
+  ledgers,
+  transactions,
+  journalEntries,
+  auditLogs,
+  bankAccounts,
+  salesPostingAccounts,
+} from "@/db/schema";
 import { requireTenantContext, requireRole, TenantAccessError } from "@/server/tenant-context";
 import { requireFeature, FeatureLockedError } from "@/server/entitlements";
 import { requireAccess, AccessRestrictedError } from "@/server/billing/access";
@@ -37,6 +44,14 @@ import {
   fromMinorUnits,
 } from "@/lib/validators/accounting";
 import type { PostTransactionInput } from "@/lib/validators/accounting";
+import { resolveStatementPeriod, previousDay } from "@/lib/accounting/periods";
+import type { StatementPeriodInput, StatementPeriod } from "@/lib/accounting/periods";
+import {
+  buildCashFlow,
+  explainCashFlowFailure,
+  type CashLedger,
+  type LedgerMovement,
+} from "@/lib/accounting/cash-flow";
 import type { Ledger, Transaction, SystemRole } from "@/db/schema";
 
 /* ------------------------------------------------------------------ */
@@ -211,7 +226,6 @@ export async function postTransaction(
     // Every ledger referenced must belong to this tenant. Without this check a
     // caller could post entries into another tenant's trust account.
     const ledgerIds = [...new Set(data.legs.map((l) => l.ledgerId))];
-    const { inArray } = await import("drizzle-orm");
 
     const ownedLedgers = await withTenant(ctx.tenant.id, (tx) =>
       tx
@@ -442,8 +456,116 @@ export async function reverseTransaction(
 }
 
 /* ------------------------------------------------------------------ */
-/* TRIAL BALANCE                                                       */
+/* STATEMENTS — TRIAL BALANCE, P&L, BALANCE SHEET                      */
 /* ------------------------------------------------------------------ */
+
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 ALL THREE STATEMENTS WERE SINCE INCEPTION, WITH NO WAY TO SAY OTHERWISE
+ * ══════════════════════════════════════════════════════════════════════
+ * `getTrialBalance()` took no arguments. The P&L and balance sheet were
+ * both derived from it, so a customer in year two could not produce a
+ * financial-year statement at all — the parameter did not exist anywhere
+ * in the path. See `lib/accounting/periods.ts` for why the default is
+ * now the current financial year rather than all of time.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 AND THE TWO KINDS OF STATEMENT NEED TWO DIFFERENT WINDOWS
+ * ══════════════════════════════════════════════════════════════════════
+ * The trial balance and the P&L measure MOVEMENT between two dates.
+ * The balance sheet measures a POSITION at one date, and that position
+ * accumulates every entry since the business began.
+ *
+ * So `ledgerBalances` takes `from: string | null`, and `null` means
+ * "from inception". The balance sheet is the caller that passes null.
+ * Handing the balance sheet a from-date filters out the opening bank
+ * balance, the fixed assets, the capital and the loans — every asset the
+ * business owned before the period starts disappears, and the statement
+ * STILL BALANCES while it does so, because a filtered set of whole
+ * transactions always balances. Nothing shouts. It just reports a
+ * company that owns nothing.
+ */
+
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴🔴🔴 WHICH TRANSACTIONS BELONG IN A FINANCIAL STATEMENT
+ * ══════════════════════════════════════════════════════════════════════
+ * ⚠️ THIS CHANGES NUMBERS THAT WERE ALREADY ON SCREEN. Read this before
+ * touching it.
+ *
+ * Until now NOTHING anywhere in the statement path looked at
+ * `transactions.status`. The trial balance, the profit & loss and the
+ * balance sheet summed every journal entry whose transaction fell in the
+ * date window, whatever state that transaction was in. `db/schema/
+ * accounting.ts` defines four states — `pending`, `posted`, `reversed`,
+ * `void` — and three of them were being treated as if they were the
+ * fourth. A voided transaction appeared in a customer's turnover.
+ *
+ * The statements now include `posted` and `reversed`, and nothing else.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * ⭐⭐⭐ WHY `reversed` IS IN, AND WHY "POSTED ONLY" IS THE TRAP
+ * ══════════════════════════════════════════════════════════════════════
+ * "Posted only" is the obvious filter, it is what every other
+ * single-transaction lookup in this codebase uses, and on a statement it
+ * is WORSE THAN NO FILTER AT ALL.
+ *
+ * Look at what `reverseTransaction` above actually writes. It inserts a
+ * SECOND transaction — the mirror image, every leg flipped — with status
+ * `posted`, and it then marks the ORIGINAL as `reversed`. So a
+ * reversal pair is one `reversed` row and one `posted` row. Both sets of
+ * legs are real, both are in `journal_entries`, and the journal is
+ * append-only precisely so that both stay visible forever. That is
+ * standard bookkeeping: a mistake is never deleted, it is undone by an
+ * equal and opposite entry, and the record shows both.
+ *
+ * 🔴 FILTER TO `posted` AND YOU KEEP THE CORRECTION AND DROP THE ERROR.
+ *
+ * Suppose ₹5,00,000 of revenue was posted to the wrong customer and
+ * reversed. Under "posted only" the statement contains the reversal —
+ * which DEBITS revenue ₹5,00,000 — and not the original credit. Turnover
+ * is now ₹5,00,000 LOWER than it ever was, in a statement that still
+ * balances perfectly, because the reversal is itself a balanced
+ * transaction and any set of whole transactions balances. Nothing on the
+ * page contradicts it. The customer's revenue account shows a negative
+ * entry they cannot explain and an auditor traces it to a correction of
+ * an error that, in the books as presented, never happened.
+ *
+ * ⚠️ THE RULE, STATED SO IT SURVIVES THE NEXT EDIT: A REVERSAL AND THE
+ * ENTRY IT REVERSES ARE ONE FACT IN TWO ROWS. BOTH ARE IN THE STATEMENT
+ * OR NEITHER IS. Including both nets them to zero, which is the true
+ * economic answer and is also what the ledger's own cached balances and
+ * the database trigger already assume.
+ *
+ * (They net to zero within the pair. They do NOT necessarily net to zero
+ * within a PERIOD — a January entry reversed in April correctly leaves
+ * January overstated and April understated, because that is what
+ * happened and that is what the January statement already filed against
+ * said. Dating the reversal is a bookkeeping decision, not ours.)
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * ⚠️ WHY `void` AND `pending` ARE OUT
+ * ══════════════════════════════════════════════════════════════════════
+ * `void` is the state for a transaction that should never have existed —
+ * `reverseTransaction` refuses to touch one, and it has no compensating
+ * entry anywhere. Its legs are in `journal_entries` because that table is
+ * append-only, not because they are facts. Counting them puts money in a
+ * P&L that the business itself has said never moved.
+ *
+ * `pending` is a transaction that has not been posted — the draft state.
+ * Nothing in the product writes it today (every insert path sets
+ * `posted`), so excluding it changes no number in any existing workspace.
+ * It is excluded anyway, because the day something does write it, the
+ * failure would be a half-entered journal quietly appearing in a filed
+ * P&L, and that day is a bad day to discover the filter was permissive.
+ *
+ * ⚠️ THE FILTER LIVES IN `ledgerBalances` AND NOWHERE ELSE, so the trial
+ * balance, the P&L, the balance sheet and the cash flow statement cannot
+ * disagree about what a fact is. Four statements built from four
+ * different definitions of "in the books" is how a set of accounts stops
+ * cross-footing.
+ */
+const STATEMENT_TRANSACTION_STATUSES = ["posted", "reversed"] as const;
 
 export type TrialBalanceRow = {
   ledgerId: string;
@@ -453,14 +575,143 @@ export type TrialBalanceRow = {
   accountType: string;
   totalDebit: string;
   totalCredit: string;
+  /** Debit-positive. Inverted for presentation exactly once, in the UI. */
   balance: string;
 };
 
+export type { StatementPeriodInput, StatementPeriod };
+
+type LedgerBalance = TrialBalanceRow & {
+  debitMinor: bigint;
+  creditMinor: bigint;
+};
+
 /**
- * Trial balance across every ledger.
- * If `isBalanced` is ever false, the double-entry guarantee has been violated
- * and the ledger needs investigation before anything else happens.
+ * Ledger totals over a window. `from === null` means since inception.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * ⚠️ WHY THE DATE PREDICATE IS IN THE JOIN *AND* IN THE CASE
+ * ══════════════════════════════════════════════════════════════════════
+ * Both halves are load-bearing and each one alone is a different bug.
+ *
+ *   • Put the date in the WHERE clause and the LEFT JOIN collapses into
+ *     an inner join: every ledger with no activity in the period drops
+ *     off the statement entirely. A dormant bank account vanishes from
+ *     the balance sheet rather than showing its balance.
+ *
+ *   • Put it only in the ON clause and it filters NOTHING. The SUM reads
+ *     `journal_entries.amount` and `journal_entries.entry_type`; those
+ *     columns are still populated for an out-of-period entry, because
+ *     the journal-entry join matched even though the transaction join
+ *     did not. The out-of-range money is counted anyway, silently.
+ *
+ * So: the ON clause narrows the scan (and lets Postgres use
+ * `transactions_tenant_date_idx`), and `transactions.id IS NOT NULL`
+ * inside the CASE is what actually excludes the amount.
+ *
+ * ⚠️ THE DATE IS `transactions.transaction_date`, NOT `created_at`.
+ * A back-dated journal posted in June for a March event belongs in
+ * March's P&L. Filtering on the row's insert timestamp would put it in
+ * June and would move numbers in a period the customer has already
+ * filed against.
  */
+async function ledgerBalances(
+  tenantId: string,
+  window: { from: string | null; to: string },
+): Promise<LedgerBalance[]> {
+  const inPeriod = and(
+    eq(transactions.id, journalEntries.transactionId),
+    // Tenant-scoped on every join. A missing predicate here is the exact
+    // bug that leaks another tenant's numbers into a financial statement.
+    eq(transactions.tenantId, tenantId),
+    /**
+     * 🔴 THE STATUS FILTER. See `STATEMENT_TRANSACTION_STATUSES` above for
+     * the full reasoning — in short, `posted` AND `reversed`, because a
+     * reversal is `posted` while the entry it reverses is `reversed`, and
+     * keeping one without the other leaves a correction in the books with
+     * nothing to correct.
+     *
+     * ⚠️ IT BELONGS IN THIS `and(...)`, WITH THE DATE PREDICATE, AND NOT
+     * IN THE `.where()`. The ledger table is LEFT JOINed so that a dormant
+     * account still shows on the balance sheet; a predicate on the
+     * right-hand table in the WHERE clause collapses that into an inner
+     * join and every ledger with no in-period activity disappears. The
+     * `transactions.id IS NOT NULL` guard inside the CASE below is what
+     * actually excludes an out-of-scope amount from the sum.
+     */
+    inArray(transactions.status, [...STATEMENT_TRANSACTION_STATUSES]),
+    lte(transactions.transactionDate, window.to),
+    ...(window.from === null ? [] : [gte(transactions.transactionDate, window.from)]),
+  );
+
+  const rows = await withTenant(tenantId, (tx) =>
+    tx
+      .select({
+        ledgerId: ledgers.id,
+        code: ledgers.code,
+        name: ledgers.name,
+        type: ledgers.type,
+        accountType: ledgers.accountType,
+        totalDebit: sql<string>`COALESCE(SUM(CASE WHEN ${transactions.id} IS NOT NULL AND ${journalEntries.entryType} = 'debit'  THEN ${journalEntries.amount} ELSE 0 END), 0)::text`,
+        totalCredit: sql<string>`COALESCE(SUM(CASE WHEN ${transactions.id} IS NOT NULL AND ${journalEntries.entryType} = 'credit' THEN ${journalEntries.amount} ELSE 0 END), 0)::text`,
+      })
+      .from(ledgers)
+      .leftJoin(
+        journalEntries,
+        and(
+          eq(journalEntries.ledgerId, ledgers.id),
+          eq(journalEntries.tenantId, tenantId),
+        ),
+      )
+      .leftJoin(transactions, inPeriod)
+      .where(and(eq(ledgers.tenantId, tenantId), isNull(ledgers.deletedAt)))
+      .groupBy(ledgers.id, ledgers.code, ledgers.name, ledgers.type, ledgers.accountType)
+      .orderBy(ledgers.code)
+  );
+
+  return rows.map((r) => {
+    /**
+     * ⚠️ THE DECIMAL STRING GOES STRAIGHT TO BIGINT PAISE.
+     * This used to be `toMinorUnits(Number(r.totalDebit).toFixed(2))` —
+     * a round trip through an IEEE-754 double. Postgres already returns
+     * an exact 2-decimal string; putting a float in the middle of it can
+     * only lose information, and money is never a float here.
+     */
+    const debitMinor = toMinorUnits(r.totalDebit);
+    const creditMinor = toMinorUnits(r.totalCredit);
+    return {
+      ...r,
+      debitMinor,
+      creditMinor,
+      totalDebit: fromMinorUnits(debitMinor),
+      totalCredit: fromMinorUnits(creditMinor),
+      balance: fromMinorUnits(debitMinor - creditMinor),
+    };
+  });
+}
+
+/** Strip the bigint working columns before the data crosses to the client. */
+function toRows(list: readonly LedgerBalance[]): TrialBalanceRow[] {
+  return list.map(({ debitMinor: _d, creditMinor: _c, ...row }) => row);
+}
+
+const PL_TYPES = new Set(["revenue", "expense"]);
+
+/**
+ * Revenue less expenses over whatever set of rows is handed in, in the
+ * reader's sign: POSITIVE IS A PROFIT.
+ *
+ * ⚠️ Derived from debit/credit totals rather than from `balance`, so the
+ * one place a sign is flipped for presentation stays in the UI. Revenue
+ * is credit-positive and expenses are debit-positive; the net of the two
+ * is simply credits minus debits across both.
+ */
+function netResultMinor(list: readonly LedgerBalance[]): bigint {
+  return list
+    .filter((r) => PL_TYPES.has(r.accountType))
+    .reduce((acc, r) => acc + r.creditMinor - r.debitMinor, 0n);
+}
+
 /**
  * ⚠️ DELIBERATELY NOT GATED BY `requireFeature`.
  *
@@ -472,9 +723,16 @@ export type TrialBalanceRow = {
  *
  * The Phase 12 brief calls this "graceful degradation, never a hard
  * crash", and this is what that means in practice.
+ *
+ * ⚠️ `requireTenantContext()` IS STILL THE GUARD, AND IS NOT OPTIONAL.
+ * Every `"use server"` export is a URL the browser can POST to. Without
+ * it this is an unauthenticated endpoint that returns a company's
+ * complete financial position. The same applies to `getProfitAndLoss`
+ * and `getBalanceSheet` below.
  */
-export async function getTrialBalance(): Promise<
+export async function getTrialBalance(input?: StatementPeriodInput): Promise<
   ActionResult<{
+    period: StatementPeriod;
     rows: TrialBalanceRow[];
     totalDebits: string;
     totalCredits: string;
@@ -484,48 +742,21 @@ export async function getTrialBalance(): Promise<
 > {
   try {
     const ctx = await requireTenantContext();
+    const period = resolveStatementPeriod(input);
 
-    const rows = await withTenant(ctx.tenant.id, (tx) =>
-      tx
-        .select({
-          ledgerId: ledgers.id,
-          code: ledgers.code,
-          name: ledgers.name,
-          type: ledgers.type,
-          accountType: ledgers.accountType,
-          totalDebit: sql<string>`COALESCE(SUM(CASE WHEN ${journalEntries.entryType} = 'debit'  THEN ${journalEntries.amount} ELSE 0 END), 0)::text`,
-          totalCredit: sql<string>`COALESCE(SUM(CASE WHEN ${journalEntries.entryType} = 'credit' THEN ${journalEntries.amount} ELSE 0 END), 0)::text`,
-        })
-        .from(ledgers)
-        .leftJoin(
-          journalEntries,
-          and(
-            eq(journalEntries.ledgerId, ledgers.id),
-            // The join is tenant-scoped too — a missing predicate here would be
-            // the exact bug that leaks another tenant's numbers into a report.
-            eq(journalEntries.tenantId, ctx.tenant.id),
-          ),
-        )
-        .where(and(eq(ledgers.tenantId, ctx.tenant.id), isNull(ledgers.deletedAt)))
-        .groupBy(ledgers.id, ledgers.code, ledgers.name, ledgers.type, ledgers.accountType)
-        .orderBy(ledgers.code)
-    );
+    // Movement between two dates — a trial balance for a period, which is
+    // what a close or a review is run against.
+    const balances = await ledgerBalances(ctx.tenant.id, {
+      from: period.from,
+      to: period.to,
+    });
 
     let totalDebitMinor = 0n;
     let totalCreditMinor = 0n;
-
-    const enriched: TrialBalanceRow[] = rows.map((r) => {
-      const debit = toMinorUnits(Number(r.totalDebit).toFixed(2));
-      const credit = toMinorUnits(Number(r.totalCredit).toFixed(2));
-      totalDebitMinor += debit;
-      totalCreditMinor += credit;
-      return {
-        ...r,
-        totalDebit: fromMinorUnits(debit),
-        totalCredit: fromMinorUnits(credit),
-        balance: fromMinorUnits(debit - credit),
-      };
-    });
+    for (const r of balances) {
+      totalDebitMinor += r.debitMinor;
+      totalCreditMinor += r.creditMinor;
+    }
 
     const difference =
       totalDebitMinor > totalCreditMinor
@@ -535,11 +766,385 @@ export async function getTrialBalance(): Promise<
     return {
       ok: true,
       data: {
-        rows: enriched,
+        period,
+        rows: toRows(balances),
         totalDebits: fromMinorUnits(totalDebitMinor),
         totalCredits: fromMinorUnits(totalCreditMinor),
         isBalanced: difference === 0n,
         difference: fromMinorUnits(difference),
+      },
+    };
+  } catch (err) {
+    return toActionError(err);
+  }
+}
+
+/**
+ * ⭐ PROFIT & LOSS FOR A PERIOD.
+ *
+ * Revenue and expense ledgers only, and only the movement between the
+ * two dates. Asset, liability and equity ledgers are excluded here
+ * rather than filtered in the UI — a P&L that carries the balance sheet
+ * accounts around with it is one careless `.map()` away from adding a
+ * bank balance to turnover.
+ */
+export async function getProfitAndLoss(input?: StatementPeriodInput): Promise<
+  ActionResult<{
+    period: StatementPeriod;
+    rows: TrialBalanceRow[];
+    /** Revenue less expenses for the period. Positive is a profit. */
+    netResult: string;
+  }>
+> {
+  try {
+    const ctx = await requireTenantContext();
+    const period = resolveStatementPeriod(input);
+
+    const balances = await ledgerBalances(ctx.tenant.id, {
+      from: period.from,
+      to: period.to,
+    });
+    const pl = balances.filter((r) => PL_TYPES.has(r.accountType));
+
+    return {
+      ok: true,
+      data: {
+        period,
+        rows: toRows(pl),
+        netResult: fromMinorUnits(netResultMinor(pl)),
+      },
+    };
+  } catch (err) {
+    return toActionError(err);
+  }
+}
+
+/**
+ * ⭐⭐ BALANCE SHEET AS AT A DATE.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 THERE IS NO FROM-DATE HERE AND THERE MUST NEVER BE ONE
+ * ══════════════════════════════════════════════════════════════════════
+ * `input` is a period only so that callers can hand it the same object
+ * they hand the P&L. The ONLY field read from it is `asAt` (which is the
+ * period's to-date). `from` is passed as `null` to `ledgerBalances`,
+ * meaning "since inception", and that is the whole point:
+ *
+ *   A balance sheet is a photograph, not a film. The bank balance on
+ *   31 March is the sum of every receipt and payment ever made, not the
+ *   ones made since 1 April. Filter by `from` and the opening position
+ *   disappears — cash, stock, fixed assets, share capital, loans — and
+ *   the statement still balances at a smaller, wrong number.
+ *
+ * ⚠️ `retainedResultToDate` IS WHY THE THING STILL ADDS UP.
+ * Assets = Liabilities + Equity + (Revenue − Expenses), where that last
+ * term is measured over the SAME window as the rest of the statement,
+ * i.e. since inception. The P&L above reports only the current period's
+ * slice of it. The difference between the two is last year's profit —
+ * retained earnings brought forward — and the UI shows it as its own
+ * line. Without it, a customer in year two opens the balance sheet and
+ * is told, in red, that their accounts do not balance.
+ */
+export async function getBalanceSheet(input?: StatementPeriodInput): Promise<
+  ActionResult<{
+    period: StatementPeriod;
+    /** The single date this position is stated at. */
+    asAt: string;
+    /** Asset, liability and equity ledgers, cumulative to `asAt`. */
+    rows: TrialBalanceRow[];
+    /** Revenue less expenses from inception to `asAt`. Positive is a profit. */
+    retainedResultToDate: string;
+  }>
+> {
+  try {
+    const ctx = await requireTenantContext();
+    const period = resolveStatementPeriod(input);
+
+    const balances = await ledgerBalances(ctx.tenant.id, {
+      // 🔴 null, NOT period.from. See the note above. Changing this to
+      // `period.from` makes every asset a customer owned before the
+      // period start silently disappear.
+      from: null,
+      to: period.asAt,
+    });
+
+    return {
+      ok: true,
+      data: {
+        period,
+        asAt: period.asAt,
+        rows: toRows(balances.filter((r) => !PL_TYPES.has(r.accountType))),
+        retainedResultToDate: fromMinorUnits(netResultMinor(balances)),
+      },
+    };
+  } catch (err) {
+    return toActionError(err);
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* ⭐⭐⭐ CASH FLOW STATEMENT — INDIRECT METHOD — Batch 65               */
+/* ------------------------------------------------------------------ */
+
+/**
+ * ⚠️ THE ARITHMETIC IS NOT IN THIS FILE. `lib/accounting/cash-flow.ts`
+ * decides every rupee and is pure; this function loads rows, identifies
+ * which ledgers hold cash, and hands both over. The split follows
+ * `server/payroll/run.ts`: a cash flow statement is exactly the kind of
+ * thing somebody checks by hand with a calculator and a reason to care,
+ * and arithmetic that can only be exercised by standing up Postgres gets
+ * tested once and then trusted forever.
+ */
+
+/** One line of the statement, as it crosses to the client. */
+export type CashFlowLineRow = {
+  ledgerId: string;
+  code: string;
+  name: string;
+  type: string;
+  accountType: string;
+  /** Effect on cash as a 2-decimal string. POSITIVE IS CASH IN. */
+  cashEffect: string;
+};
+
+export type CashFlowResult = {
+  period: StatementPeriod;
+  /** The date the opening balance is stated at — the day before `period.from`. */
+  openingAsAt: string;
+  /** The date the closing balance is stated at. Equal to `period.asAt`. */
+  asAt: string;
+
+  /** Profit for the period. Positive is a profit. */
+  netResult: string;
+  assetMovements: CashFlowLineRow[];
+  assetMovementTotal: string;
+  fundingMovements: CashFlowLineRow[];
+  fundingMovementTotal: string;
+  netMovement: string;
+
+  openingCash: string;
+  /** Derived: opening plus the movement built up above. */
+  computedClosingCash: string;
+  /** The fact: the cash and bank ledgers' own closing balance. */
+  actualClosingCash: string;
+  /** computed − actual. Zero, or the statement is wrong. */
+  discrepancy: string;
+
+  /**
+   * 🔴 FALSE MEANS DO NOT RENDER A SINGLE FIGURE FROM THIS OBJECT.
+   * Render `failureReasons` instead. See the header of
+   * `lib/accounting/cash-flow.ts`.
+   */
+  usable: boolean;
+  reconciles: boolean;
+
+  /** Which ledgers were treated as cash, and the structural reason. */
+  cashLedgers: Array<{ ledgerId: string; code: string; name: string; source: string }>;
+  /** Empty exactly when `usable` is true. */
+  failureReasons: string[];
+};
+
+/**
+ * ⭐⭐ CASH AND BANK LEDGERS, FROM STRUCTURE AND NEVER FROM A NAME.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 THERE IS NO `is_bank_account` FLAG ON `ledgers`. THERE ARE TWO
+ *    RELATIONSHIPS, AND THEY ARE BOTH DATA THE TENANT DECLARED.
+ * ══════════════════════════════════════════════════════════════════════
+ *   ① `bank_accounts.ledger_id` — the strongest signal in the system.
+ *      `db/schema/banking.ts` exists to record that a chart-of-accounts
+ *      line corresponds to a real account with a real statement, and it
+ *      enforces one bank account per ledger.
+ *
+ *   ② `sales_posting_accounts` with role `bank` — the tenant's mapped
+ *      "Bank / Cash" account, described in `lib/accounting/sales-posting.ts`
+ *      as "where customer receipts land". This is how CASH IN HAND is
+ *      identified for a tenant who has no `bank_accounts` row for it.
+ *
+ * ⚠️ NOT `code LIKE '1%'`, NOT `name ILIKE '%bank%'`, NOT
+ * `bank_details <> '{}'`. `db/schema/accounting.ts` already settled this
+ * argument for the posting-role table: "A LEDGER CANNOT BE GUESSED FROM
+ * ITS NAME OR ITS CODE. Every tenant builds their own chart of accounts."
+ * A name match here fails silently — a missed cash ledger keeps the
+ * statement reconciling and simply reports less money than the business
+ * has, which is the one error nobody double-checks.
+ *
+ * ⚠️ INACTIVE BANK ACCOUNTS ARE INCLUDED. `is_active` says the account
+ * is not to be used going forward; it says nothing about whether it held
+ * money during the period being reported. Excluding it would drop a real
+ * balance out of a historical statement.
+ */
+async function cashLedgersFor(tenantId: string): Promise<CashLedger[]> {
+  const [linked, mapped] = await Promise.all([
+    withTenant(tenantId, (tx) =>
+      tx
+        .select({ ledgerId: bankAccounts.ledgerId, label: bankAccounts.label })
+        .from(bankAccounts)
+        .where(eq(bankAccounts.tenantId, tenantId)),
+    ),
+    withTenant(tenantId, (tx) =>
+      tx
+        .select({ ledgerId: salesPostingAccounts.ledgerId })
+        .from(salesPostingAccounts)
+        .where(
+          and(
+            eq(salesPostingAccounts.tenantId, tenantId),
+            eq(salesPostingAccounts.role, "bank"),
+          ),
+        ),
+    ),
+  ]);
+
+  // Code and name are filled in from the chart of accounts by the caller,
+  // which already has it loaded. A row that cannot be filled in is a
+  // deleted ledger, and `buildCashFlow` reports that rather than hiding it.
+  return [
+    ...linked.map((row) => ({
+      ledgerId: row.ledgerId,
+      code: "",
+      name: row.label,
+      source: "bank_account" as const,
+    })),
+    ...mapped.map((row) => ({
+      ledgerId: row.ledgerId,
+      code: "",
+      name: "Bank / Cash (posting role)",
+      source: "posting_role" as const,
+    })),
+  ];
+}
+
+/**
+ * ⭐⭐⭐ THE CASH FLOW STATEMENT FOR A PERIOD.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 THREE QUERIES, AND EACH ONE COVERS A DIFFERENT SPAN OF TIME
+ * ══════════════════════════════════════════════════════════════════════
+ * This is the part that is easy to get wrong, so it is spelled out:
+ *
+ *   MOVEMENT   [from, to]        — every ledger's activity IN the period.
+ *                                  This is the P&L's window, and it is
+ *                                  where the profit and every working-
+ *                                  capital movement come from.
+ *   OPENING    (−∞, from)        — cash and bank as at the instant the
+ *                                  period opened, i.e. cumulative to the
+ *                                  DAY BEFORE `from`. A balance is always
+ *                                  since inception; see the balance-sheet
+ *                                  note above for why filtering a position
+ *                                  by a from-date deletes the opening
+ *                                  balance and still balances while it does.
+ *   CLOSING    (−∞, to]          — cash and bank at the period end. The
+ *                                  balance sheet's window exactly.
+ *
+ * ⚠️ `previousDay(period.from)`, NOT `period.from`. The opening window is
+ * OPEN at its right end. Using `from` itself counts the first day of the
+ * year in both the opening balance and the period movement, and the
+ * statement then fails to reconcile by exactly one day's trading — except
+ * on the many years where nothing was posted on 1 April, when it
+ * reconciles perfectly and is wrong only for the customers who traded.
+ *
+ * ⚠️ AND THE THREE WINDOWS TILE THE TIMELINE EXACTLY: (−∞, from) ∪
+ * [from, to] = (−∞, to]. `buildCashFlow` checks that they did, as a
+ * second reconciliation independent of the first.
+ *
+ * ⚠️ NOT GATED BY `requireFeature`, for the same reason as the other
+ * statements: this is a READ of the customer's own records, and refusing
+ * to show them at the moment we are asking to be paid is not graceful
+ * degradation. `requireTenantContext()` is still the guard and is not
+ * optional — every `"use server"` export is a URL the browser can POST
+ * to, and an unguarded one here returns a company's bank balances.
+ */
+export async function getCashFlowStatement(
+  input?: StatementPeriodInput,
+): Promise<ActionResult<CashFlowResult>> {
+  try {
+    const ctx = await requireTenantContext();
+    const period = resolveStatementPeriod(input);
+    const openingAsAt = previousDay(period.from);
+
+    const [movementRows, openingRows, closingRows, cashLinks] = await Promise.all([
+      ledgerBalances(ctx.tenant.id, { from: period.from, to: period.to }),
+      ledgerBalances(ctx.tenant.id, { from: null, to: openingAsAt }),
+      ledgerBalances(ctx.tenant.id, { from: null, to: period.asAt }),
+      cashLedgersFor(ctx.tenant.id),
+    ]);
+
+    const byId = new Map(movementRows.map((r) => [r.ledgerId, r]));
+
+    // Fill the code and name in from the chart of accounts. A link whose
+    // ledger is absent keeps its placeholder and is reported as a problem.
+    const cashLedgers: CashLedger[] = cashLinks.map((link) => {
+      const ledger = byId.get(link.ledgerId);
+      return ledger
+        ? { ...link, code: ledger.code, name: ledger.name }
+        : { ...link, code: link.code || "—" };
+    });
+
+    const cashIds = new Set(cashLedgers.map((c) => c.ledgerId));
+    const sumCash = (rows: readonly LedgerBalance[]) =>
+      rows
+        .filter((r) => cashIds.has(r.ledgerId))
+        // Debit-positive. A bank account with money in it is a DEBIT
+        // balance; flipping the sign here would report an overdraft.
+        .reduce((acc, r) => acc + r.debitMinor - r.creditMinor, 0n);
+
+    const movements: LedgerMovement[] = movementRows.map((r) => ({
+      ledgerId: r.ledgerId,
+      code: r.code,
+      name: r.name,
+      type: r.type,
+      accountType: r.accountType,
+      movementMinor: r.debitMinor - r.creditMinor,
+    }));
+
+    const statement = buildCashFlow({
+      movements,
+      cashLedgers,
+      openingCashMinor: sumCash(openingRows),
+      actualClosingCashMinor: sumCash(closingRows),
+    });
+
+    const toLine = (l: {
+      ledgerId: string;
+      code: string;
+      name: string;
+      type: string;
+      accountType: string;
+      cashEffectMinor: bigint;
+    }): CashFlowLineRow => ({
+      ledgerId: l.ledgerId,
+      code: l.code,
+      name: l.name,
+      type: l.type,
+      accountType: l.accountType,
+      cashEffect: fromMinorUnits(l.cashEffectMinor),
+    });
+
+    return {
+      ok: true,
+      data: {
+        period,
+        openingAsAt,
+        asAt: period.asAt,
+        netResult: fromMinorUnits(statement.netResultMinor),
+        assetMovements: statement.assetMovements.map(toLine),
+        assetMovementTotal: fromMinorUnits(statement.assetMovementTotalMinor),
+        fundingMovements: statement.fundingMovements.map(toLine),
+        fundingMovementTotal: fromMinorUnits(statement.fundingMovementTotalMinor),
+        netMovement: fromMinorUnits(statement.netMovementMinor),
+        openingCash: fromMinorUnits(statement.openingCashMinor),
+        computedClosingCash: fromMinorUnits(statement.computedClosingCashMinor),
+        actualClosingCash: fromMinorUnits(statement.actualClosingCashMinor),
+        discrepancy: fromMinorUnits(statement.discrepancyMinor),
+        usable: statement.usable,
+        reconciles: statement.reconciles,
+        cashLedgers: statement.cashLedgers.map((c) => ({
+          ledgerId: c.ledgerId,
+          code: c.code,
+          name: c.name,
+          source: c.source,
+        })),
+        failureReasons: explainCashFlowFailure(statement),
       },
     };
   } catch (err) {

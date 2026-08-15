@@ -70,6 +70,7 @@ import {
   jsonb,
   boolean,
   integer,
+  bigint,
   index,
   uniqueIndex,
   inet,
@@ -612,6 +613,34 @@ export const platformActionLog = pgTable(
     requestId: varchar("request_id", { length: 255 }),
 
     createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+
+    /* ---------------------------------------------------------------- */
+    /* THE HASH CHAIN — SQL-FILES/0081_audit_hash_chain.sql (Batch 44)   */
+    /* ---------------------------------------------------------------- */
+    /**
+     * 🔴 THESE COLUMNS EXIST AND ARE NOT YET WRITTEN. Said out loud
+     * because a silently-empty integrity column is worse than an absent
+     * one: a reader assumes it is populated.
+     *
+     * `recordPlatformAudit()` lives in `server/platform/guard.ts`, which
+     * Batch 44 does not own, so every `platform_action_log` row is still
+     * written UNCHAINED. `VERIFY-0081-neon-safe.sql` reports that as
+     * "0 of N chained — writer not wired" rather than as a broken chain,
+     * and wiring it is the same three lines `server/audit.ts` uses.
+     *
+     * ⚠️ THEY ARE DECLARED HERE ANYWAY so the Drizzle schema matches the
+     * database. A column that exists in Postgres and not in the schema is
+     * a column `drizzle-kit` will happily generate a DROP for.
+     *
+     * ⭐ THIS TABLE IS ONE CHAIN, not one per tenant, because it has no
+     * `tenant_id` — the rows that belong to a workspace go to
+     * `audit_logs` by the Phase 17 rule. Its scope key is the literal
+     * `platform`; see constraint 2 in `lib/audit/chain.ts`.
+     */
+    chainSeq: bigint("chain_seq", { mode: "number" }),
+    prevHash: text("prev_hash"),
+    contentHash: text("content_hash"),
+    rowHash: text("row_hash"),
   },
   (t) => ({
     actorCreatedIdx: index("platform_action_log_actor_idx").on(t.actorClerkId, t.createdAt),

@@ -1,6 +1,6 @@
 {
   "name": "ordence",
-  "version": "1.43.0-alpha",
+  "version": "1.46.0-alpha",
   "private": true,
   "scripts": {
     "dev": "next dev",
@@ -43,7 +43,8 @@
     "check:sql-executes": "node scripts/check-sql-executes.mjs",
     "check:rls-writes": "node scripts/check-rls-writes.mjs",
     "check:tax-decisions": "node scripts/check-tax-decisions.mjs",
-    "check:links": "node scripts/check-links.mjs"
+    "check:links": "node scripts/check-links.mjs",
+    "check:tenant-isolation": "node scripts/check-tenant-isolation.mjs"
   },
   "dependencies": {
     "@clerk/nextjs": "^6.39.6",

@@ -56,6 +56,16 @@ type Outcome<T> = Refusal | Ok<T>;
 /* ① PREPARE                                                           */
 /* ================================================================== */
 
+/**
+ * ⚠️ THE MINIMUM AN OVERRIDE REASON HAS TO BE.
+ *
+ * Short enough that a real sentence clears it, long enough that
+ * "adjustment", "as advised" and "." do not. A required field with no
+ * floor is a field everybody fills with a full stop, and then the audit
+ * trail records that a reason was given and nothing about what it was.
+ */
+const OVERRIDE_REASON_MIN = 20;
+
 const prepareSchema = z.object({
   gstin: z.string().trim().length(15),
   taxPeriod: z.string().regex(/^\d{4}-\d{2}$/),
@@ -63,6 +73,36 @@ const prepareSchema = z.object({
   itcReversedCgstMinor: z.string().regex(/^\d+$/).default("0"),
   itcReversedSgstMinor: z.string().regex(/^\d+$/).default("0"),
   itcReversedCessMinor: z.string().regex(/^\d+$/).default("0"),
+
+  /**
+   * ⭐⭐ WHAT THE RULE 42 ENGINE COMPUTED FOR THIS PERIOD.
+   *
+   * ══════════════════════════════════════════════════════════════════
+   * 🔴 WHY THE COMPUTED FIGURE IS AN INPUT AND NOT RECOMPUTED HERE
+   * ══════════════════════════════════════════════════════════════════
+   * Rule 42 needs E and F — exempt and total turnover — and the
+   * Explanation to the rule pulls into E the value of land sold and of
+   * buildings sold AFTER the completion certificate. Neither raises a
+   * tax invoice, because a sale after the certificate is outside GST
+   * entirely (Schedule III para 5). They cannot be derived from any
+   * table Ordence holds, so they are typed into the working panel, and
+   * recomputing here without them would produce a DIFFERENT computed
+   * figure from the one the operator was shown — which is worse than
+   * not computing at all.
+   *
+   * ⚠️ SO THIS IS NOT A TRUST BOUNDARY AND IS NOT PRETENDING TO BE ONE.
+   * A caller with curl can send any pair of numbers. What it buys is the
+   * thing the operator at a keyboard cannot do: change the reversal
+   * without leaving a record that they changed it and why.
+   */
+  itcReversalComputedIgstMinor: z.string().regex(/^\d+$/).optional(),
+  itcReversalComputedCgstMinor: z.string().regex(/^\d+$/).optional(),
+  itcReversalComputedSgstMinor: z.string().regex(/^\d+$/).optional(),
+  itcReversalComputedCessMinor: z.string().regex(/^\d+$/).optional(),
+  /** One line saying where the computed figure came from. Stored. */
+  itcReversalBasis: z.string().trim().max(500).optional(),
+  itcReversalOverrideReason: z.string().trim().max(2000).optional(),
+
   interestMinor: z.string().regex(/^\d+$/).default("0"),
   lateFeeMinor: z.string().regex(/^\d+$/).default("0"),
 });
@@ -80,6 +120,21 @@ export async function prepareGstr3b(
     const parsed = prepareSchema.safeParse(input);
     if (!parsed.success) return { ok: false, error: "Check the form." };
     const d = parsed.data;
+
+    /* ---------------------------------------------------------------- */
+    /* ⭐⭐⭐ THE REVERSAL: COMPUTED, OR OVERRIDDEN WITH A REASON        */
+    /* ---------------------------------------------------------------- */
+    //
+    // 🔴 THE FIGURE THAT USED TO ARRIVE HERE WAS TYPED, AND NOTHING
+    // RECORDED WHERE IT CAME FROM. Sections 17(5) and Rule 42 were
+    // implemented, tested and unreachable; the return took whatever was
+    // in the box. An accountant with a figure from their own working
+    // papers is a legitimate case — Rule 43 on capital goods bought in
+    // earlier periods is genuinely not in the computed number — but
+    // SILENTLY replacing a computed figure is not, because then the
+    // register and the return disagree and nothing says so.
+    const reversalCheck = describeReversal(d);
+    if (reversalCheck.refusal) return { ok: false, error: reversalCheck.refusal };
 
     const outcome = await withTenant(
       ctx.tenant.id,
@@ -160,7 +215,15 @@ export async function prepareGstr3b(
             ...m,
             amountMinor: m.amountMinor.toString(),
           })),
-          notes: [...b.notes],
+          /**
+           * ⚠️ THE PROVENANCE GOES IN `notes`, WHICH IS A COLUMN ON THE
+           * RETURN AND IS RENDERED. Not into a comment, not only into the
+           * audit log — the person who opens this return in eighteen
+           * months to answer a notice reads the return, and the sentence
+           * saying whether the reversal was computed or overridden, and
+           * on what basis, has to be there when they do.
+           */
+          notes: [...b.notes, reversalCheck.note],
           problems: [...b.problems],
           dueOn: gstr3bDueDate(d.taxPeriod),
           preparedAt: new Date(),
@@ -194,7 +257,25 @@ export async function prepareGstr3b(
       action: "create",
       resourceType: "gst_return",
       resourceId: outcome.id,
-      newValue: { taxPeriod: d.taxPeriod, gstin: d.gstin },
+      /**
+       * ⭐ BOTH NUMBERS, NOT THE ONE THAT WON. The return row keeps the
+       * figure that was filed; only the audit keeps the figure that was
+       * refused and the reason it was refused. Recording just the filed
+       * one would make an override indistinguishable from an agreement,
+       * which is the whole thing an assessment wants to know.
+       */
+      newValue: {
+        taxPeriod: d.taxPeriod,
+        gstin: d.gstin,
+        itcReversalEnteredMinor: reversalCheck.enteredTotalMinor,
+        itcReversalComputedMinor: reversalCheck.computedTotalMinor,
+        itcReversalOverridden: reversalCheck.overridden,
+        itcReversalBasis: d.itcReversalBasis ?? null,
+        itcReversalOverrideReason: d.itcReversalOverrideReason ?? null,
+      },
+      // An override is the event somebody goes looking for later; the
+      // agreed case is routine and should not compete with it.
+      severity: reversalCheck.overridden ? "notice" : "info",
     });
 
     revalidatePath("/gst/gstr3b");
@@ -213,6 +294,129 @@ export async function prepareGstr3b(
   } catch (error) {
     return toSalesActionError(error, "prepareGstr3b");
   }
+}
+
+/**
+ * ⭐⭐ DECIDE WHETHER THE REVERSAL IN THE RETURN IS THE COMPUTED ONE, AND
+ * WRITE THE SENTENCE THAT SAYS SO.
+ *
+ * ⚠️ NOT EXPORTED. This module is `"use server"`, and every export of
+ * such a module is a public HTTP endpoint. A synchronous helper exported
+ * from here would be published as an RPC that returns a refusal string —
+ * useless to an attacker, but the boundary gate refuses it on principle
+ * and the principle is right: the rule is "every export is an async
+ * function", and a rule with one exception has none.
+ */
+function describeReversal(d: {
+  itcReversedIgstMinor: string;
+  itcReversedCgstMinor: string;
+  itcReversedSgstMinor: string;
+  itcReversedCessMinor: string;
+  itcReversalComputedIgstMinor?: string | undefined;
+  itcReversalComputedCgstMinor?: string | undefined;
+  itcReversalComputedSgstMinor?: string | undefined;
+  itcReversalComputedCessMinor?: string | undefined;
+  itcReversalBasis?: string | undefined;
+  itcReversalOverrideReason?: string | undefined;
+}): {
+  refusal: string | null;
+  overridden: boolean;
+  note: string;
+  enteredTotalMinor: string;
+  computedTotalMinor: string | null;
+} {
+  const entered = [
+    BigInt(d.itcReversedIgstMinor),
+    BigInt(d.itcReversedCgstMinor),
+    BigInt(d.itcReversedSgstMinor),
+    BigInt(d.itcReversedCessMinor),
+  ];
+  const enteredTotal = entered.reduce((sum, head) => sum + head, 0n);
+
+  const computedHeads = [
+    d.itcReversalComputedIgstMinor,
+    d.itcReversalComputedCgstMinor,
+    d.itcReversalComputedSgstMinor,
+    d.itcReversalComputedCessMinor,
+  ];
+  const hasComputed = computedHeads.every((head) => head !== undefined);
+  const computed = hasComputed ? computedHeads.map((head) => BigInt(head as string)) : null;
+  const computedTotal = computed ? computed.reduce((sum, head) => sum + head, 0n) : null;
+
+  /**
+   * ⚠️ HEAD BY HEAD, NOT ON THE TOTAL. Four heads that sum to the same
+   * figure are still a different return: ₹1,000 moved from CGST to SGST
+   * reverses credit in the wrong pool, files cleanly, balances, and is
+   * found years later. A total-only comparison would let it through
+   * without ever asking for a reason.
+   */
+  const differs =
+    computed === null
+      ? enteredTotal !== 0n
+      : computed.some((head, i) => head !== entered[i]);
+
+  const reason = (d.itcReversalOverrideReason ?? "").trim();
+
+  if (differs && reason.length < OVERRIDE_REASON_MIN) {
+    return {
+      refusal:
+        computed === null
+          ? "This return carries an ITC reversal but no Rule 42 working was run for the " +
+            "period. Compute the reversal — the Section 17(5) and Rule 42 engines will do " +
+            "it from the purchase lines and show you which bills were blocked under which " +
+            "clause — or, if the figure comes from your own working papers, say so in a " +
+            "sentence. A reversal with no stated source cannot be defended at an " +
+            "assessment, and the person defending it will not be you."
+          : "The reversal in this return differs from the computed Rule 42 figure. That is " +
+            "allowed — Rule 43 on capital goods bought in earlier periods is not in the " +
+            "computed number, and your working papers may be right — but it has to be " +
+            "written down. Say in a sentence why the return carries a different figure. " +
+            "Both numbers are kept with the return.",
+      overridden: true,
+      note: "",
+      enteredTotalMinor: enteredTotal.toString(),
+      computedTotalMinor: computedTotal === null ? null : computedTotal.toString(),
+    };
+  }
+
+  if (differs) {
+    return {
+      refusal: null,
+      overridden: true,
+      note:
+        `⚠️ ITC reversal OVERRIDDEN. Computed under Rule 42: ` +
+        `${computedTotal === null ? "not computed" : `${computedTotal} paise`}. ` +
+        `Filed in this return: ${enteredTotal} paise. Reason given: ${reason}` +
+        (d.itcReversalBasis ? ` Computed basis: ${d.itcReversalBasis}` : ""),
+      enteredTotalMinor: enteredTotal.toString(),
+      computedTotalMinor: computedTotal === null ? null : computedTotal.toString(),
+    };
+  }
+
+  if (computed === null) {
+    // Nothing reversed and nothing computed. Saying so is worth one line:
+    // a nil reversal that nobody decided looks identical to one somebody
+    // did, and only the second one is an answer.
+    return {
+      refusal: null,
+      overridden: false,
+      note:
+        "ITC reversal: nil. No Rule 42 working was run for this period — nil is the " +
+        "figure by default, not by determination.",
+      enteredTotalMinor: enteredTotal.toString(),
+      computedTotalMinor: null,
+    };
+  }
+
+  return {
+    refusal: null,
+    overridden: false,
+    note:
+      `ITC reversal ${enteredTotal} paise computed under Rule 42, accepted unchanged. ` +
+      (d.itcReversalBasis ?? ""),
+    enteredTotalMinor: enteredTotal.toString(),
+    computedTotalMinor: computedTotal === null ? null : computedTotal.toString(),
+  };
 }
 
 /* ================================================================== */

@@ -1,5 +1,7 @@
 "use client";
 
+import Link from "next/link";
+
 /**
  * Ordence — ⭐⭐ PURCHASE ORDERS, GOODS RECEIPTS, AND THE MATCH
  * Version: v1.19.0-alpha
@@ -180,7 +182,18 @@ export function OrderManager({
         <Card key={o.id}>
           <CardHeader className="pb-2">
             <div className="flex flex-wrap items-center gap-2">
-              <CardTitle className="text-base">{o.poNumber}</CardTitle>
+              {/*
+                ⭐ v1.44.0: THE ROUTE EXISTED AND NOTHING POINTED AT IT.
+                `/purchases/orders/[id]` is where goods are booked in and
+                a bill is matched. `check:links` cannot catch this, because
+                it finds links with no destination, not destinations with
+                no link, and an orphan route is just as unreachable.
+              */}
+              <CardTitle className="text-base">
+                <Link href={`/purchases/orders/${o.id}`} className="hover:underline">
+                  {o.poNumber}
+                </Link>
+              </CardTitle>
               <Badge variant="secondary">{o.vendorName}</Badge>
               <Badge variant={o.status === "received" ? "default" : "secondary"}>
                 {o.status.replace(/_/g, " ")}

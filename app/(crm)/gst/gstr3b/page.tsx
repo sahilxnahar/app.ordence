@@ -1,8 +1,26 @@
 /**
  * Ordence — ⭐⭐⭐ GSTR-3B
- * Version: v1.24.0-alpha · Batch 16
+ * Version: v1.46.0-alpha · Batch 16, then Batch 39
  *
  * ⚠️ The guards are on the actions, not on this route.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * ⭐⭐ BATCH 39: THE ITC REVERSAL IS COMPUTED HERE NOW
+ * ══════════════════════════════════════════════════════════════════════
+ * Until this batch, Table 4(B)(1) — reversal of input tax credit — was an
+ * empty box on the prepare form with a note beside it saying reversals
+ * are entered, not calculated. They were calculable: `lib/purchases/itc.ts`
+ * has decided Section 17(5) for every purchase line since Phase 33 and
+ * `lib/purchases/apportionment.ts` implements Rule 42 exactly. Neither
+ * was reachable from this page.
+ *
+ * ⚠️ THE PANEL LIVES INSIDE `Gstr3bBoard` RATHER THAN BESIDE IT, and that
+ * is not a layout preference. The working has to be computed for the SAME
+ * tax period the return is being prepared for, and the period is state
+ * owned by the prepare form. Two components each holding their own period
+ * would let somebody compute July's reversal into August's return — a
+ * perfectly-formed figure for the wrong month, which reconciles to
+ * nothing and looks entirely correct.
  */
 
 import Link from "next/link";
@@ -87,7 +105,9 @@ export default async function Gstr3bPage() {
           GSTR-1 lists what you sold. This is the one you pay from: output tax meets input credit,
           and whatever is left has to leave a bank account by the twentieth. Assembled from the
           ledger rather than the invoice table, because the return and the books are the two
-          documents an assessment compares.
+          documents an assessment compares. The Rule 42 reversal is computed from the
+          period&apos;s purchase lines and shows its working — which bills were blocked, under
+          which clause, and what share of turnover was exempt.
         </p>
         <p className="mt-2 text-xs">
           <Link href="/compliance/due" className="underline">

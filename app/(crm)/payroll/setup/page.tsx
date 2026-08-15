@@ -42,6 +42,19 @@ export default async function PayrollSetupPage() {
           Three things have to exist before the first run: the components people are paid in, the
           statutory rates in force, and nine ledger accounts for the journal to land in.
         </p>
+        {/*
+          ⚠️ SEEDING IS ONCE; MAINTAINING IS FOREVER. The seed writes
+          opening figures and deliberately never overwrites them, so
+          every rate change after the first day happens on the rates
+          screen. A setup page that did not point at it left that screen
+          reachable only by typing a URL.
+        */}
+        <p className="mt-1 text-xs">
+          <Link href="/payroll/rates" className="underline">
+            Statutory rates
+          </Link>{" "}
+          — add a dated rate, see which one is in force, and see which runs used each one.
+        </p>
       </div>
 
       <SetupPanel

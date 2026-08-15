@@ -122,6 +122,209 @@ export function needsApproval(kind: string): boolean {
   return kind in POLICY_BY_KIND;
 }
 
+/* ================================================================== */
+/* ⭐⭐⭐ LISTED IS NOT ENFORCED                                        */
+/* ================================================================== */
+
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴🔴 THE LIST ABOVE DESCRIBES WHAT SHOULD BE HELD. UNTIL v1.32.0 THE
+ *      APPROVALS SCREEN PRESENTED IT AS WHAT IS HELD.
+ * ══════════════════════════════════════════════════════════════════════
+ * `app/platform/approvals/page.tsx` mapped over `APPROVAL_POLICIES` and
+ * printed all six under "What is held, and why". One was held. The other
+ * five were rows nothing enforced: the actions they name still executed
+ * the moment somebody clicked them.
+ *
+ * ⚠️ THAT IS WORSE THAN HAVING NO SCREEN, AND THE REASON IS NOT
+ * PEDANTIC. A missing control produces a question — "so what stops
+ * somebody terminating a workspace by accident?" — and questions get
+ * answered. A dead control answers it first, wrongly, and it is never
+ * asked again. An audit reads the same screen and records the gap as
+ * covered, which is how a gap survives a review.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * ⭐⭐ ENFORCED MEANS BOTH HALVES OF THE ROUND TRIP EXIST
+ * ══════════════════════════════════════════════════════════════════════
+ *   ① A REQUEST PATH — something an operator can actually reach that
+ *      calls `queueForApproval` INSTEAD OF doing the thing. Without it
+ *      the policy is a row nobody can create, and the dangerous action
+ *      keeps its old immediate door. This is the state that reads most
+ *      like enforcement from outside, because the queue exists, the
+ *      screen exists, and nothing ever appears in it.
+ *
+ *   ② AN EXECUTOR — a registration in the server's map, so an approved
+ *      row becomes the same function call it would have been. Without it
+ *      a request can be raised and approved and then refuses to run,
+ *      which is the most confusing possible ordering of events.
+ *
+ * ⚠️ ① IS DECLARED HERE AND ② IS OBSERVED AT RUNTIME, and the asymmetry
+ * is forced rather than chosen. A registry can be read; a function that
+ * has never been called cannot be distinguished from one that does not
+ * exist, and waiting for the first request before admitting a path
+ * exists would report every policy as unenforceable on a cold boot.
+ *
+ * 🔴 SO THE DECLARATION IS PINNED BY A TEST. `tests/ui/approval-
+ * policies.test.ts` compares these keys against the actual `kind:`
+ * literals in `server/platform/control-actions.ts` in BOTH directions.
+ * Adding a request path without listing it here fails; listing one that
+ * does not exist fails. That is what stops this table becoming the next
+ * hand-maintained list that quietly goes stale.
+ */
+export const REQUEST_PATHS: Readonly<Partial<Record<ApprovalKind, string>>> =
+  Object.freeze({
+    "tenant.suspend":
+      "requestSuspend() in server/platform/control-actions.ts, reached from the Suspend dialog on a tenant's page.",
+    "tenant.terminate":
+      "requestTermination() in server/platform/control-actions.ts, reached from the termination panel on a tenant's page. Approving SCHEDULES a deletion and locks the workspace read-only; it does not delete.",
+  });
+
+/**
+ * ⭐ WHY EACH UNENFORCED POLICY IS UNENFORCED, IN THE WORDS AN OPERATOR
+ * AND AN AUDITOR BOTH NEED.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * ⚠️ THESE ARE PRECONDITIONS, NOT APOLOGIES. "This policy will apply
+ * once X exists" is a sentence somebody can plan around and chase.
+ * "Coming soon" is not, and an unexplained gap gets read as an oversight
+ * that somebody then helpfully papers over.
+ * ══════════════════════════════════════════════════════════════════════
+ *
+ * 🔴 NONE OF IT IS PRINTED WHEN THE GAP IS GONE. `enforcementReport`
+ * blanks the text the moment both halves exist, because a caveat that
+ * outlives its own fix is how a screen starts lying in the other
+ * direction.
+ *
+ * ⚠️ THE HONEST ANSWER FOR TWO OF THESE IS "IT CANNOT BE WIRED", NOT
+ * "IT HAS NOT BEEN WIRED YET", and the two are recorded differently on
+ * purpose — one is a backlog item, the other is a design constraint that
+ * a future attempt needs to know about before it starts.
+ */
+export const BLOCKED_BECAUSE: Readonly<Record<ApprovalKind, string>> = Object.freeze({
+  /**
+   * Enforced. Present so the record stays exhaustive: `Record<ApprovalKind,
+   * string>` means a seventh policy cannot be added without somebody
+   * being made to write this sentence for it.
+   */
+  "tenant.suspend": "",
+
+  /**
+   * ⚠️ THE MOST MISLEADING OF THE FIVE, because half of it is built. An
+   * executor IS registered, so a queued row of this kind would run
+   * correctly — there is simply no way to create one.
+   */
+  "entitlement.override_paid":
+    "Half-built, and the built half is the wrong half. The executor is registered " +
+    "and works, but nothing raises the request: applyEntitlementChange still calls " +
+    "setTenantFlag directly. Until that call is replaced by queueForApproval, an " +
+    "override on a paying customer takes effect the instant it is clicked. This " +
+    "policy will apply once the entitlement toggle is routed through the queue.",
+
+  /**
+   * ⭐ ENFORCED SINCE v1.33.0, AND IT ARRIVED THE RIGHT WAY ROUND.
+   *
+   * ⚠️ FOR MOST OF THIS FILE'S LIFE THE HONEST TEXT HERE WAS "nothing in
+   * this build terminates a workspace" — there was no delete path, no
+   * archive path and no scheduled-deletion path, so there was no call
+   * site for an approval to sit in front of. `lib/platform/roles.ts`
+   * made the same observation from the other direction, which is why
+   * provisioning is a step-up capability: a workspace minted by mistake
+   * could not be un-minted.
+   *
+   * 🔴 THE MISTAKE WORTH AVOIDING WAS BUILDING TERMINATION FIRST AND
+   * WIRING THE APPROVAL AFTERWARDS, and it was avoided: the request
+   * path, the executor and the queue arrived in the same change. The
+   * sentence is retained rather than deleted because the next unwired
+   * policy on this list is in exactly the position this one was in.
+   */
+  "tenant.terminate":
+    "Termination has to exist before an approval can hold it. This policy will " +
+    "apply the moment a request path and an executor both exist — and building " +
+    "termination without wiring them in the same change would be the mistake.",
+
+  /**
+   * ⚠️ THIS ONE IS A DESIGN CONSTRAINT AND NOT A BACKLOG ITEM. Anybody
+   * who later tries to wire it needs to read this before they start, or
+   * they will ship a queue that hands the customer's data to the wrong
+   * engineer.
+   */
+  "impersonate.break_glass":
+    "It cannot go through this queue as the queue is built, and wiring it anyway " +
+    "would be worse than leaving it out. An executor runs inside the APPROVER's " +
+    "request, and startImpersonation binds the session it creates to whoever is " +
+    "calling — staff id, Clerk id, email, and the live banner. Approving a queued " +
+    "break-glass would open the customer's workspace for the approver rather than " +
+    "for the engineer who needs it, and would name the wrong person in the email " +
+    "the customer receives. It keeps its own controls instead: owner grade, a " +
+    "written reason, a refusal if usable consent exists, an out-of-band email to " +
+    "the customer, an alert to the platform owners, and a post-incident write-up " +
+    "that blocks the next one.",
+
+  "staff.elevate":
+    "A queue here would sit beside grantPlatformStaffAction, which still calls " +
+    "grantPlatformStaff directly — and a control with an open door next to it is " +
+    "decoration. This policy will apply once the grant action itself is moved " +
+    "behind the queue, which has to happen in the same change. Meanwhile the " +
+    "grant is not unguarded: owner grade, a fresh step-up, a deploy-time " +
+    "allowlist entry, a mandatory expiry, and a refusal to grant or renew your " +
+    "own access.",
+
+  "tenant.plan_change":
+    "Same shape as the one above. setPlanAndLimits is the enforcement point and " +
+    "setPlanAndLimitsAction still reaches it directly, so a request path added on " +
+    "its own would leave the immediate route running alongside the queue. This " +
+    "policy will apply once the plan editor is routed through it.",
+});
+
+export type PolicyEnforcement = {
+  readonly kind: ApprovalKind;
+  readonly label: string;
+  readonly because: string;
+  readonly approverGrade: PlatformGrade;
+  readonly expiryHours: number;
+  /** ⭐ The ONLY field a screen may draw a "this is covered" badge from. */
+  readonly enforced: boolean;
+  readonly hasRequestPath: boolean;
+  readonly hasExecutor: boolean;
+  /** How a request of this kind is raised, or null if it cannot be. */
+  readonly requestPath: string | null;
+  /** Empty when enforced; the precondition otherwise. */
+  readonly blockedBecause: string;
+};
+
+/**
+ * ⚠️ THE REGISTERED KINDS ARE AN ARGUMENT, NOT AN IMPORT. This function
+ * has to run in a jsdom test and in a React render as readily as on the
+ * server, and reaching for the executor map would drag `@/db` into both.
+ * Passing it in is also what lets a test prove the "executor present,
+ * request path absent" case, which is the state that has actually been
+ * shipping.
+ */
+export function enforcementReport(
+  registeredKinds: readonly string[],
+): readonly PolicyEnforcement[] {
+  return APPROVAL_POLICIES.map((policy) => {
+    const hasExecutor = registeredKinds.includes(policy.kind);
+    const requestPath = REQUEST_PATHS[policy.kind] ?? null;
+    const hasRequestPath = requestPath !== null;
+    const enforced = hasExecutor && hasRequestPath;
+
+    return {
+      kind: policy.kind,
+      label: policy.label,
+      because: policy.because,
+      approverGrade: policy.approverGrade,
+      expiryHours: policy.expiryHours,
+      enforced,
+      hasRequestPath,
+      hasExecutor,
+      requestPath,
+      // 🔴 BLANKED WHEN ENFORCED. See the note above `BLOCKED_BECAUSE`.
+      blockedBecause: enforced ? "" : BLOCKED_BECAUSE[policy.kind],
+    };
+  });
+}
+
 /* ------------------------------------------------------------------ */
 /* THE SELF-APPROVAL RULE                                              */
 /* ------------------------------------------------------------------ */

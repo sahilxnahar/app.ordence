@@ -29,7 +29,7 @@
  * behaviour for every unrelated caller including libraries.
  */
 
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { revalidatePath } from "next/cache";
 import { withTenant } from "@/db";
 import { postPurchaseInvoice } from "@/server/accounting/post-sales";
@@ -74,7 +74,9 @@ import { pricePurchase } from "@/server/purchases/engine";
 import { determineItcEligibility } from "@/lib/purchases/itc";
 import {
   apportionRule42ByHead,
+  apportionRule43,
   bucketRule42,
+  RULE_43_USEFUL_LIFE_MONTHS,
 } from "@/lib/purchases/apportionment";
 import { summariseItcRegister } from "@/lib/purchases/register";
 import {
@@ -82,7 +84,7 @@ import {
   assessMsmeExposure,
   runningBalance,
 } from "@/lib/purchases/vendor-ledger";
-import { parseMoney, serializeAmount } from "@/lib/billing/money";
+import { parseMoney, serializeAmount, toBigIntAmount } from "@/lib/billing/money";
 import type { ActionResult } from "@/lib/validators/crm";
 
 /* ------------------------------------------------------------------ */
@@ -1060,6 +1062,443 @@ export async function runRule42ForPeriod(input: unknown): Promise<
     };
   } catch (err) {
     return toPurchaseActionError(err, "runRule42ForPeriod");
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* ⭐⭐⭐ THE WORKING BEHIND THE REVERSAL                              */
+/* ------------------------------------------------------------------ */
+
+/**
+ * One purchase line, as it appears in the working.
+ *
+ * ⚠️ THE STORED VERDICT AND THE ENGINE'S VERDICT ARE BOTH CARRIED, AND
+ * THEY ARE NOT THE SAME QUESTION. The stored verdict was reached at entry
+ * with facts that are no longer on the row — whether the canteen is
+ * mandatory under the Factories Act, whether the outward rate is one of
+ * the 1%/5% residential rates notified without credit. Re-running
+ * `determineItcEligibility` on what the row DOES carry gives the verdict
+ * before any of those provisos, which is the only thing a reader can
+ * check unaided. Where the two differ, that difference is the sentence
+ * worth printing: it names the exact lines whose eligibility rests on
+ * evidence somebody has to be able to produce.
+ */
+export type ItcWorkingLine = {
+  invoiceNumber: string;
+  invoiceDate: string;
+  vendorName: string;
+  lineNumber: number;
+  description: string;
+  /** The clause the row was STORED under: "17(5)(d)". */
+  statutoryRef: string | null;
+  blockReason: string | null;
+  eligibility: string;
+  /** The whole tax on the line, all four heads, in paise. */
+  taxMinor: string;
+  /** What the engine says from the line's own facts, provisos aside. */
+  engineEligibility: string;
+  engineStatutoryRef: string;
+  engineExplanation: string;
+  /** Non-null where the stored verdict and the engine disagree. */
+  divergence: string | null;
+};
+
+export type ItcReversalWorkingView = {
+  taxPeriod: string;
+  registrationId: string | null;
+  /** How many purchase lines the period's apportionment was built from. */
+  lineCount: number;
+
+  /* --- Section 17(5): what was blocked, and under which clause --- */
+  blockedTotalMinor: string;
+  byClause: Array<{
+    statutoryRef: string;
+    blockReason: string | null;
+    lineCount: number;
+    blockedTaxMinor: string;
+  }>;
+  blockedLines: ItcWorkingLine[];
+  /** Lines the engine would block that were recorded eligible anyway. */
+  provisoLines: ItcWorkingLine[];
+  /** How many lines were dropped from the two lists above. */
+  linesNotListed: number;
+
+  /* --- Rule 42: the letters, in the rule's own names ------------ */
+  exemptTurnoverMinor: string;
+  totalTurnoverMinor: string;
+  exemptRatioBps: number;
+  deemedNonBusinessRateBps: number;
+  c1Minor: string;
+  t1Minor: string;
+  t2Minor: string;
+  t3Minor: string;
+  c2Minor: string;
+  t4Minor: string;
+  c3Minor: string;
+  d1Minor: string;
+  d2Minor: string;
+  eligibleCommonMinor: string;
+
+  /* --- ⭐ The answer, per head. This is what the return takes ---- */
+  reversalIgstMinor: string;
+  reversalCgstMinor: string;
+  reversalSgstMinor: string;
+  reversalCessMinor: string;
+  reversalTotalMinor: string;
+
+  /* --- Rule 43: excluded from the figure above, and said so ----- */
+  capitalCommonMinor: string;
+  rule43MonthlySliceMinor: string;
+  rule43ThisPeriodMinor: string;
+
+  /** Everything that makes the computed figure incomplete. */
+  caveats: string[];
+};
+
+/**
+ * ⭐⭐⭐ COMPUTE THE GSTR-3B TABLE 4(B)(1) REVERSAL, AND SHOW THE WORKING.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 WHY THIS IS A SEPARATE, READ-ONLY ACTION AND NOT `runRule42ForPeriod`
+ * ══════════════════════════════════════════════════════════════════════
+ * `runRule42ForPeriod` returns the same arithmetic, but it is a WRITE: it
+ * needs `purchases:reverse_itc`, it needs the entitlement, and it POSTS a
+ * reversal into the ITC register. A person preparing a 3B needs to see
+ * the number before deciding to accept it, and possibly to see it three
+ * times while they chase down which tower the cement went to. If the only
+ * way to see it were the posting action, they would either post three
+ * reversals or stop looking — and a figure nobody looks at is the typed
+ * figure again, wearing a computed hat.
+ *
+ * ⚠️ THE ARITHMETIC COMES FROM `loadPeriodLinesForRule42`, THE SAME
+ * LOADER THE POSTING ACTION USES. Not from the narrative query below.
+ * Two loaders with two sets of predicates would eventually disagree about
+ * one cancelled bill, and then the number on the screen and the number in
+ * the register would differ by an amount nobody could account for. The
+ * second query exists only to put invoice numbers and clauses against the
+ * buckets; it never contributes a paisa.
+ *
+ * ⚠️ NO ENTITLEMENT GATE AND NO WRITE PERMISSION — `purchases:read` only,
+ * for the same reason as `determineItc`. Showing somebody the working
+ * behind their own reversal is not a paid feature, and a gate here
+ * refuses to RENDER the panel rather than refusing a button on it.
+ */
+export async function getItcReversalWorking(
+  input: unknown,
+): Promise<ActionResult<ItcReversalWorkingView>> {
+  try {
+    const ctx = await requirePermission("purchases:read");
+    const data = runRule42Schema.parse(input);
+
+    const exemptTurnoverMinor = parseMoney(data.exemptTurnover);
+    const totalTurnoverMinor = parseMoney(data.totalTurnover);
+    const deemedBps = data.deemedNonBusinessRateBps ?? 500;
+
+    /* --- ① THE ARITHMETIC, from the canonical loader ------------- */
+
+    const lines = await loadPeriodLinesForRule42(
+      ctx.tenant.id,
+      data.taxPeriod,
+      data.registrationId ?? null,
+    );
+    const buckets = bucketRule42(lines);
+
+    let result: ReturnType<typeof apportionRule42ByHead>;
+    try {
+      result = apportionRule42ByHead({
+        totalCredit: buckets.totalCredit,
+        nonBusiness: buckets.nonBusiness,
+        exempt: buckets.exempt,
+        blocked: buckets.blocked,
+        taxable: buckets.taxable,
+        exemptTurnoverMinor,
+        totalTurnoverMinor,
+        deemedNonBusinessRateBps: deemedBps,
+      });
+    } catch (err) {
+      /**
+       * ⚠️ THE ENGINE'S OWN SENTENCE, PASSED THROUGH. `apportionRule42`
+       * refuses on a partition that does not reconcile, on E greater than
+       * F, and on a negative bucket — and every refusal is a paragraph
+       * written for the person who has to fix it. `toPurchaseActionError`
+       * has no mapping for a plain `Error` and would replace all of that
+       * with "Something went wrong. Please try again.", which tells the
+       * operator to retry an operation that will fail identically.
+       *
+       * ⚠️ NARROWED TO THIS ONE CALL. The input was already parsed above,
+       * so nothing inside this block throws a Zod error, and no database
+       * message can reach it — a blanket `err.message` around the whole
+       * action would leak constraint text the outer handler exists to
+       * translate.
+       */
+      if (err instanceof Error) return purchaseFail(err.message);
+      throw err;
+    }
+
+    /* --- ② RULE 43, computed and DELIBERATELY NOT ADDED IN ------- */
+    //
+    // ⚠️ `bucketRule42` holds capital common credit out of C1 because
+    // Rule 43 spreads it over sixty months. What is shown here is the
+    // slice for capital goods ACQUIRED IN THIS PERIOD only — Ordence does
+    // not carry a sixty-month schedule for items bought in earlier
+    // periods, so this is a floor and not the Rule 43 figure. Adding it
+    // to the Rule 42 reversal would present a part-answer as a whole one;
+    // printing it as a caveat lets the accountant see exactly what is
+    // missing and add their own figure with a reason.
+    const rule43ByHead = (["igstMinor", "cgstMinor", "sgstMinor", "cessMinor"] as const).map(
+      (head) =>
+        apportionRule43({
+          commonCreditMinor: buckets.capitalCommon[head],
+          exemptTurnoverMinor,
+          totalTurnoverMinor,
+        }),
+    );
+    const rule43Monthly = rule43ByHead.reduce((sum, r) => sum + r.tmMinor, 0n);
+    const rule43ThisPeriod = rule43ByHead.reduce((sum, r) => sum + r.teMinor, 0n);
+    const capitalCommon =
+      buckets.capitalCommon.igstMinor +
+      buckets.capitalCommon.cgstMinor +
+      buckets.capitalCommon.sgstMinor +
+      buckets.capitalCommon.cessMinor;
+
+    /* --- ③ THE NARRATIVE. Invoice numbers and clauses. ---------- */
+
+    const rows = await withTenant(ctx.tenant.id, async (tx) =>
+      tx
+        .select({
+          lineNumber: purchaseInvoiceLines.lineNumber,
+          description: purchaseInvoiceLines.description,
+          itcPurpose: purchaseInvoiceLines.itcPurpose,
+          expenditureNature: purchaseInvoiceLines.expenditureNature,
+          eligibility: purchaseInvoiceLines.itcEligibility,
+          blockReason: purchaseInvoiceLines.itcBlockReason,
+          statutoryRef: purchaseInvoiceLines.itcStatutoryRef,
+          cgst: purchaseInvoiceLines.cgstMinor,
+          sgst: purchaseInvoiceLines.sgstMinor,
+          igst: purchaseInvoiceLines.igstMinor,
+          cess: purchaseInvoiceLines.cessMinor,
+          invoiceNumber: purchaseInvoices.invoiceNumber,
+          invoiceDate: purchaseInvoices.invoiceDate,
+          isBillOfSupply: purchaseInvoices.isBillOfSupply,
+          vendorName: vendors.legalName,
+        })
+        .from(purchaseInvoiceLines)
+        .innerJoin(
+          purchaseInvoices,
+          and(
+            eq(purchaseInvoices.id, purchaseInvoiceLines.purchaseInvoiceId),
+            eq(purchaseInvoices.tenantId, purchaseInvoiceLines.tenantId),
+          ),
+        )
+        .leftJoin(
+          vendors,
+          and(
+            eq(vendors.id, purchaseInvoices.vendorId),
+            eq(vendors.tenantId, purchaseInvoices.tenantId),
+          ),
+        )
+        .where(
+          and(
+            eq(purchaseInvoiceLines.tenantId, ctx.tenant.id),
+            eq(purchaseInvoices.taxPeriod, data.taxPeriod),
+            sql`${purchaseInvoices.status} <> 'cancelled'`,
+            data.registrationId
+              ? eq(purchaseInvoices.recipientRegistrationId, data.registrationId)
+              : undefined,
+          ),
+        ),
+    );
+
+    const blockedLines: ItcWorkingLine[] = [];
+    const provisoLines: ItcWorkingLine[] = [];
+    const clauseTotals = new Map<
+      string,
+      { statutoryRef: string; blockReason: string | null; lineCount: number; minor: bigint }
+    >();
+    let blockedTotal = 0n;
+
+    for (const row of rows) {
+      const taxMinor =
+        toBigIntAmount(row.cgst) +
+        toBigIntAmount(row.sgst) +
+        toBigIntAmount(row.igst) +
+        toBigIntAmount(row.cess);
+
+      // ⚠️ ONLY THE TWO FACTS THE ROW ACTUALLY CARRIES, plus the document
+      // type. The provisos are not columns, so passing nothing for them
+      // asks the engine the honest question: "on the face of this line,
+      // is it blocked?" Inventing `statutoryObligationToEmployees: true`
+      // to make the answers match would make the check always pass and
+      // therefore worthless.
+      const engine = determineItcEligibility({
+        itcPurpose: row.itcPurpose,
+        expenditureNature: row.expenditureNature,
+        hasValidTaxInvoice: !row.isBillOfSupply,
+      });
+
+      const storedBlocked = row.eligibility === "blocked";
+      const engineBlocked = engine.eligibility === "blocked";
+
+      let divergence: string | null = null;
+      if (engineBlocked && !storedBlocked) {
+        divergence =
+          `On its own facts this line is blocked by ${engine.statutoryRef}. It was ` +
+          `recorded as ${row.eligibility} because a proviso was ticked when the bill ` +
+          `was entered — a statutory obligation to employees, an onward supply of the ` +
+          `same category, or a further supply of works contract service. That proviso ` +
+          `is what has to be evidenced if the credit is questioned.`;
+      } else if (!engineBlocked && storedBlocked) {
+        divergence =
+          `This line is not blocked by anything on its face. It was recorded blocked ` +
+          `under ${row.statutoryRef ?? "an unnamed clause"} on a fact held elsewhere — ` +
+          `an outward rate notified without credit, a composition or non-resident ` +
+          `supplier, or goods lost, destroyed or gifted.`;
+      }
+
+      const view: ItcWorkingLine = {
+        invoiceNumber: row.invoiceNumber,
+        invoiceDate: row.invoiceDate,
+        vendorName: row.vendorName ?? "—",
+        lineNumber: row.lineNumber,
+        description: row.description,
+        statutoryRef: row.statutoryRef,
+        blockReason: row.blockReason,
+        eligibility: row.eligibility,
+        taxMinor: serializeAmount(taxMinor),
+        engineEligibility: engine.eligibility,
+        engineStatutoryRef: engine.statutoryRef,
+        engineExplanation: engine.explanation,
+        divergence,
+      };
+
+      if (storedBlocked) {
+        blockedTotal += taxMinor;
+        const key = row.statutoryRef ?? engine.statutoryRef;
+        const bucket = clauseTotals.get(key) ?? {
+          statutoryRef: key,
+          blockReason: row.blockReason,
+          lineCount: 0,
+          minor: 0n,
+        };
+        bucket.lineCount += 1;
+        bucket.minor += taxMinor;
+        clauseTotals.set(key, bucket);
+        blockedLines.push(view);
+      } else if (engineBlocked) {
+        provisoLines.push(view);
+      }
+    }
+
+    /**
+     * ⚠️ THE LISTS ARE CAPPED AND THE REMAINDER IS COUNTED, NOT SILENTLY
+     * DROPPED. A developer's month is thousands of purchase lines; sending
+     * every one to the browser to render a table nobody scrolls costs more
+     * than it explains. The per-clause totals above are computed over ALL
+     * of them, so the money always reconciles even when the list does not
+     * show every row — and the count says how many are missing, because a
+     * truncated list that does not admit it is worse than no list.
+     */
+    const LIST_CAP = 100;
+    const listedBlocked = blockedLines.slice(0, LIST_CAP);
+    const listedProviso = provisoLines.slice(0, LIST_CAP);
+    const linesNotListed =
+      blockedLines.length - listedBlocked.length + (provisoLines.length - listedProviso.length);
+
+    /* --- ④ WHAT THE FIGURE DOES NOT COVER ----------------------- */
+
+    const caveats: string[] = [];
+    if (totalTurnoverMinor === 0n) {
+      caveats.push(
+        "No total turnover was given for the period, so D1 (the exempt share) is nil. " +
+          "Rule 42(1)(g) says to use the last period for which the values are available; " +
+          "if this period genuinely had no supplies, nil is correct.",
+      );
+    }
+    if (capitalCommon > 0n) {
+      caveats.push(
+        `${serializeAmount(capitalCommon)} paise of common credit on CAPITAL GOODS is ` +
+          `excluded from this figure. Rule 43 spreads it over ` +
+          `${RULE_43_USEFUL_LIFE_MONTHS} months at Tm = Tc ÷ ${RULE_43_USEFUL_LIFE_MONTHS}; ` +
+          `the slice for items bought in this period alone is ` +
+          `${serializeAmount(rule43ThisPeriod)} paise. Items bought in earlier periods ` +
+          `are not scheduled here and are not in that number.`,
+      );
+    }
+    if (provisoLines.length > 0) {
+      caveats.push(
+        `${provisoLines.length} line${provisoLines.length === 1 ? " is" : "s are"} eligible ` +
+          `only because a Section 17(5) proviso was recorded at entry. Nothing on the row ` +
+          `evidences it — check them before the return is filed.`,
+      );
+    }
+    caveats.push(
+      "Exempt and total turnover are what you typed. The Explanation to Rule 42 pulls " +
+        "the value of land sold and of buildings sold AFTER the completion certificate " +
+        "into E, and neither raises a tax invoice, so neither can be derived here. " +
+        "Omitting them understates the reversal.",
+    );
+
+    const sum = (pick: (r: (typeof result)["cgst"]) => bigint): bigint =>
+      pick(result.cgst) + pick(result.sgst) + pick(result.igst) + pick(result.cess);
+
+    const reversalTotal =
+      result.reversal.igstMinor +
+      result.reversal.cgstMinor +
+      result.reversal.sgstMinor +
+      result.reversal.cessMinor;
+
+    return {
+      ok: true,
+      data: {
+        taxPeriod: data.taxPeriod,
+        registrationId: data.registrationId ?? null,
+        lineCount: lines.length,
+
+        blockedTotalMinor: serializeAmount(blockedTotal),
+        byClause: [...clauseTotals.values()]
+          .sort((a, b) => (b.minor > a.minor ? 1 : b.minor < a.minor ? -1 : 0))
+          .map((c) => ({
+            statutoryRef: c.statutoryRef,
+            blockReason: c.blockReason,
+            lineCount: c.lineCount,
+            blockedTaxMinor: serializeAmount(c.minor),
+          })),
+        blockedLines: listedBlocked,
+        provisoLines: listedProviso,
+        linesNotListed,
+
+        exemptTurnoverMinor: serializeAmount(exemptTurnoverMinor),
+        totalTurnoverMinor: serializeAmount(totalTurnoverMinor),
+        // ⭐ One ratio for all four heads: E and F are facts about the
+        // period's SUPPLIES, so `cgst` is not a choice, it is the ratio.
+        exemptRatioBps: result.cgst.exemptRatioBps,
+        deemedNonBusinessRateBps: deemedBps,
+        c1Minor: serializeAmount(sum((r) => r.c1)),
+        t1Minor: serializeAmount(sum((r) => r.t1)),
+        t2Minor: serializeAmount(sum((r) => r.t2)),
+        t3Minor: serializeAmount(sum((r) => r.t3)),
+        c2Minor: serializeAmount(sum((r) => r.c2)),
+        t4Minor: serializeAmount(sum((r) => r.t4)),
+        c3Minor: serializeAmount(sum((r) => r.c3)),
+        d1Minor: serializeAmount(sum((r) => r.d1)),
+        d2Minor: serializeAmount(sum((r) => r.d2)),
+        eligibleCommonMinor: serializeAmount(sum((r) => r.eligibleCommonMinor)),
+
+        reversalIgstMinor: serializeAmount(result.reversal.igstMinor),
+        reversalCgstMinor: serializeAmount(result.reversal.cgstMinor),
+        reversalSgstMinor: serializeAmount(result.reversal.sgstMinor),
+        reversalCessMinor: serializeAmount(result.reversal.cessMinor),
+        reversalTotalMinor: serializeAmount(reversalTotal),
+
+        capitalCommonMinor: serializeAmount(capitalCommon),
+        rule43MonthlySliceMinor: serializeAmount(rule43Monthly),
+        rule43ThisPeriodMinor: serializeAmount(rule43ThisPeriod),
+
+        caveats,
+      },
+    };
+  } catch (err) {
+    return toPurchaseActionError(err, "getItcReversalWorking");
   }
 }
 

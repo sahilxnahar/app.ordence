@@ -38,6 +38,13 @@ import {
   closeFinancialPeriod,
   reopenFinancialPeriod,
 } from "@/server/actions/periods";
+import {
+  resolveStatementPeriod,
+  previousFyFor,
+  describePeriod,
+  todayInIndia,
+  type StatementPeriod,
+} from "@/lib/accounting/periods";
 import { JournalEntryForm, type LedgerOption } from "./journal-form";
 import {
   ClosePeriodDialog,
@@ -57,13 +64,115 @@ function Amount({ value }: { value: string }) {
   );
 }
 
-export default async function AccountingPage() {
+/**
+ * ⭐ THE TRIAL BALANCE PERIOD PICKER — A PLAIN GET FORM.
+ *
+ * ⚠️ The period lives in the URL rather than in component state, so the
+ * page a bookkeeper is looking at can be linked to an accountant and
+ * render the same figures. It also works with no JavaScript, which is
+ * the state this page is in for the first second of every load.
+ *
+ * The inputs show the RESOLVED dates. A malformed `?from=` falls back to
+ * the financial year rather than erroring, and the user needs to see the
+ * range they actually got, not the one they asked for.
+ */
+function TrialBalancePeriodPicker({ period }: { period: StatementPeriod }) {
+  const previous = previousFyFor(todayInIndia());
+  return (
+    <form method="get" className="flex flex-wrap items-end gap-3 rounded-md border border-border p-3">
+      <label className="flex flex-col gap-1 text-xs text-muted-foreground">
+        From
+        <input
+          type="date"
+          name="from"
+          defaultValue={period.from}
+          className="rounded-md border border-border bg-background px-2 py-1 text-sm text-foreground"
+        />
+      </label>
+      <label className="flex flex-col gap-1 text-xs text-muted-foreground">
+        To
+        <input
+          type="date"
+          name="to"
+          defaultValue={period.to}
+          className="rounded-md border border-border bg-background px-2 py-1 text-sm text-foreground"
+        />
+      </label>
+      <button
+        type="submit"
+        className="rounded-md border border-border bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground"
+      >
+        Apply
+      </button>
+      <div className="flex items-center gap-3 text-xs">
+        <Link href="/accounting" className="text-muted-foreground hover:underline">
+          This financial year
+        </Link>
+        <Link
+          href={`/accounting?from=${previous.from}&to=${previous.to}`}
+          className="text-muted-foreground hover:underline"
+        >
+          Previous financial year
+        </Link>
+      </div>
+    </form>
+  );
+}
+
+export default async function AccountingPage({
+  searchParams,
+}: {
+  searchParams: Promise<{ from?: string; to?: string }>;
+}) {
   const ctx = await requirePageContext();
+  const params = await searchParams;
+
+  /**
+   * ══════════════════════════════════════════════════════════════════
+   * 🔴 THE TRIAL BALANCE USED TO BE SINCE INCEPTION, WITH NO ALTERNATIVE
+   * ══════════════════════════════════════════════════════════════════
+   * `getTrialBalance()` took no arguments, so this table summed every
+   * entry the tenant had ever posted. That is a useful number roughly
+   * once — at the end of year one. After that it agrees with no return
+   * and no set of accounts, and there was no parameter to pass.
+   *
+   * ⚠️ It now defaults to the CURRENT INDIAN FINANCIAL YEAR, not to all
+   * time. See `lib/accounting/periods.ts` for why a since-inception
+   * default is the dangerous one: it over-reports, plausibly, against a
+   * range that is not printed anywhere.
+   *
+   * ⚠️ A PERIOD TRIAL BALANCE STILL BALANCES. Debits equal credits per
+   * transaction, enforced by a deferred database trigger, so any subset
+   * of whole transactions sums to zero. Narrowing the range cannot make
+   * `isBalanced` false — which is why the close dialog below can still
+   * trust it.
+   *
+   * ══════════════════════════════════════════════════════════════════
+   * 🔴 BATCH 65 — AND IT NOW EXCLUDES VOID AND UNPOSTED TRANSACTIONS
+   * ══════════════════════════════════════════════════════════════════
+   * ⚠️ THIS MOVED NUMBERS THAT WERE ALREADY ON SCREEN. Nothing in the
+   * statement path filtered `transactions.status`, so a voided
+   * transaction was counted in this table exactly like a real one.
+   *
+   * The set is now `posted` and `reversed`. `reversed` is INCLUDED, and
+   * that is the half people get wrong: `reverseTransaction` writes the
+   * mirror entry as a NEW `posted` transaction and marks the original
+   * `reversed`, so filtering to "posted only" would keep every
+   * correction and drop every thing it corrected — turnover would go
+   * negative by the value of each reversed sale, in a trial balance that
+   * still balances perfectly. Both rows, or neither. The reasoning lives
+   * on `STATEMENT_TRANSACTION_STATUSES` in `server/actions/accounting.ts`.
+   *
+   * ⚠️ `isBalanced` IS UNAFFECTED. The filter selects whole transactions,
+   * and a whole transaction balances by database trigger, so the close
+   * dialog can still trust the flag.
+   */
+  const period = resolveStatementPeriod({ from: params.from, to: params.to });
 
   const [ledgersResult, trialBalanceResult, periodsResult, transactionsResult] =
     await Promise.all([
       getLedgers(),
-      getTrialBalance(),
+      getTrialBalance({ from: period.from, to: period.to }),
       getFinancialPeriods(),
       getRecentTransactions(15),
     ]);
@@ -113,20 +222,43 @@ export default async function AccountingPage() {
 
   return (
     <main className="space-y-8 p-6">
-      <header>
-        <h1 className="text-2xl font-bold">Accounting</h1>
-        <p className="mt-1 text-sm text-muted-foreground">
-          Double-entry general ledger. Every transaction must balance before it can
-          be saved — enforced in the form, in the server action, and by the database.
-        </p>
+      <header className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <h1 className="text-2xl font-bold">Accounting</h1>
+          <p className="mt-1 text-sm text-muted-foreground">
+            Double-entry general ledger. Every transaction must balance before it can
+            be saved — enforced in the form, in the server action, and by the database.
+          </p>
+        </div>
+        {/* The three statements are one click away, in both directions. */}
+        <Link href="/statements" className="text-sm text-muted-foreground hover:underline">
+          Profit &amp; loss, balance sheet, cash flow
+        </Link>
       </header>
 
       {/* ── TRIAL BALANCE ─────────────────────────────────────────── */}
       <section aria-labelledby="trial-balance-heading" className="space-y-3">
         <div className="flex flex-wrap items-center justify-between gap-3">
-          <h2 id="trial-balance-heading" className="text-lg font-semibold">
-            Trial balance
-          </h2>
+          <div>
+            <h2 id="trial-balance-heading" className="text-lg font-semibold">
+              Trial balance
+            </h2>
+            {/* The range the numbers below cover, always stated. */}
+            <p className="text-xs text-muted-foreground tabular-nums">
+              Movement for {describePeriod(period)}
+            </p>
+            {/*
+              ⚠️ WHAT COUNTS AS "IN THE BOOKS" IS STATED ON THE PAGE, not
+              just in a comment. This filter changed the figures in this
+              table, and a bookkeeper comparing today's trial balance to
+              last week's printout needs to be able to see why.
+            */}
+            <p className="text-xs text-muted-foreground">
+              Posted and reversed transactions. Voided and unposted entries are
+              excluded; a reversal and the entry it reverses are both included and
+              net to nothing.
+            </p>
+          </div>
           {trialBalance && (
             <span
               role="status"
@@ -142,6 +274,8 @@ export default async function AccountingPage() {
             </span>
           )}
         </div>
+
+        <TrialBalancePeriodPicker period={period} />
 
         {!trialBalanceResult.ok ? (
           <p className="text-sm text-destructive">{trialBalanceResult.error}</p>

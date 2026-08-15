@@ -42,15 +42,13 @@ const ROOT = process.cwd();
  * Raising it to make a build pass converts the gate into a formality.
  * If a change genuinely needs a new destination, build the destination.
  */
-const KNOWN_DEAD_MAX = 10;
+const KNOWN_DEAD_MAX = 8;
 
 /**
  * The twelve, each with the screen that links to it and what it costs a
  * customer who clicks it. Ordered by how early in a trial they hit it.
  */
 const KNOWN_DEAD = new Map([
-  ["/sales/leads/new", "Leads list · the New lead button · a trial's first click"],
-  ["/sales/leads/:id", "Lead table and pipeline board · every row"],
   ["/sales/inventory/new", "Inventory list · New unit"],
   ["/sales/inventory/:id", "Inventory grid · every unit code"],
   ["/sales/bookings/new", "Bookings list · New booking"],

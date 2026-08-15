@@ -19,6 +19,7 @@ import {
   jsonb,
   boolean,
   integer,
+  bigint,
   index,
   uniqueIndex,
   primaryKey,
@@ -390,6 +391,36 @@ export const auditLogs = pgTable(
     severity: varchar("severity", { length: 20 }).default("info").notNull(),
 
     createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+
+    /* ---------------------------------------------------------------- */
+    /* THE HASH CHAIN — SQL-FILES/0081_audit_hash_chain.sql (Batch 44)   */
+    /* ---------------------------------------------------------------- */
+    /**
+     * ⚠️ ALL FOUR ARE NULLABLE, AND THAT IS THE DESIGN, NOT AN OVERSIGHT.
+     * Two populations carry NULLs and they mean different things:
+     *
+     *   • every row written BEFORE 0081. There is no honest hash to give
+     *     them — see constraint 4 in `lib/audit/chain.ts`. They are not
+     *     backfilled, and the verifier reports "chain starts at row X"
+     *     rather than pretending the history is attested.
+     *   • a row whose chaining DEGRADED at write time (repeated
+     *     `23505` under contention, or a read of the head that failed).
+     *     `server/audit.ts` writes the row anyway, unchained, because an
+     *     audit row present but outside the chain beats no audit row.
+     *
+     * A CHECK constraint in 0081 makes "all four NULL" and "all four set,
+     * bar `prevHash` at the genesis row" the ONLY permitted states, so a
+     * half-hashed row means somebody wrote to this table outside the
+     * application.
+     */
+    /** Dense, 1-based, per `tenantId`. UNIQUE with it. Never reused. */
+    chainSeq: bigint("chain_seq", { mode: "number" }),
+    /** `rowHash` of `chainSeq - 1` in the same tenant. NULL at genesis. */
+    prevHash: text("prev_hash"),
+    /** SHA-256 of this row's canonical content. Checkable only in TS. */
+    contentHash: text("content_hash"),
+    /** SHA-256 of (domain, scope, seq, prevHash, contentHash). Checkable in SQL. */
+    rowHash: text("row_hash"),
   },
   (t) => ({
     tenantCreatedIdx: index("audit_logs_tenant_created_idx").on(t.tenantId, t.createdAt),
