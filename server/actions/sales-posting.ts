@@ -66,12 +66,12 @@ const setAccountSchema = z.object({
 });
 
 /**
- * ⚠️ GATED ON `settings.manage`, NOT on an invoicing permission. Choosing
+ * ⚠️ GATED ON `settings:update`, NOT on an invoicing permission. Choosing
  * which ledger turnover lands in is a decision about the books, not about
  * a document — and somebody who may raise an invoice should not be able
  * to silently redirect a year of revenue into a different account.
  */
-const SETTINGS_PERMISSION = "settings.manage" as const;
+const SETTINGS_PERMISSION = "settings:update" as const;
 
 export async function getSalesPostingSetup(): Promise<
   ActionResult<{

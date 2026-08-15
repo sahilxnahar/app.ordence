@@ -372,6 +372,15 @@ export const STEP_UP_CAPABILITIES: readonly PlatformCapability[] = [
   // and no second factor.
   "entitlements:override",
   "tenants:configure",
+  /**
+   * 🔴 ADDED IN v1.31.0. Provisioning was exempted on the grounds that
+   * it is "routine and reversible". It is routine. It is NOT reversible
+   * — there is no code path anywhere in this repository that deletes or
+   * terminates a tenant, so a workspace minted by a lifted cookie stays
+   * minted, on a public hostname, with a chosen plan tier, and every
+   * piece of platform tooling treats it as a customer.
+   */
+  "tenants:provision",
 ];
 
 export function requiresStepUp(capability: PlatformCapability): boolean {

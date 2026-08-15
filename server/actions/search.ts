@@ -31,7 +31,7 @@
 
 import { z } from "zod";
 import { and, eq, isNull, or, ilike, desc, sql } from "drizzle-orm";
-import { db } from "@/db";
+import { db, withTenant } from "@/db";
 import { contacts, companies, deals, assets } from "@/db/schema";
 import { requireTenantContext, TenantAccessError } from "@/server/tenant-context";
 import { checkRateLimit, tenantRateLimitKey } from "@/lib/security/rate-limit";
@@ -129,177 +129,198 @@ export async function globalSearch(
     };
 
     /* ---- Build the four queries, each tenant-filtered first -------- */
-    const queries: Array<Promise<void>> = [];
-
-    if (wanted.has("contact")) {
-      queries.push(
-        db
-          .select({
-            id: contacts.id,
-            firstName: contacts.firstName,
-            lastName: contacts.lastName,
-            email: contacts.email,
-            jobTitle: contacts.jobTitle,
-          })
-          .from(contacts)
-          .where(
-            and(
-              // ── TENANT HARD FILTER — first predicate, always present ──
-              eq(contacts.tenantId, tenantId),
-              isNull(contacts.deletedAt),
-              // ── text match, fully parenthesised inside the AND ──
-              or(
-                ilike(contacts.firstName, pattern),
-                ilike(contacts.lastName, pattern),
-                ilike(contacts.email, pattern),
-                ilike(contacts.jobTitle, pattern),
+    /**
+     * ══════════════════════════════════════════════════════════════
+     * ⭐ ONE SCOPE AROUND ALL FOUR, NOT FOUR SCOPES
+     * ══════════════════════════════════════════════════════════════
+     * These four ran on the unscoped client and were the last read
+     * defect the gate could see. Under a database role that does not
+     * bypass RLS they returned nothing, so global search answered
+     * "no results" for every query in the product.
+     *
+     * ⚠️ THE TENANT FILTER BELOW IS STILL THE FIRST PREDICATE and
+     * stays that way. The policy is the guarantee; the predicate is
+     * what makes the query readable and lets the index help. Losing
+     * either one is a defect, and this file previously had only the
+     * predicate.
+     *
+     * ⭐ A SINGLE TRANSACTION, because the fan-out is deliberate: at
+     * most four concurrent queries, sharing one connection rather
+     * than opening four.
+     */
+    await withTenant(tenantId, async (tx) => {
+      const queries: Array<Promise<void>> = [];
+  
+      if (wanted.has("contact")) {
+        queries.push(
+          tx
+            .select({
+              id: contacts.id,
+              firstName: contacts.firstName,
+              lastName: contacts.lastName,
+              email: contacts.email,
+              jobTitle: contacts.jobTitle,
+            })
+            .from(contacts)
+            .where(
+              and(
+                // ── TENANT HARD FILTER — first predicate, always present ──
+                eq(contacts.tenantId, tenantId),
+                isNull(contacts.deletedAt),
+                // ── text match, fully parenthesised inside the AND ──
+                or(
+                  ilike(contacts.firstName, pattern),
+                  ilike(contacts.lastName, pattern),
+                  ilike(contacts.email, pattern),
+                  ilike(contacts.jobTitle, pattern),
+                ),
               ),
-            ),
-          )
-          .orderBy(desc(contacts.updatedAt))
-          .limit(params.limit)
-          .then((rows) => {
-            counts.contact = rows.length;
-            for (const r of rows) {
-              const name = [r.firstName, r.lastName].filter(Boolean).join(" ");
-              results.push({
-                id: r.id,
-                type: "contact",
-                title: name || r.email || "Untitled contact",
-                subtitle: r.jobTitle ?? r.email,
-                meta: null,
-                href: `/contacts/${r.id}`,
-                score: scoreMatch(name, params.query),
-              });
-            }
-          }),
-      );
-    }
-
-    if (wanted.has("company")) {
-      queries.push(
-        db
-          .select({
-            id: companies.id,
-            name: companies.name,
-            domain: companies.domain,
-            industry: companies.industry,
-          })
-          .from(companies)
-          .where(
-            and(
-              eq(companies.tenantId, tenantId),
-              isNull(companies.deletedAt),
-              or(
-                ilike(companies.name, pattern),
-                ilike(companies.domain, pattern),
-                ilike(companies.industry, pattern),
+            )
+            .orderBy(desc(contacts.updatedAt))
+            .limit(params.limit)
+            .then((rows) => {
+              counts.contact = rows.length;
+              for (const r of rows) {
+                const name = [r.firstName, r.lastName].filter(Boolean).join(" ");
+                results.push({
+                  id: r.id,
+                  type: "contact",
+                  title: name || r.email || "Untitled contact",
+                  subtitle: r.jobTitle ?? r.email,
+                  meta: null,
+                  href: `/contacts/${r.id}`,
+                  score: scoreMatch(name, params.query),
+                });
+              }
+            }),
+        );
+      }
+  
+      if (wanted.has("company")) {
+        queries.push(
+          tx
+            .select({
+              id: companies.id,
+              name: companies.name,
+              domain: companies.domain,
+              industry: companies.industry,
+            })
+            .from(companies)
+            .where(
+              and(
+                eq(companies.tenantId, tenantId),
+                isNull(companies.deletedAt),
+                or(
+                  ilike(companies.name, pattern),
+                  ilike(companies.domain, pattern),
+                  ilike(companies.industry, pattern),
+                ),
               ),
-            ),
-          )
-          .orderBy(desc(companies.updatedAt))
-          .limit(params.limit)
-          .then((rows) => {
-            counts.company = rows.length;
-            for (const r of rows) {
-              results.push({
-                id: r.id,
-                type: "company",
-                title: r.name,
-                subtitle: r.domain,
-                meta: r.industry,
-                href: `/companies/${r.id}`,
-                score: scoreMatch(r.name, params.query),
-              });
-            }
-          }),
-      );
-    }
-
-    if (wanted.has("deal")) {
-      queries.push(
-        db
-          .select({
-            id: deals.id,
-            title: deals.title,
-            stage: deals.stage,
-            amount: deals.amount,
-            currency: deals.currency,
-          })
-          .from(deals)
-          .where(
-            and(
-              eq(deals.tenantId, tenantId),
-              isNull(deals.deletedAt),
-              or(ilike(deals.title, pattern), ilike(deals.description, pattern)),
-            ),
-          )
-          .orderBy(desc(deals.updatedAt))
-          .limit(params.limit)
-          .then((rows) => {
-            counts.deal = rows.length;
-            for (const r of rows) {
-              results.push({
-                id: r.id,
-                type: "deal",
-                title: r.title,
-                subtitle: r.stage,
-                meta: r.amount ? `${r.currency} ${Number(r.amount).toLocaleString("en-IN")}` : null,
-                href: `/deals/${r.id}`,
-                score: scoreMatch(r.title, params.query),
-              });
-            }
-          }),
-      );
-    }
-
-    if (wanted.has("asset")) {
-      queries.push(
-        db
-          .select({
-            id: assets.id,
-            name: assets.name,
-            code: assets.code,
-            assetType: assets.assetType,
-            status: assets.status,
-            locality: assets.locality,
-            city: assets.city,
-          })
-          .from(assets)
-          .where(
-            and(
-              eq(assets.tenantId, tenantId),
-              isNull(assets.deletedAt),
-              or(
-                ilike(assets.name, pattern),
-                ilike(assets.code, pattern),
-                ilike(assets.description, pattern),
-                ilike(assets.locality, pattern),
-                ilike(assets.city, pattern),
+            )
+            .orderBy(desc(companies.updatedAt))
+            .limit(params.limit)
+            .then((rows) => {
+              counts.company = rows.length;
+              for (const r of rows) {
+                results.push({
+                  id: r.id,
+                  type: "company",
+                  title: r.name,
+                  subtitle: r.domain,
+                  meta: r.industry,
+                  href: `/companies/${r.id}`,
+                  score: scoreMatch(r.name, params.query),
+                });
+              }
+            }),
+        );
+      }
+  
+      if (wanted.has("deal")) {
+        queries.push(
+          tx
+            .select({
+              id: deals.id,
+              title: deals.title,
+              stage: deals.stage,
+              amount: deals.amount,
+              currency: deals.currency,
+            })
+            .from(deals)
+            .where(
+              and(
+                eq(deals.tenantId, tenantId),
+                isNull(deals.deletedAt),
+                or(ilike(deals.title, pattern), ilike(deals.description, pattern)),
               ),
-            ),
-          )
-          .orderBy(desc(assets.updatedAt))
-          .limit(params.limit)
-          .then((rows) => {
-            counts.asset = rows.length;
-            for (const r of rows) {
-              results.push({
-                id: r.id,
-                type: "asset",
-                title: r.name,
-                subtitle: r.code ?? r.assetType,
-                meta: [r.locality, r.city].filter(Boolean).join(", ") || r.status,
-                href: `/assets/${r.id}`,
-                score: scoreMatch(r.name, params.query, r.code ?? undefined),
-              });
-            }
-          }),
-      );
-    }
-
-    // Bounded fan-out: at most 4 concurrent queries, well inside Hobby limits.
-    await Promise.all(queries);
+            )
+            .orderBy(desc(deals.updatedAt))
+            .limit(params.limit)
+            .then((rows) => {
+              counts.deal = rows.length;
+              for (const r of rows) {
+                results.push({
+                  id: r.id,
+                  type: "deal",
+                  title: r.title,
+                  subtitle: r.stage,
+                  meta: r.amount ? `${r.currency} ${Number(r.amount).toLocaleString("en-IN")}` : null,
+                  href: `/deals/${r.id}`,
+                  score: scoreMatch(r.title, params.query),
+                });
+              }
+            }),
+        );
+      }
+  
+      if (wanted.has("asset")) {
+        queries.push(
+          tx
+            .select({
+              id: assets.id,
+              name: assets.name,
+              code: assets.code,
+              assetType: assets.assetType,
+              status: assets.status,
+              locality: assets.locality,
+              city: assets.city,
+            })
+            .from(assets)
+            .where(
+              and(
+                eq(assets.tenantId, tenantId),
+                isNull(assets.deletedAt),
+                or(
+                  ilike(assets.name, pattern),
+                  ilike(assets.code, pattern),
+                  ilike(assets.description, pattern),
+                  ilike(assets.locality, pattern),
+                  ilike(assets.city, pattern),
+                ),
+              ),
+            )
+            .orderBy(desc(assets.updatedAt))
+            .limit(params.limit)
+            .then((rows) => {
+              counts.asset = rows.length;
+              for (const r of rows) {
+                results.push({
+                  id: r.id,
+                  type: "asset",
+                  title: r.name,
+                  subtitle: r.code ?? r.assetType,
+                  meta: [r.locality, r.city].filter(Boolean).join(", ") || r.status,
+                  href: `/assets/${r.id}`,
+                  score: scoreMatch(r.name, params.query, r.code ?? undefined),
+                });
+              }
+            }),
+        );
+      }
+  
+      // Bounded fan-out: at most 4 concurrent queries, well inside Hobby limits.
+      await Promise.all(queries);
+    });
 
     results.sort((a, b) => b.score - a.score || a.title.localeCompare(b.title));
 

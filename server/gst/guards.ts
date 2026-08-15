@@ -33,6 +33,7 @@ import { requireFeature, FeatureLockedError } from "@/server/entitlements";
 import { PermissionDeniedError } from "@/lib/permissions";
 import type { FeatureKey } from "@/lib/entitlements/features";
 import type { ActionResult } from "@/lib/validators/crm";
+import type { PermissionKey } from "@/db/schema/auth";
 
 /**
  * ⚠️ WRITE SITES ONLY. A gate on a `get*` function produces the worst
@@ -43,7 +44,7 @@ import type { ActionResult } from "@/lib/validators/crm";
 export async function guardGstWrite(args: {
   operation: string;
   feature: FeatureKey;
-  permission: string;
+  permission: PermissionKey;
   resource?: { type?: string; id?: string };
 }): Promise<TenantContext> {
   const ctx = await requireTenantContext();

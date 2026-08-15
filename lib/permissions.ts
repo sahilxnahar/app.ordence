@@ -85,17 +85,23 @@ export function evaluatePermission(
 }
 
 /** Boolean shorthand. */
-export function can(subject: PermissionSubject, permission: string): boolean {
+export function can(subject: PermissionSubject, permission: PermissionKey): boolean {
   return evaluatePermission(subject, permission).allowed;
 }
 
 /** True only if the subject holds EVERY listed permission. */
-export function canAll(subject: PermissionSubject, permissions: string[]): boolean {
+export function canAll(
+  subject: PermissionSubject,
+  permissions: readonly PermissionKey[],
+): boolean {
   return permissions.every((p) => can(subject, p));
 }
 
 /** True if the subject holds AT LEAST ONE of the listed permissions. */
-export function canAny(subject: PermissionSubject, permissions: string[]): boolean {
+export function canAny(
+  subject: PermissionSubject,
+  permissions: readonly PermissionKey[],
+): boolean {
   return permissions.some((p) => can(subject, p));
 }
 

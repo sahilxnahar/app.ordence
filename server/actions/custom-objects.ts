@@ -102,58 +102,64 @@ export async function defineCustomObject(
     const slug = data.slug ?? slugify(data.name);
     const pluralName = data.pluralName ?? `${data.name}s`;
 
-    const clash = await db.query.customObjectDefinitions.findFirst({
-      where: and(
-        eq(customObjectDefinitions.tenantId, ctx.tenant.id),
-        eq(customObjectDefinitions.slug, slug),
-        isNull(customObjectDefinitions.deletedAt),
-      ),
-      columns: { id: true },
-    });
+    const clash = await withTenant(ctx.tenant.id, (tx) =>
+      tx.query.customObjectDefinitions.findFirst({
+        where: and(
+          eq(customObjectDefinitions.tenantId, ctx.tenant.id),
+          eq(customObjectDefinitions.slug, slug),
+          isNull(customObjectDefinitions.deletedAt),
+        ),
+        columns: { id: true },
+      })
+    );
     if (clash) {
       return fail("Validation failed.", { slug: [`An object with slug "${slug}" already exists.`] });
     }
 
-    const [definition] = await db
-      .insert(customObjectDefinitions)
-      .values({
-        tenantId: ctx.tenant.id,
-        name: data.name,
-        pluralName,
-        slug,
-        icon: data.icon,
-        color: data.color,
-        description: data.description ?? null,
-        industryTemplate: data.industryTemplate ?? null,
-        // First field doubles as the display value by default.
-        displayFieldName: data.fields[0]?.fieldName ?? null,
-        createdBy: ctx.user.id,
-      })
-      .returning();
+    const [definition] = await withTenant(ctx.tenant.id, (tx) =>
+      tx
+        .insert(customObjectDefinitions)
+        .values({
+          tenantId: ctx.tenant.id,
+          name: data.name,
+          pluralName,
+          slug,
+          icon: data.icon,
+          color: data.color,
+          description: data.description ?? null,
+          industryTemplate: data.industryTemplate ?? null,
+          // First field doubles as the display value by default.
+          displayFieldName: data.fields[0]?.fieldName ?? null,
+          createdBy: ctx.user.id,
+        })
+        .returning()
+    );
 
     if (!definition) return fail("Failed to create object definition.");
 
-    const insertedFields = await db
-      .insert(customFieldDefinitions)
-      .values(
-        data.fields.map((f, index) => ({
-          tenantId: ctx.tenant.id,
-          objectDefinitionId: definition.id,
-          fieldName: f.fieldName,
-          label: f.label,
-          fieldType: f.fieldType,
-          isRequired: f.isRequired,
-          isUnique: f.isUnique,
-          showInGrid: f.showInGrid,
-          helpText: f.helpText ?? null,
-          placeholder: f.placeholder ?? null,
-          options: f.options,
-          validation: f.validation,
-          defaultValue: f.defaultValue ?? null,
-          sortOrder: f.sortOrder || index,
-        })),
-      )
-      .returning();
+    const insertedFields = await withTenant(ctx.tenant.id, (tx) =>
+      tx
+        .insert(customFieldDefinitions)
+        .values(
+          data.fields.map((f, index) => ({
+            tenantId: ctx.tenant.id,
+            objectDefinitionId: definition.id,
+            fieldName: f.fieldName,
+            label: f.label,
+            fieldType: f.fieldType,
+            isRequired: f.isRequired,
+            isUnique: f.isUnique,
+            showInGrid: f.showInGrid,
+            helpText: f.helpText ?? null,
+            placeholder: f.placeholder ?? null,
+            options: f.options,
+            validation: f.validation,
+            defaultValue: f.defaultValue ?? null,
+            sortOrder: f.sortOrder || index,
+          })),
+        )
+        .returning()
+    );
 
     revalidatePath("/objects");
     return { ok: true, data: { ...definition, fields: insertedFields } };
@@ -175,20 +181,22 @@ export async function getCustomObjects(): Promise<ActionResult<CustomObjectWithF
   try {
     const ctx = await requireTenantContext();
 
-    const definitions = await db.query.customObjectDefinitions.findMany({
-      where: and(
-        eq(customObjectDefinitions.tenantId, ctx.tenant.id),
-        eq(customObjectDefinitions.isActive, true),
-        isNull(customObjectDefinitions.deletedAt),
-      ),
-      orderBy: [asc(customObjectDefinitions.sortOrder), asc(customObjectDefinitions.name)],
-      with: {
-        fields: {
-          where: isNull(customFieldDefinitions.deletedAt),
-          orderBy: [asc(customFieldDefinitions.sortOrder)],
+    const definitions = await withTenant(ctx.tenant.id, (tx) =>
+      tx.query.customObjectDefinitions.findMany({
+        where: and(
+          eq(customObjectDefinitions.tenantId, ctx.tenant.id),
+          eq(customObjectDefinitions.isActive, true),
+          isNull(customObjectDefinitions.deletedAt),
+        ),
+        orderBy: [asc(customObjectDefinitions.sortOrder), asc(customObjectDefinitions.name)],
+        with: {
+          fields: {
+            where: isNull(customFieldDefinitions.deletedAt),
+            orderBy: [asc(customFieldDefinitions.sortOrder)],
+          },
         },
-      },
-    });
+      })
+    );
 
     return { ok: true, data: definitions as CustomObjectWithFields[] };
   } catch (err) {
@@ -203,19 +211,21 @@ export async function getCustomObjectBySlug(
     const ctx = await requireTenantContext();
     const parsed = slugSchema.parse(slug);
 
-    const definition = await db.query.customObjectDefinitions.findFirst({
-      where: and(
-        eq(customObjectDefinitions.tenantId, ctx.tenant.id),
-        eq(customObjectDefinitions.slug, parsed),
-        isNull(customObjectDefinitions.deletedAt),
-      ),
-      with: {
-        fields: {
-          where: isNull(customFieldDefinitions.deletedAt),
-          orderBy: [asc(customFieldDefinitions.sortOrder)],
+    const definition = await withTenant(ctx.tenant.id, (tx) =>
+      tx.query.customObjectDefinitions.findFirst({
+        where: and(
+          eq(customObjectDefinitions.tenantId, ctx.tenant.id),
+          eq(customObjectDefinitions.slug, parsed),
+          isNull(customObjectDefinitions.deletedAt),
+        ),
+        with: {
+          fields: {
+            where: isNull(customFieldDefinitions.deletedAt),
+            orderBy: [asc(customFieldDefinitions.sortOrder)],
+          },
         },
-      },
-    });
+      })
+    );
 
     if (!definition) return fail("Object not found.");
     return { ok: true, data: definition as CustomObjectWithFields };
@@ -237,6 +247,10 @@ export async function createCustomRecord(
     // reason outermost, so the customer is told the thing they can
     // actually act on rather than an inner detail.
     await requireAccess("customObjects:create", ctx);
+    /**
+     * 🔴 ADDED IN v1.26.0-alpha BY `check:guards`. Creating a record in a custom object was reachable by any member. Note the key spelling differs from the one passed to `requireAccess` above — that argument is a billing exemption label, not a permission, which is exactly why the two were never reconciled.
+     */
+    await requirePermission("custom_objects:create_record");
     // ⚠️ ENTITLEMENT BEFORE PERMISSION. If a workspace owner on a plan
     // without this feature hits it, the true answer is "your plan does
     // not include it" — not "you lack permission", which would send the
@@ -246,16 +260,18 @@ export async function createCustomRecord(
 
     // The definition must belong to this tenant — otherwise a caller could
     // write records against another tenant's object definition.
-    const definition = await db.query.customObjectDefinitions.findFirst({
-      where: and(
-        eq(customObjectDefinitions.id, parsed.definitionId),
-        eq(customObjectDefinitions.tenantId, ctx.tenant.id),
-        isNull(customObjectDefinitions.deletedAt),
-      ),
-      with: {
-        fields: { where: isNull(customFieldDefinitions.deletedAt) },
-      },
-    });
+    const definition = await withTenant(ctx.tenant.id, (tx) =>
+      tx.query.customObjectDefinitions.findFirst({
+        where: and(
+          eq(customObjectDefinitions.id, parsed.definitionId),
+          eq(customObjectDefinitions.tenantId, ctx.tenant.id),
+          isNull(customObjectDefinitions.deletedAt),
+        ),
+        with: {
+          fields: { where: isNull(customFieldDefinitions.deletedAt) },
+        },
+      })
+    );
 
     if (!definition) return fail("Object definition not found.");
 
@@ -269,20 +285,22 @@ export async function createCustomRecord(
         ? String(validation.cleaned[displayField]).slice(0, 500)
         : null;
 
-    const [created] = await db
-      .insert(customObjectRecords)
-      .values({
-        tenantId: ctx.tenant.id,
-        definitionId: definition.id,
-        data: validation.cleaned,
-        displayValue,
-        relatedCompanyId: parsed.relatedCompanyId ?? null,
-        relatedContactId: parsed.relatedContactId ?? null,
-        relatedDealId: parsed.relatedDealId ?? null,
-        ownerId: ctx.user.id,
-        createdBy: ctx.user.id,
-      })
-      .returning();
+    const [created] = await withTenant(ctx.tenant.id, (tx) =>
+      tx
+        .insert(customObjectRecords)
+        .values({
+          tenantId: ctx.tenant.id,
+          definitionId: definition.id,
+          data: validation.cleaned,
+          displayValue,
+          relatedCompanyId: parsed.relatedCompanyId ?? null,
+          relatedContactId: parsed.relatedContactId ?? null,
+          relatedDealId: parsed.relatedDealId ?? null,
+          ownerId: ctx.user.id,
+          createdBy: ctx.user.id,
+        })
+        .returning()
+    );
 
     if (!created) return fail("Failed to create record.");
 
@@ -317,16 +335,18 @@ export async function getCustomRecords(
 
     const where = and(...conditions);
 
-    const [rows, totalResult] = await Promise.all([
-      db
-        .select()
-        .from(customObjectRecords)
-        .where(where)
-        .orderBy(desc(customObjectRecords.createdAt))
-        .limit(params.pageSize)
-        .offset((params.page - 1) * params.pageSize),
-      db.select({ value: count() }).from(customObjectRecords).where(where),
-    ]);
+    const [rows, totalResult] = await withTenant(ctx.tenant.id, (tx) =>
+      Promise.all([
+        tx
+          .select()
+          .from(customObjectRecords)
+          .where(where)
+          .orderBy(desc(customObjectRecords.createdAt))
+          .limit(params.pageSize)
+          .offset((params.page - 1) * params.pageSize),
+        tx.select({ value: count() }).from(customObjectRecords).where(where),
+      ]),
+    );
 
     return { ok: true, data: { rows, total: totalResult[0]?.value ?? 0 } };
   } catch (err) {

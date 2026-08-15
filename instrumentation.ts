@@ -47,6 +47,30 @@
  *    can be down, misconfigured, or out of quota on the day you need it.
  */
 export async function register() {
+  /**
+   * ══════════════════════════════════════════════════════════════════
+   * 🔴 CONFIG VALIDITY IS A BOOT QUESTION, NOT A RUNTIME DISCOVERY
+   * ══════════════════════════════════════════════════════════════════
+   * Until v1.32.0 nothing here validated anything, `getServerEnv()` was
+   * lazy by design, and `/api/health` returned a hard-coded body — so a
+   * deployment with no webhook secret, no admin allowlist and no vault
+   * keys served 200s indefinitely while being unable to create a single
+   * workspace. See `lib/env-boot.ts` for what it checks and, more
+   * importantly, what it deliberately does not.
+   *
+   * ⚠️ BEFORE SENTRY, AND NOT GATED ON IT. `SENTRY_ENABLED` is false in
+   * plenty of correct deployments, and the early return below would
+   * have skipped this entirely.
+   *
+   * ⚠️ NODE RUNTIME ONLY. `register()` runs once per runtime; asserting
+   * on the edge runtime as well would print the same block twice and
+   * add a second way for a deploy to fail for the same reason.
+   */
+  if (process.env.NEXT_RUNTIME === "nodejs") {
+    const { assertBootEnv } = await import("@/lib/env-boot");
+    assertBootEnv();
+  }
+
   if (!SENTRY_ENABLED) return;
 
   /**

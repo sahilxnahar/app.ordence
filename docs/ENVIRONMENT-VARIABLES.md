@@ -284,14 +284,34 @@ Worker knows. I generated them with a cryptographic random number generator —
 **copy these exactly**:
 
 ```
-UPLOAD_TICKET_SECRET   =   1GSZtlO8JT_N86zG9Dqjjcdfw6gIpSOkvphc_uUpNeg
-CRON_SECRET            =   sTHq4KNKEDFqiqdfq7sQQnvZGM6mQ40SpI0VIZeuYBc
-WORKER_API_SECRET      =   Eg4ymJs0yVapH0xPdwvIyGZcYrl6AEc6Bx453EJSlf0
+UPLOAD_TICKET_SECRET   = <generate one>
+CRON_SECRET            = <generate one>
+WORKER_API_SECRET      = <generate one>
 ```
 
-> ⚠️ These are now written in this document, which is on your disk. That is
-> fine for today. If this file is ever shared, emailed, or committed to git,
-> regenerate all three. There is a command for it in Part 6.
+Generate each one **on your own machine** and paste it straight into Railway:
+
+```
+openssl rand -hex 32
+```
+
+(On macOS that is a single dash. Run it three times, once per name.)
+
+> 🔴 **THESE THREE USED TO BE PRINTED HERE AS LITERAL VALUES**, with the
+> instruction to "copy these exactly", and this document is in the
+> repository. The caveat that used to sit here said to regenerate them if
+> the file was ever shared or committed. It was already committed.
+>
+> Anyone with read access to the repo therefore held the bearer token
+> `app/api/workers/route.ts` accepts, the cron secret it also accepts,
+> and the HMAC key that signs upload tickets. `WORKER_API_SECRET` was 43
+> characters, so the constant-time comparison's length check gave no
+> additional protection.
+>
+> ⚠️ **If you deployed from a version of this document that carried the
+> literals, rotate all three now.** Generate new values with the command
+> above, set them in Railway, and redeploy. Nothing needs to change in
+> the code.
 
 ---
 

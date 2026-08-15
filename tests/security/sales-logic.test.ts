@@ -52,6 +52,14 @@ import {
   TDS_194H_BPS,
   TDS_NO_PAN_BPS,
 } from "@/lib/sales/commission";
+
+/**
+ * ⚠️ A FIXED DATE, NOT `new Date()`. Every figure below depends on which
+ * side of 1 October 2024 the credit falls, and a test whose expected
+ * values move with the calendar is a test that will fail on a Tuesday
+ * for no reason anybody can reconstruct.
+ */
+const TDS_DAY = "2026-08-14";
 import {
   buildPlan,
   validateTemplate,
@@ -460,7 +468,7 @@ describe("commission", () => {
 
 describe("TDS", () => {
   it("does not deduct below the annual threshold", () => {
-    const result = computeTds({ grossMinor: 1_000_000n, hasPan: true }); // ₹10,000
+    const result = computeTds({ grossMinor: 1_000_000n, hasPan: true, onDate: TDS_DAY }); // ₹10,000
     expect(result.applicable).toBe(false);
     expect(result.tdsMinor).toBe(0n);
     expect(result.netMinor).toBe(1_000_000n);
@@ -475,15 +483,50 @@ describe("TDS", () => {
     const second = computeTds({
       grossMinor: 1_500_000n,
       hasPan: true,
+      onDate: TDS_DAY,
       ytdGrossMinor: 1_500_000n,
+      ytdTdsMinor: 0n,
     });
     expect(second.applicable).toBe(true);
     expect(second.rateBps).toBe(TDS_194H_BPS);
-    expect(second.tdsMinor).toBe(75_000n); // 5% of ₹15,000 = ₹750
+    // ══════════════════════════════════════════════════════════════
+    // 🔴 THIS ASSERTION WAS WRONG TWICE OVER UNTIL v1.25.0-alpha, and
+    // it kept passing.
+    //
+    // It expected ₹750 — 5% of THIS payment. Both halves were wrong:
+    //   • the rate has been 2% since 1 October 2024, not 5%;
+    //   • 194H is `aggregate_whole`, so once the year crosses ₹20,000
+    //     the tax is due on ALL of it. The base is ₹30,000, not
+    //     ₹15,000.
+    //
+    // ⚠️ AND IT PASSED BECAUSE IT CALLED WITHOUT A DATE. The resolver
+    // fell back to the oldest rate, which was exactly the stale 5% the
+    // assertion expected. `resolve194hRateBps` now throws on a missing
+    // date rather than agreeing with whoever forgot it.
+    // ══════════════════════════════════════════════════════════════
+    expect(second.chargeableBaseMinor).toBe(3_000_000n); // ₹30,000, the whole year
+    expect(second.tdsMinor).toBe(60_000n); // 2% of ₹30,000 = ₹600
+  });
+
+  it("🔴 refuses to resolve a rate without the date it applies to", () => {
+    expect(() =>
+      // @ts-expect-error — deliberately calling it the way the old test did.
+      computeTds({ grossMinor: 3_000_000n, hasPan: true }),
+    ).toThrow(/YYYY-MM-DD/);
+  });
+
+  it("keeps the pre-October-2024 rate for a credit made then", () => {
+    const old = computeTds({
+      grossMinor: 3_000_000n,
+      hasPan: true,
+      onDate: "2024-09-30",
+    });
+    expect(old.rateBps).toBe(500);
+    expect(old.tdsMinor).toBe(150_000n); // 5% of ₹30,000
   });
 
   it("deducts 20% when there is no PAN, and says why", () => {
-    const result = computeTds({ grossMinor: 10_000_000n, hasPan: false });
+    const result = computeTds({ grossMinor: 10_000_000n, hasPan: false, onDate: TDS_DAY });
     expect(result.rateBps).toBe(TDS_NO_PAN_BPS);
     expect(result.tdsMinor).toBe(2_000_000n);
     expect(result.explanation).toMatch(/206AA/);
@@ -494,7 +537,7 @@ describe("TDS", () => {
 
   it("net plus TDS always equals gross", () => {
     for (const gross of [10_000_000n, 3_333_333n, 1n + 10_000_000n]) {
-      const result = computeTds({ grossMinor: gross, hasPan: true });
+      const result = computeTds({ grossMinor: gross, hasPan: true, onDate: TDS_DAY });
       expect(result.netMinor + result.tdsMinor).toBe(gross);
     }
   });

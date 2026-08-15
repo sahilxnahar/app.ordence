@@ -17,8 +17,9 @@
 import { z } from "zod";
 import { revalidatePath } from "next/cache";
 import { and, eq, isNull, desc, asc, ilike, or, sql, count } from "drizzle-orm";
-import { db } from "@/db";
+import { db, withTenant } from "@/db";
 import { contacts, companies } from "@/db/schema";
+import { requirePermission } from "@/server/audit";
 import { requireTenantContext, TenantAccessError } from "@/server/tenant-context";
 import {
   assertImpersonationAllows,
@@ -123,44 +124,46 @@ export async function getContacts(
 
     const orderBy = params.sortDir === "asc" ? asc(sortColumn) : desc(sortColumn);
 
-    const [rows, totalResult] = await Promise.all([
-      db
-        .select({
-          id: contacts.id,
-          tenantId: contacts.tenantId,
-          companyId: contacts.companyId,
-          firstName: contacts.firstName,
-          lastName: contacts.lastName,
-          email: contacts.email,
-          phone: contacts.phone,
-          mobile: contacts.mobile,
-          jobTitle: contacts.jobTitle,
-          department: contacts.department,
-          linkedinUrl: contacts.linkedinUrl,
-          customFields: contacts.customFields,
-          ownerId: contacts.ownerId,
-          notes: contacts.notes,
-          lastContactedAt: contacts.lastContactedAt,
-          createdAt: contacts.createdAt,
-          updatedAt: contacts.updatedAt,
-          createdBy: contacts.createdBy,
-          deletedAt: contacts.deletedAt,
-          deletedBy: contacts.deletedBy,
-          companyName: companies.name,
-        })
-        .from(contacts)
-        // Join is also tenant-scoped — prevents a cross-tenant company leaking in.
-        .leftJoin(
-          companies,
-          and(eq(companies.id, contacts.companyId), eq(companies.tenantId, ctx.tenant.id)),
-        )
-        .where(where)
-        .orderBy(orderBy)
-        .limit(params.pageSize)
-        .offset((params.page - 1) * params.pageSize),
-
-      db.select({ value: count() }).from(contacts).where(where),
-    ]);
+    const [rows, totalResult] = await withTenant(ctx.tenant.id, (tx) =>
+      Promise.all([
+        tx
+          .select({
+            id: contacts.id,
+            tenantId: contacts.tenantId,
+            companyId: contacts.companyId,
+            firstName: contacts.firstName,
+            lastName: contacts.lastName,
+            email: contacts.email,
+            phone: contacts.phone,
+            mobile: contacts.mobile,
+            jobTitle: contacts.jobTitle,
+            department: contacts.department,
+            linkedinUrl: contacts.linkedinUrl,
+            customFields: contacts.customFields,
+            ownerId: contacts.ownerId,
+            notes: contacts.notes,
+            lastContactedAt: contacts.lastContactedAt,
+            createdAt: contacts.createdAt,
+            updatedAt: contacts.updatedAt,
+            createdBy: contacts.createdBy,
+            deletedAt: contacts.deletedAt,
+            deletedBy: contacts.deletedBy,
+            companyName: companies.name,
+          })
+          .from(contacts)
+          // Join is also tenant-scoped — prevents a cross-tenant company leaking in.
+          .leftJoin(
+            companies,
+            and(eq(companies.id, contacts.companyId), eq(companies.tenantId, ctx.tenant.id)),
+          )
+          .where(where)
+          .orderBy(orderBy)
+          .limit(params.pageSize)
+          .offset((params.page - 1) * params.pageSize),
+  
+        tx.select({ value: count() }).from(contacts).where(where),
+      ]),
+    );
 
     return {
       ok: true,
@@ -181,15 +184,17 @@ export async function getContactById(id: string): Promise<ActionResult<ContactWi
     const ctx = await requireTenantContext();
     const contactId = uuidSchema.parse(id);
 
-    const row = await db.query.contacts.findFirst({
-      // id AND tenantId — never id alone.
-      where: and(
-        eq(contacts.id, contactId),
-        eq(contacts.tenantId, ctx.tenant.id),
-        isNull(contacts.deletedAt),
-      ),
-      with: { company: { columns: { name: true } } },
-    });
+    const row = await withTenant(ctx.tenant.id, (tx) =>
+      tx.query.contacts.findFirst({
+        // id AND tenantId — never id alone.
+        where: and(
+          eq(contacts.id, contactId),
+          eq(contacts.tenantId, ctx.tenant.id),
+          isNull(contacts.deletedAt),
+        ),
+        with: { company: { columns: { name: true } } },
+      })
+    );
 
     if (!row) return fail("Contact not found.");
 
@@ -227,57 +232,94 @@ export async function createContact(
      * never going to be allowed to submit.
      */
     await requireAccess("contacts:create", ctx);
+    /**
+     * 🔴 THE THIRD STEP, ADDED IN v1.26.0-alpha. The comment above has
+     * prescribed this order since v0.83.2 and the code stopped after
+     * the second line — so this write was reachable by ANY member of
+     * the workspace, including the Accountant role, which the
+     * permission table grants `contacts:read` and not `contacts:create`.
+     *
+     * ⚠️ `requireAccess()` READS LIKE A PERMISSION CHECK AND IS NOT
+     * ONE. It takes `"contacts:create"` as an argument and uses it only to
+     * look up a write exemption; what it actually answers is whether
+     * the WORKSPACE is in good billing standing. That is a property of
+     * the account, not of the person, and it is true for everybody in
+     * a paid-up workspace.
+     */
+    await requirePermission("contacts:create");
 
     const data = createContactSchema.parse(input);
 
     // A supplied companyId must belong to THIS tenant. Without this check a
     // caller could attach their contact to another tenant's company record.
     if (data.companyId) {
-      const owned = await db.query.companies.findFirst({
-        where: and(
-          eq(companies.id, data.companyId),
-          eq(companies.tenantId, ctx.tenant.id),
-          isNull(companies.deletedAt),
-        ),
-        columns: { id: true },
-      });
+      /**
+       * ⚠️ HOISTED OUT OF THE CLOSURE. The `if` above narrows this away
+       * from null, and TypeScript cannot carry that into a callback it
+       * cannot prove runs synchronously. Binding it keeps the guard
+       * meaningful; a non-null assertion would delete the check the
+       * `if` exists for.
+       */
+      const companyId = data.companyId;
+      const owned = await withTenant(ctx.tenant.id, (tx) =>
+        tx.query.companies.findFirst({
+          where: and(
+            eq(companies.id, companyId),
+            eq(companies.tenantId, ctx.tenant.id),
+            isNull(companies.deletedAt),
+          ),
+          columns: { id: true },
+        })
+      );
       if (!owned) return fail("Selected company does not exist.");
     }
 
     if (data.email) {
-      const duplicate = await db.query.contacts.findFirst({
-        where: and(
-          eq(contacts.tenantId, ctx.tenant.id),
-          eq(contacts.email, data.email),
-          isNull(contacts.deletedAt),
-        ),
-        columns: { id: true },
-      });
+      /**
+       * ⚠️ HOISTED OUT OF THE CLOSURE. The `if` above narrows this away
+       * from null, and TypeScript cannot carry that into a callback it
+       * cannot prove runs synchronously. Binding it keeps the guard
+       * meaningful; a non-null assertion would delete the check the
+       * `if` exists for.
+       */
+      const email = data.email;
+      const duplicate = await withTenant(ctx.tenant.id, (tx) =>
+        tx.query.contacts.findFirst({
+          where: and(
+            eq(contacts.tenantId, ctx.tenant.id),
+            eq(contacts.email, email),
+            isNull(contacts.deletedAt),
+          ),
+          columns: { id: true },
+        })
+      );
       if (duplicate) {
         return fail("Validation failed.", { email: ["A contact with this email already exists."] });
       }
     }
 
-    const [created] = await db
-      .insert(contacts)
-      .values({
-        // tenantId comes from the session, never from `input`.
-        tenantId: ctx.tenant.id,
-        firstName: data.firstName,
-        lastName: data.lastName ?? null,
-        email: data.email ?? null,
-        phone: data.phone ?? null,
-        mobile: data.mobile ?? null,
-        jobTitle: data.jobTitle ?? null,
-        department: data.department ?? null,
-        linkedinUrl: data.linkedinUrl ?? null,
-        companyId: data.companyId ?? null,
-        notes: data.notes ?? null,
-        customFields: data.customFields,
-        ownerId: ctx.user.id,
-        createdBy: ctx.user.id,
-      })
-      .returning();
+    const [created] = await withTenant(ctx.tenant.id, (tx) =>
+      tx
+        .insert(contacts)
+        .values({
+          // tenantId comes from the session, never from `input`.
+          tenantId: ctx.tenant.id,
+          firstName: data.firstName,
+          lastName: data.lastName ?? null,
+          email: data.email ?? null,
+          phone: data.phone ?? null,
+          mobile: data.mobile ?? null,
+          jobTitle: data.jobTitle ?? null,
+          department: data.department ?? null,
+          linkedinUrl: data.linkedinUrl ?? null,
+          companyId: data.companyId ?? null,
+          notes: data.notes ?? null,
+          customFields: data.customFields,
+          ownerId: ctx.user.id,
+          createdBy: ctx.user.id,
+        })
+        .returning()
+    );
 
     if (!created) return fail("Failed to create contact.");
 
@@ -299,52 +341,79 @@ export async function updateContact(
     const ctx = await requireTenantContext();
     // Access before validation — see `createContact`.
     await requireAccess("contacts:update", ctx);
+    /**
+     * 🔴 THE THIRD STEP, ADDED IN v1.26.0-alpha. The comment above has
+     * prescribed this order since v0.83.2 and the code stopped after
+     * the second line — so this write was reachable by ANY member of
+     * the workspace, including the Accountant role, which the
+     * permission table grants `contacts:read` and not `contacts:update`.
+     *
+     * ⚠️ `requireAccess()` READS LIKE A PERMISSION CHECK AND IS NOT
+     * ONE. It takes `"contacts:update"` as an argument and uses it only to
+     * look up a write exemption; what it actually answers is whether
+     * the WORKSPACE is in good billing standing. That is a property of
+     * the account, not of the person, and it is true for everybody in
+     * a paid-up workspace.
+     */
+    await requirePermission("contacts:update");
 
     const { id, ...data } = updateContactSchema.parse(input);
 
-    const existing = await db.query.contacts.findFirst({
-      where: and(
-        eq(contacts.id, id),
-        eq(contacts.tenantId, ctx.tenant.id),
-        isNull(contacts.deletedAt),
-      ),
-      columns: { id: true },
-    });
+    const existing = await withTenant(ctx.tenant.id, (tx) =>
+      tx.query.contacts.findFirst({
+        where: and(
+          eq(contacts.id, id),
+          eq(contacts.tenantId, ctx.tenant.id),
+          isNull(contacts.deletedAt),
+        ),
+        columns: { id: true },
+      })
+    );
     if (!existing) return fail("Contact not found.");
 
     if (data.companyId) {
-      const owned = await db.query.companies.findFirst({
-        where: and(
-          eq(companies.id, data.companyId),
-          eq(companies.tenantId, ctx.tenant.id),
-          isNull(companies.deletedAt),
-        ),
-        columns: { id: true },
-      });
+      /** ⚠️ Same narrowing hoist as `createContact` above. */
+      const companyId = data.companyId;
+      const owned = await withTenant(ctx.tenant.id, (tx) =>
+        tx.query.companies.findFirst({
+          where: and(
+            eq(companies.id, companyId),
+            eq(companies.tenantId, ctx.tenant.id),
+            isNull(companies.deletedAt),
+          ),
+          columns: { id: true },
+        })
+      );
       if (!owned) return fail("Selected company does not exist.");
     }
 
     if (data.email) {
-      const duplicate = await db.query.contacts.findFirst({
-        where: and(
-          eq(contacts.tenantId, ctx.tenant.id),
-          eq(contacts.email, data.email),
-          isNull(contacts.deletedAt),
-          sql`${contacts.id} <> ${id}`,
-        ),
-        columns: { id: true },
-      });
+      /** ⚠️ Same narrowing hoist as `createContact` above. */
+      const email = data.email;
+      const duplicate = await withTenant(ctx.tenant.id, (tx) =>
+        tx.query.contacts.findFirst({
+          where: and(
+            eq(contacts.tenantId, ctx.tenant.id),
+            eq(contacts.email, email),
+            isNull(contacts.deletedAt),
+            sql`${contacts.id} <> ${id}`,
+          ),
+          columns: { id: true },
+        })
+      );
       if (duplicate) {
         return fail("Validation failed.", { email: ["Another contact already uses this email."] });
       }
     }
 
-    const [updated] = await db
-      .update(contacts)
-      .set({ ...stripUndefined(data), updatedAt: new Date() })
-      // Both predicates. Dropping the tenant one here would be the IDOR.
-      .where(and(eq(contacts.id, id), eq(contacts.tenantId, ctx.tenant.id)))
-      .returning();
+    const [updated] = await withTenant(ctx.tenant.id, (tx) =>
+      tx
+        .update(contacts)
+        .set({ ...stripUndefined(data), updatedAt: new Date() })
+        // Both predicates. Dropping the tenant one here would be the IDOR.
+        .where(and(eq(contacts.id, id), eq(contacts.tenantId, ctx.tenant.id)))
+        .returning()
+    );
 
     if (!updated) return fail("Failed to update contact.");
 
@@ -365,6 +434,21 @@ export async function deleteContact(id: string): Promise<ActionResult<{ id: stri
     const ctx = await requireTenantContext();
     // Access before anything else — see `createContact`.
     await requireAccess("contacts:delete", ctx);
+    /**
+     * 🔴 THE THIRD STEP, ADDED IN v1.26.0-alpha. The comment above has
+     * prescribed this order since v0.83.2 and the code stopped after
+     * the second line — so this write was reachable by ANY member of
+     * the workspace, including the Accountant role, which the
+     * permission table grants `contacts:read` and not `contacts:delete`.
+     *
+     * ⚠️ `requireAccess()` READS LIKE A PERMISSION CHECK AND IS NOT
+     * ONE. It takes `"contacts:delete"` as an argument and uses it only to
+     * look up a write exemption; what it actually answers is whether
+     * the WORKSPACE is in good billing standing. That is a property of
+     * the account, not of the person, and it is true for everybody in
+     * a paid-up workspace.
+     */
+    await requirePermission("contacts:delete");
     /*
       ⭐ A SOFT DELETE IS AN UPDATE, SO THE DATABASE GUARD NEVER SEES IT.
       `refuse_delete_under_impersonation()` fires on DELETE. This row is
@@ -376,17 +460,19 @@ export async function deleteContact(id: string): Promise<ActionResult<{ id: stri
     await assertImpersonationAllows("delete:contact", ctx);
     const contactId = uuidSchema.parse(id);
 
-    const [deleted] = await db
-      .update(contacts)
-      .set({ deletedAt: new Date(), deletedBy: ctx.user.id, updatedAt: new Date() })
-      .where(
-        and(
-          eq(contacts.id, contactId),
-          eq(contacts.tenantId, ctx.tenant.id),
-          isNull(contacts.deletedAt),
-        ),
-      )
-      .returning({ id: contacts.id });
+    const [deleted] = await withTenant(ctx.tenant.id, (tx) =>
+      tx
+        .update(contacts)
+        .set({ deletedAt: new Date(), deletedBy: ctx.user.id, updatedAt: new Date() })
+        .where(
+          and(
+            eq(contacts.id, contactId),
+            eq(contacts.tenantId, ctx.tenant.id),
+            isNull(contacts.deletedAt),
+          ),
+        )
+        .returning({ id: contacts.id })
+    );
 
     if (!deleted) return fail("Contact not found.");
 

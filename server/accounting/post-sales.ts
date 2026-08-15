@@ -40,6 +40,12 @@ import {
   buildDemandPosting,
   buildBookingReceiptPosting,
   buildPossessionPosting,
+  buildCancellationPosting,
+  buildRefundPaymentPosting,
+  buildBrokeragePosting,
+  buildPartnerPaymentPosting,
+  buildMeteringPosting,
+  meteringRolesUsed,
   propertyRolesUsed,
   type PropertyLeg,
   buildRaBillPosting,
@@ -58,6 +64,16 @@ import {
   type PostingLeg,
   type PostingRole,
   type SalesTaxBreakdown,
+  buildPayrollPosting,
+  payrollRolesUsed,
+  type PayrollLeg,
+  type PayrollPostingFacts,
+  type PayrollPostingRole,
+  buildReturnSetoffPosting,
+  returnRolesUsed,
+  type ReturnLeg,
+  type ReturnPostingFacts,
+  type ReturnPostingRole,
 } from "@/lib/accounting/sales-posting";
 
 type Tx = Parameters<Parameters<typeof withTenant>[1]>[0];
@@ -73,8 +89,7 @@ type Tx = Parameters<Parameters<typeof withTenant>[1]>[0];
  * below is a courtesy that produces a clear outcome; the index is what
  * makes two people pressing "post the backlog" at once safe.
  */
-export function salesTransactionKey(
-  kind:
+export type SalesKeyKind =
     | "invoice"
     | "credit_note"
     | "receipt"
@@ -93,28 +108,133 @@ export function salesTransactionKey(
      * becomes a receipt key. Two different documents whose keys claim
      * to be the same kind is a trail that lies to whoever follows it.
      */
-    | "stock_count",
-  documentId: string,
-): string {
-  const tag =
-    kind === "invoice"
-      ? "INV"
-      : kind === "credit_note"
-        ? "CN"
-        : kind === "purchase"
-          ? "PI"
-          : kind === "ra_bill"
-            ? "RAB"
-            : kind === "demand"
-              ? "DMD"
-              : kind === "booking_receipt"
-                ? "BRC"
-                : kind === "possession"
-                  ? "POS"
-                  : kind === "stock_count"
-                    ? "SCNT"
-                    : "RCP";
+    | "stock_count"
+    /**
+     * ⭐ v1.23.0 — the payroll run.
+     *
+     * ⚠️ ONE KEY PER RUN, NOT PER PAYSLIP. The journal is one balanced
+     * entry for the whole wage bill; five hundred payslips producing
+     * five hundred transactions would make the trial balance unreadable
+     * and would not tell anybody anything the run total does not.
+     */
+    | "payroll"
+    /**
+     * ⭐ v1.24.0 — the monthly return set-off.
+     *
+     * ⚠️ ONE KEY PER RETURN. The journal clears a month of output tax
+     * against a month of credit; per-invoice keys would be a thousand
+     * transactions saying the same thing.
+     */
+    | "gst_return"
+    /**
+     * ⭐ v1.25.0-alpha — the four real-estate events that close the
+     * module. Each is its own kind rather than sharing `possession`'s,
+     * because the key is what makes a posting idempotent: a cancellation
+     * and the refund that follows it are separate decisions on separate
+     * dates, and one key covering both would silently swallow the second.
+     */
+    | "cancellation"
+    | "buyer_refund"
+    | "brokerage"
+    | "partner_payment"
+  /** ⭐ v1.28.0-alpha — a finalised meter billing period. */
+  | "meter_period";
+
+export function salesTransactionKey(kind: SalesKeyKind, documentId: string): string {
+  const tag = SALES_KEY_TAGS[kind];
   return `SALES:${tag}:${documentId}`;
+}
+
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴🔴 A MAP, NOT A TERNARY CHAIN — AND THE CHANGE IS THE FIX
+ * ══════════════════════════════════════════════════════════════════════
+ * This was fifteen nested ternaries ending in `: "RCP"`. The comment on
+ * `stock_count` above warned, in these words:
+ *
+ *     "IT GETS ITS OWN TAG RATHER THAN FALLING THROUGH TO THE DEFAULT.
+ *      The chain below ends in `"RCP"`, so any unlisted kind silently
+ *      becomes a receipt key. Two different documents whose keys claim
+ *      to be the same kind is a trail that lies to whoever follows it."
+ *
+ * ⚠️ AND THEN IT HAPPENED. `vendor_payment` was added to the union in
+ * v1.11.0 and never added to the chain, so every vendor payment posted
+ * since has carried `SALES:RCP:<id>` — the CUSTOMER RECEIPT tag. Money
+ * leaving the company, keyed as money arriving.
+ *
+ * Nothing was corrupted: the document id is a uuid, so a payment and a
+ * receipt can never collide. What is wrong is the AUDIT TRAIL. Anybody
+ * classifying entries by their transaction number — which is the only
+ * thing the number is FOR — reads a vendor payment as a receipt, and the
+ * close-readiness check built in this version reads it that way too.
+ *
+ * ⭐ SO THE STRUCTURE CHANGES, NOT JUST THE ENTRY. A `Record` keyed on
+ *   the union makes TypeScript REFUSE TO COMPILE when a kind is added
+ *   without a tag. The comment asked for that and could not enforce it;
+ *   the compiler can, and now does.
+ */
+const SALES_KEY_TAGS: Record<SalesKeyKind, string> = {
+  invoice: "INV",
+  credit_note: "CN",
+  receipt: "RCP",
+  purchase: "PI",
+  ra_bill: "RAB",
+  demand: "DMD",
+  booking_receipt: "BRC",
+  possession: "POS",
+  /** 🔴 Was silently "RCP" from v1.11.0 until v1.27.0-alpha. */
+  vendor_payment: "VPY",
+  stock_count: "SCNT",
+  payroll: "PAY",
+  gst_return: "R3B",
+  cancellation: "CNL",
+  buyer_refund: "RFD",
+  brokerage: "BRK",
+  partner_payment: "PPY",
+  meter_period: "MTR",
+};
+
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴🔴🔴 THE KEY IS THE IDEMPOTENCY GUARD, SO CHANGING A TAG IS A
+ *        DOUBLE-POSTING HAZARD
+ * ══════════════════════════════════════════════════════════════════════
+ * Every writer below asks "does a transaction with this key already
+ * exist" before it posts. A vendor payment posted last month carries
+ * `SALES:RCP:<id>`. The moment the tag becomes `VPY`, that check looks
+ * for `SALES:VPY:<id>`, does not find it, and POSTS THE JOURNAL AGAIN.
+ *
+ * ⚠️ AND IT WOULD LOOK LIKE A SUCCESS. The second entry balances, the
+ * bank is credited twice, and the only symptom is a reconciliation that
+ * is out by exactly one payment — found weeks later, by hand.
+ *
+ * ⭐ SO THE CHECK ASKS FOR EVERY KEY THIS DOCUMENT COULD EVER HAVE HAD,
+ *   and new writes use the current one. No backfill, no migration, and
+ *   nothing to run in Neon: legacy keys simply age out as the documents
+ *   they belong to stop being re-posted.
+ *
+ * ⚠️ AN ENTRY HERE IS PERMANENT. Removing one re-opens the hazard for
+ * every document posted before the rename, however long ago.
+ */
+const LEGACY_KEY_TAGS: Partial<Record<SalesKeyKind, readonly string[]>> = {
+  vendor_payment: ["RCP"],
+};
+
+/**
+ * Every key a document of this kind could carry — current first.
+ *
+ * ⚠️ USED BY THE "ALREADY POSTED" CHECK, NEVER BY THE WRITE. A new
+ * posting always gets the current key; only the LOOKUP is generous.
+ */
+export function salesTransactionKeyCandidates(
+  kind: SalesKeyKind,
+  documentId: string,
+): string[] {
+  const legacy = LEGACY_KEY_TAGS[kind] ?? [];
+  return [
+    `SALES:${SALES_KEY_TAGS[kind]}:${documentId}`,
+    ...legacy.map((tag) => `SALES:${tag}:${documentId}`),
+  ];
 }
 
 export type PostOutcome =
@@ -599,11 +719,33 @@ export async function postVendorPayment(
 ): Promise<PurchasePostOutcome> {
   const key = salesTransactionKey("vendor_payment", args.paymentId);
 
+  /**
+   * ══════════════════════════════════════════════════════════════════
+   * 🔴🔴 EVERY KEY THIS PAYMENT COULD EVER HAVE HAD — v1.27.0-alpha
+   * ══════════════════════════════════════════════════════════════════
+   * The tag for a vendor payment changed from `RCP` to `VPY` in this
+   * version, because it had been silently sharing the customer-receipt
+   * tag since v1.11.0.
+   *
+   * ⚠️ AND A TAG IS AN IDEMPOTENCY KEY. Checking only the NEW key would
+   * find nothing for every payment posted before the rename, post the
+   * journal a second time, credit the bank twice and report success —
+   * with the only symptom a reconciliation out by exactly one payment,
+   * found weeks later by hand.
+   *
+   * The write below still uses the current key. Only the lookup is
+   * generous, and it has to stay generous permanently.
+   */
+  const candidates = salesTransactionKeyCandidates("vendor_payment", args.paymentId);
+
   const [existing] = await tx
     .select({ id: transactions.id })
     .from(transactions)
     .where(
-      and(eq(transactions.tenantId, args.tenantId), eq(transactions.transactionNumber, key)),
+      and(
+        eq(transactions.tenantId, args.tenantId),
+        inArray(transactions.transactionNumber, candidates),
+      ),
     )
     .limit(1);
 
@@ -803,6 +945,18 @@ export async function postRaBill(
  */
 const BOOKING_COUNTERPARTY = "booking" as const;
 
+/**
+ * ⭐ AND THE CHANNEL PARTNER IS ITS OWN COUNTERPARTY KIND — v1.25.0-alpha.
+ *
+ * ⚠️ FOR THE SAME REASON, IN REVERSE. A broker is not a booking: they
+ * earn across many of them, and the question their statement answers is
+ * "what does this firm have outstanding", which a booking-shaped
+ * counterparty cannot group. They are also not a `company` — the sales
+ * ledger is company-shaped and `channel_partners` is a separate table
+ * with its own KYC, RERA number and commission agreement.
+ */
+const PARTNER_COUNTERPARTY = "channel_partner" as const;
+
 async function writePropertyPosting(
   tx: Tx,
   args: {
@@ -816,6 +970,12 @@ async function writePropertyPosting(
     referenceId: string;
     bookingId: string;
     buyerName: string | null;
+    /**
+     * ⚠️ OVERRIDE FOR BROKERAGE, WHICH IS COUNTERPARTIED TO THE PARTNER.
+     * Defaulted rather than required so every existing caller keeps the
+     * booking counterparty it already had.
+     */
+    counterpartyType?: string;
   },
 ): Promise<PostOutcome> {
   const [existing] = await tx
@@ -829,6 +989,22 @@ async function writePropertyPosting(
     )
     .limit(1);
   if (existing) return { posted: false, reason: "already_posted" };
+
+  /**
+   * 🔴🔴 A GAP FOUND WHILE BUILDING PAYROLL, IN v1.23.0.
+   *
+   * ⚠️ v1.21.0 ADDED THE PERIOD LOCK TO `writePosting` AND NOT TO THIS
+   * ONE. The DATA was never at risk — 0073's trigger sits on
+   * `transactions` and refuses the insert whichever writer attempts it.
+   * What was wrong is what the operator SEES: `writePosting` returns a
+   * sentence naming the closed month, and this path threw a raw
+   * database exception at whoever raised a demand notice dated in it.
+   *
+   * ⭐ A CORRECT REFUSAL DELIVERED AS AN UNHANDLED ERROR IS READ AS A
+   * BUG, and the response to a bug is to look for a way around it.
+   */
+  const lockedIn = await closedPeriodFor(tx, args.tenantId, args.transactionDate);
+  if (lockedIn) return { posted: false, reason: "period_closed", period: lockedIn };
 
   const roleMap = await loadPurchaseRoleMap(tx, args.tenantId);
   const missing = propertyRolesUsed(args.legs).filter((r) => !roleMap.has(r as never));
@@ -873,7 +1049,7 @@ async function writePropertyPosting(
       description: l.description,
       referenceType: args.referenceType,
       referenceId: args.referenceId,
-      counterpartyType: BOOKING_COUNTERPARTY,
+      counterpartyType: args.counterpartyType ?? BOOKING_COUNTERPARTY,
       counterpartyId: args.bookingId,
       counterpartyName: args.buyerName,
     })),
@@ -1002,6 +1178,304 @@ export async function postPossession(
 }
 
 /* ------------------------------------------------------------------ */
+/* ⭐⭐⭐ CANCELLATION AND BROKERAGE — v1.25.0-alpha                    */
+/* ------------------------------------------------------------------ */
+
+/**
+ * ⭐ THE CANCELLATION. Closes every balance the booking carries.
+ *
+ * ⚠️ THE CALLER MUST HAVE RUN `cancellationProblem()` FIRST. This
+ * function trusts its facts; the builder's balance assertion would catch
+ * an imbalance but would report it as a ledger fault rather than as the
+ * mistyped refund it usually is.
+ */
+export async function postCancellation(
+  tx: Tx,
+  args: {
+    tenantId: string;
+    userId: string;
+    bookingId: string;
+    bookingReference: string;
+    cancelledOn: string;
+    unitLabel: string | null;
+    buyerName: string | null;
+    advanceMinor: bigint;
+    receivableMinor: bigint;
+    forfeitMinor: bigint;
+    refundMinor: bigint;
+    reversedCgstMinor: bigint;
+    reversedSgstMinor: bigint;
+    reversedIgstMinor: bigint;
+    irrecoverableTaxMinor: bigint;
+    creditNoteNumber: string | null;
+  },
+): Promise<PostOutcome> {
+  return writePropertyPosting(tx, {
+    tenantId: args.tenantId,
+    userId: args.userId,
+    legs: buildCancellationPosting({
+      advanceMinor: args.advanceMinor,
+      receivableMinor: args.receivableMinor,
+      forfeitMinor: args.forfeitMinor,
+      refundMinor: args.refundMinor,
+      reversedCgstMinor: args.reversedCgstMinor,
+      reversedSgstMinor: args.reversedSgstMinor,
+      reversedIgstMinor: args.reversedIgstMinor,
+      irrecoverableTaxMinor: args.irrecoverableTaxMinor,
+      bookingReference: args.bookingReference,
+      unitLabel: args.unitLabel,
+      buyerName: args.buyerName,
+      creditNoteNumber: args.creditNoteNumber,
+    }),
+    key: salesTransactionKey("cancellation", args.bookingId),
+    description: `Cancellation — booking ${args.bookingReference}`,
+    transactionDate: args.cancelledOn,
+    referenceType: "adjustment",
+    referenceId: args.bookingId,
+    bookingId: args.bookingId,
+    buyerName: args.buyerName,
+  });
+}
+
+/**
+ * ⭐ THE REFUND LEAVING. A different date, and often a much later one.
+ *
+ * ⚠️ KEYED ON THE PAYMENT REFERENCE AND NOT ON THE BOOKING. A refund is
+ * sometimes paid in two transfers, and a booking-keyed idempotency check
+ * would accept the first and silently discard the second — leaving the
+ * payable overstated and the bank understated by the same amount, which
+ * reconciles to nothing.
+ */
+export async function postBuyerRefund(
+  tx: Tx,
+  args: {
+    tenantId: string;
+    userId: string;
+    bookingId: string;
+    bookingReference: string;
+    buyerName: string | null;
+    paidOn: string;
+    paymentReference: string;
+    amountMinor: bigint;
+  },
+): Promise<PostOutcome> {
+  return writePropertyPosting(tx, {
+    tenantId: args.tenantId,
+    userId: args.userId,
+    legs: buildRefundPaymentPosting({
+      amountMinor: args.amountMinor,
+      bookingReference: args.bookingReference,
+      buyerName: args.buyerName,
+      paymentReference: args.paymentReference,
+    }),
+    key: salesTransactionKey("buyer_refund", `${args.bookingId}:${args.paymentReference}`),
+    description: `Refund ${args.paymentReference} — booking ${args.bookingReference}`,
+    transactionDate: args.paidOn,
+    referenceType: "receipt",
+    referenceId: args.bookingId,
+    bookingId: args.bookingId,
+    buyerName: args.buyerName,
+  });
+}
+
+/**
+ * ⭐ THE BROKERAGE BILL.
+ *
+ * ⚠️ COUNTERPARTIED TO THE PARTNER, NOT THE BOOKING, even though it
+ * usually has a booking. "What does this firm have outstanding" is the
+ * question a broker asks and a booking-shaped counterparty cannot group.
+ */
+export async function postBrokerage(
+  tx: Tx,
+  args: {
+    tenantId: string;
+    userId: string;
+    commissionId: string;
+    reference: string;
+    creditedOn: string;
+    partnerId: string;
+    partnerName: string;
+    bookingReference: string | null;
+    grossMinor: bigint;
+    cgstMinor: bigint;
+    sgstMinor: bigint;
+    igstMinor: bigint;
+    itcEligible: boolean;
+    tdsMinor: bigint;
+  },
+): Promise<PostOutcome> {
+  return writePropertyPosting(tx, {
+    tenantId: args.tenantId,
+    userId: args.userId,
+    legs: buildBrokeragePosting({
+      grossMinor: args.grossMinor,
+      cgstMinor: args.cgstMinor,
+      sgstMinor: args.sgstMinor,
+      igstMinor: args.igstMinor,
+      itcEligible: args.itcEligible,
+      tdsMinor: args.tdsMinor,
+      reference: args.reference,
+      partnerName: args.partnerName,
+      bookingReference: args.bookingReference,
+    }),
+    key: salesTransactionKey("brokerage", args.commissionId),
+    description: `Brokerage ${args.reference} — ${args.partnerName}`,
+    transactionDate: args.creditedOn,
+    referenceType: "invoice",
+    referenceId: args.commissionId,
+    bookingId: args.partnerId,
+    buyerName: args.partnerName,
+    counterpartyType: PARTNER_COUNTERPARTY,
+  });
+}
+
+/** ⭐ Paying the partner. Clears the payable and touches nothing else. */
+export async function postPartnerPayment(
+  tx: Tx,
+  args: {
+    tenantId: string;
+    userId: string;
+    commissionId: string;
+    reference: string;
+    paidOn: string;
+    partnerId: string;
+    partnerName: string;
+    paymentReference: string;
+    amountMinor: bigint;
+  },
+): Promise<PostOutcome> {
+  return writePropertyPosting(tx, {
+    tenantId: args.tenantId,
+    userId: args.userId,
+    legs: buildPartnerPaymentPosting({
+      amountMinor: args.amountMinor,
+      reference: args.reference,
+      partnerName: args.partnerName,
+    }),
+    key: salesTransactionKey(
+      "partner_payment",
+      `${args.commissionId}:${args.paymentReference}`,
+    ),
+    description: `Partner payment ${args.paymentReference} — ${args.partnerName}`,
+    transactionDate: args.paidOn,
+    referenceType: "receipt",
+    referenceId: args.commissionId,
+    bookingId: args.partnerId,
+    buyerName: args.partnerName,
+    counterpartyType: PARTNER_COUNTERPARTY,
+  });
+}
+
+/* ------------------------------------------------------------------ */
+/* ⭐⭐⭐ THE METER BILLING PERIOD — v1.28.0-alpha                      */
+/* ------------------------------------------------------------------ */
+
+/**
+ * ⭐ THE LAST MODULE ON THE POSTING DEBT LIST.
+ *
+ * ⚠️ THE COUNTERPARTY IS THE CONSUMER CONTACT, not the meter. A meter is
+ * a device; the debt is owed by a person, and a statement has to group
+ * by them across however many meters they have.
+ */
+export async function postMeterPeriod(
+  tx: Tx,
+  args: {
+    tenantId: string;
+    userId: string;
+    periodId: string;
+    meterLabel: string;
+    periodLabel: string;
+    /** ⚠️ The period END. A bill belongs to the month it measured. */
+    billedOn: string;
+    consumerContactId: string | null;
+    consumerName: string | null;
+    energyChargeMinor: bigint;
+    fixedChargeMinor: bigint;
+    dutyMinor: bigint;
+    exportCreditMinor: bigint;
+    totalMinor: bigint;
+  },
+): Promise<PostOutcome> {
+  const key = salesTransactionKey("meter_period", args.periodId);
+
+  const [existing] = await tx
+    .select({ id: transactions.id })
+    .from(transactions)
+    .where(
+      and(eq(transactions.tenantId, args.tenantId), eq(transactions.transactionNumber, key)),
+    )
+    .limit(1);
+  if (existing) return { posted: false, reason: "already_posted" };
+
+  const lockedIn = await closedPeriodFor(tx, args.tenantId, args.billedOn);
+  if (lockedIn) return { posted: false, reason: "period_closed", period: lockedIn };
+
+  const legs = buildMeteringPosting({
+    facts: {
+      energyChargeMinor: args.energyChargeMinor,
+      fixedChargeMinor: args.fixedChargeMinor,
+      dutyMinor: args.dutyMinor,
+      exportCreditMinor: args.exportCreditMinor,
+      totalMinor: args.totalMinor,
+    },
+    meterLabel: args.meterLabel,
+    periodLabel: args.periodLabel,
+    consumerName: args.consumerName,
+  });
+
+  const roleMap = await loadPurchaseRoleMap(tx, args.tenantId);
+  const missing = meteringRolesUsed(legs).filter((r) => !roleMap.has(r as never));
+  if (missing.length > 0) {
+    return {
+      posted: false,
+      reason: "unmapped_roles",
+      missing: missing as unknown as PostingRole[],
+    };
+  }
+
+  const debitTotal = legs
+    .filter((l) => l.entryType === "debit")
+    .reduce((sum, l) => sum + l.amountMinor, 0n);
+
+  const [txn] = await tx
+    .insert(transactions)
+    .values({
+      tenantId: args.tenantId,
+      transactionNumber: key,
+      description: `Utility bill — meter ${args.meterLabel}, ${args.periodLabel}`,
+      transactionDate: args.billedOn,
+      status: "posted",
+      referenceType: "invoice",
+      referenceId: args.periodId,
+      currency: "INR",
+      totalAmount: formatMoneyPlain(debitTotal, "INR"),
+      createdBy: args.userId,
+      postedAt: new Date(),
+    })
+    .returning({ id: transactions.id });
+
+  if (!txn) throw new Error("The journal entry could not be created.");
+
+  await tx.insert(journalEntries).values(
+    legs.map((l) => ({
+      tenantId: args.tenantId,
+      transactionId: txn.id,
+      ledgerId: roleMap.get(l.role as never) as string,
+      entryType: l.entryType,
+      amount: formatMoneyPlain(l.amountMinor, "INR"),
+      description: l.description,
+      referenceType: "invoice" as const,
+      referenceId: args.periodId,
+      counterpartyType: args.consumerContactId ? ("contact" as const) : null,
+      counterpartyId: args.consumerContactId,
+      counterpartyName: args.consumerName,
+    })),
+  );
+
+  return { posted: true, transactionId: txn.id };
+}
+
+/* ------------------------------------------------------------------ */
 /* ⭐⭐ THE STOCK COUNT — v1.18.0                                       */
 /* ------------------------------------------------------------------ */
 
@@ -1107,6 +1581,243 @@ export async function postStockCount(
     counterpartyName: null,
   });
 }
+
+/* ================================================================== */
+/* ⭐⭐⭐ PAYROLL — Batch 15, v1.23.0-alpha                             */
+/* ================================================================== */
+
+/**
+ * ⭐ ONE JOURNAL FOR THE WHOLE RUN, NOT ONE PER PAYSLIP.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * ⚠️ FIVE HUNDRED PAYSLIPS WOULD MAKE FIVE HUNDRED TRANSACTIONS
+ * ══════════════════════════════════════════════════════════════════════
+ * Every one of them balanced, every one of them correct, and a trial
+ * balance nobody can read. Worse, the PF challan is settled once for the
+ * whole month against one payable balance — split across five hundred
+ * entries, reconciling it means summing five hundred rows and hoping.
+ *
+ * 🔴 THE PER-EMPLOYEE DETAIL LIVES ON THE PAYSLIP, WHICH IS WHERE
+ * SOMEBODY ACTUALLY LOOKS FOR IT. The ledger records what the business
+ * owes and to whom; it is not a personnel record and should not become
+ * one.
+ *
+ * ⚠️ AND THE POSTING DATE IS THE PERIOD END, NEVER TODAY. A March
+ * payroll posted on the 7th of April belongs in March, which is both
+ * correct accounting and the thing that makes the period lock mean
+ * something.
+ */
+export async function postPayrollRun(
+  tx: Tx,
+  args: {
+    tenantId: string;
+    userId: string;
+    runId: string;
+    runNo: string;
+    /** ⚠️ The last day of the period. Not the day the run was approved. */
+    periodEnd: string;
+    periodLabel: string;
+    facts: PayrollPostingFacts;
+  },
+): Promise<PostOutcome> {
+  // ⚠️ A RUN WITH NOTHING IN IT POSTS NOTHING, and says so rather than
+  // writing an empty journal that every statement afterwards has to
+  // filter out.
+  if (args.facts.grossMinor === 0n) {
+    return { posted: false, reason: "nothing_to_post" };
+  }
+
+  const legs: PayrollLeg[] = buildPayrollPosting({
+    facts: args.facts,
+    periodLabel: args.periodLabel,
+  });
+
+  const key = salesTransactionKey("payroll", args.runId);
+
+  const [existing] = await tx
+    .select({ id: transactions.id })
+    .from(transactions)
+    .where(
+      and(eq(transactions.tenantId, args.tenantId), eq(transactions.transactionNumber, key)),
+    )
+    .limit(1);
+  if (existing) return { posted: false, reason: "already_posted" };
+
+  const lockedIn = await closedPeriodFor(tx, args.tenantId, args.periodEnd);
+  if (lockedIn) return { posted: false, reason: "period_closed", period: lockedIn };
+
+  const roleMap = await loadPurchaseRoleMap(tx, args.tenantId);
+  const missing = payrollRolesUsed(legs).filter((r) => !roleMap.has(r as never));
+  if (missing.length > 0) {
+    // 🔴 THE WHOLE POSTING IS REFUSED, NEVER A PARTIAL ONE. A payroll
+    // journal missing its ESI payable leg does not balance, and a
+    // half-posted wage bill is worse than an unposted one because it
+    // looks done.
+    return {
+      posted: false,
+      reason: "unmapped_roles",
+      missing: missing as unknown as PostingRole[],
+    };
+  }
+
+  const debitTotal = legs
+    .filter((l) => l.entryType === "debit")
+    .reduce((sum, l) => sum + l.amountMinor, 0n);
+
+  const [txn] = await tx
+    .insert(transactions)
+    .values({
+      tenantId: args.tenantId,
+      transactionNumber: key,
+      description: `Payroll ${args.runNo} — ${args.periodLabel}`,
+      transactionDate: args.periodEnd,
+      status: "posted",
+      // ⚠️ `adjustment` RATHER THAN A NEW ENUM MEMBER. Payroll is not a
+      // sale, not a purchase and not a receipt, and `classifyVoucherType`
+      // already maps an adjustment with no debtor leg to a Tally JOURNAL,
+      // which is exactly what this is.
+      referenceType: "adjustment",
+      referenceId: args.runId,
+      currency: "INR",
+      totalAmount: formatMoneyPlain(debitTotal, "INR"),
+      createdBy: args.userId,
+      postedAt: new Date(),
+    })
+    .returning({ id: transactions.id });
+
+  if (!txn) throw new Error("The payroll journal could not be created.");
+
+  await tx.insert(journalEntries).values(
+    legs.map((l) => ({
+      tenantId: args.tenantId,
+      transactionId: txn.id,
+      ledgerId: roleMap.get(l.role as never) as string,
+      entryType: l.entryType,
+      amount: formatMoneyPlain(l.amountMinor, "INR"),
+      description: l.description,
+      referenceType: "adjustment" as const,
+      referenceId: args.runId,
+      // ⚠️ NO COUNTERPARTY. A wage bill has five hundred counterparties
+      // and naming one of them would be a lie; naming all of them is what
+      // the payslips are for.
+      counterpartyType: null,
+      counterpartyId: null,
+      counterpartyName: null,
+    })),
+  );
+
+  return { posted: true, transactionId: txn.id };
+}
+
+export type { PayrollPostingFacts, PayrollPostingRole };
+
+/* ================================================================== */
+/* ⭐⭐⭐ THE MONTHLY RETURN SET-OFF — Batch 16, v1.24.0-alpha          */
+/* ================================================================== */
+
+/**
+ * ⭐ ONE JOURNAL PER RETURN, DATED THE LAST DAY OF THE TAX PERIOD.
+ *
+ * ⚠️ NOT THE FILING DATE. A July return filed on 20 August belongs in
+ * July, or the July balance sheet shows a liability that the July return
+ * says was settled — and those two documents are exactly the pair an
+ * assessment compares.
+ *
+ * 🔴 THE AMOUNTS COME FROM THE SET-OFF, NEVER FROM THE ACCOUNT BALANCES.
+ * Clearing "whatever is in the account" would sweep up credit this
+ * return did not claim and output tax from a period already filed.
+ */
+export async function postReturnSetoff(
+  tx: Tx,
+  args: {
+    tenantId: string;
+    userId: string;
+    returnId: string;
+    taxPeriod: string;
+    /** ⚠️ The last day of the period. Not the day it was filed. */
+    periodEnd: string;
+    facts: ReturnPostingFacts;
+  },
+): Promise<PostOutcome> {
+  const legs: ReturnLeg[] = buildReturnSetoffPosting({
+    facts: args.facts,
+    periodLabel: args.taxPeriod,
+  });
+
+  // ⚠️ A RETURN WITH NOTHING TO CLEAR POSTS NOTHING. A nil month is a
+  // successful month, not a failure, and an empty journal is a row every
+  // statement afterwards has to filter out.
+  if (legs.length === 0) return { posted: false, reason: "nothing_to_post" };
+
+  const key = salesTransactionKey("gst_return", args.returnId);
+
+  const [existing] = await tx
+    .select({ id: transactions.id })
+    .from(transactions)
+    .where(
+      and(eq(transactions.tenantId, args.tenantId), eq(transactions.transactionNumber, key)),
+    )
+    .limit(1);
+  if (existing) return { posted: false, reason: "already_posted" };
+
+  const lockedIn = await closedPeriodFor(tx, args.tenantId, args.periodEnd);
+  if (lockedIn) return { posted: false, reason: "period_closed", period: lockedIn };
+
+  const roleMap = await loadPurchaseRoleMap(tx, args.tenantId);
+  const missing = returnRolesUsed(legs).filter((r) => !roleMap.has(r as never));
+  if (missing.length > 0) {
+    return {
+      posted: false,
+      reason: "unmapped_roles",
+      missing: missing as unknown as PostingRole[],
+    };
+  }
+
+  const debitTotal = legs
+    .filter((l) => l.entryType === "debit")
+    .reduce((sum, l) => sum + l.amountMinor, 0n);
+
+  const [txn] = await tx
+    .insert(transactions)
+    .values({
+      tenantId: args.tenantId,
+      transactionNumber: key,
+      description: `GSTR-3B set-off — ${args.taxPeriod}`,
+      transactionDate: args.periodEnd,
+      status: "posted",
+      referenceType: "adjustment",
+      referenceId: args.returnId,
+      currency: "INR",
+      totalAmount: formatMoneyPlain(debitTotal, "INR"),
+      createdBy: args.userId,
+      postedAt: new Date(),
+    })
+    .returning({ id: transactions.id });
+
+  if (!txn) throw new Error("The return journal could not be created.");
+
+  await tx.insert(journalEntries).values(
+    legs.map((l) => ({
+      tenantId: args.tenantId,
+      transactionId: txn.id,
+      ledgerId: roleMap.get(l.role as never) as string,
+      entryType: l.entryType,
+      amount: formatMoneyPlain(l.amountMinor, "INR"),
+      description: l.description,
+      referenceType: "adjustment" as const,
+      referenceId: args.returnId,
+      // ⚠️ THE COUNTERPARTY IS THE GOVERNMENT, WHICH IS NOT A COMPANY
+      // ROW. Naming one would put a tax authority in the customer list.
+      counterpartyType: null,
+      counterpartyId: null,
+      counterpartyName: null,
+    })),
+  );
+
+  return { posted: true, transactionId: txn.id };
+}
+
+export type { ReturnPostingFacts, ReturnPostingRole };
 
 /**
  * ⚠️ RETURNS THE PERIOD'S NAME RATHER THAN A BOOLEAN, because "you

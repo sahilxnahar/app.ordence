@@ -30,7 +30,7 @@ import {
   type TemplateSnapshot,
 } from "@/lib/messaging/window";
 
-const READ = "crm.contacts.read" as const;
+const READ = "contacts:read" as const;
 
 export interface SpendToday {
   readonly connectionName: string;

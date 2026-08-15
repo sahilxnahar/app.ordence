@@ -92,7 +92,14 @@ import { tenants, users } from "./core";
 import { companies, contacts, deals } from "./crm";
 import { assets } from "./assets";
 import { projects, bookings, channelPartners } from "./sales";
-import { gstParties, gstRegistrations, hsnSacCodes, hsnSacRates } from "./gst";
+import {
+  gstParties,
+  gstRegistrations,
+  gstRegistrationTypeEnum,
+  gstSupplyTypeEnum,
+  hsnSacCodes,
+  hsnSacRates,
+} from "./gst";
 
 /* ------------------------------------------------------------------ */
 /* ENUMS                                                               */
@@ -233,6 +240,58 @@ export const salesOrders = pgTable(
      */
     placeOfSupplyCode: varchar("place_of_supply_code", { length: 2 }),
     isInterState: boolean("is_inter_state"),
+
+    /* --- ⭐ v1.37.0 (Batch 33): THE FIELDS THAT MAKE THE ANSWER SAYABLE -- */
+    //
+    // 🔴 UNTIL NOW THIS TABLE COULD NOT REPRESENT THE CORRECT ANSWER.
+    //
+    // `invoices` has carried `supplyType`, `propertyStateCode`,
+    // `placeOfSupplyBasis`, `isUnionTerritory` and `recipientRegistration`
+    // since Phase 32, together with a CHECK enforcing Section 12(3). The
+    // order that PRODUCES the invoice carried two columns and decided
+    // between them by comparing two strings.
+    //
+    // The consequence was not that the order was sometimes wrong. It was
+    // that the order could not be right:
+    //
+    //   • A works contract on a site in another state has its place of
+    //     supply at the SITE (s.12(3)). With no `propertyStateCode` there
+    //     was nowhere to put the site, so the buyer's state won.
+    //   • An SEZ recipient is deemed inter-state even across the road
+    //     (s.7(5)(b)). With no `recipientRegistration` the codes matched
+    //     and the order concluded intra-state.
+    //   • An intra-UT supply is CGST + UTGST, a different Act and a
+    //     different box in GSTR-1. With no `isUnionTerritory` every one
+    //     was recorded as CGST + SGST.
+    //
+    // The money is identical in the UT case and wrong in the other two.
+    // All three are invisible on the document.
+
+    /** ⭐ Selects the section: 12(3) for property, 10(1)(a) for goods. */
+    supplyType: gstSupplyTypeEnum("supply_type").default("services").notNull(),
+
+    /**
+     * ⭐ WHERE THE SITE, FLAT OR PLOT IS. Under s.12(3) this IS the place
+     * of supply for anything relating to immovable property, regardless
+     * of where the buyer is registered. The CHECK below refuses any
+     * immovable-property order whose place of supply is anything else.
+     */
+    propertyStateCode: varchar("property_state_code", { length: 2 }),
+
+    /** The recipient's status. `sez` is deemed inter-state by statute. */
+    recipientRegistration: gstRegistrationTypeEnum("recipient_registration"),
+
+    /** Which rule produced the answer. For the tooltip and the papers. */
+    placeOfSupplyBasis: varchar("place_of_supply_basis", { length: 40 }),
+
+    /** The provision relied on, e.g. "Section 12(3)(a), IGST Act". */
+    placeOfSupplyRef: varchar("place_of_supply_ref", { length: 60 }),
+
+    /**
+     * ⚠️ Intra-UT supplies are CGST + UTGST. Same money, different Act,
+     * different box. Stored so the return does not have to re-derive it.
+     */
+    isUnionTerritory: boolean("is_union_territory").default(false).notNull(),
 
     /* --- Provenance ------------------------------------------------- */
     dealId: uuid("deal_id").references(() => deals.id, { onDelete: "set null" }),
@@ -394,6 +453,61 @@ export const salesOrders = pgTable(
     revisionNonNegative: check(
       "sales_orders_revision_non_negative",
       sql`${t.revision} >= 0`,
+    ),
+
+    /**
+     * ⭐ SECTION 12(3), IGST ACT — ENFORCED BY THE DATABASE, exactly as
+     * `invoices_immovable_property_pos` has been since Phase 32.
+     *
+     * ⚠️ THE APPLICATION IS ONE WRITE PATH OF FOUR. The others are an
+     * import of historical orders, a support fix at a psql prompt, and
+     * the public REST API. Each of them will reach for the customer's
+     * state, because the column next to it is called
+     * `place_of_supply_code` and the customer's state is the obvious
+     * thing to put in it. The constraint is what makes the obvious wrong
+     * thing impossible rather than merely discouraged.
+     */
+    immovablePropertyPos: check(
+      "sales_orders_immovable_property_pos",
+      sql`${t.supplyType} <> 'immovable_property'
+          OR (${t.propertyStateCode} IS NOT NULL
+              AND ${t.placeOfSupplyCode} IS NOT NULL
+              AND ${t.placeOfSupplyCode} = ${t.propertyStateCode})`,
+    ),
+
+    /**
+     * 🔴 AN SEZ RECIPIENT IS INTER-STATE WHEREVER IT SITS. s.7(5)(b).
+     *
+     * An SEZ unit two kilometres away in the same state is still an
+     * inter-state supply. Matching the state codes and concluding
+     * intra-state is the single most common SEZ mistake, and it
+     * under-collects IGST that is paid later with interest.
+     */
+    sezIsInterState: check(
+      "sales_orders_sez_is_inter_state",
+      sql`${t.recipientRegistration} IS DISTINCT FROM 'sez'
+          OR ${t.isInterState} = true`,
+    ),
+
+    /**
+     * ⚠️ A UNION TERRITORY SUPPLY IS NEVER INTER-STATE. `isUnionTerritory`
+     * selects CGST + UTGST, which only exists on an intra-state supply.
+     * Both true at once would mean IGST and UTGST on one document.
+     */
+    utIsIntraState: check(
+      "sales_orders_ut_is_intra_state",
+      sql`${t.isUnionTerritory} = false OR ${t.isInterState} IS NOT TRUE`,
+    ),
+
+    /**
+     * ⭐ A DETERMINATION LEAVES A TRACE. If a place of supply is present
+     * the rule that produced it must be too. This is what stops a future
+     * write path storing a code it guessed: it would have to invent a
+     * basis, and every basis is checked by `check:tax-decisions`.
+     */
+    posHasBasis: check(
+      "sales_orders_pos_has_basis",
+      sql`${t.placeOfSupplyCode} IS NULL OR ${t.placeOfSupplyBasis} IS NOT NULL`,
     ),
   }),
 );

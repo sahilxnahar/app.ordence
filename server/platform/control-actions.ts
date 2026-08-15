@@ -291,7 +291,10 @@ const applySchema = z.object({
   tenantId: z.string().uuid(),
   featureKey: z.string().min(1).max(120),
   enabled: z.boolean(),
-  reason: z.string().min(10).max(1000),
+  // ⚠️ 15, not 10. `setTenantFlagSchema` demands 15, so a
+  // 12-character reason passed this form and was rejected downstream
+  // with "Check the form." and no field to point at.
+  reason: z.string().min(15).max(1000),
 });
 
 /**
@@ -315,7 +318,7 @@ export async function applyEntitlementChange(
 
   const written = await setTenantFlag({
     tenantId: parsed.data.tenantId,
-    key: flagKey,
+    flagKey,
     enabled: parsed.data.enabled,
     reason: parsed.data.reason,
   });
@@ -383,7 +386,7 @@ export async function revertEntitlementChange(
 
   const written = await setTenantFlag({
     tenantId: row.tenantId,
-    key: row.flagKey,
+    flagKey: row.flagKey,
     enabled: target,
     reason: `Reverting the change made on ${row.changedAt.toISOString().slice(0, 10)}.`,
   });

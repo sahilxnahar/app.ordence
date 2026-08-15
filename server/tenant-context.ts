@@ -16,7 +16,7 @@ import "server-only";
 import { auth } from "@clerk/nextjs/server";
 import { headers } from "next/headers";
 import { eq, and, isNull } from "drizzle-orm";
-import { db } from "@/db";
+import { db, withPlatformScope, withTenant } from "@/db";
 import { SENTRY_ENABLED } from "@/lib/observability/sentry-options";
 import { tenants, users } from "@/db/schema";
 import { TENANT_HEADERS } from "@/lib/tenant";
@@ -122,10 +122,34 @@ export async function requireTenantContext(): Promise<TenantContext> {
     throw new TenantAccessError("No active organization selected.", "no_organization");
   }
 
-  // Authoritative lookup: Clerk org id → tenant row. The header is never the source.
-  const tenantRow = await db.query.tenants.findFirst({
-    where: and(eq(tenants.clerkOrgId, orgId), isNull(tenants.deletedAt)),
-  });
+  /**
+   * ══════════════════════════════════════════════════════════════════
+   * 🔴 THE BOOTSTRAP READ, AND IT CANNOT BE TENANT-SCOPED
+   * ══════════════════════════════════════════════════════════════════
+   * Authoritative lookup: Clerk org id → tenant row. The header is never
+   * the source.
+   *
+   * ⚠️ THIS RAN ON THE UNSCOPED CLIENT UNTIL v1.34.0. Under a database
+   * role that does not bypass RLS, `app_current_tenant_id()` is NULL
+   * here — there is no tenant yet, that is what this query is for — so
+   * the `tenants` policy matched nothing and this returned undefined.
+   * Every signed-in request in the product would have failed with
+   * `tenant_not_found`, which reads as "your workspace is not
+   * provisioned" and is the most misleading error the product can show.
+   *
+   * ⭐ PLATFORM SCOPE IS THE CORRECT ANSWER, not a workaround: resolving
+   * which workspace a session belongs to is by definition a question no
+   * single workspace can answer. The `tenants` policy admits platform
+   * scope on USING and the read is by `clerk_org_id`, which the caller's
+   * verified session supplies.
+   */
+  const tenantRow = await withPlatformScope(
+    `Resolve the workspace for an authenticated session`,
+    (tx) =>
+      tx.query.tenants.findFirst({
+        where: and(eq(tenants.clerkOrgId, orgId), isNull(tenants.deletedAt)),
+      }),
+  );
 
   if (!tenantRow) {
     throw new TenantAccessError("Workspace not provisioned.", "tenant_not_found");
@@ -147,13 +171,21 @@ export async function requireTenantContext(): Promise<TenantContext> {
     );
   }
 
-  const userRow = await db.query.users.findFirst({
-    where: and(
-      eq(users.clerkUserId, userId),
-      eq(users.tenantId, tenantRow.id),
-      isNull(users.deletedAt),
-    ),
-  });
+  /**
+   * ⭐ AND THIS ONE IS TENANT-SCOPED, because by now the workspace IS
+   * known. Reading the caller's own membership as that workspace is
+   * exactly the check the policy exists to perform, so it runs under
+   * the same isolation every later query in the request will.
+   */
+  const userRow = await withTenant(tenantRow.id, (tx) =>
+    tx.query.users.findFirst({
+      where: and(
+        eq(users.clerkUserId, userId),
+        eq(users.tenantId, tenantRow.id),
+        isNull(users.deletedAt),
+      ),
+    }),
+  );
 
   if (!userRow) {
     throw new TenantAccessError("User not provisioned in this workspace.", "user_not_provisioned");

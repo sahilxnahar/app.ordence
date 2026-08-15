@@ -148,6 +148,26 @@ export const FEATURE_CATALOG = {
     description: "Hours by person, project and task.",
     minTier: "basic",
   },
+  /**
+   * ⭐⭐ PAYROLL — v1.23.0-alpha, batch 15.
+   *
+   * ⚠️ `advanced`, NOT `basic`, AND IT IS A COMMERCIAL DECISION RATHER
+   * THAN A TECHNICAL ONE. A business small enough to be on the basic
+   * tier usually runs payroll on a spreadsheet or through its
+   * accountant, and pricing it into the entry tier gives away the
+   * feature most likely to justify an upgrade.
+   *
+   * 🔴 IT IS ALSO THE FEATURE WITH THE HIGHEST SUPPORT COST. Statutory
+   * rates change, States disagree, and every question about a payslip
+   * is asked by somebody who is owed money. Putting it behind a tier
+   * that comes with support is honest in both directions.
+   */
+  "hr.payroll": {
+    label: "Payroll",
+    description:
+      "Employees, salary structures, statutory deductions and a wage bill that posts to the ledger.",
+    minTier: "advanced",
+  },
   "timesheets.utilisation": {
     label: "Utilisation & WIP",
     description: "Billable ratio, realisation rate and unbilled work in progress.",

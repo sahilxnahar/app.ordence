@@ -101,7 +101,7 @@ export async function saveLegalPracticeProfile(
 ): Promise<ActionResult<{ ok: true }>> {
   try {
     const data = profileSchema.parse(input);
-    const ctx = await requirePermission("settings.manage");
+    const ctx = await requirePermission("settings:update");
 
     if (data.seniorToAdvocatePosition && !data.seniorToAdvocateNote) {
       throw new Error(

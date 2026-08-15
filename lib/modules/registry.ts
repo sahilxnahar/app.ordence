@@ -388,6 +388,64 @@ export const MODULE_REGISTRY: Readonly<Record<string, ModuleDescriptor>> =
       status: "live",
       href: "/sales/partners",
     },
+    today: {
+      navId: "today",
+      label: "Today",
+      description: "What needs attention, ordered by what it costs to ignore.",
+      group: "customers",
+      /**
+       * 🔴 `feature: null` — THE SECOND MODULE TO BE UNGATED, AND FOR
+       * THE SAME REASON AS THE FIRST.
+       *
+       * `statutory_due` was left ungated in v1.24.0 because a tenant who
+       * has stopped paying us still has to pay the Government. This page
+       * is the thing that TELLS THEM the deadline is coming.
+       *
+       * ⚠️ AND IT IS THE PAGE A DOWNGRADED WORKSPACE NEEDS MOST. Gating
+       * it would mean the moment a business is short of money — which is
+       * when a plan gets downgraded — is the moment we stop warning them
+       * about the payments that carry damages.
+       *
+       * ⭐ It also carries no data of its own: every line is a count and
+       * a total read from a module that has its own gate, so a locked
+       * module simply contributes nothing to it.
+       */
+      feature: null,
+      status: "live",
+      href: "/command",
+    },
+    brokerage: {
+      navId: "brokerage",
+      label: "Brokerage",
+      description: "What brokers have earned, what was withheld, what is owed.",
+      group: "customers",
+      /**
+       * ⭐ `sales.brokerage` ALREADY EXISTED AS A FEATURE KEY and had
+       * exactly one reference in the whole product, in a lead action.
+       * The calculation it gated had no screen and no document — which
+       * is the same shape as the engine itself.
+       */
+      feature: "sales.brokerage",
+      status: "live",
+      href: "/sales/brokerage",
+    },
+    cancellations: {
+      navId: "cancellations",
+      label: "Cancellations",
+      description: "Forfeiture, refunds owed to buyers, and the tax reversal.",
+      group: "customers",
+      /**
+       * ⚠️ GATED ON `sales.bookings`, THE SAME KEY THE BOOKINGS SCREEN
+       * USES, and not on a key of its own. A tenant who can create a
+       * booking must be able to close one: gating the cancellation
+       * separately would let a workspace record sales it has no way to
+       * unwind, and the balances would accumulate against buyers who
+       * had gone.
+       */
+      feature: "sales.bookings",
+      status: "live",
+      href: "/sales/cancellations",
+    },
 
     /* ---- PROJECTS & LAND ----------------------------------------- */
 
@@ -865,6 +923,28 @@ export const MODULE_REGISTRY: Readonly<Record<string, ModuleDescriptor>> =
       href: "/timesheets",
       industries: ["software","professional_services"],
     },
+    /**
+     * ⭐⭐⭐ PAYROLL — v1.23.0-alpha, batch 15.
+     *
+     * ⚠️ `money`, NOT `site`. Payroll is a wage BILL: it posts a
+     * journal, it creates five statutory liabilities, and the person
+     * who looks at it is the person who looks at the ledger. Filing it
+     * beside site attendance would put it in front of a site engineer
+     * and hide it from the accountant.
+     *
+     * 🔴 AND NO `industries` NARROWING. Everybody who employs anybody
+     * runs payroll.
+     */
+    payroll: {
+      navId: "payroll",
+      label: "Payroll",
+      description:
+        "Employees, salary structures, statutory deductions and a wage bill that posts to the ledger.",
+      group: "money",
+      feature: "hr.payroll",
+      status: "live",
+      href: "/payroll",
+    },
 
     /* ---- VERTICAL VOCABULARY OVER EXISTING MODULES --------------- */
     /*
@@ -1003,6 +1083,21 @@ export const MODULE_REGISTRY: Readonly<Record<string, ModuleDescriptor>> =
       description: "Double-entry books and period close.",
       group: "money", feature: "accounting.ledger", status: "live", href: "/accounting",
     },
+    "period-close": {
+      navId: "period-close",
+      label: "Close a period",
+      description: "What is still outside the ledger before a month is sealed.",
+      group: "money",
+      /**
+       * ⚠️ `accounting.period_close`, THE SAME KEY `closeFinancialPeriod`
+       * ALREADY REQUIRES. Gating the checklist on `accounting.ledger`
+       * would show a workspace the list and then refuse the close it is
+       * a checklist for.
+       */
+      feature: "accounting.period_close",
+      status: "live",
+      href: "/accounting/close",
+    },
     /**
      * ⭐ UNDER `money`, BESIDE RATES. A price check is opened while
      * somebody is on the phone to a customer holding an invoice at a
@@ -1098,6 +1193,31 @@ export const MODULE_REGISTRY: Readonly<Record<string, ModuleDescriptor>> =
       navId: "tds", label: "TDS",
       description: "Deductions, challans and quarterly returns.",
       group: "money", feature: "tds.deductions", status: "live", href: "/tds",
+    },
+    /**
+     * ⭐⭐⭐ WHAT IS DUE — v1.24.0-alpha, batch 16.
+     *
+     * ⚠️ ITS OWN NAV ENTRY RATHER THAN A TAB INSIDE GST, because it is
+     * not a GST screen. It answers one question — what does this
+     * business owe a government right now — across GST, both TDS
+     * sections, provident fund, ESI and professional tax. Filing it
+     * under GST would hide the payroll liabilities from the person who
+     * pays them.
+     *
+     * 🔴 NO FEATURE GATE. Knowing what you owe is not a paid capability.
+     * A tenant who has stopped paying us still has to pay the
+     * Government, and hiding this behind a tier would be the one
+     * entitlement in the product with a genuine ethical problem.
+     */
+    statutory_due: {
+      navId: "statutory_due",
+      label: "What is due",
+      description:
+        "Everything owed to a government this month — GST, TDS, provident fund, ESI and professional tax — from your own ledger balances, with due dates.",
+      group: "money",
+      feature: null,
+      status: "live",
+      href: "/compliance/due",
     },
     gstr2b: {
       navId: "gstr2b",

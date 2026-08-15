@@ -140,16 +140,32 @@ export function TenantActions(props: TenantActionsProps) {
       <DangerDialog
         open={open === "suspend"}
         onOpenChange={(v) => setOpen(v ? "suspend" : null)}
-        title={`Suspend ${props.tenantName}`}
-        description="Everyone in this workspace loses access until it is reactivated."
+        title={`Request suspension of ${props.tenantName}`}
+        description="This goes to the approval queue. Nothing happens until a second owner approves it."
+        /**
+         * 🔴 THIS LIST USED TO SAY "They can still sign in, reach
+         * billing, and export all of their data." IT IS NOT TRUE.
+         * `requireTenantContext` refuses any workspace whose status is
+         * not `active` or `pending`, before the billing gate and before
+         * the export exemption, and `/settings/billing` lives inside the
+         * same layout — so a suspended customer cannot reach the page
+         * this console tells you to send them to.
+         *
+         * ⚠️ THE FIX IS A SEPARATE BATCH because it opens a door that is
+         * currently shut and every route has to be checked against
+         * `canWrite: false` first. Until then the operator is told what
+         * actually happens, not what was intended. An operator making a
+         * suspension decision on a false description of its effect is
+         * worse than the lockout itself.
+         */
         consequences={[
           "NOTHING is deleted. Every record stays exactly where it is.",
-          "They can still sign in, reach billing, and export all of their data.",
+          "⚠️ Today this is a FULL lockout: they cannot sign in, cannot reach billing and cannot export. That is not the intended behaviour and is being fixed.",
           "This is fully reversible and the previous status is restored.",
-          "The reason below appears in the customer's own audit log.",
+          "The reason below appears in the customer's own audit log, and in the approval request.",
         ]}
         confirmValue={props.tenantSlug}
-        actionLabel="Suspend workspace"
+        actionLabel="Send for approval"
         pending={pending}
         error={error}
         onConfirm={({ confirmValue, justification }) =>

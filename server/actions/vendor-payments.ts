@@ -43,8 +43,8 @@ import {
 } from "@/lib/purchases/ageing";
 import { assessMsmeBill, type MsmeCategory, type SupplierKind } from "@/lib/purchases/msme";
 
-const READ = "purchases.invoices.read" as const;
-const WRITE = "purchases.invoices.create" as const;
+const READ = "purchases:read" as const;
+const WRITE = "purchases:record_invoice" as const;
 
 /**
  * ⚠️ THE RBI BANK RATE IS AN ARGUMENT, NOT A CONSTANT.

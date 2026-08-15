@@ -12,9 +12,9 @@
  */
 
 import { and, eq } from "drizzle-orm";
-import { db } from "@/db";
+import { db, withTenant } from "@/db";
 import { tenants } from "@/db/schema";
-import { requirePermission } from "@/server/audit";
+import { requirePermission, writeAudit } from "@/server/audit";
 import { TenantAccessError } from "@/server/tenant-context";
 import {
   assertImpersonationAllows,
@@ -34,7 +34,14 @@ import {
   serialiseExport,
   exportFileName,
 } from "@/server/backup/export";
-import { RECOVERY_WINDOW_DAYS } from "@/lib/backup/recoverable";
+import {
+  RECOVERY_WINDOW_DAYS,
+  recoverableFor,
+} from "@/lib/backup/recoverable";
+import {
+  checkRateLimit,
+  tenantRateLimitKey,
+} from "@/lib/security/rate-limit";
 import type { ActionResult } from "@/lib/validators/crm";
 
 function fail(error: string): ActionResult<never> {
@@ -121,9 +128,27 @@ export async function restoreFromRecycleBin(input: {
   id: string;
 }): Promise<ActionResult<{ label: string }>> {
   try {
-    // Restoring CHANGES data, so it needs a write permission — unlike
-    // merely looking at the bin.
-    const ctx = await requirePermission("contacts:update");
+    /**
+     * 🔴 WAS A FLAT `contacts:update` FOR EVERY TABLE.
+     *
+     * Restoring changes data, so a write permission was right. Using
+     * the CONTACTS write permission to restore a CONTRACT was not: a
+     * `member` holds `contacts:update` and holds neither
+     * `contracts:update` nor `documents:create`, so the recycle bin was
+     * a way around both.
+     *
+     * ⚠️ THE PERMISSION NOW COMES FROM THE CATALOGUE ENTRY, so a new
+     * recoverable entity cannot be added without deciding who may bring
+     * one back — the type requires it.
+     */
+    const entity = recoverableFor(input.table);
+    if (!entity) {
+      return fail(
+        "That is not something the recycle bin can restore. If you reached " +
+          "this from a link, the link is out of date.",
+      );
+    }
+    const ctx = await requirePermission(entity.restorePermission);
 
     const result = await restoreRecord({
       tenantId: ctx.tenant.id,
@@ -150,16 +175,22 @@ export async function restoreFromRecycleBin(input: {
 /**
  * A complete copy of the workspace's data.
  *
- * Requires `settings:read` — an ordinary member should not be able to
- * pull the entire workspace, but this must NOT be so restricted that a
- * customer trying to leave cannot get their data out. An owner or admin
- * holds it, which is the right line.
+ * ⚠️ Requires `workspace:export`. It required `settings:read` until
+ * v1.31.0, and the `read_only` role holds `settings:read` — so the role
+ * handed out for "let them see the numbers", deliberately denied
+ * `contacts:export`, `reports:export`, `leads:export` and `tds:read`,
+ * could pull all of it in one call with nothing recorded.
+ *
+ * The line the old comment described was right; the key was not. An
+ * owner or admin holds `workspace:export`, and a customer trying to
+ * leave can still always get their data out — it stays on the
+ * always-permitted list for a locked account.
  */
 export async function exportWorkspace(): Promise<
   ActionResult<{ json: string; fileName: string; counts: Record<string, number> }>
 > {
   try {
-    const ctx = await requirePermission("settings:read");
+    const ctx = await requirePermission("workspace:export");
     /*
       ⭐ THE ONE THAT TURNS SUPPORT INTO AN EXFILTRATION CHANNEL.
       This action returns the ENTIRE workspace as a JSON file. It is
@@ -171,16 +202,68 @@ export async function exportWorkspace(): Promise<
     */
     await assertImpersonationAllows("export:workspace", ctx);
 
-    const [tenant] = await db
-      .select({ name: tenants.name, legalName: tenants.legalName })
-      .from(tenants)
-      .where(and(eq(tenants.id, ctx.tenant.id)))
-      .limit(1);
+    /**
+     * 🔴 A BUDGET, BECAUSE ONE EXPORT IS A BACKUP AND FIFTY IS A LEAK.
+     *
+     * There was no limit of any kind on this action. A departing
+     * employee could call it in a loop and nothing counted. The budget
+     * is deliberately generous — a customer leaving must not be
+     * throttled out of their own data — and deliberately finite.
+     */
+    const budget = await checkRateLimit(
+      "search",
+      tenantRateLimitKey(ctx.tenant.id, ctx.user.id),
+    );
+    if (!budget.allowed) {
+      return fail(
+        "You have exported this workspace several times in a short period. " +
+          "Wait a few minutes and try again. If you are migrating away and " +
+          "need this repeatedly, contact support and we will help directly.",
+      );
+    }
+
+    const [tenant] = await withTenant(ctx.tenant.id, (tx) =>
+      tx
+        .select({ name: tenants.name, legalName: tenants.legalName })
+        .from(tenants)
+        .where(and(eq(tenants.id, ctx.tenant.id)))
+        .limit(1)
+    );
 
     const exported = await exportTenantData(
       ctx.tenant.id,
       tenant?.legalName ?? tenant?.name ?? "workspace",
     );
+
+    /**
+     * 🔴 RECORDED BEFORE THE PAYLOAD LEAVES, AND AT `critical`.
+     *
+     * Nothing on this path wrote an audit row before v1.31.0. The
+     * single largest read in the product left no trace at all, so
+     * "did anyone take a copy of everything before they left?" was
+     * unanswerable.
+     *
+     * ⚠️ The counts go in the row. "Exported the workspace" is not
+     * evidence; "exported 4,182 contacts and 11,904 journal entries at
+     * 02:14" is.
+     */
+    await writeAudit(ctx, {
+      action: "export",
+      resourceType: "workspace",
+      resourceId: ctx.tenant.id,
+      severity: "critical",
+      reason:
+        "Complete workspace export downloaded. Every record in every module, " +
+        "including the audit log.",
+      metadata: {
+        counts: exported.manifest.counts,
+        totalRows: Object.values(exported.manifest.counts).reduce(
+          (a, b) => a + b,
+          0,
+        ),
+        exportedAt: exported.manifest.exportedAt,
+      },
+    });
 
     return {
       ok: true,

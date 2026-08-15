@@ -167,10 +167,24 @@ describe("⭐ the counterparty is the BOOKING — the Session 2 question, settle
    * per home buyer would create thousands of shell CRM records whose only
    * purpose is to satisfy a foreign key.
    */
+  /**
+   * ⚠️ REWRITTEN IN v1.25.0-alpha, AND THE CHANGE IS THE INTERESTING
+   * PART. This used to assert the literal `counterpartyType:
+   * BOOKING_COUNTERPARTY`. Brokerage is counterpartied to the PARTNER —
+   * a broker earns across many bookings, and "what does this firm have
+   * outstanding" is a question a booking-shaped counterparty cannot
+   * group — so the writer took an optional override.
+   *
+   * ⭐ THE ASSERTION NOW CHECKS THE DEFAULT RATHER THAN THE SPELLING.
+   * What matters is that a caller who says nothing still gets the
+   * booking; a test pinned to the exact expression would have to be
+   * edited every time the line is touched, which teaches people to edit
+   * it without thinking.
+   */
   it("posts against the booking, not an invented company", () => {
     const c = code(POST);
     expect(c).toContain('const BOOKING_COUNTERPARTY = "booking"');
-    expect(c).toContain("counterpartyType: BOOKING_COUNTERPARTY");
+    expect(c).toContain("counterpartyType: args.counterpartyType ?? BOOKING_COUNTERPARTY");
   });
 
   it("still carries a name, so Tally has a party", () => {

@@ -134,8 +134,19 @@ Create a **second service** in the same Railway project:
 - **Start command**:
 
   ```
-  curl -fsS -X POST "$APP_URL/api/workers" -H "x-worker-secret: $WORKER_API_SECRET"
+  curl -fsS -X POST "$APP_URL/api/workers" \
+    -H "Authorization: Bearer $WORKER_API_SECRET" \
+    -H "Content-Type: application/json" \
+    -d '{"mode":"cron"}'
   ```
+
+  > 🔴 **This command was wrong until v1.32.0** and could never have
+  > worked. It sent `x-worker-secret`, a header the route does not read
+  > — `app/api/workers/route.ts` accepts `Authorization: Bearer` — and
+  > it sent no body, so even with correct authentication the route
+  > returns 400 "Nothing to do" without `{"mode":"cron"}`. `-f` makes
+  > curl exit non-zero, so the sweep has been failing loudly rather than
+  > silently, which is the only good part of it.
 
 - Variables: `APP_URL` = `https://app.ordence.com`, and the same
   `WORKER_API_SECRET` as the web service.

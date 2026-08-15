@@ -44,6 +44,20 @@ const CHECKS = [
     why: "a client component importing a server module, or a stripped server-only guard",
   },
   {
+    /**
+     * ⭐ ADDED IN v1.26.0-alpha, AND IT RUNS SECOND FOR A REASON.
+     *
+     * It is nearly free — one pass over `server/actions` — and it is the
+     * only check in this list that can find an UNAUTHENTICATED PUBLIC
+     * ENDPOINT. Everything below it is about whether the code is
+     * correct; this one is about whether it is reachable by people who
+     * should not reach it.
+     */
+    name: "action guards",
+    cmd: ["node", ["scripts/check-action-guards.mjs"]],
+    why: "a server action that does not ask who is calling it, or a write behind an identity check only",
+  },
+  {
     name: "migration numbering",
     cmd: ["node", ["scripts/check-migrations.mjs"]],
     why: "duplicate or out-of-sequence SQL files",
@@ -52,6 +66,34 @@ const CHECKS = [
     name: "SQL completeness",
     cmd: ["node", ["scripts/check-sql-completeness.mjs"]],
     why: "a tenant table with no RLS anywhere in SQL, or a table drizzle-kit push would drop",
+  },
+  {
+    /**
+     * ⭐ ADDED IN v1.29.0-alpha, AND IT IS THE FIRST CHECK HERE THAT
+     * EXECUTES ANYTHING RATHER THAN READING IT.
+     *
+     * ⚠️ IT SKIPS WITHOUT `HARNESS_DATABASE_URL`, so it passes on a
+     * machine with no Postgres. That is deliberate and it is also the
+     * risk: a gate that skips can quietly stop running. Its skip message
+     * names exactly what went unchecked.
+     */
+    name: "SQL executes",
+    cmd: ["node", ["scripts/check-sql-executes.mjs"]],
+    why: "a query built by string concatenation that compiles and cannot run",
+  },
+  {
+    /**
+     * ⭐⭐⭐ THE ELEVENTH GATE, v1.33.0.
+     *
+     * 🔴 The scan half ALWAYS runs and can always fail: it counts write
+     * statements issued on the unscoped `db` client, every one of which
+     * raises 42501 under the database role every deployment document in
+     * this repository demands. The executing half proves the semantics
+     * against a throwaway Postgres as a non-superuser table owner.
+     */
+    name: "RLS writes",
+    cmd: ["node", ["scripts/check-rls-writes.mjs"]],
+    why: "a write the database will refuse under the role the deploy checklist demands",
   },
   {
     name: "typecheck",

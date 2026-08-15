@@ -26,7 +26,7 @@
 import { z } from "zod";
 import { revalidatePath } from "next/cache";
 import { and, eq, isNull } from "drizzle-orm";
-import { db } from "@/db";
+import { db, withTenant } from "@/db";
 import {
   assets,
   customObjectRecords,
@@ -187,13 +187,15 @@ export async function updateAssetCell(
     if (!column) return fail("That column cannot be edited.");
 
     // Fetch with BOTH predicates. Fetching by id alone would be the IDOR.
-    const existing = await db.query.assets.findFirst({
-      where: and(
-        eq(assets.id, parsed.rowId),
-        eq(assets.tenantId, ctx.tenant.id),
-        isNull(assets.deletedAt),
-      ),
-    });
+    const existing = await withTenant(ctx.tenant.id, (tx) =>
+      tx.query.assets.findFirst({
+        where: and(
+          eq(assets.id, parsed.rowId),
+          eq(assets.tenantId, ctx.tenant.id),
+          isNull(assets.deletedAt),
+        ),
+      })
+    );
     if (!existing) return fail("Record not found.");
 
     let updatePayload: Record<string, unknown>;
@@ -252,11 +254,13 @@ export async function updateAssetCell(
       updatePayload = { dynamicAttributes: nextAttributes };
     }
 
-    const [updated] = await db
-      .update(assets)
-      .set({ ...updatePayload, updatedAt: new Date(), updatedBy: ctx.user.id })
-      .where(and(eq(assets.id, parsed.rowId), eq(assets.tenantId, ctx.tenant.id)))
-      .returning({ id: assets.id });
+    const [updated] = await withTenant(ctx.tenant.id, (tx) =>
+      tx
+        .update(assets)
+        .set({ ...updatePayload, updatedAt: new Date(), updatedBy: ctx.user.id })
+        .where(and(eq(assets.id, parsed.rowId), eq(assets.tenantId, ctx.tenant.id)))
+        .returning({ id: assets.id })
+    );
 
     if (!updated) return fail("Could not save the change.");
 
@@ -301,24 +305,28 @@ export async function updateCustomRecordCell(
     const fieldName = column.path[0];
     if (!fieldName) return fail("Invalid field.");
 
-    const record = await db.query.customObjectRecords.findFirst({
-      where: and(
-        eq(customObjectRecords.id, parsed.rowId),
-        eq(customObjectRecords.tenantId, ctx.tenant.id),
-        isNull(customObjectRecords.deletedAt),
-      ),
-    });
+    const record = await withTenant(ctx.tenant.id, (tx) =>
+      tx.query.customObjectRecords.findFirst({
+        where: and(
+          eq(customObjectRecords.id, parsed.rowId),
+          eq(customObjectRecords.tenantId, ctx.tenant.id),
+          isNull(customObjectRecords.deletedAt),
+        ),
+      })
+    );
     if (!record) return fail("Record not found.");
 
     // The definition must belong to this tenant too — belt and braces.
-    const definition = await db.query.customObjectDefinitions.findFirst({
-      where: and(
-        eq(customObjectDefinitions.id, record.definitionId),
-        eq(customObjectDefinitions.tenantId, ctx.tenant.id),
-        isNull(customObjectDefinitions.deletedAt),
-      ),
-      with: { fields: { where: isNull(customFieldDefinitions.deletedAt) } },
-    });
+    const definition = await withTenant(ctx.tenant.id, (tx) =>
+      tx.query.customObjectDefinitions.findFirst({
+        where: and(
+          eq(customObjectDefinitions.id, record.definitionId),
+          eq(customObjectDefinitions.tenantId, ctx.tenant.id),
+          isNull(customObjectDefinitions.deletedAt),
+        ),
+        with: { fields: { where: isNull(customFieldDefinitions.deletedAt) } },
+      })
+    );
     if (!definition) return fail("Object definition not found.");
 
     const fields = (definition as unknown as { fields: CustomFieldDefinition[] }).fields;
@@ -342,21 +350,23 @@ export async function updateCustomRecordCell(
         ? String(validation.cleaned[definition.displayFieldName]).slice(0, 500)
         : record.displayValue;
 
-    const [updated] = await db
-      .update(customObjectRecords)
-      .set({
-        data: validation.cleaned,
-        displayValue,
-        updatedAt: new Date(),
-        updatedBy: ctx.user.id,
-      })
-      .where(
-        and(
-          eq(customObjectRecords.id, parsed.rowId),
-          eq(customObjectRecords.tenantId, ctx.tenant.id),
-        ),
-      )
-      .returning({ id: customObjectRecords.id });
+    const [updated] = await withTenant(ctx.tenant.id, (tx) =>
+      tx
+        .update(customObjectRecords)
+        .set({
+          data: validation.cleaned,
+          displayValue,
+          updatedAt: new Date(),
+          updatedBy: ctx.user.id,
+        })
+        .where(
+          and(
+            eq(customObjectRecords.id, parsed.rowId),
+            eq(customObjectRecords.tenantId, ctx.tenant.id),
+          ),
+        )
+        .returning({ id: customObjectRecords.id })
+    );
 
     if (!updated) return fail("Could not save the change.");
 
@@ -416,22 +426,24 @@ export async function bulkUpdateAssetStatus(
 
     const { inArray } = await import("drizzle-orm");
 
-    const updated = await db
-      .update(assets)
-      .set({
-        status: parsed.status as (typeof assets.status.enumValues)[number],
-        updatedAt: new Date(),
-        updatedBy: ctx.user.id,
-      })
-      // Tenant predicate applies to every row in the set.
-      .where(
-        and(
-          inArray(assets.id, parsed.ids),
-          eq(assets.tenantId, ctx.tenant.id),
-          isNull(assets.deletedAt),
-        ),
-      )
-      .returning({ id: assets.id });
+    const updated = await withTenant(ctx.tenant.id, (tx) =>
+      tx
+        .update(assets)
+        .set({
+          status: parsed.status as (typeof assets.status.enumValues)[number],
+          updatedAt: new Date(),
+          updatedBy: ctx.user.id,
+        })
+        // Tenant predicate applies to every row in the set.
+        .where(
+          and(
+            inArray(assets.id, parsed.ids),
+            eq(assets.tenantId, ctx.tenant.id),
+            isNull(assets.deletedAt),
+          ),
+        )
+        .returning({ id: assets.id })
+    );
 
     await writeAudit({
       tenantId: ctx.tenant.id,
@@ -466,7 +478,9 @@ async function writeAudit(entry: {
   newValue?: Record<string, unknown>;
 }): Promise<void> {
   try {
-    await db.insert(auditLogs).values({
+    /** ⚠️ Into the customer's own log, so it writes AS that tenant. */
+    await withTenant(entry.tenantId, (tx) =>
+      tx.insert(auditLogs).values({
       tenantId: entry.tenantId,
       actorUserId: entry.actorUserId,
       actorEmail: entry.actorEmail,
@@ -477,7 +491,8 @@ async function writeAudit(entry: {
       oldValue: entry.oldValue ?? null,
       newValue: entry.newValue ?? null,
       reason: "Inline grid edit",
-    });
+      }),
+    );
   } catch (err) {
     console.error("[grid audit]", err);
   }

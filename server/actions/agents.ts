@@ -43,7 +43,7 @@ import {
 import { MCP_TOOLS } from "@/lib/mcp/registry";
 import type { ActionResult } from "@/lib/validators/crm";
 
-const MANAGE = "settings.manage" as const;
+const MANAGE = "settings:update" as const;
 
 /* ------------------------------------------------------------------ */
 /* THE SHELF                                                           */

@@ -36,11 +36,18 @@ import { sql } from "drizzle-orm";
 
 export const REFERENCE_RETRY_LIMIT = 5;
 
-export type ReferenceScope = "lead" | "booking";
+export type ReferenceScope = "lead" | "booking" | "brokerage";
 
 const PREFIXES: Readonly<Record<ReferenceScope, string>> = Object.freeze({
   lead: "LEAD",
   booking: "BKG",
+  /**
+   * ⭐ v1.25.0-alpha. A brokerage bill is a document a BROKER reads,
+   * chases and quotes back down the phone, so it needs a number for
+   * exactly the reason leads and bookings do — and more urgently,
+   * because the person on the other end is not an employee.
+   */
+  brokerage: "BRK",
 });
 
 /**
@@ -57,7 +64,12 @@ export async function nextReference(
   scope: ReferenceScope,
   attempt = 0,
 ): Promise<string> {
-  const table = scope === "lead" ? sql`leads` : sql`bookings`;
+  const table =
+    scope === "lead"
+      ? sql`leads`
+      : scope === "brokerage"
+        ? sql`channel_partner_commissions`
+        : sql`bookings`;
   const prefix = PREFIXES[scope];
 
   // Derived from the highest number ALREADY USED rather than from a row
@@ -130,10 +142,20 @@ function isReferenceCollision(err: unknown, scope: ReferenceScope): boolean {
   const candidate = err as { code?: unknown; constraint?: unknown; message?: unknown };
   if (candidate.code !== "23505") return false;
 
+  /**
+   * ⚠️ THE INDEX NAME IS PER SCOPE AND HAS TO BE, because this function
+   * decides whether to RETRY or to RETHROW. A brokerage bill that
+   * collided on `cp_commissions_one_live_per_tranche` — the same tranche
+   * raised twice — must NOT be retried under a new reference; that is a
+   * duplicate bill, and retrying it would pay the broker twice with two
+   * different numbers on it.
+   */
   const indexName =
     scope === "lead"
       ? "leads_reference_tenant_unique"
-      : "bookings_reference_tenant_unique";
+      : scope === "brokerage"
+        ? "cp_commissions_reference_tenant_unique"
+        : "bookings_reference_tenant_unique";
 
   if (candidate.constraint === indexName) return true;
   return typeof candidate.message === "string" && candidate.message.includes(indexName);

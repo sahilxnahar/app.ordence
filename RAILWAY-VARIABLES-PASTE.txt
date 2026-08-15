@@ -52,14 +52,40 @@ NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY=PASTE_HERE
 NEXT_PUBLIC_APP_URL=https://appordence-production.up.railway.app
 NEXT_PUBLIC_ROOT_DOMAIN=ordence.com
 NEXT_PUBLIC_ZONE_DOMAIN=ordence.com
-PLATFORM_HOST=appordence-production.up.railway.app
+# 🔴 LEAVE THIS BLANK UNTIL THE CONSOLE HAS ITS OWN HOSTNAME.
+#
+# It used to be set to the same value as NEXT_PUBLIC_APP_URL above, and
+# that combination makes the customer application unreachable: every
+# request to the canonical URL classifies as the platform host, and the
+# middleware rewrites /dashboard and /sign-in into /platform/*, which
+# 404. /api/* keeps working, so /api/health stays green while nothing
+# else does.
+#
+# When app.ordence.com is connected, set this to admin.ordence.com.
+PLATFORM_HOST=
 NEXT_PUBLIC_CLERK_SIGN_IN_URL=/sign-in
 NEXT_PUBLIC_CLERK_SIGN_UP_URL=/sign-up
 NODE_ENV=production
 # run background jobs in-process until you add QStash
 ORDENCE_INLINE_JOBS=true
-# turn on once you confirm nothing is blocked
+# turn on once you confirm nothing is blocked. Set CSP_REPORT_URI first,
+# or the report-only phase collects nothing and can never end.
 CSP_ENFORCE=false
+CSP_REPORT_URI=
+
+# ---- VAULT (integration credentials) -------------------------------
+# 🔴 THESE APPEARED IN NO DEPLOYMENT DOCUMENT UNTIL v1.32.0, so every
+# deployment made from these files has an unconfigured vault: no
+# connector credential can be stored, and the failure is silent.
+#
+# Generate each one LOCALLY and paste only into Railway:
+#   openssl rand -hex 32
+#
+# ⚠️ ROTATING VAULT_ENCRYPTION_KEY ORPHANS EVERY EXISTING ROW. There is
+# no key registry yet. Set it once, keep it, and treat losing it as
+# losing every stored credential.
+VAULT_ENCRYPTION_KEY=
+VAULT_BLIND_INDEX_PEPPER=
 # NEVER set this to true
 SEED_ALLOW_PROD=false
 

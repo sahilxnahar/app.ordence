@@ -118,6 +118,39 @@ describe("registry completeness", () => {
     // the upsell was aimed at, and it is the screen they open on the
     // morning the enquiries stopped. What gets charged for is the volume
     // that comes through it, not the socket.
+    //
+    // ⭐⭐ `statutory_due` JOINED IN v1.24.0-alpha, AND IT IS THE ONE
+    // ENTRY ON THIS LIST WITH AN ETHICAL ARGUMENT RATHER THAN A
+    // COMMERCIAL ONE.
+    //
+    // 🔴 It shows what a business owes a GOVERNMENT — GST, both TDS
+    // sections, provident fund, ESI and professional tax — from its own
+    // ledger balances. A tenant who has stopped paying us still has to
+    // pay the Government, and the interest, late fees and provident-fund
+    // damages that follow a missed date are not ours to hold hostage.
+    //
+    // ⚠️ Charging for it would also be commercially stupid: the tenant
+    // most likely to be behind on our invoice is the one most likely to
+    // be behind on a challan, and locking the screen that would have
+    // told them is how a lapsed customer becomes an angry one.
+    //
+    // ⭐⭐ `today` JOINED IN v1.26.0-alpha, ON THE SAME ARGUMENT AND ONE
+    // STEP EARLIER IN IT.
+    //
+    // 🔴 `statutory_due` lists the deadlines. THIS is the page that
+    // tells somebody one of them is three days away, ranked above the
+    // things that merely look bigger. Leaving the list free while gating
+    // the warning is the same decision made twice with opposite answers.
+    //
+    // ⚠️ AND IT IS THE PAGE A DOWNGRADED WORKSPACE NEEDS MOST. A plan
+    // gets downgraded when a business is short of money, which is
+    // exactly when a provident-fund payment gets missed and exactly when
+    // the damages under section 14B hurt most.
+    //
+    // ⭐ It also carries nothing of its own: every line is a count and a
+    // total read from a module that has its own gate, so a locked module
+    // contributes nothing to it. Making it free gives away no data that
+    // was not already free.
     expect(free).toEqual([
       "assistant",
       "billing",
@@ -129,7 +162,9 @@ describe("registry completeness", () => {
       "search",
       "settings",
       "setup",
+      "statutory_due",
       "team",
+      "today",
     ]);
   });
 });

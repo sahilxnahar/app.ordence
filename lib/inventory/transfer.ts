@@ -22,6 +22,9 @@
  *    is yes.
  */
 
+import { determinePlaceOfSupply } from "@/lib/gst/place-of-supply";
+import type { GstRegistrationType } from "@/db/schema/gst";
+
 /* ------------------------------------------------------------------ */
 /* TAX TREATMENT                                                       */
 /* ------------------------------------------------------------------ */
@@ -29,7 +32,12 @@
 export class TransferError extends Error {}
 
 export type TransferDocumentType = "delivery_challan" | "tax_invoice";
-export type TransferTaxKind = "none" | "cgst_sgst" | "igst";
+/**
+ * ⚠️ `cgst_utgst` ADDED v1.37.0. Its absence is why every transfer into a
+ * Union Territory was recorded under the wrong Act: the type could not
+ * express the answer, so the code could not give it.
+ */
+export type TransferTaxKind = "none" | "cgst_sgst" | "cgst_utgst" | "igst";
 
 export type TransferTreatment = {
   isTaxableSupply: boolean;
@@ -59,6 +67,13 @@ export function transferTaxTreatment(args: {
   toGstin: string | null;
   fromStateCode: string | null;
   toStateCode: string | null;
+  /**
+   * ⭐ THE FIELD WITHOUT WHICH s.7(5)(b) CANNOT BE APPLIED. A destination
+   * that is an SEZ unit makes the move inter-state however close it is.
+   * Defaults to "regular" so existing callers keep their behaviour for
+   * every non-SEZ destination, which is all of them today.
+   */
+  toRegistrationType?: GstRegistrationType | null;
 }): TransferTreatment {
   const from = args.fromGstin?.trim().toUpperCase() || null;
   const to = args.toGstin?.trim().toUpperCase() || null;
@@ -87,18 +102,63 @@ export function transferTaxTreatment(args: {
    *    states are. Two registrations in ONE state (a business with an
    *    SEZ unit, or separate verticals) are still distinct persons.
    */
-  const interState =
-    (args.fromStateCode ?? from.slice(0, 2)) !== (args.toStateCode ?? to.slice(0, 2));
+
+  /**
+   * ⭐ v1.37.0 (Batch 33): WHICH TAX IS ASKED OF THE ENGINE, NOT OF `!==`.
+   *
+   * ══════════════════════════════════════════════════════════════════
+   * 🔴 THIS FILE'S OWN COMMENT NAMED THE CASE IT GOT WRONG.
+   * ══════════════════════════════════════════════════════════════════
+   * Four lines above, "a business with an SEZ unit" is given as the
+   * example of two registrations in one state. Then the code compared
+   * the two state codes, found them equal, and answered `cgst_sgst`.
+   *
+   * Section 7(5)(b) says a supply to an SEZ unit is inter-state **even
+   * when the SEZ is in our own state**. So a Pune head office moving
+   * stock to its own Pune SEZ unit owed IGST and this function said
+   * CGST + SGST. The document totals identically, the SEZ branch claims
+   * a credit in the wrong pool, and the shortfall accrues interest from
+   * the original date.
+   *
+   * ⚠️ AND THE SECOND BLIND SPOT: a transfer terminating in a Union
+   * Territory without a legislature is CGST + UTGST, a different Act and
+   * a different box. `interState ? "igst" : "cgst_sgst"` cannot say it.
+   */
+  const determination = determinePlaceOfSupply({
+    supplierStateCode: args.fromStateCode ?? from.slice(0, 2),
+    // Goods physically moving between two places: s.10(1)(a), the place
+    // of supply is where the movement terminates.
+    supplyType: "goods",
+    recipientRegistration: args.toRegistrationType ?? "regular",
+    recipientStateCode: args.toStateCode ?? to.slice(0, 2),
+    deliveryStateCode: args.toStateCode ?? to.slice(0, 2),
+  });
+
+  /**
+   * ⚠️ A REFUSAL HERE IS NOT SURVIVABLE BY GUESSING, so it is thrown.
+   * The engine only refuses when the supplier state is unusable, and a
+   * transfer out of an unusable registration is a data problem that a
+   * default would bury.
+   */
+  if (!determination.ok) {
+    throw new TransferError(
+      `${determination.problem.message} ${determination.problem.remedy}`,
+    );
+  }
+
+  const { isInterState, taxKind, statutoryRef } = determination.supply;
 
   return {
     isTaxableSupply: true,
     documentType: "tax_invoice",
-    taxKind: interState ? "igst" : "cgst_sgst",
+    taxKind,
     reason: `These are two separate GST registrations, so they are distinct persons and this move is a supply between them — taxable even though no money changes hands. ${
-      interState ? "Different states, so IGST." : "Same state, so CGST and SGST."
+      determination.supply.explanation
     }`,
     authority:
-      "Section 25(4) read with Schedule I para 2 — supply between distinct persons, without consideration.",
+      "Section 25(4) read with Schedule I para 2 — supply between distinct persons, " +
+      `without consideration. Place of supply: ${statutoryRef}.` +
+      (isInterState ? "" : " Intra-state, so the credit stays in this state's pool."),
   };
 }
 

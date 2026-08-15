@@ -232,6 +232,64 @@ const GRADE_RANK: Readonly<Record<PlatformGrade, number>> = Object.freeze({
   owner: 2,
 });
 
+/* ------------------------------------------------------------------ */
+/* ⭐ THE REJECT VERDICT                                                */
+/* ------------------------------------------------------------------ */
+
+export type RejectVerdict =
+  | { allowed: true; withdrawal: boolean }
+  | { allowed: false; reason: string; withdrawal?: undefined };
+
+/**
+ * 🔴 REJECTING IS A DECISION ON A CONTROL, SO IT NEEDS THE SAME GRADE
+ *    AS APPROVING.
+ *
+ * Until v1.31.0 the server's reject branch ran above `mayApprove` and
+ * tested nothing: any grade could reject any request in any state. A
+ * `support` account could clear an owner's queue during an incident,
+ * and a row already `executed` could be rewritten to `rejected`,
+ * destroying the record of who authorised what actually ran.
+ *
+ * ⚠️ WITHDRAWAL IS THE ONE EXCEPTION, and it is not a lower bar — it is
+ * a different act. The person who raised a request may always pull it,
+ * whatever their grade, because withdrawing your own unapproved request
+ * takes nothing away from anybody. It is recorded as a withdrawal and
+ * leaves `approver_id` NULL, so it never reads as a second operator
+ * having considered and refused.
+ */
+export function mayReject(args: {
+  readonly kind: string;
+  readonly requestedBy: string;
+  readonly approverId: string;
+  readonly approverGrade: PlatformGrade;
+  readonly status: string;
+}): RejectVerdict {
+  const policy = POLICY_BY_KIND[args.kind];
+  if (!policy) {
+    return { allowed: false, reason: "This action does not go through the queue." };
+  }
+
+  if (args.status !== "pending") {
+    return {
+      allowed: false,
+      reason: `This request has already been ${args.status}. Rewriting a decided request would destroy the record of who decided it.`,
+    };
+  }
+
+  if (args.approverId === args.requestedBy) {
+    return { allowed: true, withdrawal: true };
+  }
+
+  if (!gradeAtLeast(args.approverGrade, policy.approverGrade)) {
+    return {
+      allowed: false,
+      reason: `This needs ${policy.approverGrade} grade to decide either way. ${policy.because}`,
+    };
+  }
+
+  return { allowed: true, withdrawal: false };
+}
+
 export function gradeAtLeast(have: PlatformGrade, need: PlatformGrade): boolean {
   return GRADE_RANK[have] >= GRADE_RANK[need];
 }

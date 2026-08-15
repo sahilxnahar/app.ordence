@@ -34,7 +34,7 @@ import "server-only";
  * were ever staff.
  */
 
-import { eq, desc } from "drizzle-orm";
+import { and, desc, eq, gt, isNull, ne, or } from "drizzle-orm";
 import { withPlatformScope } from "@/db";
 import { platformStaff } from "@/db/schema/platform";
 import { getServerEnv } from "@/lib/env";
@@ -119,6 +119,31 @@ export async function grantPlatformStaff(input: unknown): Promise<PlatformResult
     };
   }
   const { clerkUserId, email, displayName, grade, reason, expiresAt } = parsed.data;
+
+  /**
+   * 🔴 (0): NOT YOURSELF.
+   *
+   * `onConflictDoUpdate` targets `clerk_user_id`, so this function is
+   * also the RENEWAL path. Without this check an owner could extend
+   * their own grant indefinitely, clear their own `revoked_at` and
+   * re-grade themselves, with no second party anywhere in the flow —
+   * which makes the mandatory expiry, the whole point of which is that
+   * a grant ends without somebody choosing to end it, self-serviceable.
+   *
+   * ⚠️ REVOCATION IS DELIBERATELY NOT SYMMETRIC. Revoking your own
+   * compromised access must stay available at 3am; extending it must
+   * not.
+   */
+  if (clerkUserId === operator.staff.clerkUserId) {
+    return {
+      ok: false,
+      error:
+        "You cannot grant or renew your own platform access. Ask another " +
+        "owner. If you are the only owner, the grant has to be made in the " +
+        "database, which is the same door the first one came through.",
+      fieldErrors: { clerkUserId: ["This is your own account."] },
+    };
+  }
 
   /* ---- (3): KEY 1 must already be held --------------------------- */
   const allowlist = parseAdminAllowlist(getServerEnv().PLATFORM_ADMIN_EMAILS);
@@ -219,16 +244,66 @@ export async function revokePlatformStaff(input: unknown): Promise<PlatformResul
 
       if (!target) return { error: "No such grant." } as const;
 
-      // Self-revocation is PERMITTED. Locking yourself out is a recoverable
-      // mistake (another owner, or a config deploy); being unable to
-      // revoke your own compromised access while you wait for someone else
-      // to wake up is not.
+      /**
+       * 🔴 THE LAST OWNER STAYS.
+       *
+       * Nothing stopped this before v1.31.0, and the console is the
+       * only door back in: `grantPlatformStaff` requires
+       * `staff:manage`, which only `owner` holds. So an owner revoking
+       * themselves — or an attacker with a stolen owner session
+       * revoking every owner in turn — locked the console permanently
+       * for everybody, and recovery meant a hand-written INSERT against
+       * the production database. That is a denial of service with a
+       * one-line trigger.
+       *
+       * ⚠️ SELF-REVOCATION IS STILL PERMITTED while somebody else can
+       * still get in. Being unable to kill your own compromised access
+       * at 3am is the worse failure, and it is the reason this check
+       * counts REMAINING owners rather than refusing self-revocation.
+       */
+      if (target.grade === "owner") {
+        const remaining = await db
+          .select({ id: platformStaff.id })
+          .from(platformStaff)
+          .where(
+            and(
+              eq(platformStaff.grade, "owner"),
+              eq(platformStaff.status, "active"),
+              isNull(platformStaff.revokedAt),
+              ne(platformStaff.id, staffId),
+              or(
+                isNull(platformStaff.expiresAt),
+                gt(platformStaff.expiresAt, new Date()),
+              ),
+            ),
+          )
+          .limit(1);
+
+        if (remaining.length === 0) {
+          return {
+            error:
+              "This is the last usable owner. Revoking it would lock the " +
+              "console for everybody, including you, and the only way back " +
+              "in would be a hand-written row in the production database. " +
+              "Grant somebody else owner grade first.",
+          } as const;
+        }
+      }
+
       await db
         .update(platformStaff)
         .set({
           status: "revoked",
           revokedAt: new Date(),
           revokeReason: reason,
+          /**
+           * 🔴 THE COLUMN EXISTED SINCE PHASE 17 AND NOTHING WROTE IT.
+           * `platform_staff.revoked_by` was always NULL, so the table
+           * alone could not say who revoked a grant — you had to join
+           * `platform_action_log`, which is exactly the two-table
+           * problem the guard argues against elsewhere.
+           */
+          revokedBy: operator.staff.id,
           lastStepUpAt: null,
           updatedAt: new Date(),
         })

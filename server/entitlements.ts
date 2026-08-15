@@ -44,7 +44,7 @@ import "server-only";
 
 import { cache } from "react";
 import { and, eq, sql } from "drizzle-orm";
-import { db } from "@/db";
+import { db, withTenant } from "@/db";
 import { subscriptions, plans, grantsAccess } from "@/db/schema";
 import { platformTenantFlags } from "@/db/schema/platform";
 import { ENTITLEMENT_OVERRIDE_PREFIX } from "@/lib/entitlements/overrides";
@@ -58,6 +58,7 @@ import {
   type FeatureKey,
 } from "@/lib/entitlements/features";
 import type { PlanTier } from "@/db/schema/core";
+import type { PermissionKey } from "@/db/schema/auth";
 
 /* ------------------------------------------------------------------ */
 /* ERRORS                                                              */
@@ -154,34 +155,36 @@ export const getEntitlementContext = cache(async function getEntitlementContext(
    * in SQL rather than in TypeScript so a forgotten pilot switches itself
    * off at the moment it is supposed to, without anybody remembering.
    */
-  const [row, flagRows] = await Promise.all([
-    db
-      .select({ status: subscriptions.status, tier: plans.tier })
-      .from(subscriptions)
-      .innerJoin(plans, eq(plans.id, subscriptions.planId))
-      .where(
-        and(
-          eq(subscriptions.tenantId, tenantContext.tenant.id),
-          sql`${subscriptions.deletedAt} IS NULL`,
-          sql`${subscriptions.status} IN ('trialing','active','past_due','unpaid','paused')`,
+  const [row, flagRows] = await withTenant(tenantContext.tenant.id, (tx) =>
+    Promise.all([
+      tx
+        .select({ status: subscriptions.status, tier: plans.tier })
+        .from(subscriptions)
+        .innerJoin(plans, eq(plans.id, subscriptions.planId))
+        .where(
+          and(
+            eq(subscriptions.tenantId, tenantContext.tenant.id),
+            sql`${subscriptions.deletedAt} IS NULL`,
+            sql`${subscriptions.status} IN ('trialing','active','past_due','unpaid','paused')`,
+          ),
+        )
+        .limit(1)
+        .then((rows) => rows[0]),
+      tx
+        .select({
+          flagKey: platformTenantFlags.flagKey,
+          enabled: platformTenantFlags.enabled,
+        })
+        .from(platformTenantFlags)
+        .where(
+          and(
+            eq(platformTenantFlags.tenantId, tenantContext.tenant.id),
+            sql`${platformTenantFlags.flagKey} LIKE ${ENTITLEMENT_OVERRIDE_PREFIX + "%"}`,
+            sql`(${platformTenantFlags.expiresAt} IS NULL OR ${platformTenantFlags.expiresAt} > now())`,
+          ),
         ),
-      )
-      .limit(1)
-      .then((rows) => rows[0]),
-    db
-      .select({
-        flagKey: platformTenantFlags.flagKey,
-        enabled: platformTenantFlags.enabled,
-      })
-      .from(platformTenantFlags)
-      .where(
-        and(
-          eq(platformTenantFlags.tenantId, tenantContext.tenant.id),
-          sql`${platformTenantFlags.flagKey} LIKE ${ENTITLEMENT_OVERRIDE_PREFIX + "%"}`,
-          sql`(${platformTenantFlags.expiresAt} IS NULL OR ${platformTenantFlags.expiresAt} > now())`,
-        ),
-      ),
-  ]);
+    ]),
+  );
 
   /**
    * ⚠️ ONLY `entitlement:` KEYS, AND THE PREFIX IS THE WHOLE POINT.
@@ -380,7 +383,7 @@ export async function getEntitlementSummary(
  */
 export async function requireFeatureAndPermission(
   feature: FeatureKey,
-  permission: string,
+  permission: PermissionKey,
 ): Promise<TenantContext> {
   const ctx = await requireTenantContext();
 

@@ -129,14 +129,16 @@ export async function createLedger(
     await requireFeature("accounting.ledger", ctx);
     const data = createLedgerSchema.parse(input);
 
-    const clash = await db.query.ledgers.findFirst({
-      where: and(
-        eq(ledgers.tenantId, ctx.tenant.id),
-        eq(ledgers.code, data.code),
-        isNull(ledgers.deletedAt),
-      ),
-      columns: { id: true },
-    });
+    const clash = await withTenant(ctx.tenant.id, (tx) =>
+      tx.query.ledgers.findFirst({
+        where: and(
+          eq(ledgers.tenantId, ctx.tenant.id),
+          eq(ledgers.code, data.code),
+          isNull(ledgers.deletedAt),
+        ),
+        columns: { id: true },
+      })
+    );
     if (clash) {
       return fail("Validation failed.", { code: [`Ledger code "${data.code}" is already in use.`] });
     }
@@ -145,21 +147,23 @@ export async function createLedger(
     const requiresReconciliation =
       data.type === "trust" || data.type === "escrow" || data.requiresReconciliation;
 
-    const [created] = await db
-      .insert(ledgers)
-      .values({
-        tenantId: ctx.tenant.id,
-        name: data.name,
-        code: data.code,
-        description: data.description ?? null,
-        type: data.type,
-        accountType: data.accountType,
-        currency: data.currency,
-        requiresReconciliation,
-        bankDetails: data.bankDetails,
-        createdBy: ctx.user.id,
-      })
-      .returning();
+    const [created] = await withTenant(ctx.tenant.id, (tx) =>
+      tx
+        .insert(ledgers)
+        .values({
+          tenantId: ctx.tenant.id,
+          name: data.name,
+          code: data.code,
+          description: data.description ?? null,
+          type: data.type,
+          accountType: data.accountType,
+          currency: data.currency,
+          requiresReconciliation,
+          bankDetails: data.bankDetails,
+          createdBy: ctx.user.id,
+        })
+        .returning()
+    );
 
     if (!created) return fail("Failed to create ledger.");
 
@@ -209,16 +213,18 @@ export async function postTransaction(
     const ledgerIds = [...new Set(data.legs.map((l) => l.ledgerId))];
     const { inArray } = await import("drizzle-orm");
 
-    const ownedLedgers = await db
-      .select({ id: ledgers.id, currency: ledgers.currency, isActive: ledgers.isActive })
-      .from(ledgers)
-      .where(
-        and(
-          inArray(ledgers.id, ledgerIds),
-          eq(ledgers.tenantId, ctx.tenant.id),
-          isNull(ledgers.deletedAt),
-        ),
-      );
+    const ownedLedgers = await withTenant(ctx.tenant.id, (tx) =>
+      tx
+        .select({ id: ledgers.id, currency: ledgers.currency, isActive: ledgers.isActive })
+        .from(ledgers)
+        .where(
+          and(
+            inArray(ledgers.id, ledgerIds),
+            eq(ledgers.tenantId, ctx.tenant.id),
+            isNull(ledgers.deletedAt),
+          ),
+        )
+    );
 
     if (ownedLedgers.length !== ledgerIds.length) {
       return fail("One or more ledgers do not exist in this workspace.");
@@ -284,17 +290,19 @@ export async function postTransaction(
       // raises and the whole transaction rolls back — no partial state.
     });
 
-    await db.insert(auditLogs).values({
-      tenantId: ctx.tenant.id,
-      actorUserId: ctx.user.id,
-      actorEmail: ctx.user.email,
-      actorRole: ctx.role,
-      action: "create",
-      resourceType: "transaction",
-      resourceId: result.id,
-      newValue: { totalAmount, legCount: data.legs.length, currency: data.currency },
-      reason: data.description,
-    });
+    await withTenant(ctx.tenant.id, (tx) =>
+      tx.insert(auditLogs).values({
+        tenantId: ctx.tenant.id,
+        actorUserId: ctx.user.id,
+        actorEmail: ctx.user.email,
+        actorRole: ctx.role,
+        action: "create",
+        resourceType: "transaction",
+        resourceId: result.id,
+        newValue: { totalAmount, legCount: data.legs.length, currency: data.currency },
+        reason: data.description,
+      })
+    );
 
     revalidatePath("/accounting");
     return {
@@ -339,13 +347,15 @@ export async function reverseTransaction(
     await requireFeature("accounting.ledger", ctx);
     const data = reverseSchema.parse(input);
 
-    const original = await db.query.transactions.findFirst({
-      where: and(
-        eq(transactions.id, data.transactionId),
-        eq(transactions.tenantId, ctx.tenant.id),
-      ),
-      with: { entries: true },
-    });
+    const original = await withTenant(ctx.tenant.id, (tx) =>
+      tx.query.transactions.findFirst({
+        where: and(
+          eq(transactions.id, data.transactionId),
+          eq(transactions.tenantId, ctx.tenant.id),
+        ),
+        with: { entries: true },
+      })
+    );
 
     if (!original) return fail("Transaction not found.");
     if (original.status === "reversed") return fail("This transaction has already been reversed.");
@@ -409,18 +419,20 @@ export async function reverseTransaction(
       return reversal.id;
     });
 
-    await db.insert(auditLogs).values({
-      tenantId: ctx.tenant.id,
-      actorUserId: ctx.user.id,
-      actorEmail: ctx.user.email,
-      actorRole: ctx.role,
-      action: "update",
-      resourceType: "transaction",
-      resourceId: original.id,
-      oldValue: { status: original.status },
-      newValue: { status: "reversed", reversalId },
-      reason: data.reason,
-    });
+    await withTenant(ctx.tenant.id, (tx) =>
+      tx.insert(auditLogs).values({
+        tenantId: ctx.tenant.id,
+        actorUserId: ctx.user.id,
+        actorEmail: ctx.user.email,
+        actorRole: ctx.role,
+        action: "update",
+        resourceType: "transaction",
+        resourceId: original.id,
+        oldValue: { status: original.status },
+        newValue: { status: "reversed", reversalId },
+        reason: data.reason,
+      })
+    );
 
     revalidatePath("/accounting");
     return { ok: true, data: { originalId: original.id, reversalId } };
@@ -473,29 +485,31 @@ export async function getTrialBalance(): Promise<
   try {
     const ctx = await requireTenantContext();
 
-    const rows = await db
-      .select({
-        ledgerId: ledgers.id,
-        code: ledgers.code,
-        name: ledgers.name,
-        type: ledgers.type,
-        accountType: ledgers.accountType,
-        totalDebit: sql<string>`COALESCE(SUM(CASE WHEN ${journalEntries.entryType} = 'debit'  THEN ${journalEntries.amount} ELSE 0 END), 0)::text`,
-        totalCredit: sql<string>`COALESCE(SUM(CASE WHEN ${journalEntries.entryType} = 'credit' THEN ${journalEntries.amount} ELSE 0 END), 0)::text`,
-      })
-      .from(ledgers)
-      .leftJoin(
-        journalEntries,
-        and(
-          eq(journalEntries.ledgerId, ledgers.id),
-          // The join is tenant-scoped too — a missing predicate here would be
-          // the exact bug that leaks another tenant's numbers into a report.
-          eq(journalEntries.tenantId, ctx.tenant.id),
-        ),
-      )
-      .where(and(eq(ledgers.tenantId, ctx.tenant.id), isNull(ledgers.deletedAt)))
-      .groupBy(ledgers.id, ledgers.code, ledgers.name, ledgers.type, ledgers.accountType)
-      .orderBy(ledgers.code);
+    const rows = await withTenant(ctx.tenant.id, (tx) =>
+      tx
+        .select({
+          ledgerId: ledgers.id,
+          code: ledgers.code,
+          name: ledgers.name,
+          type: ledgers.type,
+          accountType: ledgers.accountType,
+          totalDebit: sql<string>`COALESCE(SUM(CASE WHEN ${journalEntries.entryType} = 'debit'  THEN ${journalEntries.amount} ELSE 0 END), 0)::text`,
+          totalCredit: sql<string>`COALESCE(SUM(CASE WHEN ${journalEntries.entryType} = 'credit' THEN ${journalEntries.amount} ELSE 0 END), 0)::text`,
+        })
+        .from(ledgers)
+        .leftJoin(
+          journalEntries,
+          and(
+            eq(journalEntries.ledgerId, ledgers.id),
+            // The join is tenant-scoped too — a missing predicate here would be
+            // the exact bug that leaks another tenant's numbers into a report.
+            eq(journalEntries.tenantId, ctx.tenant.id),
+          ),
+        )
+        .where(and(eq(ledgers.tenantId, ctx.tenant.id), isNull(ledgers.deletedAt)))
+        .groupBy(ledgers.id, ledgers.code, ledgers.name, ledgers.type, ledgers.accountType)
+        .orderBy(ledgers.code)
+    );
 
     let totalDebitMinor = 0n;
     let totalCreditMinor = 0n;
@@ -540,11 +554,13 @@ export async function getTrialBalance(): Promise<
 export async function getLedgers(): Promise<ActionResult<Ledger[]>> {
   try {
     const ctx = await requireTenantContext();
-    const rows = await db
-      .select()
-      .from(ledgers)
-      .where(and(eq(ledgers.tenantId, ctx.tenant.id), isNull(ledgers.deletedAt)))
-      .orderBy(ledgers.code);
+    const rows = await withTenant(ctx.tenant.id, (tx) =>
+      tx
+        .select()
+        .from(ledgers)
+        .where(and(eq(ledgers.tenantId, ctx.tenant.id), isNull(ledgers.deletedAt)))
+        .orderBy(ledgers.code)
+    );
     return { ok: true, data: rows };
   } catch (err) {
     return toActionError(err);
@@ -557,12 +573,14 @@ export async function getRecentTransactions(
   try {
     const ctx = await requireTenantContext();
     const capped = Math.min(Math.max(1, limit), 200);
-    const rows = await db
-      .select()
-      .from(transactions)
-      .where(eq(transactions.tenantId, ctx.tenant.id))
-      .orderBy(desc(transactions.transactionDate), desc(transactions.createdAt))
-      .limit(capped);
+    const rows = await withTenant(ctx.tenant.id, (tx) =>
+      tx
+        .select()
+        .from(transactions)
+        .where(eq(transactions.tenantId, ctx.tenant.id))
+        .orderBy(desc(transactions.transactionDate), desc(transactions.createdAt))
+        .limit(capped)
+    );
     return { ok: true, data: rows };
   } catch (err) {
     return toActionError(err);

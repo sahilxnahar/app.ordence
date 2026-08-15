@@ -99,12 +99,76 @@ export type FlagKey = keyof typeof FLAG_CATALOG;
 
 export const FLAG_KEYS = Object.keys(FLAG_CATALOG) as FlagKey[];
 
-export function isFlagKey(value: unknown): value is FlagKey {
-  return typeof value === "string" && value in FLAG_CATALOG;
+/* ------------------------------------------------------------------ */
+/* ⭐ THE ENTITLEMENT NAMESPACE                                         */
+/* ------------------------------------------------------------------ */
+
+/**
+ * 🔴 WHY THIS EXISTS.
+ *
+ * `applyEntitlementChange` has always built a key of the shape
+ * `entitlement:<featureKey>` and handed it to `setTenantFlag`. That
+ * schema took `z.enum(FLAG_KEYS)`, which contains seven `beta.*`,
+ * `limits.*`, `killswitch.*` and `support.*` keys and no entitlement,
+ * so EVERY entitlement override and every revert returned "Check the
+ * form." with no field to fix. The screen, the history table
+ * (`platform_entitlement_history`), the verify-on-fresh-read and the
+ * undo path were all unreachable.
+ *
+ * ⚠️ THE CATALOGUE STAYS CLOSED. An entitlement key is not an invented
+ * flag: the feature key comes from the module registry, and this
+ * namespace is the one place a key is allowed to be constructed rather
+ * than enumerated.
+ */
+export const ENTITLEMENT_FLAG_PREFIX = "entitlement:" as const;
+
+export type EntitlementFlagKey = `entitlement:${string}`;
+
+/** Any key `platform_tenant_flags` accepts. */
+export type TenantFlagKey = FlagKey | EntitlementFlagKey;
+
+export function isEntitlementFlagKey(value: unknown): value is EntitlementFlagKey {
+  return (
+    typeof value === "string" &&
+    value.startsWith(ENTITLEMENT_FLAG_PREFIX) &&
+    /^entitlement:[a-z0-9][a-z0-9._-]{0,110}$/.test(value)
+  );
+}
+
+export function isFlagKey(value: unknown): value is TenantFlagKey {
+  if (typeof value !== "string") return false;
+  return value in FLAG_CATALOG || isEntitlementFlagKey(value);
+}
+
+/**
+ * The definition for any accepted key.
+ *
+ * ⚠️ AN ENTITLEMENT OVERRIDE GRANTS PAID CAPABILITY AND IS NOT FORCED
+ * TO EXPIRE, which is the one place this differs from a `beta.*` flag.
+ * The control on an entitlement is not a clock: every change writes a
+ * row to `platform_entitlement_history` with a before, an after, a
+ * named operator and a written reason, and the revert path is a NEW row
+ * rather than a deletion. A deal that includes a module indefinitely is
+ * a real thing to sell; a beta flag left on for a year is an accident.
+ */
+export function flagDefinitionFor(key: string): FlagDefinition | null {
+  if (key in FLAG_CATALOG) return FLAG_CATALOG[key as FlagKey];
+  if (isEntitlementFlagKey(key)) {
+    const feature = key.slice(ENTITLEMENT_FLAG_PREFIX.length);
+    return {
+      label: `Entitlement override — ${feature}`,
+      description:
+        `Grants or removes the "${feature}" module for this workspace, ` +
+        `independently of its plan. Recorded in the entitlement history.`,
+      grantsPaidCapability: true,
+      isKillSwitch: false,
+    };
+  }
+  return null;
 }
 
 export function describeFlag(key: string): string {
-  return isFlagKey(key) ? FLAG_CATALOG[key].label : key;
+  return flagDefinitionFor(key)?.label ?? key;
 }
 
 /**
@@ -118,8 +182,8 @@ export function validateFlagExpiry(
   key: string,
   expiresAt: Date | null,
 ): string | null {
-  if (!isFlagKey(key)) return `Unknown flag "${key}".`;
-  const def = FLAG_CATALOG[key];
+  const def = flagDefinitionFor(key);
+  if (!def) return `Unknown flag "${key}".`;
 
   // ⚠️ THE PAST-DATE CHECK COMES FIRST, BEFORE THE KILL-SWITCH EXEMPTION.
   // An earlier version returned early for kill switches and therefore
@@ -136,6 +200,10 @@ export function validateFlagExpiry(
   // switch turned off because it is breaking a customer should stay off
   // until somebody fixes the cause.
   if (def.isKillSwitch) return null;
+
+  // ⚠️ So are entitlement overrides. See `flagDefinitionFor` — their
+  // control is the history table and the revert path, not a clock.
+  if (isEntitlementFlagKey(key)) return null;
 
   if (def.grantsPaidCapability && !expiresAt) {
     return "This flag grants a paid capability, so it needs an end date.";

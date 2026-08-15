@@ -210,7 +210,19 @@ export async function verifyWorkerUan(
     const ctx = await guardSalesWrite({
       operation: "labour:verify-uan",
       feature: LABOUR_FEATURE,
-      permission: "construction.variation.approve",
+      /**
+       * 🔴 THIS SAID `construction.variation.approve`, WHICH IS NOT A
+       * PERMISSION. `evaluatePermission` fails closed on an unknown key,
+       * so UAN verification denied EVERY user including the owner, and
+       * nothing noticed because the guard was present and correctly
+       * shaped. Found by typing the argument, not by reading it.
+       *
+       * ⚠️ The three other writes in this file all use
+       * `construction.boq.manage`. Inventing a new approval key here
+       * would change who may verify a worker in a way I cannot check
+       * against a real site office, so this matches its siblings.
+       */
+      permission: "construction.boq.manage",
     });
 
     const result = await withTenant(

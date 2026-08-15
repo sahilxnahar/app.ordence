@@ -84,28 +84,62 @@ export async function createContract(
 ): Promise<ActionResult<Contract>> {
   try {
     const ctx = await requireTenantContext();
+    /**
+     * 🔴 ADDED IN v1.26.0-alpha BY `check:guards`. Drafting a contract was reachable by any member of the workspace, including read-only roles that the permission table grants `contracts:read` and nothing more.
+     */
+    await requirePermission("contracts:create");
     const data = createContractSchema.parse(input);
 
     // Every linked record must belong to this tenant.
     if (data.assetId) {
-      const owned = await db.query.assets.findFirst({
-        where: and(eq(assets.id, data.assetId), eq(assets.tenantId, ctx.tenant.id)),
-        columns: { id: true },
-      });
+      /**
+       * ⚠️ HOISTED OUT OF THE CLOSURE. The `if` above narrows this away
+       * from null, and TypeScript cannot carry that into a callback it
+       * cannot prove runs synchronously. Binding it keeps the guard
+       * meaningful; a non-null assertion would delete the check the
+       * `if` exists for.
+       */
+      const assetId = data.assetId;
+      const owned = await withTenant(ctx.tenant.id, (tx) =>
+        tx.query.assets.findFirst({
+          where: and(eq(assets.id, assetId), eq(assets.tenantId, ctx.tenant.id)),
+          columns: { id: true },
+        })
+      );
       if (!owned) return fail("Selected asset does not exist.");
     }
     if (data.contactId) {
-      const owned = await db.query.contacts.findFirst({
-        where: and(eq(contacts.id, data.contactId), eq(contacts.tenantId, ctx.tenant.id)),
-        columns: { id: true },
-      });
+      /**
+       * ⚠️ HOISTED OUT OF THE CLOSURE. The `if` above narrows this away
+       * from null, and TypeScript cannot carry that into a callback it
+       * cannot prove runs synchronously. Binding it keeps the guard
+       * meaningful; a non-null assertion would delete the check the
+       * `if` exists for.
+       */
+      const contactId = data.contactId;
+      const owned = await withTenant(ctx.tenant.id, (tx) =>
+        tx.query.contacts.findFirst({
+          where: and(eq(contacts.id, contactId), eq(contacts.tenantId, ctx.tenant.id)),
+          columns: { id: true },
+        })
+      );
       if (!owned) return fail("Selected contact does not exist.");
     }
     if (data.companyId) {
-      const owned = await db.query.companies.findFirst({
-        where: and(eq(companies.id, data.companyId), eq(companies.tenantId, ctx.tenant.id)),
-        columns: { id: true },
-      });
+      /**
+       * ⚠️ HOISTED OUT OF THE CLOSURE. The `if` above narrows this away
+       * from null, and TypeScript cannot carry that into a callback it
+       * cannot prove runs synchronously. Binding it keeps the guard
+       * meaningful; a non-null assertion would delete the check the
+       * `if` exists for.
+       */
+      const companyId = data.companyId;
+      const owned = await withTenant(ctx.tenant.id, (tx) =>
+        tx.query.companies.findFirst({
+          where: and(eq(companies.id, companyId), eq(companies.tenantId, ctx.tenant.id)),
+          columns: { id: true },
+        })
+      );
       if (!owned) return fail("Selected company does not exist.");
     }
 
@@ -113,20 +147,22 @@ export async function createContract(
     const sections = [...data.sections];
     if (data.clauseIds.length > 0) {
       const { inArray } = await import("drizzle-orm");
-      const clauses = await db
-        .select({
-          id: clauseLibrary.id,
-          title: clauseLibrary.title,
-          content: clauseLibrary.content,
-        })
-        .from(clauseLibrary)
-        .where(
-          and(
-            inArray(clauseLibrary.id, data.clauseIds),
-            eq(clauseLibrary.tenantId, ctx.tenant.id),
-            isNull(clauseLibrary.deletedAt),
-          ),
-        );
+      const clauses = await withTenant(ctx.tenant.id, (tx) =>
+        tx
+          .select({
+            id: clauseLibrary.id,
+            title: clauseLibrary.title,
+            content: clauseLibrary.content,
+          })
+          .from(clauseLibrary)
+          .where(
+            and(
+              inArray(clauseLibrary.id, data.clauseIds),
+              eq(clauseLibrary.tenantId, ctx.tenant.id),
+              isNull(clauseLibrary.deletedAt),
+            ),
+          )
+      );
 
       // Preserve the caller's ordering rather than the database's.
       const byId = new Map(clauses.map((c) => [c.id, c]));
@@ -153,48 +189,52 @@ export async function createContract(
         : undefined,
     };
 
-    const [created] = await db
-      .insert(contracts)
-      .values({
-        tenantId: ctx.tenant.id,
-        title: data.title,
-        contractNumber: data.contractNumber ?? null,
-        contractType: data.contractType,
-        status: "draft",
-        assetId: data.assetId ?? null,
-        contactId: data.contactId ?? null,
-        companyId: data.companyId ?? null,
-        dealId: data.dealId ?? null,
-        value: data.value ?? null,
-        currency: data.currency,
-        effectiveDate: data.effectiveDate ?? null,
-        expiryDate: data.expiryDate ?? null,
-        governingLaw: data.governingLaw,
-        jurisdiction: data.jurisdiction ?? null,
-        documentData,
-        currentVersion: 1,
-        ownerId: ctx.user.id,
-        createdBy: ctx.user.id,
-      })
-      .returning();
+    const [created] = await withTenant(ctx.tenant.id, (tx) =>
+      tx
+        .insert(contracts)
+        .values({
+          tenantId: ctx.tenant.id,
+          title: data.title,
+          contractNumber: data.contractNumber ?? null,
+          contractType: data.contractType,
+          status: "draft",
+          assetId: data.assetId ?? null,
+          contactId: data.contactId ?? null,
+          companyId: data.companyId ?? null,
+          dealId: data.dealId ?? null,
+          value: data.value ?? null,
+          currency: data.currency,
+          effectiveDate: data.effectiveDate ?? null,
+          expiryDate: data.expiryDate ?? null,
+          governingLaw: data.governingLaw,
+          jurisdiction: data.jurisdiction ?? null,
+          documentData,
+          currentVersion: 1,
+          ownerId: ctx.user.id,
+          createdBy: ctx.user.id,
+        })
+        .returning()
+    );
 
     if (!created) return fail("Failed to create contract.");
 
     // Version 1 — the genesis block of the hash chain.
-    await db.insert(contractVersions).values({
-      tenantId: ctx.tenant.id,
-      contractId: created.id,
-      versionNumber: 1,
-      changeType: "created",
-      documentData,
-      contentHash: contentHash(JSON.stringify(documentData)),
-      previousVersionHash: null,
-      statusAtVersion: "draft",
-      changeSummary: "Contract created.",
-      authorUserId: ctx.user.id,
-      authorName: [ctx.user.firstName, ctx.user.lastName].filter(Boolean).join(" ") || null,
-      authorEmail: ctx.user.email,
-    });
+    await withTenant(ctx.tenant.id, (tx) =>
+      tx.insert(contractVersions).values({
+        tenantId: ctx.tenant.id,
+        contractId: created.id,
+        versionNumber: 1,
+        changeType: "created",
+        documentData,
+        contentHash: contentHash(JSON.stringify(documentData)),
+        previousVersionHash: null,
+        statusAtVersion: "draft",
+        changeSummary: "Contract created.",
+        authorUserId: ctx.user.id,
+        authorName: [ctx.user.firstName, ctx.user.lastName].filter(Boolean).join(" ") || null,
+        authorEmail: ctx.user.email,
+      })
+    );
 
     revalidatePath("/contracts");
     return { ok: true, data: created };
@@ -237,15 +277,21 @@ export async function assembleDocument(
 ): Promise<ActionResult<AssembleResult>> {
   try {
     const ctx = await requireTenantContext();
+    /**
+     * 🔴 ADDED IN v1.26.0-alpha BY `check:guards`. Assembling a document writes contract content. `contracts:update` rather than `create`, because assembly happens against a contract that already exists.
+     */
+    await requirePermission("contracts:update");
     const data = assembleDocumentSchema.parse(input);
 
-    const contract = await db.query.contracts.findFirst({
-      where: and(
-        eq(contracts.id, data.contractId),
-        eq(contracts.tenantId, ctx.tenant.id),
-        isNull(contracts.deletedAt),
-      ),
-    });
+    const contract = await withTenant(ctx.tenant.id, (tx) =>
+      tx.query.contracts.findFirst({
+        where: and(
+          eq(contracts.id, data.contractId),
+          eq(contracts.tenantId, ctx.tenant.id),
+          isNull(contracts.deletedAt),
+        ),
+      })
+    );
     if (!contract) return fail("Contract not found.");
 
     // Executed contracts are immutable. Assembling into one would rewrite a
@@ -305,41 +351,47 @@ export async function assembleDocument(
     const nextVersion = contract.currentVersion + 1;
     const hash = contentHash(JSON.stringify(nextDocumentData));
 
-    const previous = await db.query.contractVersions.findFirst({
-      where: and(
-        eq(contractVersions.contractId, contract.id),
-        eq(contractVersions.tenantId, ctx.tenant.id),
-      ),
-      orderBy: [desc(contractVersions.versionNumber)],
-      columns: { contentHash: true },
-    });
-
-    await db.insert(contractVersions).values({
-      tenantId: ctx.tenant.id,
-      contractId: contract.id,
-      versionNumber: nextVersion,
-      changeType: "edited",
-      documentData: nextDocumentData,
-      contentHash: hash,
-      previousVersionHash: previous?.contentHash ?? null,
-      statusAtVersion: contract.status,
-      changeSummary: `Assembled with ${Object.keys(mergeFields).length} merge fields${
-        sourceType ? ` from ${sourceType}` : ""
-      }.`,
-      authorUserId: ctx.user.id,
-      authorName: [ctx.user.firstName, ctx.user.lastName].filter(Boolean).join(" ") || null,
-      authorEmail: ctx.user.email,
-    });
-
-    await db
-      .update(contracts)
-      .set({
-        documentData: nextDocumentData,
-        currentVersion: nextVersion,
-        updatedAt: new Date(),
-        updatedBy: ctx.user.id,
+    const previous = await withTenant(ctx.tenant.id, (tx) =>
+      tx.query.contractVersions.findFirst({
+        where: and(
+          eq(contractVersions.contractId, contract.id),
+          eq(contractVersions.tenantId, ctx.tenant.id),
+        ),
+        orderBy: [desc(contractVersions.versionNumber)],
+        columns: { contentHash: true },
       })
-      .where(and(eq(contracts.id, contract.id), eq(contracts.tenantId, ctx.tenant.id)));
+    );
+
+    await withTenant(ctx.tenant.id, (tx) =>
+      tx.insert(contractVersions).values({
+        tenantId: ctx.tenant.id,
+        contractId: contract.id,
+        versionNumber: nextVersion,
+        changeType: "edited",
+        documentData: nextDocumentData,
+        contentHash: hash,
+        previousVersionHash: previous?.contentHash ?? null,
+        statusAtVersion: contract.status,
+        changeSummary: `Assembled with ${Object.keys(mergeFields).length} merge fields${
+          sourceType ? ` from ${sourceType}` : ""
+        }.`,
+        authorUserId: ctx.user.id,
+        authorName: [ctx.user.firstName, ctx.user.lastName].filter(Boolean).join(" ") || null,
+        authorEmail: ctx.user.email,
+      })
+    );
+
+    await withTenant(ctx.tenant.id, (tx) =>
+      tx
+        .update(contracts)
+        .set({
+          documentData: nextDocumentData,
+          currentVersion: nextVersion,
+          updatedAt: new Date(),
+          updatedBy: ctx.user.id,
+        })
+        .where(and(eq(contracts.id, contract.id), eq(contracts.tenantId, ctx.tenant.id)))
+    );
 
     /* ---- Enqueue rendering (slow, async) ------------------------- */
     let rendering: AssembleResult["rendering"];
@@ -397,17 +449,19 @@ export async function assembleDocument(
       rendering = { queued: false, reason: "Rendering not requested.", renderedInline: false };
     }
 
-    await db.insert(auditLogs).values({
-      tenantId: ctx.tenant.id,
-      actorUserId: ctx.user.id,
-      actorEmail: ctx.user.email,
-      actorRole: ctx.role,
-      action: "update",
-      resourceType: "contract",
-      resourceId: contract.id,
-      newValue: { version: nextVersion, contentHash: hash },
-      reason: "Document assembly",
-    });
+    await withTenant(ctx.tenant.id, (tx) =>
+      tx.insert(auditLogs).values({
+        tenantId: ctx.tenant.id,
+        actorUserId: ctx.user.id,
+        actorEmail: ctx.user.email,
+        actorRole: ctx.role,
+        action: "update",
+        resourceType: "contract",
+        resourceId: contract.id,
+        newValue: { version: nextVersion, contentHash: hash },
+        reason: "Document assembly",
+      })
+    );
 
     revalidatePath(`/contracts/${contract.id}`);
 
@@ -452,21 +506,23 @@ export async function verifyContractIntegrity(
     const ctx = await requireTenantContext();
     const id = uuidSchema.parse(contractId);
 
-    const versions = await db
-      .select({
-        versionNumber: contractVersions.versionNumber,
-        documentData: contractVersions.documentData,
-        contentHash: contractVersions.contentHash,
-        previousVersionHash: contractVersions.previousVersionHash,
-      })
-      .from(contractVersions)
-      .where(
-        and(
-          eq(contractVersions.contractId, id),
-          eq(contractVersions.tenantId, ctx.tenant.id),
-        ),
-      )
-      .orderBy(contractVersions.versionNumber);
+    const versions = await withTenant(ctx.tenant.id, (tx) =>
+      tx
+        .select({
+          versionNumber: contractVersions.versionNumber,
+          documentData: contractVersions.documentData,
+          contentHash: contractVersions.contentHash,
+          previousVersionHash: contractVersions.previousVersionHash,
+        })
+        .from(contractVersions)
+        .where(
+          and(
+            eq(contractVersions.contractId, id),
+            eq(contractVersions.tenantId, ctx.tenant.id),
+          ),
+        )
+        .orderBy(contractVersions.versionNumber)
+    );
 
     if (versions.length === 0) return fail("Contract not found.");
 
@@ -515,9 +571,11 @@ async function resolveSource(
   sourceId: string,
 ): Promise<Record<string, string | number | boolean | null>> {
   if (sourceType === "asset") {
-    const row = await db.query.assets.findFirst({
-      where: and(eq(assets.id, sourceId), eq(assets.tenantId, tenantId)),
-    });
+    const row = await withTenant(tenantId, (tx) =>
+      tx.query.assets.findFirst({
+        where: and(eq(assets.id, sourceId), eq(assets.tenantId, tenantId)),
+      })
+    );
     if (!row) return {};
     return {
       asset_name: row.name,
@@ -534,9 +592,11 @@ async function resolveSource(
   }
 
   if (sourceType === "contact") {
-    const row = await db.query.contacts.findFirst({
-      where: and(eq(contacts.id, sourceId), eq(contacts.tenantId, tenantId)),
-    });
+    const row = await withTenant(tenantId, (tx) =>
+      tx.query.contacts.findFirst({
+        where: and(eq(contacts.id, sourceId), eq(contacts.tenantId, tenantId)),
+      })
+    );
     if (!row) return {};
     return {
       contact_name: [row.firstName, row.lastName].filter(Boolean).join(" "),
@@ -546,9 +606,11 @@ async function resolveSource(
     };
   }
 
-  const row = await db.query.companies.findFirst({
-    where: and(eq(companies.id, sourceId), eq(companies.tenantId, tenantId)),
-  });
+  const row = await withTenant(tenantId, (tx) =>
+    tx.query.companies.findFirst({
+      where: and(eq(companies.id, sourceId), eq(companies.tenantId, tenantId)),
+    })
+  );
   if (!row) return {};
   return {
     company_name: row.name,

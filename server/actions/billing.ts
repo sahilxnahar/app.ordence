@@ -448,11 +448,13 @@ export async function startCheckout(
     await assertImpersonationAllows("subscription:start", ctx);
     const parsed = startCheckoutSchema.parse(input);
 
-    const [plan] = await db
-      .select()
-      .from(plans)
-      .where(and(eq(plans.id, parsed.planId), eq(plans.isActive, true)))
-      .limit(1);
+    const [plan] = await withTenant(ctx.tenant.id, (tx) =>
+      tx
+        .select()
+        .from(plans)
+        .where(and(eq(plans.id, parsed.planId), eq(plans.isActive, true)))
+        .limit(1)
+    );
 
     if (!plan) return fail("That plan is not available.");
 
@@ -588,11 +590,13 @@ export async function previewPlanChange(
     const ctx = await requirePermission("billing:read");
     const parsed = changePlanSchema.parse(input);
 
-    const [newPlan] = await db
-      .select()
-      .from(plans)
-      .where(and(eq(plans.id, parsed.planId), eq(plans.isActive, true)))
-      .limit(1);
+    const [newPlan] = await withTenant(ctx.tenant.id, (tx) =>
+      tx
+        .select()
+        .from(plans)
+        .where(and(eq(plans.id, parsed.planId), eq(plans.isActive, true)))
+        .limit(1)
+    );
 
     if (!newPlan) return fail("That plan is not available.");
 

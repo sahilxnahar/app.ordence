@@ -31,8 +31,8 @@
 
 import { z } from "zod";
 import { revalidatePath } from "next/cache";
-import { and, eq, ne, asc, count } from "drizzle-orm";
-import { db } from "@/db";
+import { and, asc, count, eq, isNull, ne } from "drizzle-orm";
+import { db, withTenant } from "@/db";
 import { users } from "@/db/schema";
 import { requirePermission, writeAudit, auditMeta } from "@/server/audit";
 import { TenantAccessError } from "@/server/tenant-context";
@@ -57,6 +57,33 @@ const updateStatusSchema = z.object({
   userId: z.string().uuid("Invalid identifier."),
   status: z.enum(["active", "suspended"]),
 });
+
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 WHO COUNTS AS AN OWNER WHO COULD ACTUALLY RESCUE THIS WORKSPACE
+ * ══════════════════════════════════════════════════════════════════════
+ * Both last-owner guards used `ne(status, "suspended")` and applied no
+ * `deletedAt` filter. `user_status` has FOUR values, so `offboarded`
+ * survived that test, and so did a soft-deleted row.
+ *
+ * ⚠️ A GHOST COULD THEREFORE BE THE LAST OWNER. An owner removed from
+ * the Clerk organisation is set to `offboarded` with `deleted_at` filled
+ * in and their role untouched, and was then counted. A workspace whose
+ * only remaining `tenant_owner` rows were people who left two years ago
+ * read as having two owners, and the real one could be demoted or
+ * suspended on that basis, leaving nobody who could pay for it.
+ *
+ * ⭐ Only `active`, not deleted, and holding the role: the set of people
+ * who could sign in right now and fix it.
+ */
+function usableOwners(tenantId: string) {
+  return and(
+    eq(users.tenantId, tenantId),
+    eq(users.role, "tenant_owner"),
+    eq(users.status, "active"),
+    isNull(users.deletedAt),
+  );
+}
 
 function fail(error: string, fieldErrors?: Record<string, string[]>): ActionResult<never> {
   return { ok: false, error, fieldErrors };
@@ -100,23 +127,31 @@ export async function getTeamMembers(): Promise<ActionResult<TeamMember[]>> {
   try {
     const ctx = await requirePermission("users:read");
 
-    const rows = await db
-      .select({
-        id: users.id,
-        email: users.email,
-        firstName: users.firstName,
-        lastName: users.lastName,
-        avatarUrl: users.avatarUrl,
-        role: users.role,
-        status: users.status,
-        jobTitle: users.jobTitle,
-        department: users.department,
-        lastSeenAt: users.lastSeenAt,
-      })
-      .from(users)
-      .where(eq(users.tenantId, ctx.tenant.id))
-      .orderBy(asc(users.email))
-      .limit(500);
+    const rows = await withTenant(ctx.tenant.id, (tx) =>
+      tx
+        .select({
+          id: users.id,
+          email: users.email,
+          firstName: users.firstName,
+          lastName: users.lastName,
+          avatarUrl: users.avatarUrl,
+          role: users.role,
+          status: users.status,
+          jobTitle: users.jobTitle,
+          department: users.department,
+          lastSeenAt: users.lastSeenAt,
+        })
+        .from(users)
+        /**
+         * ⚠️ SOFT-DELETED ROWS ARE NOT TEAM MEMBERS. The team screen
+         * computes its own owner count from this list, so an offboarded
+         * owner appeared as a colleague AND as an owner, and the page
+         * agreed with the server about a number both had wrong.
+         */
+        .where(and(eq(users.tenantId, ctx.tenant.id), isNull(users.deletedAt)))
+        .orderBy(asc(users.email))
+        .limit(500)
+    );
 
     return {
       ok: true,
@@ -159,10 +194,12 @@ export async function updateUserRole(input: {
       );
     }
 
-    const target = await db.query.users.findFirst({
-      where: and(eq(users.id, data.userId), eq(users.tenantId, ctx.tenant.id)),
-      columns: { id: true, role: true, email: true, status: true },
-    });
+    const target = await withTenant(ctx.tenant.id, (tx) =>
+      tx.query.users.findFirst({
+        where: and(eq(users.id, data.userId), eq(users.tenantId, ctx.tenant.id)),
+        columns: { id: true, role: true, email: true, status: true },
+      })
+    );
 
     if (!target) return fail("That person is not a member of this workspace.");
 
@@ -181,16 +218,14 @@ export async function updateUserRole(input: {
 
     // RULE 3 — never remove the last owner.
     if (target.role === "tenant_owner" && data.role !== "tenant_owner") {
-      const [owners] = await db
-        .select({ value: count() })
-        .from(users)
-        .where(
-          and(
-            eq(users.tenantId, ctx.tenant.id),
-            eq(users.role, "tenant_owner"),
-            ne(users.status, "suspended"),
-          ),
-        );
+      const [owners] = await withTenant(ctx.tenant.id, (tx) =>
+        tx
+          .select({ value: count() })
+          .from(users)
+          .where(
+            usableOwners(ctx.tenant.id),
+          )
+      );
 
       if ((owners?.value ?? 0) <= 1) {
         return fail(
@@ -199,11 +234,13 @@ export async function updateUserRole(input: {
       }
     }
 
-    const [updated] = await db
-      .update(users)
-      .set({ role: data.role, updatedAt: new Date() })
-      .where(and(eq(users.id, data.userId), eq(users.tenantId, ctx.tenant.id)))
-      .returning({ id: users.id, role: users.role });
+    const [updated] = await withTenant(ctx.tenant.id, (tx) =>
+      tx
+        .update(users)
+        .set({ role: data.role, updatedAt: new Date() })
+        .where(and(eq(users.id, data.userId), eq(users.tenantId, ctx.tenant.id)))
+        .returning({ id: users.id, role: users.role })
+    );
 
     if (!updated) return fail("Could not update that person's role.");
 
@@ -250,10 +287,12 @@ export async function updateUserStatus(input: {
       return fail("You cannot suspend your own account.");
     }
 
-    const target = await db.query.users.findFirst({
-      where: and(eq(users.id, data.userId), eq(users.tenantId, ctx.tenant.id)),
-      columns: { id: true, role: true, email: true },
-    });
+    const target = await withTenant(ctx.tenant.id, (tx) =>
+      tx.query.users.findFirst({
+        where: and(eq(users.id, data.userId), eq(users.tenantId, ctx.tenant.id)),
+        columns: { id: true, role: true, email: true },
+      })
+    );
 
     if (!target) return fail("That person is not a member of this workspace.");
 
@@ -262,16 +301,14 @@ export async function updateUserStatus(input: {
     }
 
     if (target.role === "tenant_owner" && data.status === "suspended") {
-      const [owners] = await db
-        .select({ value: count() })
-        .from(users)
-        .where(
-          and(
-            eq(users.tenantId, ctx.tenant.id),
-            eq(users.role, "tenant_owner"),
-            ne(users.status, "suspended"),
-          ),
-        );
+      const [owners] = await withTenant(ctx.tenant.id, (tx) =>
+        tx
+          .select({ value: count() })
+          .from(users)
+          .where(
+            usableOwners(ctx.tenant.id),
+          )
+      );
 
       if ((owners?.value ?? 0) <= 1) {
         return fail("This is the only active owner. Suspending them would lock the workspace.");
@@ -298,11 +335,13 @@ export async function updateUserStatus(input: {
       await requireSeat(ctx.tenant.id, ctx.tenant.seatLimit, 1);
     }
 
-    const [updated] = await db
-      .update(users)
-      .set({ status: data.status, updatedAt: new Date() })
-      .where(and(eq(users.id, data.userId), eq(users.tenantId, ctx.tenant.id)))
-      .returning({ id: users.id, status: users.status });
+    const [updated] = await withTenant(ctx.tenant.id, (tx) =>
+      tx
+        .update(users)
+        .set({ status: data.status, updatedAt: new Date() })
+        .where(and(eq(users.id, data.userId), eq(users.tenantId, ctx.tenant.id)))
+        .returning({ id: users.id, status: users.status })
+    );
 
     if (!updated) return fail("Could not update that person's status.");
 

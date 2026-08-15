@@ -44,6 +44,7 @@ import {
   purchaseOrders,
 } from "@/db/schema/procurement";
 import { purchaseInvoices, purchaseInvoiceLines, vendors } from "@/db/schema/purchases";
+import { stockMovements } from "@/db/schema/inventory";
 import { requirePermission, writeAudit } from "@/server/audit";
 import { toSalesActionError } from "@/server/sales/guards";
 import { tryEmitAutomationEvent } from "@/server/automation/emit";
@@ -64,9 +65,14 @@ import type { ActionResult } from "@/lib/validators/crm";
  * approves, and a three-way match between three documents one person
  * wrote is theatre.
  */
-const ORDER = "settings.manage" as const;
-const RECEIVE = "inventory.stock.read" as const;
-const APPROVE = "settings.manage" as const;
+const ORDER = "settings:update" as const;
+/**
+ * 🔴 WAS `inventory.stock.read`. A goods receipt POSTS STOCK and closes
+ * a purchase-order line; guarding it on the permission to *look* at
+ * stock let the read-only role receive goods.
+ */
+const RECEIVE = "inventory.movements.post" as const;
+const APPROVE = "settings:update" as const;
 
 /* ------------------------------------------------------------------ */
 /* THE ORDER                                                           */
@@ -365,6 +371,17 @@ export async function recordGoodsReceipt(
             lineNo: purchaseOrderLines.lineNo,
             description: purchaseOrderLines.description,
             stockItemId: purchaseOrderLines.stockItemId,
+            /**
+             * ⭐ v1.43.0: SELECTED SO THE STOCK MOVEMENT CARRIES A COST.
+             *
+             * ⚠️ Without it `unitCostMinor` on the movement would be
+             * null, and a movement with no cost is invisible to every
+             * valuation method. Batch 86 makes `valuationMethod` actually
+             * read, and it would have read a ledger of costless receipts:
+             * quantity right, value zero, inventory asset understated to
+             * nothing on the balance sheet.
+             */
+            unitPriceMinor: purchaseOrderLines.unitPriceMinor,
           })
           .from(purchaseOrderLines)
           .where(
@@ -394,6 +411,86 @@ export async function recordGoodsReceipt(
             };
           }),
         );
+
+        /* ---------------------------------------------------------- */
+        /* ⭐⭐ v1.43.0 (Batch 38): THE GRN NOW MOVES THE STOCK         */
+        /* ---------------------------------------------------------- */
+        //
+        // ══════════════════════════════════════════════════════════════
+        // 🔴 IT DID NOT, AND THAT IS THE MOST EXPENSIVE KIND OF WRONG.
+        // ══════════════════════════════════════════════════════════════
+        // A goods receipt is the moment stock arrives. Until now this
+        // action wrote a `goods_receipts` row, wrote its lines, moved the
+        // purchase order's status, emitted an automation event, and left
+        // the stock ledger untouched.
+        //
+        // ⚠️ SO EVERY QUANTITY IN THE PRODUCT WAS UNDERSTATED, silently,
+        // by exactly the amount that had been received. Not "inventory is
+        // a bit off": inventory could only ever go DOWN, because
+        // `sales_dispatch` writes movements and `purchase_receipt` did
+        // not. A warehouse that received a hundred and sold ten showed
+        // minus ten.
+        //
+        // ⭐ ACCEPTED QUANTITY ONLY, NOT ACCEPTED PLUS REJECTED. Rejected
+        // goods are physically on the premises and are NOT ours: they are
+        // awaiting return to the vendor, they were never bought, and no
+        // credit is owed on them. Counting them would inflate stock and
+        // inflate the value of the inventory asset on the balance sheet.
+        //
+        // ⚠️ A LINE WITH NO `stockItemId` IS SKIPPED, NOT DEFAULTED. A
+        // purchase order line for a service, a freight charge or a
+        // one-off with no catalogue item has nothing to move. Inventing a
+        // stock item for it would put a phantom row in the ledger that
+        // nobody could ever count.
+        const movements = data.lines
+          .map((l) => {
+            const poLine = byId.get(l.poLineId);
+            const stockItemId = (poLine?.stockItemId as string | null) ?? null;
+            const accepted = toThousandths(l.acceptedQty);
+            return { stockItemId, accepted, unitCostMinor: poLine?.unitPriceMinor };
+          })
+          .filter((m) => m.stockItemId !== null && m.accepted > 0n);
+
+        if (movements.length > 0) {
+          /**
+           * 🔴 A RECEIPT WITHOUT A WAREHOUSE CANNOT MOVE STOCK, AND IS
+           * REFUSED RATHER THAN GUESSED.
+           *
+           * `goods_receipts.warehouse_id` is nullable, because a receipt
+           * of pure services has no warehouse. But a receipt of ITEMS
+           * with nowhere to put them is a data problem, and defaulting to
+           * "the first warehouse" would put a hundred bags of cement in
+           * whichever godown happened to sort first.
+           */
+          if (!data.warehouseId) {
+            throw new Error(
+              "This receipt includes stock items but no warehouse was chosen. " +
+                "Stock has to arrive somewhere, and picking one for you would " +
+                "put the goods in the wrong godown without telling anybody.",
+            );
+          }
+
+          await tx.insert(stockMovements).values(
+            movements.map((m) => ({
+              tenantId: ctx.tenant.id,
+              stockItemId: m.stockItemId as string,
+              warehouseId: data.warehouseId as string,
+              /**
+               * ⭐ SIGNED, POSITIVE FOR IN. The schema comment is
+               * explicit that a direction flag alongside an unsigned
+               * quantity is two facts that can disagree.
+               */
+              quantity: fromThousandths(m.accepted),
+              reason: "purchase_receipt" as const,
+              movedAt: now,
+              referenceType: "goods_receipt",
+              referenceId: grn.id,
+              unitCostMinor:
+                typeof m.unitCostMinor === "bigint" ? m.unitCostMinor : null,
+              createdBy: ctx.user.id,
+            })) as never,
+          );
+        }
 
         // ⭐ THE ORDER'S STATUS FOLLOWS FROM WHAT HAS ARRIVED, computed
         // from the receipts rather than typed. A status somebody sets by

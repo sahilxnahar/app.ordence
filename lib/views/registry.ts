@@ -68,6 +68,7 @@ import { leads, units, bookings, projects, channelPartners } from "@/db/schema/s
 import { contacts, companies, deals } from "@/db/schema/crm";
 
 import type { FieldKind, SortSpec } from "./types";
+import type { PermissionKey } from "@/db/schema/auth";
 
 /* ------------------------------------------------------------------ */
 /* DESCRIPTORS                                                         */
@@ -114,7 +115,7 @@ export type ViewObjectDefinition = {
    * OPENING the view, never against the person who saved it. See the
    * header of `server/views/guards.ts`.
    */
-  readonly readPermission: string;
+  readonly readPermission: PermissionKey;
   /**
    * The column naming who a record belongs to, or null when the object
    * has no owner concept (a unit belongs to the building, not to a rep).
@@ -162,7 +163,7 @@ type ObjectPolicy = {
   key: string;
   label: string;
   pluralLabel: string;
-  readPermission: string;
+  readPermission: PermissionKey;
   ownerColumn: string | null;
   softDelete: boolean;
   /** Columns to withhold, each with the reason in a comment at the call site. */

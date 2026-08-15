@@ -36,7 +36,7 @@
 import { z } from "zod";
 import { revalidatePath } from "next/cache";
 import { and, eq, isNull, desc } from "drizzle-orm";
-import { db } from "@/db";
+import { db, withTenant } from "@/db";
 import { portalLinks, contracts, assets } from "@/db/schema";
 import { requirePermission, writeAudit, auditMeta } from "@/server/audit";
 import { TenantAccessError } from "@/server/tenant-context";
@@ -120,23 +120,27 @@ async function loadOwnedEntity(
   | null
 > {
   if (entityType === "contract") {
-    const row = await db.query.contracts.findFirst({
-      where: and(
-        eq(contracts.id, entityId),
-        eq(contracts.tenantId, tenantId),
-        isNull(contracts.deletedAt),
-      ),
-    });
+    const row = await withTenant(tenantId, (tx) =>
+      tx.query.contracts.findFirst({
+        where: and(
+          eq(contracts.id, entityId),
+          eq(contracts.tenantId, tenantId),
+          isNull(contracts.deletedAt),
+        ),
+      })
+    );
     return row ? { kind: "contract", row } : null;
   }
 
-  const row = await db.query.assets.findFirst({
-    where: and(
-      eq(assets.id, entityId),
-      eq(assets.tenantId, tenantId),
-      isNull(assets.deletedAt),
-    ),
-  });
+  const row = await withTenant(tenantId, (tx) =>
+    tx.query.assets.findFirst({
+      where: and(
+        eq(assets.id, entityId),
+        eq(assets.tenantId, tenantId),
+        isNull(assets.deletedAt),
+      ),
+    })
+  );
   return row ? { kind: "asset", row } : null;
 }
 
@@ -236,22 +240,24 @@ export async function createPortalLink(
       return fail(`A link cannot last longer than ${MAX_EXPIRY_DAYS} days.`);
     }
 
-    const [created] = await db
-      .insert(portalLinks)
-      .values({
-        // From the session. Never from `input`.
-        tenantId: ctx.tenant.id,
-        entityType: data.entityType,
-        entityId: data.entityId,
-        tokenHash,
-        tokenPrefix,
-        expiresAt,
-        permission: data.permission,
-        recipientEmail: data.recipientEmail ?? null,
-        recipientName: data.recipientName ?? null,
-        createdBy: ctx.user.id,
-      })
-      .returning();
+    const [created] = await withTenant(ctx.tenant.id, (tx) =>
+      tx
+        .insert(portalLinks)
+        .values({
+          // From the session. Never from `input`.
+          tenantId: ctx.tenant.id,
+          entityType: data.entityType,
+          entityId: data.entityId,
+          tokenHash,
+          tokenPrefix,
+          expiresAt,
+          permission: data.permission,
+          recipientEmail: data.recipientEmail ?? null,
+          recipientName: data.recipientName ?? null,
+          createdBy: ctx.user.id,
+        })
+        .returning()
+    );
 
     if (!created) return fail("Could not create the link.");
 
@@ -384,34 +390,36 @@ export async function getPortalLinks(input: {
       })
       .parse(input);
 
-    const rows = await db
-      .select({
-        id: portalLinks.id,
-        tokenPrefix: portalLinks.tokenPrefix,
-        permission: portalLinks.permission,
-        isActive: portalLinks.isActive,
-        expiresAt: portalLinks.expiresAt,
-        createdAt: portalLinks.createdAt,
-        recipientEmail: portalLinks.recipientEmail,
-        recipientName: portalLinks.recipientName,
-        viewCount: portalLinks.viewCount,
-        firstViewedAt: portalLinks.firstViewedAt,
-        lastViewedAt: portalLinks.lastViewedAt,
-        signedAt: portalLinks.signedAt,
-        revokedAt: portalLinks.revokedAt,
-        revokedReason: portalLinks.revokedReason,
-      })
-      .from(portalLinks)
-      .where(
-        and(
-          // Tenant predicate first. RLS enforces it independently.
-          eq(portalLinks.tenantId, ctx.tenant.id),
-          eq(portalLinks.entityType, params.entityType),
-          eq(portalLinks.entityId, params.entityId),
-        ),
-      )
-      .orderBy(desc(portalLinks.createdAt))
-      .limit(200);
+    const rows = await withTenant(ctx.tenant.id, (tx) =>
+      tx
+        .select({
+          id: portalLinks.id,
+          tokenPrefix: portalLinks.tokenPrefix,
+          permission: portalLinks.permission,
+          isActive: portalLinks.isActive,
+          expiresAt: portalLinks.expiresAt,
+          createdAt: portalLinks.createdAt,
+          recipientEmail: portalLinks.recipientEmail,
+          recipientName: portalLinks.recipientName,
+          viewCount: portalLinks.viewCount,
+          firstViewedAt: portalLinks.firstViewedAt,
+          lastViewedAt: portalLinks.lastViewedAt,
+          signedAt: portalLinks.signedAt,
+          revokedAt: portalLinks.revokedAt,
+          revokedReason: portalLinks.revokedReason,
+        })
+        .from(portalLinks)
+        .where(
+          and(
+            // Tenant predicate first. RLS enforces it independently.
+            eq(portalLinks.tenantId, ctx.tenant.id),
+            eq(portalLinks.entityType, params.entityType),
+            eq(portalLinks.entityId, params.entityId),
+          ),
+        )
+        .orderBy(desc(portalLinks.createdAt))
+        .limit(200)
+    );
 
     // NOTE: `tokenHash` is deliberately absent from the projection above.
     // It is not a usable credential, but there is no reason for it to
@@ -457,12 +465,14 @@ export async function revokePortalLink(
     const ctx = await requirePermission("contracts:update", { type: "portal_link" });
     const data = revokePortalLinkSchema.parse(input);
 
-    const existing = await db.query.portalLinks.findFirst({
-      where: and(
-        eq(portalLinks.id, data.linkId),
-        eq(portalLinks.tenantId, ctx.tenant.id),
-      ),
-    });
+    const existing = await withTenant(ctx.tenant.id, (tx) =>
+      tx.query.portalLinks.findFirst({
+        where: and(
+          eq(portalLinks.id, data.linkId),
+          eq(portalLinks.tenantId, ctx.tenant.id),
+        ),
+      })
+    );
 
     if (!existing) return fail("Link not found.");
 
@@ -473,18 +483,20 @@ export async function revokePortalLink(
       return { ok: true, data: { id: existing.id } };
     }
 
-    const [revoked] = await db
-      .update(portalLinks)
-      .set({
-        isActive: false,
-        revokedAt: new Date(),
-        revokedBy: ctx.user.id,
-        revokedReason: data.reason ?? null,
-      })
-      .where(
-        and(eq(portalLinks.id, data.linkId), eq(portalLinks.tenantId, ctx.tenant.id)),
-      )
-      .returning({ id: portalLinks.id });
+    const [revoked] = await withTenant(ctx.tenant.id, (tx) =>
+      tx
+        .update(portalLinks)
+        .set({
+          isActive: false,
+          revokedAt: new Date(),
+          revokedBy: ctx.user.id,
+          revokedReason: data.reason ?? null,
+        })
+        .where(
+          and(eq(portalLinks.id, data.linkId), eq(portalLinks.tenantId, ctx.tenant.id)),
+        )
+        .returning({ id: portalLinks.id })
+    );
 
     if (!revoked) return fail("Link not found.");
 
@@ -532,23 +544,25 @@ export async function revokeAllPortalLinks(input: {
       })
       .parse(input);
 
-    const revoked = await db
-      .update(portalLinks)
-      .set({
-        isActive: false,
-        revokedAt: new Date(),
-        revokedBy: ctx.user.id,
-        revokedReason: params.reason ?? "Bulk revocation",
-      })
-      .where(
-        and(
-          eq(portalLinks.tenantId, ctx.tenant.id),
-          eq(portalLinks.entityType, params.entityType),
-          eq(portalLinks.entityId, params.entityId),
-          eq(portalLinks.isActive, true),
-        ),
-      )
-      .returning({ id: portalLinks.id });
+    const revoked = await withTenant(ctx.tenant.id, (tx) =>
+      tx
+        .update(portalLinks)
+        .set({
+          isActive: false,
+          revokedAt: new Date(),
+          revokedBy: ctx.user.id,
+          revokedReason: params.reason ?? "Bulk revocation",
+        })
+        .where(
+          and(
+            eq(portalLinks.tenantId, ctx.tenant.id),
+            eq(portalLinks.entityType, params.entityType),
+            eq(portalLinks.entityId, params.entityId),
+            eq(portalLinks.isActive, true),
+          ),
+        )
+        .returning({ id: portalLinks.id })
+    );
 
     if (revoked.length > 0) {
       await writeAudit(ctx, {

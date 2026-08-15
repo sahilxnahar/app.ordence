@@ -34,7 +34,7 @@ import { auth } from "@clerk/nextjs/server";
 import { CreateOrganization } from "@clerk/nextjs";
 import { and, eq, isNull } from "drizzle-orm";
 import { AlertTriangle } from "lucide-react";
-import { db } from "@/db";
+import { db, withPlatformScope } from "@/db";
 import { tenants } from "@/db/schema";
 
 export const dynamic = "force-dynamic";
@@ -52,10 +52,23 @@ export default async function OnboardingPage() {
 
   if (orgId) {
     try {
-      const row = await db.query.tenants.findFirst({
-        where: and(eq(tenants.clerkOrgId, orgId), isNull(tenants.deletedAt)),
-        columns: { id: true },
-      });
+      /**
+       * ⭐ PLATFORM SCOPE, LIKE `requireTenantContext`. This asks
+       * "does a workspace exist for this Clerk organisation" BEFORE any
+       * workspace is known, which is by definition a question no single
+       * workspace can answer. Unscoped it returned nothing under a
+       * correct role, so this page would have told every user their
+       * workspace was missing — on the one screen whose entire job is
+       * to say whether it is.
+       */
+      const row = await withPlatformScope(
+        `Onboarding: check whether a workspace exists for this organisation`,
+        (tx) =>
+          tx.query.tenants.findFirst({
+            where: and(eq(tenants.clerkOrgId, orgId), isNull(tenants.deletedAt)),
+            columns: { id: true },
+          }),
+      );
       workspaceMissing = !row;
     } catch (err) {
       console.error("[onboarding] could not resolve tenant for org", orgId, err);

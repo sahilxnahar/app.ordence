@@ -14,7 +14,7 @@ import { and, eq, desc, asc, sql, ilike, or, isNull } from "drizzle-orm";
 import { db } from "@/db";
 import { users, tenants } from "@/db/schema";
 import { requireCapability, recordPlatformAudit, type PlatformOperator } from "@/server/platform/guard";
-import { withTenant } from "@/db";
+import { withPlatformScope, withTenant } from "@/db";
 import type { PlatformResult } from "@/lib/platform/schemas";
 
 /* ------------------------------------------------------------------ */
@@ -92,7 +92,7 @@ export async function listAllUsers(filters: {
   offset?: number;
 }): Promise<PlatformResult<{ rows: PlatformUserSummary[]; total: number }>> {
   try {
-    await requireCapability("tenants:read");
+    const operator = await requireCapability("tenants:read");
 
     const conditions = [isNull(users.deletedAt)];
 
@@ -129,30 +129,86 @@ export async function listAllUsers(filters: {
     const offset = Math.min(filters.offset ?? 0, 10_000);
     const limit = 100;
 
-    const rows = await db
-      .select({
-        clerkUserId: users.clerkUserId,
-        email: users.email,
-        firstName: users.firstName,
-        lastName: users.lastName,
-        avatarUrl: users.avatarUrl,
-        role: users.role,
-        status: users.status,
-        lastSeenAt: users.lastSeenAt,
-        createdAt: users.createdAt,
-        tenantId: users.tenantId,
-      })
-      .from(users)
-      .where(and(...conditions))
-      .orderBy(direction(sortColumn))
-      .limit(limit)
-      .offset(offset);
+    /**
+     * ══════════════════════════════════════════════════════════════
+     * 🔴 THIS RETURNED NOTHING, AND THAT WAS THE ONLY THING SAVING IT
+     * ══════════════════════════════════════════════════════════════
+     * It ran on the unscoped client, so under a role that does not
+     * bypass RLS the `users` policy matched no rows and the directory
+     * was permanently empty. It failed closed BY ACCIDENT.
+     *
+     * ⚠️ THE OBVIOUS FIX FOR AN EMPTY SCREEN IS THE DANGEROUS ONE.
+     * Wrapping it in `withPlatformScope` alone turns it into an
+     * UNAUDITED `ilike` substring search across every customer's people
+     * — email, first name, last name — which is exactly the thing
+     * `platformSearch` was built to make impossible without a written
+     * justification and a recorded row.
+     *
+     * ⭐ SO THE SCOPE AND THE AUDIT LAND IN THE SAME CHANGE. Neither is
+     * useful without the other, and shipping the scope first would have
+     * been a strict downgrade on a screen that currently shows nothing.
+     */
+    const { rows, total } = await withPlatformScope(
+      `Platform console: list users across workspaces` +
+        (filters.query ? ` matching "${filters.query.slice(0, 60)}"` : ""),
+      async (tx) => {
+        const found = await tx
+          .select({
+            clerkUserId: users.clerkUserId,
+            email: users.email,
+            firstName: users.firstName,
+            lastName: users.lastName,
+            avatarUrl: users.avatarUrl,
+            role: users.role,
+            status: users.status,
+            lastSeenAt: users.lastSeenAt,
+            createdAt: users.createdAt,
+            tenantId: users.tenantId,
+          })
+          .from(users)
+          .where(and(...conditions))
+          .orderBy(direction(sortColumn))
+          .limit(limit)
+          .offset(offset);
 
-    const countResult = await db
-      .select({ count: sql<number>`count(*)::int` })
-      .from(users)
-      .where(and(...conditions));
-    const total = countResult[0]?.count ?? 0;
+        /** ⚠️ Same transaction as the page. A count from a different
+         *  connection can disagree with the rows beside it. */
+        const counted = await tx
+          .select({ count: sql<number>`count(*)::int` })
+          .from(users)
+          .where(and(...conditions));
+
+        return { rows: found, total: counted[0]?.count ?? 0 };
+      },
+    );
+
+    /**
+     * 🔴 RECORDED BEFORE THE ROWS ARE RETURNED, and the operator is
+     * named. `platformSearch` argues this at length and throws if the
+     * record fails; this path is a directory listing rather than a
+     * targeted lookup, so it records rather than refuses — but it
+     * records the SEARCH TERM, which is the part that makes it a
+     * people search rather than a page of a list.
+     */
+    await recordPlatformAudit({
+      operator,
+      tenantId: null,
+      action: "read",
+      resourceType: "platform_user_directory",
+      resourceId: filters.tenantId ?? "all",
+      severity: filters.query ? "warning" : "info",
+      reason: filters.query
+        ? `Searched every workspace's people for "${filters.query.slice(0, 80)}".`
+        : "Listed the cross-workspace user directory.",
+      metadata: {
+        query: filters.query ?? null,
+        tenantFilter: filters.tenantId ?? null,
+        status: filters.status ?? null,
+        role: filters.role ?? null,
+        resultCount: rows.length,
+        total,
+      },
+    });
 
     // Group by clerkUserId to collapse multi-tenant memberships
     const byClerk = new Map<string, PlatformUserSummary>();
@@ -201,40 +257,70 @@ export async function getPlatformUserDetail(
   clerkUserId: string,
 ): Promise<PlatformResult<PlatformUserDetail>> {
   try {
-    await requireCapability("tenants:read");
+    const operator = await requireCapability("tenants:read");
 
-    const userRows = await db
-      .select({
-        userId: users.id,
-        tenantId: users.tenantId,
-        email: users.email,
-        firstName: users.firstName,
-        lastName: users.lastName,
-        avatarUrl: users.avatarUrl,
-        role: users.role,
-        status: users.status,
-        department: users.department,
-        jobTitle: users.jobTitle,
-        lastSeenAt: users.lastSeenAt,
-        createdAt: users.createdAt,
-      })
-      .from(users)
-      .where(and(eq(users.clerkUserId, clerkUserId), isNull(users.deletedAt)))
-      .orderBy(desc(users.createdAt));
+    /**
+     * 🔴 A NAMED PERSON, ACROSS EVERY WORKSPACE THEY BELONG TO. More
+     * targeted than the directory and therefore MORE interesting in an
+     * audit, not less: "who looked up this individual, and why" is the
+     * question a customer asks when something leaks.
+     */
+    const { userRows, tenantRows } = await withPlatformScope(
+      `Platform console: read the cross-workspace profile for ${clerkUserId}`,
+      async (tx) => {
+        const found = await tx
+          .select({
+            userId: users.id,
+            tenantId: users.tenantId,
+            email: users.email,
+            firstName: users.firstName,
+            lastName: users.lastName,
+            avatarUrl: users.avatarUrl,
+            role: users.role,
+            status: users.status,
+            department: users.department,
+            jobTitle: users.jobTitle,
+            lastSeenAt: users.lastSeenAt,
+            createdAt: users.createdAt,
+          })
+          .from(users)
+          .where(and(eq(users.clerkUserId, clerkUserId), isNull(users.deletedAt)))
+          .orderBy(desc(users.createdAt));
+
+        if (found.length === 0) return { userRows: found, tenantRows: [] };
+
+        const ids = found.map((u) => u.tenantId);
+        const workspaces = await tx
+          .select({
+            id: tenants.id,
+            name: tenants.name,
+            slug: tenants.slug,
+          })
+          .from(tenants)
+          .where(sql`${tenants.id} = any(${ids})`);
+
+        return { userRows: found, tenantRows: workspaces };
+      },
+    );
 
     if (userRows.length === 0) {
       return { ok: false, error: "No user found with that id." };
     }
 
-    const tenantIds = userRows.map((u) => u.tenantId);
-    const tenantRows = await db
-      .select({
-        id: tenants.id,
-        name: tenants.name,
-        slug: tenants.slug,
-      })
-      .from(tenants)
-      .where(sql`${tenants.id} = any(${tenantIds})`);
+    await recordPlatformAudit({
+      operator,
+      tenantId: null,
+      action: "read",
+      resourceType: "platform_user_profile",
+      resourceId: clerkUserId,
+      severity: "warning",
+      reason:
+        "Opened one person's profile across every workspace they belong to.",
+      metadata: {
+        workspaceCount: tenantRows.length,
+        memberships: userRows.length,
+      },
+    });
 
     const tenantMap = new Map(tenantRows.map((t) => [t.id, t]));
 
@@ -398,16 +484,27 @@ export async function listAllTenantsForFilter(): Promise<
   try {
     await requireCapability("tenants:read");
 
-    const rows = await db
-      .select({
-        id: tenants.id,
-        name: tenants.name,
-        slug: tenants.slug,
-      })
-      .from(tenants)
-      .where(and(eq(tenants.status, "active"), isNull(tenants.deletedAt)))
-      .orderBy(asc(tenants.name))
-      .limit(500);
+    /**
+     * ⚠️ NOT AUDITED, AND THAT IS A DELIBERATE LINE. This populates a
+     * filter dropdown with workspace NAMES and nothing else: no people,
+     * no money, no configuration. `listTenants` makes the same argument
+     * for the same reason. Auditing every dropdown render buries the
+     * rows that matter under rows that do not.
+     */
+    const rows = await withPlatformScope(
+      `Platform console: workspace names for the directory filter`,
+      (tx) =>
+        tx
+          .select({
+            id: tenants.id,
+            name: tenants.name,
+            slug: tenants.slug,
+          })
+          .from(tenants)
+          .where(and(eq(tenants.status, "active"), isNull(tenants.deletedAt)))
+          .orderBy(asc(tenants.name))
+          .limit(500),
+    );
 
     return { ok: true, data: rows };
   } catch (err) {

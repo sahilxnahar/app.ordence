@@ -60,7 +60,7 @@ import {
   type SyncOutcome,
 } from "@/lib/integrations/policy";
 
-const MANAGE = "settings.manage" as const;
+const MANAGE = "settings:update" as const;
 
 const connectorKeys = Object.keys(CONNECTOR_POLICIES) as [
   ConnectorKey,

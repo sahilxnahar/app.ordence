@@ -159,3 +159,32 @@ export function financialYearOf(value: Date | string): string {
   const startYear = month >= 4 ? year : year - 1;
   return `${startYear}-${String((startYear + 1) % 100).padStart(2, "0")}`;
 }
+
+/**
+ * ⭐ THE SAME FINANCIAL YEAR AS A HALF-OPEN WINDOW — added v1.25.0-alpha.
+ *
+ * ⚠️ HALF-OPEN, `start <= x < end`, and that is the whole reason it is a
+ * function rather than two lines at each call site. An inclusive end of
+ * "2026-03-31" silently drops everything timestamped during 31 March,
+ * which for a year-end threshold is the single busiest day in it.
+ *
+ * ⚠️ AND IT IS DERIVED FROM `financialYearOf` RATHER THAN RE-DERIVED
+ * FROM THE MONTH. Two places that each decide when a financial year
+ * begins is two places that can disagree, and the one that disagrees is
+ * never the one being read.
+ */
+export function financialYearWindow(value: Date | string): {
+  financialYear: string;
+  /** Inclusive. "2026-04-01". */
+  start: string;
+  /** EXCLUSIVE. "2027-04-01". */
+  end: string;
+} {
+  const financialYear = financialYearOf(value);
+  const startYear = Number(financialYear.slice(0, 4));
+  return {
+    financialYear,
+    start: `${startYear}-04-01`,
+    end: `${startYear + 1}-04-01`,
+  };
+}

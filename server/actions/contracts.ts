@@ -32,7 +32,7 @@
 import { z } from "zod";
 import { revalidatePath } from "next/cache";
 import { and, eq, isNull, desc } from "drizzle-orm";
-import { db } from "@/db";
+import { db, withTenant } from "@/db";
 import { contracts, contractVersions, contacts, companies, assets } from "@/db/schema";
 import { requirePermission, writeAudit, auditMeta } from "@/server/audit";
 import { requireTenantContext, TenantAccessError } from "@/server/tenant-context";
@@ -95,18 +95,20 @@ export async function getContracts(): Promise<ActionResult<ContractListItem[]>> 
   try {
     const ctx = await requirePermission("contracts:read");
 
-    const rows = await db.query.contracts.findMany({
-      where: and(
-        eq(contracts.tenantId, ctx.tenant.id),
-        isNull(contracts.deletedAt),
-      ),
-      orderBy: [desc(contracts.updatedAt)],
-      limit: 500,
-      with: {
-        contact: { columns: { firstName: true, lastName: true } },
-        company: { columns: { name: true } },
-      },
-    });
+    const rows = await withTenant(ctx.tenant.id, (tx) =>
+      tx.query.contracts.findMany({
+        where: and(
+          eq(contracts.tenantId, ctx.tenant.id),
+          isNull(contracts.deletedAt),
+        ),
+        orderBy: [desc(contracts.updatedAt)],
+        limit: 500,
+        with: {
+          contact: { columns: { firstName: true, lastName: true } },
+          company: { columns: { name: true } },
+        },
+      })
+    );
 
     return {
       ok: true,
@@ -163,42 +165,46 @@ export async function getContractById(id: string): Promise<ActionResult<Contract
     const ctx = await requirePermission("contracts:read", { type: "contract", id });
     const contractId = z.string().uuid("Invalid identifier.").parse(id);
 
-    const row = await db.query.contracts.findFirst({
-      where: and(
-        eq(contracts.id, contractId),
-        // Explicit tenant predicate as well as RLS. Two independent checks.
-        eq(contracts.tenantId, ctx.tenant.id),
-        isNull(contracts.deletedAt),
-      ),
-      with: {
-        contact: {
-          columns: { id: true, firstName: true, lastName: true, email: true },
+    const row = await withTenant(ctx.tenant.id, (tx) =>
+      tx.query.contracts.findFirst({
+        where: and(
+          eq(contracts.id, contractId),
+          // Explicit tenant predicate as well as RLS. Two independent checks.
+          eq(contracts.tenantId, ctx.tenant.id),
+          isNull(contracts.deletedAt),
+        ),
+        with: {
+          contact: {
+            columns: { id: true, firstName: true, lastName: true, email: true },
+          },
+          company: { columns: { id: true, name: true } },
+          asset: { columns: { name: true } },
         },
-        company: { columns: { id: true, name: true } },
-        asset: { columns: { name: true } },
-      },
-    });
+      })
+    );
 
     if (!row) return fail("Contract not found.");
 
-    const versions = await db
-      .select({
-        id: contractVersions.id,
-        versionNumber: contractVersions.versionNumber,
-        changeType: contractVersions.changeType,
-        changeSummary: contractVersions.changeSummary,
-        createdAt: contractVersions.createdAt,
-        contentHash: contractVersions.contentHash,
-      })
-      .from(contractVersions)
-      .where(
-        and(
-          eq(contractVersions.tenantId, ctx.tenant.id),
-          eq(contractVersions.contractId, contractId),
-        ),
-      )
-      .orderBy(desc(contractVersions.versionNumber))
-      .limit(100);
+    const versions = await withTenant(ctx.tenant.id, (tx) =>
+      tx
+        .select({
+          id: contractVersions.id,
+          versionNumber: contractVersions.versionNumber,
+          changeType: contractVersions.changeType,
+          changeSummary: contractVersions.changeSummary,
+          createdAt: contractVersions.createdAt,
+          contentHash: contractVersions.contentHash,
+        })
+        .from(contractVersions)
+        .where(
+          and(
+            eq(contractVersions.tenantId, ctx.tenant.id),
+            eq(contractVersions.contractId, contractId),
+          ),
+        )
+        .orderBy(desc(contractVersions.versionNumber))
+        .limit(100)
+    );
 
     const contactName = row.contact
       ? [row.contact.firstName, row.contact.lastName].filter(Boolean).join(" ").trim()
@@ -275,16 +281,18 @@ export async function sendContractToClient(input: {
       );
     }
 
-    const row = await db.query.contracts.findFirst({
-      where: and(
-        eq(contracts.id, data.contractId),
-        eq(contracts.tenantId, ctx.tenant.id),
-        isNull(contracts.deletedAt),
-      ),
-      with: {
-        contact: { columns: { firstName: true, lastName: true, email: true } },
-      },
-    });
+    const row = await withTenant(ctx.tenant.id, (tx) =>
+      tx.query.contracts.findFirst({
+        where: and(
+          eq(contracts.id, data.contractId),
+          eq(contracts.tenantId, ctx.tenant.id),
+          isNull(contracts.deletedAt),
+        ),
+        with: {
+          contact: { columns: { firstName: true, lastName: true, email: true } },
+        },
+      })
+    );
 
     if (!row) return fail("Contract not found.");
 
@@ -355,15 +363,17 @@ export async function sendContractToClient(input: {
     let statusAdvanced = false;
 
     if (data.advanceStatus && (row.status === "draft" || row.status === "internal_review")) {
-      const [updated] = await db
-        .update(contracts)
-        .set({
-          status: "counterparty_review",
-          updatedAt: new Date(),
-          updatedBy: ctx.user.id,
-        })
-        .where(and(eq(contracts.id, row.id), eq(contracts.tenantId, ctx.tenant.id)))
-        .returning({ id: contracts.id });
+      const [updated] = await withTenant(ctx.tenant.id, (tx) =>
+        tx
+          .update(contracts)
+          .set({
+            status: "counterparty_review",
+            updatedAt: new Date(),
+            updatedBy: ctx.user.id,
+          })
+          .where(and(eq(contracts.id, row.id), eq(contracts.tenantId, ctx.tenant.id)))
+          .returning({ id: contracts.id })
+      );
 
       statusAdvanced = Boolean(updated);
     }

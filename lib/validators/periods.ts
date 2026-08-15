@@ -42,6 +42,35 @@ export const closePeriodSchema = z.object({
    * Requires an explicit acknowledgement — this should almost never be used.
    */
   forceUnbalanced: z.boolean().default(false),
+  /**
+   * ══════════════════════════════════════════════════════════════════
+   * 🔴 CLOSE EVEN THOUGH DOCUMENTS FROM THIS PERIOD ARE NOT IN THE
+   *    LEDGER — v1.27.0-alpha
+   * ══════════════════════════════════════════════════════════════════
+   * ⚠️ IT NEEDS A WRITTEN REASON AND `forceUnbalanced` DOES NOT, and
+   * the asymmetry is deliberate.
+   *
+   * An unbalanced period is VISIBLE. It shows on every trial balance
+   * anybody runs, forever, and somebody will ask. A period sealed over
+   * missing entries looks perfect: it balances, because the missing
+   * entries are missing from both sides.
+   *
+   * 🔴 It is also the more destructive of the two. The period lock will
+   * refuse those documents from that month permanently, so the override
+   * does not defer a problem — it creates one that can only be undone
+   * by reopening the month, which is itself a critical audit event.
+   *
+   * ⭐ So the harder-to-see mistake is the harder one to make.
+   */
+  strandDocumentsReason: z
+    .string()
+    .trim()
+    .min(
+      20,
+      "Say why these documents are being left out of the month, in a sentence somebody reading the audit log in a year can understand.",
+    )
+    .max(2_000)
+    .optional(),
 });
 
 export const reopenPeriodSchema = z.object({

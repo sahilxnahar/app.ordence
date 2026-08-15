@@ -24,7 +24,12 @@ import { and, eq, isNull, or, sql, gt } from "drizzle-orm";
 import { withPlatformScope, withTenant } from "@/db";
 import { tenants } from "@/db/schema";
 import { platformTenantFlags } from "@/db/schema/platform";
-import { isFlagKey, validateFlagExpiry, FLAG_CATALOG } from "@/lib/platform/flags-catalog";
+import {
+  isFlagKey,
+  validateFlagExpiry,
+  flagDefinitionFor,
+  FLAG_CATALOG,
+} from "@/lib/platform/flags-catalog";
 import { setTenantFlagSchema, type PlatformResult } from "@/lib/platform/schemas";
 import { requireCapability, recordPlatformAudit } from "./guard";
 
@@ -129,8 +134,9 @@ export async function setTenantFlag(input: unknown): Promise<PlatformResult<void
     severity: "notice",
     reason,
     metadata: {
-      flagLabel: FLAG_CATALOG[flagKey].label,
-      grantsPaidCapability: FLAG_CATALOG[flagKey].grantsPaidCapability,
+      flagLabel: flagDefinitionFor(flagKey)?.label ?? flagKey,
+      grantsPaidCapability:
+        flagDefinitionFor(flagKey)?.grantsPaidCapability ?? false,
     },
   });
 

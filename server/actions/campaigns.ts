@@ -25,8 +25,8 @@ import type { ActionResult } from "@/lib/validators/crm";
 import { checkApproval } from "@/lib/campaigns/approval";
 import { formatMinor } from "@/lib/campaigns/audience";
 
-const READ = "crm.contacts.read" as const;
-const APPROVE = "settings.manage" as const;
+const READ = "contacts:read" as const;
+const APPROVE = "settings:update" as const;
 
 /* ------------------------------------------------------------------ */
 /* THE STOP                                                            */
@@ -51,7 +51,18 @@ export async function stopCampaign(
 ): Promise<ActionResult<{ stopped: true }>> {
   try {
     const data = stopSchema.parse(input);
-    const ctx = await requirePermission(READ);
+    /**
+     * 🔴 WAS `READ`. Stopping a campaign writes a stop reason and
+     * finishes the run; `contacts:read` is held by `read_only` and
+     * `guest`, so an external contractor could halt a live campaign.
+     *
+     * ⚠️ There is a real argument for an emergency brake being broadly
+     * held — `workflows:cancel_run` is deliberately given to
+     * `security_admin` for exactly that reason. That argument needs its
+     * own key. Until it has one, this matches every other write in this
+     * file rather than sitting on a read.
+     */
+    const ctx = await requirePermission(APPROVE);
 
     await withTenant(
       ctx.tenant.id,

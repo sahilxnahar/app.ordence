@@ -91,7 +91,13 @@ import { contacts } from "@/db/schema/crm";
 import { rateCards } from "@/db/schema/pricing";
 import { users } from "@/db/schema/core";
 import { requirePermission, writeAudit } from "@/server/audit";
-import { guardSalesWrite, toSalesActionError } from "@/server/sales/guards";
+import { guardSalesWrite, salesFail, toSalesActionError } from "@/server/sales/guards";
+import { postMeterPeriod } from "@/server/accounting/post-sales";
+import {
+  meteringProblem,
+  METERING_ROLE_META,
+} from "@/lib/accounting/sales-posting";
+import { salesPostingAccounts } from "@/db/schema";
 import type { ActionResult } from "@/lib/validators/crm";
 
 /** ⚠️ Exactly this string. It is the key in lib/modules/registry.ts. */
@@ -2284,5 +2290,237 @@ export async function setMeterPeriodFinalised(
     const explained = explainMeterError(err);
     if (explained) return { ok: false, error: explained };
     return toSalesActionError(err, "metering");
+  }
+}
+
+/* ================================================================== */
+/* ⭐⭐⭐ POSTING A UTILITY BILL — Batch 20, v1.28.0-alpha             */
+/* ================================================================== */
+
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * ⭐ THE LAST ENTRY ON THE POSTING DEBT LIST
+ * ══════════════════════════════════════════════════════════════════════
+ * `check-posting-coverage.mjs` has carried the same note against
+ * `metering` since Session 12:
+ *
+ *     "Consumption billing produces revenue and has no posting path yet."
+ *
+ * It was accurate. `closeMeterPeriod` computes an energy charge, a fixed
+ * charge, electricity duty and a net-metering export credit, stamps a
+ * total, and the money went nowhere.
+ *
+ * 🔴 AND THE INTERESTING PART IS THE DUTY. It is a State levy collected
+ * on the State's behalf — not income — and a recovery spreadsheet that
+ * books the whole bill to revenue overstates turnover by the duty on
+ * every unit ever billed while hiding a statutory liability nobody is
+ * tracking. `lib/accounting/sales-posting.ts` has the full reasoning.
+ */
+
+const meterPeriodIdSchema = z.object({ id: z.string().uuid() });
+
+/**
+ * ⭐ WHICH LEDGER ACCOUNTS ARE MISSING, ASKED BEFORE THE WORK.
+ *
+ * ⚠️ THE CONSUMER-CREDIT ACCOUNT IS REPORTED SEPARATELY, because it is
+ * only needed where net metering runs and a bill can go negative.
+ * Listing it as required would send a workspace with no solar off to
+ * create a liability account it will never post to.
+ */
+export async function meteringAccountsNeeded(): Promise<
+  ActionResult<{
+    missing: { role: string; label: string; help: string }[];
+    missingForExport: { role: string; label: string; help: string }[];
+  }>
+> {
+  try {
+    const ctx = await requirePermission(READ_PERMISSION);
+
+    const mapped = await withTenant(ctx.tenant.id, async (tx) =>
+      tx
+        .select({ role: salesPostingAccounts.role })
+        .from(salesPostingAccounts)
+        .where(eq(salesPostingAccounts.tenantId, ctx.tenant.id)),
+    );
+    const have = new Set(mapped.map((m) => m.role));
+
+    const describe = (role: string) => {
+      const meta = (METERING_ROLE_META as Record<string, { label: string; help: string }>)[
+        role
+      ];
+      return { role, label: meta?.label ?? role, help: meta?.help ?? "" };
+    };
+
+    const core = ["receivable", "metering_revenue", "electricity_duty_payable"];
+    const forExport = ["metering_export_credit", "metering_consumer_credit"];
+
+    return {
+      ok: true,
+      data: {
+        missing: core.filter((r) => !have.has(r)).map(describe),
+        missingForExport: forExport.filter((r) => !have.has(r)).map(describe),
+      },
+    };
+  } catch (err) {
+    return toSalesActionError(err, "meteringAccountsNeeded");
+  }
+}
+
+/**
+ * ⭐⭐ POST A FINALISED BILLING PERIOD.
+ *
+ * ⚠️ FINALISED ONLY. An open period is still being recomputed every time
+ * a reading lands, so posting one would put a figure in the ledger that
+ * changes underneath it — and the transaction key would then refuse the
+ * corrected version, which is the worst of both.
+ */
+export async function postMeterBill(
+  input: unknown,
+): Promise<ActionResult<{ id: string; transactionId: string | null }>> {
+  try {
+    const data = meterPeriodIdSchema.parse(input);
+    const ctx = await requirePermission("transactions:post");
+
+    type Outcome =
+      | { kind: "refused"; message: string }
+      | { kind: "ok"; transactionId: string | null; label: string };
+
+    const outcome = await withTenant(
+      ctx.tenant.id,
+      async (tx): Promise<Outcome> => {
+        const [row] = await tx
+          .select({
+            period: meterBillingPeriods,
+            meterSerial: utilityMeters.serialNumber,
+            meterLocation: utilityMeters.location,
+            consumerContactId: utilityMeters.consumerContactId,
+            /**
+             * ⚠️ BUILT FROM THE PARTS, because `contacts` has no
+             * `full_name`. Concatenating in SQL rather than in TypeScript
+             * keeps it null-safe on a contact with no surname — which is
+             * common enough in this market that a "Ravi null" on somebody's
+             * electricity bill is a real outcome.
+             */
+            consumerName: sql<string | null>`NULLIF(TRIM(COALESCE(${contacts.firstName}, '') || ' ' || COALESCE(${contacts.lastName}, '')), '')`,
+          })
+          .from(meterBillingPeriods)
+          .innerJoin(utilityMeters, eq(utilityMeters.id, meterBillingPeriods.meterId))
+          .leftJoin(contacts, eq(contacts.id, utilityMeters.consumerContactId))
+          .where(
+            and(
+              eq(meterBillingPeriods.tenantId, ctx.tenant.id),
+              eq(meterBillingPeriods.id, data.id),
+            ),
+          )
+          .limit(1);
+
+        if (!row) return { kind: "refused", message: "That billing period does not exist." };
+        const p = row.period;
+
+        if (!p.isFinalised) {
+          return {
+            kind: "refused",
+            message:
+              `This period has not been finalised. It is still recomputed every time a ` +
+              `reading lands, so posting it now would put a figure in the ledger that ` +
+              `changes underneath it.`,
+          };
+        }
+
+        const facts = {
+          energyChargeMinor: BigInt(p.energyChargeMinor ?? 0),
+          fixedChargeMinor: BigInt(p.fixedChargeMinor ?? 0),
+          dutyMinor: BigInt(p.dutyMinor ?? 0),
+          exportCreditMinor: BigInt(p.exportCreditMinor ?? 0),
+          totalMinor: BigInt(p.totalMinor ?? 0),
+        };
+
+        /**
+         * 🔴 THE STORED TOTAL IS CHECKED AGAINST ITS OWN PARTS. If they
+         * disagree, something recomputed one and not the others, and the
+         * ledger would carry a figure the consumer's bill does not
+         * support.
+         */
+        const problem = meteringProblem(facts);
+        if (problem) return { kind: "refused", message: problem };
+
+        if (
+          facts.energyChargeMinor === 0n &&
+          facts.fixedChargeMinor === 0n &&
+          facts.dutyMinor === 0n &&
+          facts.exportCreditMinor === 0n
+        ) {
+          return {
+            kind: "refused",
+            message:
+              `Meter ${row.meterSerial} billed nothing for ${p.label ?? "this period"}. ` +
+              `A nil bill is a successful period with nothing to post, not a failure.`,
+          };
+        }
+
+        const posted = await postMeterPeriod(tx, {
+          tenantId: ctx.tenant.id,
+          userId: ctx.user.id,
+          periodId: p.id,
+          meterLabel: row.meterSerial ?? row.meterLocation ?? "meter",
+          periodLabel: p.label ?? `${p.periodStart} to ${p.periodEnd}`,
+          /** ⚠️ The period END — a bill belongs to the month it measured. */
+          billedOn: String(p.periodEnd).slice(0, 10),
+          consumerContactId: row.consumerContactId,
+          consumerName: row.consumerName,
+          ...facts,
+        });
+
+        if (!posted.posted) {
+          if (posted.reason === "already_posted") {
+            return {
+              kind: "refused",
+              message: `That billing period is already in the ledger.`,
+            };
+          }
+          if (posted.reason === "unmapped_roles") {
+            return {
+              kind: "refused",
+              message:
+                `These ledger accounts have not been mapped yet: ` +
+                `${posted.missing.join(", ")}. Map them under Accounting → Posting ` +
+                `accounts, then post this again. Nothing has been written.`,
+            };
+          }
+          if (posted.reason === "period_closed") {
+            return {
+              kind: "refused",
+              message:
+                `This bill is dated in ${String(posted.period)}, which has been closed. ` +
+                `Reopen that period, or agree a date in an open one.`,
+            };
+          }
+          return { kind: "refused", message: "That bill could not be posted." };
+        }
+
+        return {
+          kind: "ok",
+          transactionId: posted.transactionId,
+          label: p.label ?? `${p.periodStart} to ${p.periodEnd}`,
+        };
+      },
+      { impersonationId: ctx.impersonationId },
+    );
+
+    if (outcome.kind === "refused") return salesFail(outcome.message);
+
+    await writeAudit(ctx, {
+      action: "create",
+      resourceType: "transaction",
+      resourceId: outcome.transactionId ?? data.id,
+      newValue: { kind: "meter_period", periodId: data.id, label: outcome.label },
+      severity: "critical",
+    });
+
+    revalidatePath("/meters");
+    revalidatePath("/accounting/posting");
+    return { ok: true, data: { id: data.id, transactionId: outcome.transactionId } };
+  } catch (err) {
+    return toSalesActionError(err, "postMeterBill");
   }
 }

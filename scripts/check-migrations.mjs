@@ -75,6 +75,20 @@ const KNOWN_GAPS = new Map([
    * migration log which cannot be replayed from scratch.
    */
   [72, "retired — 0072_quick_flows.sql superseded, number not reused"],
+  /**
+   * ⭐ 0076 IS RETIRED, AND THIS IS THE THIRD TIME.
+   * `0076_mass_deployment_backup.sql` was superseded and sits in
+   * `_superseded/`. v1.24.0 tried to reuse the number for the monthly
+   * return; this check refused, and the file went out as 0077.
+   *
+   * ⚠️ THREE TIMES NOW, and the pattern is worth naming: the retired
+   * numbers were 0062, 0072 and 0076 — all of them from the same batch
+   * of three files that were numbered far ahead of the real sequence
+   * years ago. Every time the real sequence catches up with one of
+   * them, reusing it is the obvious move and would produce a migration
+   * log that cannot be replayed from scratch.
+   */
+  [76, "retired — 0076_mass_deployment_backup.sql superseded, number not reused"],
 ]);
 
 /* ------------------------------------------------------------------ */

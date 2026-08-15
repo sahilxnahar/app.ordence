@@ -45,6 +45,7 @@ import {
   isBookingCollision,
   describeBookingCollision,
 } from "@/lib/sales/inventory";
+import type { PermissionKey } from "@/db/schema/auth";
 
 /**
  * Run all three application gates and return the tenant context.
@@ -64,7 +65,7 @@ export async function guardSalesWrite(args: {
   /** The operation key, e.g. "bookings:create". Used by the access gate. */
   operation: string;
   feature: FeatureKey;
-  permission: string;
+  permission: PermissionKey;
   resource?: { type?: string; id?: string };
   /**
    * Override the key the IMPERSONATION policy is evaluated against.
@@ -123,6 +124,38 @@ export function salesFail(
 }
 
 /**
+ * ⭐ THE PLACE-OF-SUPPLY ENGINE REFUSED, AND THE REFUSAL IS THE FEATURE.
+ * Added v1.37.0 (Batch 33).
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 WHY A REFUSAL AND NOT A DEFAULT
+ * ══════════════════════════════════════════════════════════════════════
+ * The code this replaces ended in `: false` — when it had not been told
+ * enough to decide, it answered "intra-state" and carried on. That is the
+ * worst available behaviour for this particular question, because:
+ *
+ *   • The total on the document is identical either way. Nothing on the
+ *     screen looks wrong.
+ *   • The error surfaces at the BUYER's reconciliation or at an
+ *     assessment, months later.
+ *   • Correcting CGST+SGST wrongly paid instead of IGST is a refund
+ *     application under Section 77, not an edit.
+ *
+ * So an unanswerable question stops the order. The message says what is
+ * missing and the remedy says which field to set — because a refusal
+ * without a remedy is just an outage, and the operator's next move is to
+ * find someone who will type it into the database directly.
+ */
+export class OrderTaxRefusal extends Error {
+  readonly remedy: string;
+  constructor(message: string, remedy: string) {
+    super(message);
+    this.name = "OrderTaxRefusal";
+    this.remedy = remedy;
+  }
+}
+
+/**
  * Turn anything thrown into a safe, useful envelope.
  *
  * ⚠️ THE DATABASE ERRORS ARE TRANSLATED, NOT PASSED THROUGH.
@@ -149,6 +182,16 @@ export function toSalesActionError(err: unknown, scope: string): ActionResult<ne
   // reaches for a database client, which is the outcome the whole
   // impersonation system exists to avoid.
   if (err instanceof ImpersonationForbiddenError) return salesFail(err.message);
+
+  /**
+   * ⭐ THE TAX REFUSAL CARRIES ITS REMEDY INTO THE MESSAGE. The operator
+   * needs both halves: what we could not determine, and which field to
+   * set so we can. Splitting them across a log line and a toast means
+   * only one of them reaches the person who can act.
+   */
+  if (err instanceof OrderTaxRefusal) {
+    return salesFail(`${err.message} ${err.remedy}`);
+  }
 
   if (err instanceof z.ZodError) {
     return salesFail(
@@ -207,6 +250,41 @@ export function toSalesActionError(err: unknown, scope: string): ActionResult<ne
     }
     if (constraint.includes("leads_score_sane")) {
       return salesFail("The lead score is out of range. This is a defect — report it.");
+    }
+
+    /* --- ⭐ v1.37.0: the constraints that outlive the fix -------------- */
+    //
+    // ⚠️ THESE FIRE FOR WRITE PATHS WE HAVE NOT CORRECTED YET — an import,
+    // the future REST API, a psql prompt. The application path determines
+    // place of supply through the engine and cannot reach them. Anything
+    // that DOES reach them is by definition code that guessed, so the
+    // message names the statute rather than apologising.
+    if (constraint.includes("sales_orders_immovable_property_pos")) {
+      return salesFail(
+        "This order relates to immovable property, so under Section 12(3) of the " +
+          "IGST Act the place of supply must be the state the property is in. Set " +
+          "the project's GST state code.",
+      );
+    }
+    if (constraint.includes("sales_orders_sez_is_inter_state")) {
+      return salesFail(
+        "The buyer is in a Special Economic Zone. Section 7(5)(b) makes that an " +
+          "inter-state supply even when the SEZ is in our own state, so it cannot " +
+          "be recorded as intra-state.",
+      );
+    }
+    if (constraint.includes("sales_orders_ut_is_intra_state")) {
+      return salesFail(
+        "An order cannot be both inter-state and in a Union Territory: UTGST only " +
+          "applies to an intra-state supply. This is a defect — report it.",
+      );
+    }
+    if (constraint.includes("sales_orders_pos_has_basis")) {
+      return salesFail(
+        "This order has a place of supply with no record of which rule produced " +
+          "it. A place of supply must be determined, not assumed. This is a " +
+          "defect — report it.",
+      );
     }
     if (pg.message) return salesFail(stripPgNoise(pg.message));
     return salesFail("That change is not allowed.");

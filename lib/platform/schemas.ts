@@ -29,7 +29,7 @@
 
 import { z } from "zod";
 import { SEARCH_SCOPES, MIN_SEARCH_JUSTIFICATION } from "./search-scopes";
-import { FLAG_KEYS } from "./flags-catalog";
+import { isFlagKey, FLAG_KEYS } from "./flags-catalog";
 import { MIN_JUSTIFICATION_LENGTH } from "./impersonation-policy";
 import { PLATFORM_GRADES } from "./roles";
 
@@ -177,7 +177,13 @@ export type PlatformSearchInput = z.infer<typeof platformSearchSchema>;
 
 export const setTenantFlagSchema = z.object({
   tenantId: uuidField,
-  flagKey: z.enum(FLAG_KEYS as [string, ...string[]]),
+  /**
+   * 🔴 WAS `z.enum(FLAG_KEYS)`, which rejected every `entitlement:*`
+   * key and so made the whole entitlement-override screen unusable.
+   * `isFlagKey` accepts the closed catalogue plus that one constructed
+   * namespace, and nothing else.
+   */
+  flagKey: z.string().refine(isFlagKey, "Unknown flag."),
   enabled: z.boolean(),
   reason: justification(15, "the flag's permanent record"),
   /** ISO date string; required for flags that grant paid capability. */

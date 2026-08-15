@@ -37,6 +37,8 @@
 /* THE CATALOGUE                                                       */
 /* ------------------------------------------------------------------ */
 
+import type { PermissionKey } from "@/db/schema/auth";
+
 export type RecoverableEntity = {
   /** Physical table name. */
   table: string;
@@ -61,6 +63,18 @@ export type RecoverableEntity = {
    * Those go through a stricter path — see `requiresFinancialReview`.
    */
   financiallySignificant: boolean;
+  /**
+   * 🔴 THE PERMISSION THE RESTORER MUST HOLD, added in v1.31.0.
+   *
+   * `restoreFromRecycleBin` required `contacts:update` for EVERY table
+   * in this catalogue, so a `member` — who holds `contacts:update` but
+   * neither `contracts:update` nor `documents:create` — could resurrect
+   * a contract or a document that counsel had deliberately deleted.
+   *
+   * ⚠️ UN-DELETING IS AS CONSEQUENTIAL AS DELETING. If somebody may not
+   * edit the thing, they may not bring it back either.
+   */
+  restorePermission: PermissionKey;
 };
 
 /**
@@ -97,6 +111,7 @@ export const RECOVERABLE_ENTITIES: readonly RecoverableEntity[] = Object.freeze(
     // A live contact may now hold this email.
     uniqueWithinTenant: ["email"],
     financiallySignificant: false,
+    restorePermission: "contacts:update",
   },
   {
     table: "companies",
@@ -106,6 +121,7 @@ export const RECOVERABLE_ENTITIES: readonly RecoverableEntity[] = Object.freeze(
     parents: [],
     uniqueWithinTenant: [],
     financiallySignificant: false,
+    restorePermission: "companies:update",
   },
   {
     table: "deals",
@@ -118,6 +134,7 @@ export const RECOVERABLE_ENTITIES: readonly RecoverableEntity[] = Object.freeze(
     ],
     uniqueWithinTenant: [],
     financiallySignificant: false,
+    restorePermission: "deals:update",
   },
   {
     table: "assets",
@@ -127,6 +144,7 @@ export const RECOVERABLE_ENTITIES: readonly RecoverableEntity[] = Object.freeze(
     parents: [],
     uniqueWithinTenant: ["code"],
     financiallySignificant: false,
+    restorePermission: "assets:update",
   },
   {
     table: "contracts",
@@ -137,6 +155,7 @@ export const RECOVERABLE_ENTITIES: readonly RecoverableEntity[] = Object.freeze(
     uniqueWithinTenant: [],
     // A contract carries a value that feeds the pipeline figures.
     financiallySignificant: true,
+    restorePermission: "contracts:update",
   },
   {
     table: "documents",
@@ -146,6 +165,7 @@ export const RECOVERABLE_ENTITIES: readonly RecoverableEntity[] = Object.freeze(
     parents: [],
     uniqueWithinTenant: [],
     financiallySignificant: false,
+    restorePermission: "documents:create",
   },
   {
     table: "custom_object_records",
@@ -163,6 +183,7 @@ export const RECOVERABLE_ENTITIES: readonly RecoverableEntity[] = Object.freeze(
     ],
     uniqueWithinTenant: [],
     financiallySignificant: false,
+    restorePermission: "custom_objects:update_record",
   },
 ]);
 

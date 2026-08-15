@@ -26,8 +26,8 @@ import { toSalesActionError } from "@/server/sales/guards";
 import type { ActionResult } from "@/lib/validators/crm";
 import { policyFor } from "@/lib/integrations/policy";
 
-const READ = "crm.contacts.read" as const;
-const WRITE = "crm.contacts.write" as const;
+const READ = "contacts:read" as const;
+const WRITE = "contacts:update" as const;
 
 export interface IntakeFailureRow {
   readonly id: string;

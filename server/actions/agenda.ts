@@ -44,7 +44,7 @@ import {
   type AgendaEntry,
 } from "@/lib/work/agenda";
 
-const READ = "crm.contacts.read" as const;
+const READ = "contacts:read" as const;
 
 /**
  * 🔴 THE BUSINESS DAY IS ASIA/KOLKATA, NOT THE SERVER'S DAY.
@@ -471,7 +471,7 @@ export async function saveCalendarEvent(
 ): Promise<ActionResult<{ id: string }>> {
   try {
     const data = eventSchema.parse(input);
-    const ctx = await requirePermission("crm.contacts.write");
+    const ctx = await requirePermission("contacts:update");
 
     const starts = new Date(data.startsAt);
     const ends = new Date(data.endsAt);

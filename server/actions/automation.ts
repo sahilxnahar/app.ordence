@@ -21,7 +21,7 @@ import { toSalesActionError } from "@/server/sales/guards";
 import { drainAutomationEvents, purgeExpiredEvents } from "@/server/automation/drain";
 import type { ActionResult } from "@/lib/validators/crm";
 
-const MANAGE = "settings.manage" as const;
+const MANAGE = "settings:update" as const;
 
 export async function runAutomationQueue(): Promise<
   ActionResult<{ considered: number; runsStarted: number; note: string }>

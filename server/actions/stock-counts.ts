@@ -66,8 +66,14 @@ import type { ActionResult } from "@/lib/validators/crm";
  * permission means whoever counts also approves their own count, which
  * is the exact arrangement stocktaking exists to prevent.
  */
-const COUNT = "inventory.stock.read" as const;
-const REVIEW = "settings.manage" as const;
+/**
+ * 🔴 WAS `inventory.stock.read`, which defeated the paragraph above:
+ * `read_only` and `guest` both hold it, so anyone at all could open a
+ * stocktake and record quantities. The counting side now has its own
+ * write key, and the review side keeps `settings:update`.
+ */
+const COUNT = "inventory.counts.record" as const;
+const REVIEW = "settings:update" as const;
 
 /* ------------------------------------------------------------------ */
 /* OPEN                                                               */

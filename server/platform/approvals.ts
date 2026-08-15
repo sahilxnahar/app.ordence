@@ -40,6 +40,7 @@ import {
   expiryFor,
   justificationProblem,
   mayApprove,
+  mayReject,
   needsApproval,
   type ApprovalKind,
   type PlatformGrade,
@@ -181,16 +182,51 @@ export async function decideApproval(args: {
   if (!row) return { ok: false, error: "No such request." };
 
   if (!args.approve) {
+    /**
+     * ══════════════════════════════════════════════════════════════
+     * 🔴 THE REJECT BRANCH USED TO CHECK NOTHING AT ALL
+     * ══════════════════════════════════════════════════════════════
+     * It sat ABOVE `mayApprove` and applied no status test and no
+     * grade test, while its caller is gated on `tenants:read` — which
+     * `support` holds. Three consequences, all real:
+     *
+     *   ① A support-grade account could reject every pending owner
+     *      request. That is a denial of control during an incident,
+     *      from the grade the code itself calls the most phished.
+     *   ② A row already `executed` could be flipped to `rejected`,
+     *      overwriting `approver_id`, `decided_at` and
+     *      `decision_note`. The record of who authorised a suspension
+     *      that actually ran was destructible from the console.
+     *   ③ A requester rejecting their own request violated
+     *      `platform_approval_not_self` and surfaced as a 500.
+     *
+     * ⚠️ WITHDRAWAL IS NOT REJECTION. Pulling your own request is a
+     * different fact from a second operator refusing it, so it leaves
+     * `approver_id` NULL — which is also what the CHECK constraint
+     * permits — and says so in the note.
+     */
+    const rejection = mayReject({
+      kind: row.actionKind,
+      requestedBy: row.requestedBy,
+      approverId: args.approver.staff.id,
+      approverGrade: args.approverGrade,
+      status: row.status,
+    });
+
+    if (!rejection.allowed) return { ok: false, error: rejection.reason };
+
     await withPlatformScope(
-      `Platform console: reject approval request ${args.requestId}`,
+      `Platform console: ${rejection.withdrawal ? "withdraw" : "reject"} approval request ${args.requestId}`,
       async (db) => {
         await db
           .update(platformApprovalQueue)
           .set({
             status: "rejected",
-            approverId: args.approver.staff.id,
+            approverId: rejection.withdrawal ? null : args.approver.staff.id,
             decidedAt: args.now,
-            decisionNote: args.note,
+            decisionNote: rejection.withdrawal
+              ? `Withdrawn by the operator who raised it. ${args.note}`
+              : args.note,
           })
           .where(eq(platformApprovalQueue.id, args.requestId));
       },
@@ -202,12 +238,21 @@ export async function decideApproval(args: {
       action: "config_change",
       resourceType: row.targetType,
       resourceId: row.targetId,
-      reason: `Rejected ${row.actionKind} on ${row.targetLabel}: ${args.note.slice(0, 200)}`,
-      metadata: { approvalKind: row.actionKind, stage: "rejected" },
+      reason: `${rejection.withdrawal ? "Withdrawn" : "Rejected"} ${row.actionKind} on ${row.targetLabel}: ${args.note.slice(0, 200)}`,
+      metadata: {
+        approvalKind: row.actionKind,
+        stage: rejection.withdrawal ? "withdrawn" : "rejected",
+      },
       severity: "notice",
     });
 
-    return { ok: true, executed: false, note: "Rejected. Nothing was changed." };
+    return {
+      ok: true,
+      executed: false,
+      note: rejection.withdrawal
+        ? "Withdrawn. Nothing was changed."
+        : "Rejected. Nothing was changed.",
+    };
   }
 
   // 🔴 THE PURE VERDICT DECIDES. Self-approval, grade and expiry are all
@@ -328,11 +373,29 @@ export async function listPending(now: Date) {
   });
 }
 
-/** ⚠️ Used to decide whether the self-approval hatch is open at all. */
+/**
+ * ⚠️ Used to decide whether the self-approval hatch is open at all.
+ *
+ * 🔴 THIS QUERIED `WHERE is_active`, A COLUMN THAT HAS NEVER EXISTED.
+ * `platform_staff` carries `status`, `expires_at` and `revoked_at`. The
+ * statement threw, and because `getApprovalQueue` and `decideRequest`
+ * both call this FIRST, the entire approvals screen rendered an error
+ * card and no request could ever be approved or rejected. The four-eyes
+ * control was not weak; it was inoperable, which is also why every
+ * dangerous operation had grown a direct path around it.
+ *
+ * ⚠️ ALL THREE COLUMNS, TOGETHER. `status` alone is what
+ * `evaluatePlatformAccess` reads, and a row that is `active` with an
+ * expiry in the past is not somebody you can ask to approve anything.
+ */
 export async function countActiveOperators(): Promise<number> {
   return withPlatformScope("Platform console: operator count", async (db) => {
     const rows = await db.execute(sql`
-      SELECT count(*)::int AS n FROM platform_staff WHERE is_active
+      SELECT count(*)::int AS n
+        FROM platform_staff
+       WHERE status = 'active'
+         AND revoked_at IS NULL
+         AND (expires_at IS NULL OR expires_at > now())
     `);
     const first = (Array.isArray(rows) ? rows[0] : (rows as { rows?: unknown[] }).rows?.[0]) ?? {};
     return Number((first as { n?: number }).n ?? 1);

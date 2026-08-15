@@ -33,6 +33,7 @@ import "server-only";
  * anything but async functions publishes them as RPC endpoints.
  */
 
+import type { PermissionKey } from "@/db/schema/auth";
 import { z } from "zod";
 import { TenantAccessError, type TenantContext } from "@/server/tenant-context";
 import { AccessRestrictedError } from "@/server/billing/access";
@@ -51,7 +52,7 @@ import type { ActionResult } from "@/lib/validators/crm";
 export async function guardGstr2bWrite(args: {
   operation: string;
   feature: FeatureKey;
-  permission: string;
+  permission: PermissionKey;
   resource?: { type?: string; id?: string };
   impersonationOperation?: string;
 }): Promise<TenantContext> {

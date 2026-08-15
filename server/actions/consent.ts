@@ -37,8 +37,8 @@ import {
   type ConsentRecord,
 } from "@/lib/crm/consent";
 
-const READ = "crm.contacts.read" as const;
-const WRITE = "crm.contacts.write" as const;
+const READ = "contacts:read" as const;
+const WRITE = "contacts:update" as const;
 
 const purposes = CONSENT_PURPOSES as unknown as [ConsentPurpose, ...ConsentPurpose[]];
 const channels = CONSENT_CHANNELS as unknown as [ConsentChannel, ...ConsentChannel[]];
@@ -72,7 +72,7 @@ export async function publishConsentNotice(
 ): Promise<ActionResult<{ id: string }>> {
   try {
     const data = noticeSchema.parse(input);
-    const ctx = await requirePermission("settings.manage");
+    const ctx = await requirePermission("settings:update");
 
     const id = await withTenant(
       ctx.tenant.id,

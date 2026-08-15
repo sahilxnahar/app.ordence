@@ -25,7 +25,7 @@ import { NextResponse, type NextRequest } from "next/server";
 import { headers } from "next/headers";
 import { timingSafeEqual } from "node:crypto";
 import { and, eq, isNull } from "drizzle-orm";
-import { db } from "@/db";
+import { db, withPlatformScope } from "@/db";
 import { tenants } from "@/db/schema";
 import { BACKGROUND_WORKERS, runAllWorkers, runWorker } from "@/server/ai/background-workers";
 
@@ -109,11 +109,28 @@ export async function POST(req: NextRequest) {
   if (body.mode === "sweep") {
     const startedAt = Date.now();
 
-    const activeTenants = await db
-      .select({ id: tenants.id, slug: tenants.slug })
-      .from(tenants)
-      .where(and(eq(tenants.status, "active"), isNull(tenants.deletedAt)))
-      .limit(MAX_TENANTS_PER_SWEEP);
+  /**
+     * 🔴 `withPlatformScope`, NOT "no scope at all".
+     *
+     * The comment above was right that this legitimately reads across
+     * every workspace. What it missed is that reading across workspaces
+     * REQUIRES THE PLATFORM MARKER: with no session variable set, the
+     * `tenants` policy evaluates `id = NULL OR false` and matches nothing,
+     * so under a database role that does not bypass RLS this sweep would
+     * process ZERO workspaces, silently, every night, forever.
+     *
+     * ⚠️ "CROSS-TENANT" AND "UNSCOPED" ARE NOT THE SAME THING, and I said
+     * they were last session. Unscoped is not a wider view; it is no view.
+     */
+    const activeTenants = await withPlatformScope(
+      `Scheduled sweep: list the workspaces to enqueue work for`,
+      (tx) =>
+        tx
+        .select({ id: tenants.id, slug: tenants.slug })
+        .from(tenants)
+        .where(and(eq(tenants.status, "active"), isNull(tenants.deletedAt)))
+        .limit(MAX_TENANTS_PER_SWEEP),
+    );
 
     const allResults: Array<{
       tenantId: string;

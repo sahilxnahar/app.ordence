@@ -30,8 +30,8 @@ import { requirePermission, writeAudit } from "@/server/audit";
 import { toSalesActionError } from "@/server/sales/guards";
 import type { ActionResult } from "@/lib/validators/crm";
 
-const MANAGE = "settings.manage" as const;
-const READ = "crm.contacts.read" as const;
+const MANAGE = "settings:update" as const;
+const READ = "contacts:read" as const;
 
 /* ------------------------------------------------------------------ */
 /* SOURCES                                                             */

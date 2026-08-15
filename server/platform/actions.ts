@@ -32,11 +32,12 @@
  */
 
 import { revalidatePath } from "next/cache";
+import { requestSuspend } from "./control-actions";
+import { suspendTenantSchema } from "@/lib/platform/schemas";
 
 import {
   listTenants as listTenantsImpl,
   getTenantDetail as getTenantDetailImpl,
-  suspendTenant as suspendTenantImpl,
   reactivateTenant as reactivateTenantImpl,
 } from "./tenants";
 import {
@@ -77,9 +78,51 @@ export async function getTenantDetailAction(tenantId: string) {
   return getTenantDetailImpl(tenantId);
 }
 
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 SUSPENSION GOES THROUGH THE QUEUE. IT USED NOT TO.
+ * ══════════════════════════════════════════════════════════════════════
+ * `APPROVAL_POLICIES` has declared `tenant.suspend` as needing a second
+ * pair of eyes since v0.54.0, `requestSuspend` was written to queue it,
+ * and the console wired the button straight to `suspendTenantImpl`
+ * instead. `requestSuspend` had ZERO CALLERS anywhere in the repository,
+ * so the queue table stayed empty, the approvals screen looked like a
+ * working control, and one owner suspended any live workspace in one
+ * click.
+ *
+ * ⚠️ THE OPERATOR TYPES EXACTLY WHAT THEY TYPED BEFORE. The dialog
+ * already collects a confirmation slug and a justification of at least
+ * twenty characters; that sentence now serves as both the queue
+ * justification and the reason written into the customer's own audit
+ * log when the suspension actually runs. The only difference they
+ * experience is that nothing happens yet.
+ *
+ * ⭐ `suspendTenantImpl` is no longer exported from this file. It is
+ * reachable only through the approval executor registered in
+ * `control-actions.ts`, so there is one door and it has two locks.
+ */
 export async function suspendTenantAction(input: unknown) {
-  const result = await suspendTenantImpl(input);
-  if (result.ok) revalidatePath("/platform");
+  const parsed = suspendTenantSchema.safeParse(input);
+  if (!parsed.success) {
+    return {
+      ok: false as const,
+      error: "Check the form.",
+      fieldErrors: parsed.error.flatten().fieldErrors as Record<string, string[]>,
+    };
+  }
+
+  const result = await requestSuspend({
+    tenantId: parsed.data.tenantId,
+    confirmSlug: parsed.data.confirmSlug,
+    reason: parsed.data.reason,
+    customerMessage: parsed.data.customerMessage,
+    justification: parsed.data.reason,
+  });
+
+  if (result.ok) {
+    revalidatePath("/platform");
+    revalidatePath("/platform/approvals");
+  }
   return result;
 }
 

@@ -11,8 +11,9 @@
  */
 
 import { and, eq } from "drizzle-orm";
-import { db } from "@/db";
+import { db, withTenant } from "@/db";
 import { tenants } from "@/db/schema";
+import { requirePermission } from "@/server/audit";
 import { requireTenantContext } from "@/server/tenant-context";
 import { writeAudit } from "@/server/audit";
 
@@ -34,13 +35,19 @@ export async function saveOrganizationDetails(input: {
 }): Promise<{ ok: true } | { ok: false; error: string }> {
   try {
     const ctx = await requireTenantContext();
+    /**
+     * 🔴 ADDED IN v1.26.0-alpha BY `check:guards`. These write the workspace's legal identity — GSTIN, PAN, registered address, fiscal year. They run against an EXISTING tenant, so the caller already has a role, and a second person who joined mid-setup as a viewer should not be able to set the company's GSTIN.
+     */
+    await requirePermission("settings:update");
 
     // Read current settings, merge the billingProfile into them.
-    const current = await db
-      .select({ settings: tenants.settings })
-      .from(tenants)
-      .where(eq(tenants.id, ctx.tenant.id))
-      .limit(1);
+    const current = await withTenant(ctx.tenant.id, (tx) =>
+      tx
+        .select({ settings: tenants.settings })
+        .from(tenants)
+        .where(eq(tenants.id, ctx.tenant.id))
+        .limit(1)
+    );
 
     const existingSettings = (current[0]?.settings ?? {}) as Record<string, unknown>;
     const existingBilling = (existingSettings.billingProfile ?? {}) as Record<string, unknown>;
@@ -62,14 +69,16 @@ export async function saveOrganizationDetails(input: {
       onboardingStep: 2,
     } as typeof tenants.settings._.data;
 
-    await db
-      .update(tenants)
-      .set({
-        legalName: input.legalName,
-        settings: mergedSettings,
-        updatedAt: new Date(),
-      })
-      .where(eq(tenants.id, ctx.tenant.id));
+    await withTenant(ctx.tenant.id, (tx) =>
+      tx
+        .update(tenants)
+        .set({
+          legalName: input.legalName,
+          settings: mergedSettings,
+          updatedAt: new Date(),
+        })
+        .where(eq(tenants.id, ctx.tenant.id))
+    );
 
     await writeAudit(ctx, {
       action: "update",
@@ -100,12 +109,18 @@ export async function saveFiscalPreferences(input: {
 }): Promise<{ ok: true } | { ok: false; error: string }> {
   try {
     const ctx = await requireTenantContext();
+    /**
+     * 🔴 ADDED IN v1.26.0-alpha BY `check:guards`. These write the workspace's legal identity — GSTIN, PAN, registered address, fiscal year. They run against an EXISTING tenant, so the caller already has a role, and a second person who joined mid-setup as a viewer should not be able to set the company's GSTIN.
+     */
+    await requirePermission("settings:update");
 
-    const current = await db
-      .select({ settings: tenants.settings })
-      .from(tenants)
-      .where(eq(tenants.id, ctx.tenant.id))
-      .limit(1);
+    const current = await withTenant(ctx.tenant.id, (tx) =>
+      tx
+        .select({ settings: tenants.settings })
+        .from(tenants)
+        .where(eq(tenants.id, ctx.tenant.id))
+        .limit(1)
+    );
 
     const existingSettings = (current[0]?.settings ?? {}) as Record<string, unknown>;
 
@@ -118,13 +133,15 @@ export async function saveFiscalPreferences(input: {
       onboardingStep: 3,
     } as typeof tenants.settings._.data;
 
-    await db
-      .update(tenants)
-      .set({
-        settings: mergedSettings,
-        updatedAt: new Date(),
-      })
-      .where(eq(tenants.id, ctx.tenant.id));
+    await withTenant(ctx.tenant.id, (tx) =>
+      tx
+        .update(tenants)
+        .set({
+          settings: mergedSettings,
+          updatedAt: new Date(),
+        })
+        .where(eq(tenants.id, ctx.tenant.id))
+    );
 
     await writeAudit(ctx, {
       action: "update",
@@ -152,12 +169,18 @@ export async function saveIndustrySelection(input: {
 }): Promise<{ ok: true } | { ok: false; error: string }> {
   try {
     const ctx = await requireTenantContext();
+    /**
+     * 🔴 ADDED IN v1.26.0-alpha BY `check:guards`. These write the workspace's legal identity — GSTIN, PAN, registered address, fiscal year. They run against an EXISTING tenant, so the caller already has a role, and a second person who joined mid-setup as a viewer should not be able to set the company's GSTIN.
+     */
+    await requirePermission("settings:update");
 
-    const current = await db
-      .select({ settings: tenants.settings })
-      .from(tenants)
-      .where(eq(tenants.id, ctx.tenant.id))
-      .limit(1);
+    const current = await withTenant(ctx.tenant.id, (tx) =>
+      tx
+        .select({ settings: tenants.settings })
+        .from(tenants)
+        .where(eq(tenants.id, ctx.tenant.id))
+        .limit(1)
+    );
 
     const existingSettings = (current[0]?.settings ?? {}) as Record<string, unknown>;
 
@@ -167,13 +190,15 @@ export async function saveIndustrySelection(input: {
       onboardingStep: 4,
     } as typeof tenants.settings._.data;
 
-    await db
-      .update(tenants)
-      .set({
-        settings: mergedSettings,
-        updatedAt: new Date(),
-      })
-      .where(eq(tenants.id, ctx.tenant.id));
+    await withTenant(ctx.tenant.id, (tx) =>
+      tx
+        .update(tenants)
+        .set({
+          settings: mergedSettings,
+          updatedAt: new Date(),
+        })
+        .where(eq(tenants.id, ctx.tenant.id))
+    );
 
     await writeAudit(ctx, {
       action: "update",
@@ -201,12 +226,18 @@ export async function completeOnboarding(): Promise<
 > {
   try {
     const ctx = await requireTenantContext();
+    /**
+     * 🔴 ADDED IN v1.26.0-alpha BY `check:guards`. These write the workspace's legal identity — GSTIN, PAN, registered address, fiscal year. They run against an EXISTING tenant, so the caller already has a role, and a second person who joined mid-setup as a viewer should not be able to set the company's GSTIN.
+     */
+    await requirePermission("settings:update");
 
-    const current = await db
-      .select({ settings: tenants.settings })
-      .from(tenants)
-      .where(eq(tenants.id, ctx.tenant.id))
-      .limit(1);
+    const current = await withTenant(ctx.tenant.id, (tx) =>
+      tx
+        .select({ settings: tenants.settings })
+        .from(tenants)
+        .where(eq(tenants.id, ctx.tenant.id))
+        .limit(1)
+    );
 
     const existingSettings = (current[0]?.settings ?? {}) as Record<string, unknown>;
 
@@ -216,13 +247,15 @@ export async function completeOnboarding(): Promise<
       onboardingStep: null,
     } as unknown as typeof tenants.settings._.data;
 
-    await db
-      .update(tenants)
-      .set({
-        settings: mergedSettings,
-        updatedAt: new Date(),
-      })
-      .where(eq(tenants.id, ctx.tenant.id));
+    await withTenant(ctx.tenant.id, (tx) =>
+      tx
+        .update(tenants)
+        .set({
+          settings: mergedSettings,
+          updatedAt: new Date(),
+        })
+        .where(eq(tenants.id, ctx.tenant.id))
+    );
 
     await writeAudit(ctx, {
       action: "update",

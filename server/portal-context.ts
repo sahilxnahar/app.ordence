@@ -323,7 +323,9 @@ export async function writePortalAudit(params: {
   metadata?: Record<string, unknown>;
 }): Promise<void> {
   try {
-    await db.insert(auditLogs).values({
+    /** ⚠️ Into the customer's own log, so it writes AS that tenant. */
+    await withTenant(params.tenantId, (tx) =>
+      tx.insert(auditLogs).values({
       tenantId: params.tenantId,
       // NULL — there is no internal user. This is the honest value.
       actorUserId: null,
@@ -342,7 +344,8 @@ export async function writePortalAudit(params: {
         portalLinkId: params.portalLinkId,
         ...params.metadata,
       },
-    });
+      }),
+    );
   } catch (err) {
     console.error("[portal] audit write failed", err);
   }

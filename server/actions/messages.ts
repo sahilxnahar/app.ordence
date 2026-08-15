@@ -33,8 +33,8 @@ import {
   type ThreadRow,
 } from "@/lib/work/threads";
 
-const READ = "crm.contacts.read" as const;
-const WRITE = "crm.contacts.write" as const;
+const READ = "contacts:read" as const;
+const WRITE = "contacts:update" as const;
 
 const SUBJECT_TYPES = [
   "company",

@@ -1,6 +1,6 @@
 {
   "name": "ordence",
-  "version": "1.22.0-alpha",
+  "version": "1.43.0-alpha",
   "private": true,
   "scripts": {
     "dev": "next dev",
@@ -38,7 +38,12 @@
     "seed:contracting": "tsx scripts/seed-contracting-demo.ts",
     "check:sql": "node scripts/check-sql-completeness.mjs",
     "check:posting": "node scripts/check-posting-coverage.mjs",
-    "check:reachability": "node scripts/check-reachability.mjs"
+    "check:reachability": "node scripts/check-reachability.mjs",
+    "check:guards": "node scripts/check-action-guards.mjs",
+    "check:sql-executes": "node scripts/check-sql-executes.mjs",
+    "check:rls-writes": "node scripts/check-rls-writes.mjs",
+    "check:tax-decisions": "node scripts/check-tax-decisions.mjs",
+    "check:links": "node scripts/check-links.mjs"
   },
   "dependencies": {
     "@clerk/nextjs": "^6.39.6",

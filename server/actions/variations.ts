@@ -49,6 +49,7 @@
  * register is for.
  */
 
+import type { PermissionKey } from "@/db/schema/auth";
 import { z } from "zod";
 import { and, eq, sql, desc, asc, inArray } from "drizzle-orm";
 import { revalidatePath } from "next/cache";
@@ -564,7 +565,7 @@ async function transitionVariation(
   input: unknown,
   to: VariationStatusLike,
   operation: string,
-  permission: string,
+  permission: PermissionKey,
 ): Promise<ActionResult<{ id: string; status: VariationStatusLike }>> {
   const data = transitionSchema.parse(input);
 

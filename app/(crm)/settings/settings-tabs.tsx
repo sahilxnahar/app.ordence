@@ -26,6 +26,7 @@ const TABS = [
   // live and is reached from the main navigation; this tab is where the
   // shapes are inspected. Two routes, two questions.
   { href: "/settings/objects", label: "Custom objects" },
+  { href: "/settings/support-access", label: "Support access" },
   { href: "/settings/recovery", label: "Recycle bin" },
 ];
 

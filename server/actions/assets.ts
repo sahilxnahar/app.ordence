@@ -33,7 +33,7 @@
 import { z } from "zod";
 import { revalidatePath } from "next/cache";
 import { and, eq, isNull, desc } from "drizzle-orm";
-import { db } from "@/db";
+import { db, withTenant } from "@/db";
 import {
   assets,
   customObjectDefinitions,
@@ -85,16 +85,18 @@ export async function getAssetFieldSpecs(): Promise<ActionResult<DynamicFieldSpe
   try {
     const ctx = await requireTenantContext();
 
-    const definition = await db.query.customObjectDefinitions.findFirst({
-      where: and(
-        eq(customObjectDefinitions.tenantId, ctx.tenant.id),
-        eq(customObjectDefinitions.slug, "asset"),
-        isNull(customObjectDefinitions.deletedAt),
-      ),
-      with: {
-        fields: { where: isNull(customFieldDefinitions.deletedAt) },
-      },
-    });
+    const definition = await withTenant(ctx.tenant.id, (tx) =>
+      tx.query.customObjectDefinitions.findFirst({
+        where: and(
+          eq(customObjectDefinitions.tenantId, ctx.tenant.id),
+          eq(customObjectDefinitions.slug, "asset"),
+          isNull(customObjectDefinitions.deletedAt),
+        ),
+        with: {
+          fields: { where: isNull(customFieldDefinitions.deletedAt) },
+        },
+      })
+    );
 
     const rows = (definition as { fields?: Array<Record<string, unknown>> } | undefined)?.fields;
 
@@ -171,33 +173,35 @@ export async function createAsset(input: CreateAssetInput): Promise<ActionResult
       return fail("Some custom fields need attention.", prefixed);
     }
 
-    const [created] = await db
-      .insert(assets)
-      .values({
-        tenantId: ctx.tenant.id,
-        name: parsed.name,
-        assetType: parsed.assetType,
-        assetSubtype: parsed.assetSubtype ?? null,
-        code: parsed.code ?? null,
-        description: parsed.description ?? null,
-        status: parsed.status,
-        dynamicAttributes: dynamicParsed.data,
-        valueAmount: parsed.valueAmount ?? null,
-        currency: parsed.currency,
-        areaValue: parsed.areaValue ?? null,
-        areaUnit: parsed.areaUnit ?? null,
-        quantity: parsed.quantity,
-        addressLine1: parsed.addressLine1 ?? null,
-        addressLine2: parsed.addressLine2 ?? null,
-        locality: parsed.locality ?? null,
-        city: parsed.city ?? null,
-        state: parsed.state ?? null,
-        postalCode: parsed.postalCode ?? null,
-        acquiredDate: parsed.acquiredDate ?? null,
-        commissionedDate: parsed.commissionedDate ?? null,
-        createdBy: ctx.user.id,
-      })
-      .returning();
+    const [created] = await withTenant(ctx.tenant.id, (tx) =>
+      tx
+        .insert(assets)
+        .values({
+          tenantId: ctx.tenant.id,
+          name: parsed.name,
+          assetType: parsed.assetType,
+          assetSubtype: parsed.assetSubtype ?? null,
+          code: parsed.code ?? null,
+          description: parsed.description ?? null,
+          status: parsed.status,
+          dynamicAttributes: dynamicParsed.data,
+          valueAmount: parsed.valueAmount ?? null,
+          currency: parsed.currency,
+          areaValue: parsed.areaValue ?? null,
+          areaUnit: parsed.areaUnit ?? null,
+          quantity: parsed.quantity,
+          addressLine1: parsed.addressLine1 ?? null,
+          addressLine2: parsed.addressLine2 ?? null,
+          locality: parsed.locality ?? null,
+          city: parsed.city ?? null,
+          state: parsed.state ?? null,
+          postalCode: parsed.postalCode ?? null,
+          acquiredDate: parsed.acquiredDate ?? null,
+          commissionedDate: parsed.commissionedDate ?? null,
+          createdBy: ctx.user.id,
+        })
+        .returning()
+    );
 
     if (!created) return fail("Failed to create the asset.");
 
@@ -217,15 +221,17 @@ export async function getAsset(id: string): Promise<ActionResult<Asset>> {
     const ctx = await requireTenantContext();
     const parsedId = z.string().uuid("Invalid identifier.").parse(id);
 
-    const row = await db.query.assets.findFirst({
-      where: and(
-        eq(assets.id, parsedId),
-        // The tenant filter is written explicitly even though RLS also
-        // enforces it. Two independent checks; either one alone is enough.
-        eq(assets.tenantId, ctx.tenant.id),
-        isNull(assets.deletedAt),
-      ),
-    });
+    const row = await withTenant(ctx.tenant.id, (tx) =>
+      tx.query.assets.findFirst({
+        where: and(
+          eq(assets.id, parsedId),
+          // The tenant filter is written explicitly even though RLS also
+          // enforces it. Two independent checks; either one alone is enough.
+          eq(assets.tenantId, ctx.tenant.id),
+          isNull(assets.deletedAt),
+        ),
+      })
+    );
 
     if (!row) return fail("Asset not found.");
     return { ok: true, data: row };
@@ -239,12 +245,14 @@ export async function getRecentAssets(limit = 20): Promise<ActionResult<Asset[]>
     const ctx = await requireTenantContext();
     const capped = Math.min(Math.max(1, limit), 100);
 
-    const rows = await db
-      .select()
-      .from(assets)
-      .where(and(eq(assets.tenantId, ctx.tenant.id), isNull(assets.deletedAt)))
-      .orderBy(desc(assets.createdAt))
-      .limit(capped);
+    const rows = await withTenant(ctx.tenant.id, (tx) =>
+      tx
+        .select()
+        .from(assets)
+        .where(and(eq(assets.tenantId, ctx.tenant.id), isNull(assets.deletedAt)))
+        .orderBy(desc(assets.createdAt))
+        .limit(capped)
+    );
 
     return { ok: true, data: rows };
   } catch (err) {

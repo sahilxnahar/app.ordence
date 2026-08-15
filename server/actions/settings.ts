@@ -30,7 +30,7 @@
 import { z } from "zod";
 import { revalidatePath } from "next/cache";
 import { eq } from "drizzle-orm";
-import { db } from "@/db";
+import { db, withTenant } from "@/db";
 import { tenants } from "@/db/schema";
 import { requirePermission, writeAudit, auditMeta } from "@/server/audit";
 import { TenantAccessError } from "@/server/tenant-context";
@@ -89,18 +89,20 @@ export async function getWorkspaceSettings(): Promise<ActionResult<WorkspaceSett
   try {
     const ctx = await requirePermission("settings:read");
 
-    const row = await db.query.tenants.findFirst({
-      where: eq(tenants.id, ctx.tenant.id),
-      columns: {
-        id: true,
-        name: true,
-        slug: true,
-        planTier: true,
-        status: true,
-        seatLimit: true,
-        settings: true,
-      },
-    });
+    const row = await withTenant(ctx.tenant.id, (tx) =>
+      tx.query.tenants.findFirst({
+        where: eq(tenants.id, ctx.tenant.id),
+        columns: {
+          id: true,
+          name: true,
+          slug: true,
+          planTier: true,
+          status: true,
+          seatLimit: true,
+          settings: true,
+        },
+      })
+    );
 
     if (!row) return fail("Workspace not found.");
 
@@ -118,10 +120,12 @@ async function mergeSettings(
   tenantId: string,
   patch: Record<string, unknown>,
 ): Promise<Record<string, unknown>> {
-  const existing = await db.query.tenants.findFirst({
-    where: eq(tenants.id, tenantId),
-    columns: { settings: true },
-  });
+  const existing = await withTenant(tenantId, (tx) =>
+    tx.query.tenants.findFirst({
+      where: eq(tenants.id, tenantId),
+      columns: { settings: true },
+    })
+  );
   return { ...((existing?.settings ?? {}) as Record<string, unknown>), ...patch };
 }
 
@@ -141,16 +145,18 @@ export async function updateGeneralSettings(
       dateFormat: data.dateFormat,
     });
 
-    const [updated] = await db
-      .update(tenants)
-      .set({
-        name: data.name,
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        settings: merged as any,
-        updatedAt: new Date(),
-      })
-      .where(eq(tenants.id, ctx.tenant.id))
-      .returning({ id: tenants.id });
+    const [updated] = await withTenant(ctx.tenant.id, (tx) =>
+      tx
+        .update(tenants)
+        .set({
+          name: data.name,
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          settings: merged as any,
+          updatedAt: new Date(),
+        })
+        .where(eq(tenants.id, ctx.tenant.id))
+        .returning({ id: tenants.id })
+    );
 
     if (!updated) return fail("Could not save your settings.");
 
@@ -194,15 +200,17 @@ export async function updateFinancialSettings(
       sessionIdleMinutes: data.sessionIdleMinutes,
     });
 
-    const [updated] = await db
-      .update(tenants)
-      .set({
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        settings: merged as any,
-        updatedAt: new Date(),
-      })
-      .where(eq(tenants.id, ctx.tenant.id))
-      .returning({ id: tenants.id });
+    const [updated] = await withTenant(ctx.tenant.id, (tx) =>
+      tx
+        .update(tenants)
+        .set({
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          settings: merged as any,
+          updatedAt: new Date(),
+        })
+        .where(eq(tenants.id, ctx.tenant.id))
+        .returning({ id: tenants.id })
+    );
 
     if (!updated) return fail("Could not save your settings.");
 

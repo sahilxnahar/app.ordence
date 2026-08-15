@@ -153,7 +153,36 @@ const CATEGORIES: EnvCategory[] = [
     name: "Security",
     description: "CSP enforcement and seed safety catches.",
     required: [],
-    optional: ["CSP_ENFORCE", "SEED_ALLOW_PROD"],
+    optional: ["CSP_ENFORCE", "CSP_REPORT_URI", "SEED_ALLOW_PROD"],
+  },
+  {
+    /**
+     * 🔴 THESE TWO APPEARED IN NO DEPLOYMENT ARTIFACT ANYWHERE.
+     *
+     * Not in `.env.example`, not in `RAILWAY-VARIABLES-PASTE.txt`, not
+     * in `docs/ENVIRONMENT-VARIABLES.md`, and not here. An operator
+     * following any shipped document set neither, so `vaultReadiness()`
+     * returned not-ready, every `putSecret` refused, and no integration
+     * credential could be saved — with no entry in the one endpoint
+     * built to explain exactly this class of failure.
+     *
+     * ⚠️ OPTIONAL, NOT REQUIRED. The vault fails closed and nothing
+     * leaks without it; the product simply cannot store a connector
+     * credential. Refusing to boot over it would take down deployments
+     * that legitimately use no connectors.
+     */
+    name: "Vault",
+    description:
+      "Application-level encryption for tenant integration credentials. " +
+      "Absent means connectors cannot be configured; nothing is stored in the clear.",
+    required: [],
+    optional: ["VAULT_ENCRYPTION_KEY", "VAULT_BLIND_INDEX_PEPPER"],
+  },
+  {
+    name: "Object Storage (R2)",
+    description: "Cloudflare R2 over the S3 API. All four or none.",
+    required: [],
+    optional: ["S3_ENDPOINT", "S3_BUCKET", "S3_ACCESS_KEY_ID", "S3_SECRET_ACCESS_KEY"],
   },
   {
     name: "Telemetry",
@@ -174,11 +203,26 @@ const REQUIRED = CATEGORIES.flatMap((c) => c.required);
 const OPTIONAL = CATEGORIES.flatMap((c) => c.optional);
 
 export async function GET() {
-  const settings: Record<string, { present: boolean; length: number }> = {};
+  /**
+   * ══════════════════════════════════════════════════════════════════
+   * 🔴 PRESENCE ONLY. THE LENGTH FIELD IS GONE.
+   * ══════════════════════════════════════════════════════════════════
+   * This route is public, and it returned `{ present, length }` for all
+   * 47 names — including `CLERK_SECRET_KEY`, `RAZORPAY_KEY_SECRET`,
+   * `WORKER_API_SECRET` and `S3_SECRET_ACCESS_KEY`. The header a few
+   * lines up claims "It never returns the VALUE of anything", which was
+   * true and beside the point: an exact character count is a
+   * truncated-paste oracle and a fingerprint of which key format is in
+   * use, handed to anybody who asks.
+   *
+   * ⚠️ THE BOOLEAN IS THE WHOLE JOB. Every question this endpoint
+   * exists to answer — is it set, did it reach the running server, is
+   * the required list satisfied — is answered by presence.
+   */
+  const settings: Record<string, { present: boolean }> = {};
 
   for (const name of [...REQUIRED, ...OPTIONAL]) {
-    const value = readRuntimeEnv(name);
-    settings[name] = { present: value !== undefined, length: value?.length ?? 0 };
+    settings[name] = { present: readRuntimeEnv(name) !== undefined };
   }
 
   const missing = REQUIRED.filter((name) => !settings[name]?.present);
@@ -194,7 +238,7 @@ export async function GET() {
       total: all.length,
       present,
       requiredMissing,
-      vars: Object.fromEntries(all.map((n) => [n, settings[n] ?? { present: false, length: 0 }])),
+      vars: Object.fromEntries(all.map((n) => [n, settings[n] ?? { present: false }])),
     };
   });
 
@@ -212,9 +256,40 @@ export async function GET() {
    * never created, which is a completely different problem from a bad
    * password and used to look identical from outside.
    */
-  let database: Record<string, unknown> = { attempted: false };
+  /**
+   * ══════════════════════════════════════════════════════════════════
+   * 🔴 THE INFRASTRUCTURE PROBES ARE STAFF-ONLY NOW
+   * ══════════════════════════════════════════════════════════════════
+   * They told an anonymous caller the Postgres role name (so, whether
+   * the app runs as `ordence_app` or as the BYPASSRLS owner), how many
+   * tables and policies exist, and on failure the RAW DRIVER MESSAGE —
+   * which the sibling `/api/ready` deliberately reduces to a SQLSTATE,
+   * with a comment saying a driver error can carry the connection
+   * string and this endpoint is unauthenticated.
+   *
+   * Worse than the disclosure: each probe opened a fresh Neon HTTP
+   * connection AND a WebSocket pool with a real transaction, on every
+   * request, with no rate limit. An unauthenticated loop exhausts the
+   * connection budget and takes the product down.
+   *
+   * ⭐ THE TWO-KEY REPORT STAYS PUBLIC. It is the state this endpoint
+   * exists to explain, it answers only about the caller's own account,
+   * and it says nothing at all to somebody who is not signed in.
+   */
+  const operator = await (async () => {
+    try {
+      const { getPlatformOperator } = await import("@/server/platform/guard");
+      return await getPlatformOperator();
+    } catch {
+      return null;
+    }
+  })();
 
-  if (settings.DATABASE_URL?.present) {
+  let database: Record<string, unknown> = operator
+    ? { attempted: false }
+    : { attempted: false, withheld: "Sign in as platform staff to run this probe." };
+
+  if (operator && settings.DATABASE_URL?.present) {
     try {
       const { neon } = await import("@neondatabase/serverless");
       const sql = neon(readRuntimeEnv("DATABASE_URL") as string);
@@ -238,9 +313,16 @@ export async function GET() {
       database = {
         attempted: true,
         connected: false,
-        // The driver's message names the fault — wrong password, no such
-        // host, refused connection. It contains no credentials.
-        error: error instanceof Error ? error.message : String(error),
+        /**
+         * ⚠️ THE CODE, NOT THE MESSAGE. The old comment argued the
+         * driver's text "contains no credentials" — which is true of
+         * the errors anyone thought to test, and not a property the
+         * driver guarantees. `/api/ready` already made the opposite
+         * call for the same reason. A SQLSTATE plus the error name is
+         * enough to tell wrong-password from no-such-host.
+         */
+        code: (error as { code?: string })?.code ?? null,
+        name: error instanceof Error ? error.name : "unknown",
       };
     }
   }
@@ -268,9 +350,11 @@ export async function GET() {
    * that fallback survives the `global_fetch_strictly_public` compatibility
    * flag is the open question this answers.
    */
-  let transaction: Record<string, unknown> = { attempted: false };
+  let transaction: Record<string, unknown> = operator
+    ? { attempted: false }
+    : { attempted: false, withheld: "Sign in as platform staff to run this probe." };
 
-  if (settings.DATABASE_URL?.present) {
+  if (operator && settings.DATABASE_URL?.present) {
     try {
       const { Pool } = await import("@neondatabase/serverless");
       const pool = new Pool({ connectionString: readRuntimeEnv("DATABASE_URL") as string });
@@ -303,7 +387,8 @@ export async function GET() {
       transaction = {
         attempted: true,
         ok: false,
-        error: error instanceof Error ? error.message : String(error),
+        code: (error as { code?: string })?.code ?? null,
+        name: error instanceof Error ? error.name : "unknown",
         note: "Transactions do NOT work in this runtime. Every signed-in page will fail.",
       };
     }
@@ -395,10 +480,17 @@ export async function GET() {
                 "or row-level security is hiding it from this connection.",
             };
       } catch (error) {
+        /**
+         * ⚠️ SAME RULE AS THE PROBES ABOVE. This block is reachable by
+         * any signed-in user of any tenant, and a Drizzle or driver
+         * error raised while reading `platform_staff` under
+         * `withPlatformScope` has no business being echoed to them.
+         */
         staffRow = {
           attempted: true,
           found: false,
-          error: error instanceof Error ? error.message : String(error),
+          code: (error as { code?: string })?.code ?? null,
+          name: error instanceof Error ? error.name : "unknown",
         };
       }
 
@@ -427,7 +519,8 @@ export async function GET() {
   } catch (error) {
     platform = {
       signedIn: false,
-      error: error instanceof Error ? error.message : String(error),
+      code: (error as { code?: string })?.code ?? null,
+      name: error instanceof Error ? error.name : "unknown",
     };
   }
 

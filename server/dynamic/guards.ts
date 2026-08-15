@@ -45,6 +45,7 @@ import { IdentifierError } from "@/lib/dynamic/identifiers";
 import { DdlPlanError } from "@/lib/dynamic/ddl";
 import type { FeatureKey } from "@/lib/entitlements/features";
 import type { ActionResult } from "@/lib/validators/crm";
+import type { PermissionKey } from "@/db/schema/auth";
 
 /**
  * The one feature key this phase gates on.
@@ -66,7 +67,7 @@ export const DYNAMIC_FEATURE: FeatureKey = "crm.custom_objects";
  */
 export async function guardDynamicWrite(args: {
   operation: string;
-  permission: string;
+  permission: PermissionKey;
   resource?: { type?: string; id?: string };
   /**
    * Override the key the IMPERSONATION policy is evaluated against.

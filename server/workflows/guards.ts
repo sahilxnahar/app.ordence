@@ -42,6 +42,7 @@ import { evaluatePermission, PermissionDeniedError } from "@/lib/permissions";
 import type { FeatureKey } from "@/lib/entitlements/features";
 import type { ActionResult } from "@/lib/validators/crm";
 import type { SystemRole } from "@/db/schema/core";
+import type { PermissionKey } from "@/db/schema/auth";
 
 /**
  * Run the three application gates and return the tenant context.
@@ -54,7 +55,7 @@ import type { SystemRole } from "@/db/schema/core";
 export async function guardWorkflowWrite(args: {
   operation: string;
   feature: FeatureKey;
-  permission: string;
+  permission: PermissionKey;
   resource?: { type?: string; id?: string };
   /**
    * Override the key the IMPERSONATION policy is evaluated against.

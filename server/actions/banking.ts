@@ -39,6 +39,7 @@ import {
   bankStatements,
 } from "@/db/schema/banking";
 import { customerReceipts } from "@/db/schema/sales-invoices";
+import { ledgers } from "@/db/schema/accounting";
 import { vendorPayments } from "@/db/schema/procurement";
 import { requirePermission, writeAudit } from "@/server/audit";
 import { toSalesActionError } from "@/server/sales/guards";
@@ -54,7 +55,26 @@ import {
 } from "@/lib/banking/match";
 import type { ActionResult } from "@/lib/validators/crm";
 
-const MANAGE = "settings.manage" as const;
+const MANAGE = "settings:update" as const;
+
+/**
+ * ⭐ A REFUSAL THAT CARRIES ITS REMEDY. Added v1.39.0 (Batch 36).
+ *
+ * The alternative is letting the unique-violation surface: an operator
+ * who typed a ledger code already in their chart of accounts would see
+ * "duplicate key value violates unique constraint
+ * ledgers_code_tenant_unique", conclude the software is broken, and ask
+ * somebody to fix it in the database. Which is how the only row in this
+ * table would have got there before today anyway.
+ */
+class BankAccountRefusal extends Error {
+  readonly remedy: string;
+  constructor(message: string, remedy: string) {
+    super(message);
+    this.name = "BankAccountRefusal";
+    this.remedy = remedy;
+  }
+}
 
 /* ------------------------------------------------------------------ */
 /* IMPORT                                                              */
@@ -88,6 +108,219 @@ const importSchema = z.object({
     .min(1)
     .max(5000),
 });
+
+/* ================================================================== */
+/* ⭐⭐ CREATE A BANK ACCOUNT — v1.39.0 (Batch 36)                      */
+/* ================================================================== */
+
+/**
+ * 🔴 `insert(bankAccounts)` APPEARED NOWHERE IN THIS TREE.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * NOT "NO SCREEN". NO CODE PATH AT ALL, ANYWHERE.
+ * ══════════════════════════════════════════════════════════════════════
+ * Reconciliation, statement import, matching, payment recording and the
+ * whole banking section were built on a table that nothing could put a
+ * row in. The only way a workspace could ever have had a bank account
+ * was somebody typing INSERT at a psql prompt.
+ *
+ * ⚠️ AND IT LOOKED FINE FROM EVERY ANGLE. `getBankAccounts()` returns an
+ * empty list, which is indistinguishable from a new workspace that has
+ * not added one yet. The reconciliation screen renders, says "no
+ * accounts", and invites you to import a statement against nothing.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * ⭐ WHY THE LEDGER IS CREATED HERE AND NOT SEPARATELY
+ * ══════════════════════════════════════════════════════════════════════
+ * `bank_accounts.ledger_id` is NOT NULL with ON DELETE RESTRICT, and
+ * `bank_accounts_one_per_ledger` makes it exclusive: two bank accounts
+ * on one ledger cannot be reconciled at all, so the database refuses it.
+ *
+ * So a bank account without its own ledger is not merely inconvenient,
+ * it is impossible. A two-step flow — make a ledger, then make an
+ * account pointing at it — would produce three failure modes on day one:
+ * a ledger with no account, an account pointed at the wrong ledger, and
+ * an operator who picks an EXISTING ledger that already has an account
+ * and gets a unique-violation they cannot interpret.
+ *
+ * 🔴 ONE TRANSACTION, BOTH ROWS, OR NEITHER. That is what makes this
+ * safe to expose to somebody who has never heard the word "ledger".
+ */
+const createBankAccountSchema = z.object({
+  label: z.string().trim().min(1, "Give this account a name you will recognise.").max(160),
+  bankName: z.string().trim().min(1, "Which bank is it with?").max(160),
+
+  /**
+   * ⚠️ LAST FOUR ONLY, AND THE SCHEMA IS WHERE THAT IS ENFORCED.
+   *
+   * The column is varchar(4). Accepting a full account number here and
+   * truncating would mean the full number arrived at the server, was
+   * logged by whatever logs request bodies, and then was discarded. The
+   * discipline only works if the full number never crosses the wire.
+   */
+  accountLast4: z
+    .string()
+    .trim()
+    .regex(/^\d{4}$/, "The last four digits only. Never the full account number.")
+    .optional(),
+
+  /**
+   * ⚠️ THE REAL IFSC SHAPE: four letters, a zero, six alphanumerics.
+   * A plain length check accepts "0000000000A", which fails at the bank
+   * on the day somebody tries to pay a vendor.
+   */
+  ifsc: z
+    .string()
+    .trim()
+    .toUpperCase()
+    .regex(/^[A-Z]{4}0[A-Z0-9]{6}$/, "An IFSC is four letters, a zero, then six characters.")
+    .optional(),
+
+  /**
+   * ⭐ THE LEDGER CODE IS THE OPERATOR'S, NOT OURS. An accountant who
+   * already runs a chart of accounts needs this account to sit where
+   * their existing numbering says it should. Generating one would
+   * guarantee a rename on the first day of real use.
+   */
+  ledgerCode: z
+    .string()
+    .trim()
+    .min(1, "Give the ledger a code from your chart of accounts.")
+    .max(40)
+    .regex(/^[A-Za-z0-9._-]+$/, "Use letters, numbers, dot, dash or underscore."),
+
+  /**
+   * ⚠️ `trust` IS NOT A LABEL, IT IS A LEGAL BOUNDARY. Client money held
+   * on trust is not the firm's asset, and commingling it with operating
+   * funds is a regulatory breach for a law firm or an escrow agent. It
+   * is offered here because the ledger type cannot be changed later
+   * without moving every transaction on it.
+   */
+  ledgerType: z
+    .enum(["operating", "trust", "escrow", "retention"])
+    .default("operating"),
+
+  currency: z.string().trim().length(3).default("INR"),
+});
+
+export type CreateBankAccountInput = z.input<typeof createBankAccountSchema>;
+
+export async function createBankAccount(
+  input: unknown,
+): Promise<ActionResult<{ bankAccountId: string; ledgerId: string; note: string }>> {
+  try {
+    const data = createBankAccountSchema.parse(input);
+    const ctx = await requirePermission(MANAGE);
+
+    const outcome = await withTenant(
+      ctx.tenant.id,
+      async (tx) => {
+        /**
+         * ⚠️ CHECKED BEFORE INSERTING RATHER THAN CAUGHT AFTER, because
+         * the constraint violation for a duplicate ledger code says
+         * "ledgers_code_tenant_unique", which tells an operator nothing
+         * about which of their two forms was wrong.
+         */
+        const [clash] = await tx
+          .select({ id: ledgers.id, name: ledgers.name })
+          .from(ledgers)
+          .where(
+            and(
+              eq(ledgers.tenantId, ctx.tenant.id),
+              eq(ledgers.code, data.ledgerCode),
+            ),
+          )
+          .limit(1);
+
+        if (clash) {
+          throw new BankAccountRefusal(
+            `Ledger code ${data.ledgerCode} is already used by "${clash.name}".`,
+            "Pick a code that is not in your chart of accounts yet. A bank account needs a ledger of its own, because two accounts sharing one ledger cannot be reconciled.",
+          );
+        }
+
+        const [ledger] = await tx
+          .insert(ledgers)
+          .values({
+            tenantId: ctx.tenant.id,
+            name: data.label,
+            code: data.ledgerCode,
+            description: `Bank account at ${data.bankName}${
+              data.accountLast4 ? ` ending ${data.accountLast4}` : ""
+            }.`,
+            type: data.ledgerType,
+            /**
+             * 🔴 A BANK ACCOUNT IS AN ASSET, ALWAYS, AND THIS IS NOT
+             * OFFERED AS A CHOICE. An overdrawn account is still an
+             * asset ledger carrying a credit balance; recording it as a
+             * liability would put it on the wrong side of the balance
+             * sheet and make the overdraft invisible when it clears.
+             */
+            accountType: "asset",
+            currency: data.currency,
+            requiresReconciliation: true,
+            createdBy: ctx.user.id,
+          })
+          .returning({ id: ledgers.id });
+
+        if (!ledger) throw new Error("The ledger could not be written.");
+
+        const [account] = await tx
+          .insert(bankAccounts)
+          .values({
+            tenantId: ctx.tenant.id,
+            ledgerId: ledger.id,
+            label: data.label,
+            bankName: data.bankName,
+            accountLast4: data.accountLast4 ?? null,
+            ifsc: data.ifsc ?? null,
+            /**
+             * ⚠️ `reconciledTo` STAYS NULL. It means "everything on or
+             * before this date has been explained", and nothing has.
+             * Defaulting it to today would silently assert that every
+             * transaction before opening the account is reconciled.
+             */
+            reconciledTo: null,
+            createdBy: ctx.user.id,
+          })
+          .returning({ id: bankAccounts.id });
+
+        if (!account) throw new Error("The bank account could not be written.");
+
+        return { bankAccountId: account.id, ledgerId: ledger.id };
+      },
+      { impersonationId: ctx.impersonationId },
+    );
+
+    await writeAudit(ctx, {
+      action: "create",
+      resourceType: "bank_account",
+      resourceId: outcome.bankAccountId,
+      newValue: {
+        label: data.label,
+        bankName: data.bankName,
+        ledgerCode: data.ledgerCode,
+        ledgerType: data.ledgerType,
+      },
+    });
+
+    revalidatePath("/banking");
+    revalidatePath("/accounting");
+
+    return {
+      ok: true,
+      data: {
+        ...outcome,
+        note: `${data.label} is open, with ledger ${data.ledgerCode}. Nothing is reconciled yet: import a statement to start explaining what has moved.`,
+      },
+    };
+  } catch (err) {
+    if (err instanceof BankAccountRefusal) {
+      return { ok: false, error: `${err.message} ${err.remedy}` };
+    }
+    return toSalesActionError(err, "createBankAccount");
+  }
+}
 
 export async function importStatement(
   input: unknown,

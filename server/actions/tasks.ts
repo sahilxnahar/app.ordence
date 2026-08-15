@@ -40,8 +40,8 @@ import {
   type TaskStatus,
 } from "@/lib/work/tasks";
 
-const READ = "crm.contacts.read" as const;
-const WRITE = "crm.contacts.write" as const;
+const READ = "contacts:read" as const;
+const WRITE = "contacts:update" as const;
 
 const civilDay = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "Use YYYY-MM-DD.");
 

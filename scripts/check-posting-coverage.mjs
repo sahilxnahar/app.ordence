@@ -45,10 +45,60 @@ const FINANCIAL_MODULES = [
   "purchases",
   "receivables",
   "ra-bills",
-  "labour",
+  /**
+   * ⭐⭐⭐ `labour` REPLACED BY `payroll` IN v1.23.0-alpha, AND IT IS A
+   * DECISION RATHER THAN A RELABELLING.
+   *
+   * 🔴 `labour` WAS NEVER THE MODULE WITH THE ECONOMIC EFFECT, and the
+   * note that used to sit in KNOWN_UNPOSTED said so: attendance, piece
+   * rates and rosters are INPUTS to a wage calculation. There is no
+   * document to post, and asking `labour.ts` to post would mean
+   * inventing a journal for an event that has none.
+   *
+   * ⭐ THE DOCUMENT IS THE PAYROLL RUN, and it now exists. It posts the
+   * gross to Salaries and Wages, the employer's own contributions as
+   * separate expenses, and five statutory liabilities — which is where
+   * the cost of employing people actually reaches the ledger.
+   *
+   * ⚠️ SITE LABOUR REMAINS UNPOSTED AND CORRECTLY SO. Contract workers
+   * are paid through their contractor's RA bill, and `ra-bills` is on
+   * this list and posts.
+   */
+  "payroll",
   "metering",
-  "billing",
+  /**
+   * ══════════════════════════════════════════════════════════════════
+   * ⭐⭐⭐ `billing` REMOVED FROM THIS LIST IN v1.28.0-alpha, AND IT IS
+   *        A CATEGORY CORRECTION RATHER THAN A COMPLETION
+   * ══════════════════════════════════════════════════════════════════
+   * Its excuse read: "Subscription invoices are OUR revenue rather than
+   * a tenant's. Different chart of accounts, different owner."
+   *
+   * 🔴 THAT IS NOT A REASON IT HAS NOT POSTED YET. IT IS A REASON IT
+   * NEVER WILL. `server/actions/billing.ts` handles a tenant's
+   * subscription to ORDENCE — what they owe us. It belongs in Ordence's
+   * own books, which are not in this database and are not a tenant
+   * ledger. There is no correct journal for it to write here.
+   *
+   * ⚠️ AND A DEBT LIST THAT CONTAINS SOMETHING THAT CAN NEVER BE PAID
+   * OFF STOPS BEING A DEBT LIST. It can never reach zero, so "8 of 10"
+   * reads as unfinished work forever and nobody looks at the remaining
+   * entry closely enough to notice it is not work at all.
+   *
+   * ⭐ Same decision as `labour` → `payroll` and `tds` →
+   * `vendor-payments` before it: the list is corrected, not padded.
+   */
   "sales-bookings",
+  /**
+   * ⭐ ADDED IN v1.25.0-alpha, AND ADDING IT IS THE POINT.
+   *
+   * Brokerage is the largest single selling cost a developer has, and
+   * it carries a TDS liability the department charges interest on. A
+   * module that moves that much money belongs on this list whether or
+   * not it posts — putting it here is what makes the answer checkable
+   * instead of assumed.
+   */
+  "sales-brokerage",
   /**
    * ⭐⭐ RENAMED FROM `tds` IN v1.11.0, AND IT IS A CORRECTION RATHER
    *     THAN A RELABELLING.
@@ -91,31 +141,43 @@ const FINANCIAL_MODULES = [
 const KNOWN_UNPOSTED = {
 
   /**
-   * ⚠️ CORRECTED IN v1.0.0-rc.2. I previously wrote that labour needed
-   * "five legs with statutory due dates". That was wrong about the
-   * blocker: `server/actions/labour.ts` has no payroll run at all.
-   * Attendance, piece-rate entries and rosters are INPUTS to a wage
-   * calculation, not economic events — there is no document to post.
-   * The payroll run has to be built before posting is even a question.
-   */
-  labour:
-    "No payroll run exists. Attendance and piece-rate entries are inputs, not documents — there is nothing to post yet. Needs a payroll run first. Session 10b.",
-  metering: "Consumption billing produces revenue and has no posting path yet. Session 12.",
-  billing:
-    "Subscription invoices are OUR revenue rather than a tenant's. Different chart of accounts, different owner. Session 12.",
-  /**
-   * ⚠️ CORRECTED IN v1.0.0-rc.3. The blocker was never the design
-   * decision — that is settled (the counterparty is the BOOKING). A
-   * booking by itself moves no money: it reserves a unit. The economic
-   * events are the demand notice, the receipt and possession, and all
-   * three now post from `receivables`.
+   * ⭐⭐⭐ `metering` REMOVED IN v1.28.0-alpha, AFTER TWENTY-SIX
+   *       SESSIONS ON THIS LIST.
    *
-   * What remains is genuinely separate: FORFEITURE on cancellation and
-   * BROKERAGE payable to a channel partner. Both are real journals with
-   * no action behind them yet.
+   * It read: "Consumption billing produces revenue and has no posting
+   * path yet. Session 12." That was accurate for the whole of that
+   * time — `closeMeterPeriod` computed an energy charge, a fixed
+   * charge, electricity duty and a net-metering export credit, stamped
+   * a total, and the money went nowhere.
+   *
+   * `postMeterBill` now books it: the recovery to income, the duty to a
+   * LIABILITY because it is collected for the State, and the export
+   * credit as contra-revenue — with a payable rather than a negative
+   * debtor when a solar month comes out negative.
+   *
+   * ⚠️ AND `billing` LEFT THE MODULE LIST ENTIRELY, above, because it
+   * was never debt. With both gone this list is EMPTY, which is the
+   * first time it has been — and an empty list is only meaningful
+   * because the entries left it one at a time, by decision, each with
+   * the reasoning written down.
    */
-  "sales-bookings":
-    "A booking reserves a unit and moves no money. What is missing is cancellation forfeiture and channel-partner brokerage — neither has an action yet. Session 11b.",
+  /**
+   * ⭐⭐⭐ `sales-bookings` REMOVED IN v1.25.0-alpha, AFTER ELEVEN
+   *       SESSIONS ON THIS LIST.
+   *
+   * It read: "A booking reserves a unit and moves no money. What is
+   * missing is cancellation forfeiture and channel-partner brokerage —
+   * neither has an action yet."
+   *
+   * Both now exist. `postBookingCancellation` clears the advance, the
+   * unpaid demands and the output tax in one entry, posting the
+   * forfeiture as income and the refund as a liability. And
+   * `sales-brokerage.ts` books the expense, the 194H deduction and the
+   * payable.
+   *
+   * ⚠️ THE ENTRY IS DELETED RATHER THAN REWORDED. A list that never
+   * shrinks by decision only shrinks by neglect.
+   */
   /**
    * ⭐⭐ `tds` REMOVED FROM THIS LIST IN v1.11.0, BY DECISION.
    *

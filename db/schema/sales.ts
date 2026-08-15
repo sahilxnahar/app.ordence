@@ -168,6 +168,23 @@ export const kycStatusEnum = pgEnum("kyc_status", [
   "rejected",
 ]);
 
+/**
+ * ⭐ v1.25.0-alpha — the life of a brokerage bill.
+ *
+ * ⚠️ IT RATCHETS, AND A TRIGGER ENFORCES THAT. Once a bill is posted its
+ * figures are in the trial balance and in a TDS return; letting it walk
+ * back to `draft` for an edit would restate a deduction that has already
+ * been certified to a broker. The remedy for a wrong bill is `cancelled`
+ * plus a new one, which is what the paper trail should show anyway.
+ */
+export const commissionStatusEnum = pgEnum("commission_status", [
+  "draft",
+  "approved",
+  "posted",
+  "paid",
+  "cancelled",
+]);
+
 /* ------------------------------------------------------------------ */
 /* PROJECTS                                                            */
 /* ------------------------------------------------------------------ */
@@ -203,6 +220,32 @@ export const projects = pgTable(
     addressLine: text("address_line"),
     city: varchar("city", { length: 120 }),
     state: varchar("state", { length: 120 }),
+
+    /**
+     * ⭐ THE SITE'S GST STATE CODE — added v1.37.0 (SQL 0080, Batch 33).
+     *
+     * ══════════════════════════════════════════════════════════════════
+     * 🔴 `state` ABOVE IS PROSE AND PROSE CANNOT DECIDE A TAX.
+     * ══════════════════════════════════════════════════════════════════
+     * Under s.12(3) of the IGST Act the place of supply for anything
+     * relating to immovable property is the LOCATION OF THE PROPERTY. For
+     * a works contract or an under-construction flat, that location is
+     * this project.
+     *
+     * `state` holds "Maharashtra", or "MAHARASHTRA", or "Maharastra". The
+     * place-of-supply engine needs "27". Those are not convertible
+     * without a lookup table and a spelling policy, and a tax decision
+     * taken on a fuzzy string match is a tax decision that will be wrong
+     * for one project in fifty and be blamed on the customer's typing.
+     *
+     * ⚠️ DELIBERATELY NULLABLE, AND DELIBERATELY NOT BACKFILLED FROM
+     * `state`. A project with no code set makes the engine REFUSE, with a
+     * remedy naming this field. A guess would make it answer, and the
+     * answer would be unverifiable. Refusing is the behaviour that gets
+     * the data fixed; guessing is the behaviour that ships wrong returns
+     * quietly for a year.
+     */
+    stateCode: varchar("state_code", { length: 2 }),
 
     /** For the lead heat-map and site navigation. */
     latitude: doublePrecision("latitude"),
@@ -704,6 +747,28 @@ export const bookings = pgTable(
     forfeitAmountMinor: bigint("forfeit_amount_minor", { mode: "bigint" }),
     refundAmountMinor: bigint("refund_amount_minor", { mode: "bigint" }),
 
+    /* --- ⭐⭐ v1.25.0-alpha — what the cancellation POSTED ---------- */
+    //
+    // 🔴 THE FIGURES ARE STORED, NOT RECOMPUTED. A cancellation posting
+    // depends on the section 34 credit-note window, which depends on
+    // today's date. Re-deriving it next year would produce a different
+    // answer to the same question, and the journal that was actually
+    // posted would then have no document behind it that agrees with it.
+    /** The section 34 credit note that reversed the output tax, if any. */
+    gstCreditNoteNumber: varchar("gst_credit_note_number", { length: 40 }),
+    reversedCgstMinor: bigint("reversed_cgst_minor", { mode: "bigint" }),
+    reversedSgstMinor: bigint("reversed_sgst_minor", { mode: "bigint" }),
+    reversedIgstMinor: bigint("reversed_igst_minor", { mode: "bigint" }),
+    /** ⚠️ Set by the posting, never by hand. Null means not yet in the ledger. */
+    cancellationPostedAt: timestamp("cancellation_posted_at", { withTimezone: true }),
+    /**
+     * ⚠️ SEPARATE FROM `cancelledAt`, AND OFTEN MONTHS AFTER IT. How long
+     * a cancelled buyer waits for their money is a question a consumer
+     * forum asks in those words, and a single date cannot answer it.
+     */
+    refundPaidAt: timestamp("refund_paid_at", { withTimezone: true }),
+    refundReference: varchar("refund_reference", { length: 60 }),
+
     customFields: jsonb("custom_fields")
       .$type<Record<string, unknown>>()
       .default(sql`'{}'::jsonb`)
@@ -841,6 +906,186 @@ export const channelPartnersRelations = relations(channelPartners, ({ one, many 
   bookings: many(bookings),
 }));
 
+/* ------------------------------------------------------------------ */
+/* ⭐⭐⭐ CHANNEL-PARTNER COMMISSIONS — v1.25.0-alpha                   */
+/* ------------------------------------------------------------------ */
+
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * WHY BROKERAGE NEEDS A DOCUMENT AND NOT A COLUMN ON THE BOOKING
+ * ══════════════════════════════════════════════════════════════════════
+ * `lib/sales/commission.ts` has been able to COMPUTE brokerage since
+ * Phase 22, and `/sales/partners/[id]` has shown the figure for almost as
+ * long. Nothing has ever recorded it, so nothing has ever posted it —
+ * the ninth time in this project that a complete engine turned out to
+ * have nothing reaching it.
+ *
+ * What was missing is a DOCUMENT. Brokerage is not one number per
+ * booking:
+ *
+ *   • It is usually paid in TRANCHES — part on agreement, part on
+ *     registration, part on possession. A column would hold only the
+ *     last one written.
+ *   • The TDS depends on everything else credited to that partner in the
+ *     SAME FINANCIAL YEAR, so each tranche has to be a dated row or the
+ *     threshold cannot be applied at all.
+ *   • The rate is resolved against the credit date and stored on the
+ *     row. A partner statement for a closed year has to reproduce the
+ *     rate that was right then, not the one in force when it is printed.
+ *   • And a broker disputes a figure a year later. The answer has to be
+ *     a document with a date on it, not a recomputation that quietly
+ *     uses today's inputs.
+ */
+export const channelPartnerCommissions = pgTable(
+  "channel_partner_commissions",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    tenantId: uuid("tenant_id")
+      .notNull()
+      .references(() => tenants.id, { onDelete: "cascade" }),
+
+    /**
+     * ⚠️ `restrict`, NOT `cascade`. Deleting a partner must not take a
+     * posted brokerage bill with it — the journal entry would survive
+     * and its counterparty would not.
+     */
+    partnerId: uuid("partner_id")
+      .notNull()
+      .references(() => channelPartners.id, { onDelete: "restrict" }),
+    /** Nullable: a referral fee is sometimes not tied to one booking. */
+    bookingId: uuid("booking_id").references(() => bookings.id, { onDelete: "set null" }),
+
+    reference: varchar("reference", { length: 40 }).notNull(),
+    status: commissionStatusEnum("status").default("draft").notNull(),
+
+    /**
+     * 🔴 THE CREDIT DATE, AND EVERYTHING STATUTORY HANGS OFF IT. The
+     * 194H rate, the annual threshold and the financial year the bill
+     * falls in are all resolved against this and never against `now()`.
+     */
+    creditedOn: date("credited_on", { mode: "string" }).notNull(),
+
+    /* --- How the figure was reached, kept so it can be re-derived --- */
+    basis: commissionBasisEnum("basis").notNull(),
+    rateBps: integer("rate_bps"),
+    monthsCentis: integer("months_centis"),
+    flatMinor: bigint("flat_minor", { mode: "bigint" }),
+    considerationMinor: bigint("consideration_minor", { mode: "bigint" }),
+    workings: text("workings").notNull(),
+
+    grossMinor: bigint("gross_minor", { mode: "bigint" }).notNull(),
+
+    /* --- The partner's own tax invoice ------------------------------ */
+    partnerInvoiceNumber: varchar("partner_invoice_number", { length: 40 }),
+    partnerInvoiceDate: date("partner_invoice_date", { mode: "string" }),
+    cgstMinor: bigint("cgst_minor", { mode: "bigint" }).default(sql`0`).notNull(),
+    sgstMinor: bigint("sgst_minor", { mode: "bigint" }).default(sql`0`).notNull(),
+    igstMinor: bigint("igst_minor", { mode: "bigint" }).default(sql`0`).notNull(),
+    /**
+     * 🔴 FALSE BY DEFAULT, DELIBERATELY. Most residential projects are on
+     * the 1%/5% concessional rate and have NO input credit. Defaulting to
+     * true would claim blocked credit on every brokerage bill in the
+     * commonest configuration in the market, which is a demand with
+     * interest and penalty on it.
+     */
+    itcEligible: boolean("itc_eligible").default(false).notNull(),
+
+    /* --- Section 194H ------------------------------------------------ */
+    tdsMinor: bigint("tds_minor", { mode: "bigint" }).default(sql`0`).notNull(),
+    /** ⚠️ Stored, not resolved at read time. 2% from 1 Oct 2024, 5% before. */
+    tdsRateBps: integer("tds_rate_bps").default(0).notNull(),
+    /** The WHOLE year's chargeable base this deduction was computed on. */
+    tdsChargeableBaseMinor: bigint("tds_chargeable_base_minor", { mode: "bigint" })
+      .default(sql`0`)
+      .notNull(),
+    tdsExplanation: text("tds_explanation"),
+
+    netPayableMinor: bigint("net_payable_minor", { mode: "bigint" }).notNull(),
+
+    approvedAt: timestamp("approved_at", { withTimezone: true }),
+    approvedBy: uuid("approved_by").references(() => users.id, { onDelete: "set null" }),
+    postedAt: timestamp("posted_at", { withTimezone: true }),
+    paidAt: timestamp("paid_at", { withTimezone: true }),
+    paymentReference: varchar("payment_reference", { length: 60 }),
+
+    note: text("note"),
+
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (t) => ({
+    referencePerTenant: uniqueIndex("cp_commissions_reference_tenant_unique").on(
+      t.tenantId,
+      t.reference,
+    ),
+    tenantIdx: index("cp_commissions_tenant_idx").on(t.tenantId, t.creditedOn),
+    partnerIdx: index("cp_commissions_partner_idx").on(t.partnerId, t.creditedOn),
+    bookingIdx: index("cp_commissions_booking_idx").on(t.bookingId),
+    statusIdx: index("cp_commissions_tenant_status_idx").on(t.tenantId, t.status),
+
+    /**
+     * ⭐ THE ARITHMETIC IS A DATABASE GUARANTEE, NOT AN APPLICATION ONE.
+     * `net = gross + tax − TDS`. A row that does not satisfy it produces
+     * a journal that does not balance, and the place to refuse it is
+     * before it is stored — an unbalanced row that reaches the posting
+     * step fails there instead, with a message about the ledger rather
+     * than about the bill.
+     */
+    addsUp: check(
+      "cp_commissions_adds_up",
+      sql`${t.netPayableMinor} = ${t.grossMinor} + ${t.cgstMinor} + ${t.sgstMinor} + ${t.igstMinor} - ${t.tdsMinor}`,
+    ),
+    amountsNonNegative: check(
+      "cp_commissions_amounts_non_negative",
+      sql`${t.grossMinor} >= 0 AND ${t.cgstMinor} >= 0 AND ${t.sgstMinor} >= 0
+          AND ${t.igstMinor} >= 0 AND ${t.tdsMinor} >= 0 AND ${t.netPayableMinor} >= 0`,
+    ),
+    /**
+     * ⚠️ TDS CANNOT EXCEED THE BROKERAGE. 20% under 206AA is the highest
+     * this can legitimately be, and a bill where tax exceeds the fee is
+     * a units error — paise passed where rupees were expected is the
+     * classic one, and it produces exactly this shape.
+     */
+    tdsSane: check("cp_commissions_tds_sane", sql`${t.tdsMinor} <= ${t.grossMinor}`),
+    /**
+     * 🔴 GST ONLY WITH AN INVOICE NUMBER. Input credit needs a document.
+     * A brokerage bill carrying tax and no invoice number is credit
+     * claimed against nothing, and it is the first thing an officer asks
+     * for.
+     */
+    taxNeedsInvoice: check(
+      "cp_commissions_tax_needs_invoice",
+      sql`(${t.cgstMinor} + ${t.sgstMinor} + ${t.igstMinor}) = 0
+          OR ${t.partnerInvoiceNumber} IS NOT NULL`,
+    ),
+    /**
+     * ⚠️ CGST AND SGST MOVE TOGETHER, AND NEITHER MOVES WITH IGST. A
+     * supply is intra-State or inter-State; there is no third case. A
+     * bill with CGST and IGST both non-zero is a place-of-supply error,
+     * and it flows straight into GSTR-3B if nothing refuses it.
+     */
+    taxShape: check(
+      "cp_commissions_tax_shape",
+      sql`(${t.igstMinor} = 0 OR (${t.cgstMinor} = 0 AND ${t.sgstMinor} = 0))`,
+    ),
+    /**
+     * ⭐ ONE LIVE BILL PER PARTNER PER BOOKING PER CREDIT DATE.
+     *
+     * ⚠️ NOT "ONE PER BOOKING". Brokerage is genuinely paid in tranches
+     * on different dates, and a constraint forbidding that would push
+     * users into one inflated bill — which breaks the TDS timing, since
+     * the threshold is tested when each amount is CREDITED.
+     *
+     * What it does forbid is the same tranche entered twice, which is
+     * the actual failure mode: two people raise the same bill on a busy
+     * launch weekend and the partner is paid twice.
+     */
+    oneLivePerTranche: uniqueIndex("cp_commissions_one_live_per_tranche")
+      .on(t.partnerId, t.bookingId, t.creditedOn)
+      .where(sql`${t.status} <> 'cancelled' AND ${t.bookingId} IS NOT NULL`),
+  }),
+);
+
 export const bookingsRelations = relations(bookings, ({ one, many }) => ({
   tenant: one(tenants, { fields: [bookings.tenantId], references: [tenants.id] }),
   lead: one(leads, { fields: [bookings.leadId], references: [leads.id] }),
@@ -854,6 +1099,24 @@ export const paymentMilestonesRelations = relations(paymentMilestones, ({ one })
     references: [bookings.id],
   }),
 }));
+
+export const channelPartnerCommissionsRelations = relations(
+  channelPartnerCommissions,
+  ({ one }) => ({
+    tenant: one(tenants, {
+      fields: [channelPartnerCommissions.tenantId],
+      references: [tenants.id],
+    }),
+    partner: one(channelPartners, {
+      fields: [channelPartnerCommissions.partnerId],
+      references: [channelPartners.id],
+    }),
+    booking: one(bookings, {
+      fields: [channelPartnerCommissions.bookingId],
+      references: [bookings.id],
+    }),
+  }),
+);
 
 /* ------------------------------------------------------------------ */
 /* INFERRED TYPES                                                      */
@@ -870,6 +1133,9 @@ export type ChannelPartner = typeof channelPartners.$inferSelect;
 export type Booking = typeof bookings.$inferSelect;
 export type NewBooking = typeof bookings.$inferInsert;
 export type PaymentMilestone = typeof paymentMilestones.$inferSelect;
+export type ChannelPartnerCommission = typeof channelPartnerCommissions.$inferSelect;
+export type NewChannelPartnerCommission = typeof channelPartnerCommissions.$inferInsert;
+export type CommissionStatus = (typeof commissionStatusEnum.enumValues)[number];
 
 export type LeadStatus = (typeof leadStatusEnum.enumValues)[number];
 export type LeadSource = (typeof leadSourceEnum.enumValues)[number];

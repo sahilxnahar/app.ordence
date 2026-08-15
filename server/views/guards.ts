@@ -68,6 +68,7 @@ import { ViewPlanError, type ViewerScope } from "@/lib/views/planner";
 import type { ViewObjectDefinition } from "@/lib/views/registry";
 import type { FeatureKey } from "@/lib/entitlements/features";
 import type { ActionResult } from "@/lib/validators/crm";
+import type { PermissionKey } from "@/db/schema/auth";
 
 /* ------------------------------------------------------------------ */
 /* GATES 1–3 — WRITES                                                  */
@@ -84,7 +85,7 @@ import type { ActionResult } from "@/lib/validators/crm";
 export async function guardViewWrite(args: {
   operation: string;
   feature: FeatureKey;
-  permission: string;
+  permission: PermissionKey;
   resource?: { type?: string; id?: string };
   /**
    * Override the key the IMPERSONATION policy is evaluated against.

@@ -197,18 +197,35 @@ describe("🔴 the gate's debt list was corrected, not just extended", () => {
   });
 
   /**
-   * The old excuse claimed labour needed "five legs with statutory due
-   * dates". The real blocker is that no payroll run exists at all.
+   * ⭐⭐⭐ UPDATED IN v1.23.0-alpha, BECAUSE THE DEBT WAS PAID.
+   *
+   * The excuse went through two corrections and then stopped being an
+   * excuse. It first claimed labour needed "five legs with statutory due
+   * dates", which was wrong about the blocker. It was corrected to "no
+   * payroll run exists", which was right. Batch 15 built the payroll
+   * run, so `labour` is off the financial list entirely and `payroll` is
+   * on it, posting.
+   *
+   * ⚠️ THIS TEST NOW ASSERTS THE OUTCOME RATHER THAN THE EXCUSE. An
+   * assertion that a debt note still exists is an assertion that the
+   * debt is never paid.
    */
-  it("the labour excuse was corrected to the real blocker", () => {
-    expect(GATE).toContain("No payroll run exists");
+  it("the labour debt was cleared by building the thing it was waiting for", () => {
+    // `labour` is no longer a financial module: attendance and piece
+    // rates are inputs, and the document with the economic effect is the
+    // payroll run.
+    expect(GATE).not.toMatch(/^\s*"labour",$/m);
+    expect(GATE).toMatch(/^\s*"payroll",$/m);
+    expect(GATE).toContain("The document is the payroll run".toUpperCase());
+
     /**
-     * ⚠️ THE NEGATIVE RUNS AGAINST COMMENT-STRIPPED SOURCE. The old
-     * wording survives in the comment that EXPLAINS the correction, and a
+     * ⚠️ THE NEGATIVES RUN AGAINST COMMENT-STRIPPED SOURCE. Both old
+     * wordings survive in the comment that EXPLAINS the history, and a
      * test whose only remedy is deleting that explanation is a bad test.
      * This has now caught me three times.
      */
     expect(code(GATE)).not.toContain("five legs with statutory due dates");
+    expect(code(GATE)).not.toContain("No payroll run exists");
   });
 
   it("ra-bills is off the debt list because it now posts", () => {

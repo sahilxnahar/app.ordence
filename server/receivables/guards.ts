@@ -1,3 +1,4 @@
+import type { PermissionKey } from "@/db/schema/auth";
 import "server-only";
 
 /**
@@ -55,7 +56,7 @@ import type { ActionResult } from "@/lib/validators/crm";
 export async function guardReceivablesWrite(args: {
   operation: string;
   feature: FeatureKey;
-  permission: string;
+  permission: PermissionKey;
   resource?: { type?: string; id?: string };
   impersonationOperation?: string;
 }): Promise<TenantContext> {

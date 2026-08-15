@@ -183,16 +183,169 @@ function formatPaise(minor: bigint): string {
  * their KYC — so surfacing the reason matters commercially, not just
  * legally.
  *
- * ⚠️ These are DEFAULTS AS OF THIS BUILD. Rates change with the Finance
- * Act. They are constants in one place so a change is one edit, and any
- * figure already recorded against a payout keeps the rate it was
- * computed with.
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴🔴🔴 TWO DEFECTS FOUND AND FIXED IN v1.25.0-alpha, BOTH OF THEM
+ *        SILENT, AND BOTH FOUND BY THE CODEBASE ARGUING WITH ITSELF
+ * ══════════════════════════════════════════════════════════════════════
+ *
+ * ① THE RATE WAS STALE BY NEARLY TWO YEARS.
+ *
+ *    This file said `TDS_194H_BPS = 500` — five percent. 194H fell to
+ *    TWO percent with effect from 1 October 2024, and it is still two
+ *    percent for FY 2026-27.
+ *
+ *    ⚠️ AND `lib/tds/sections.ts` ALREADY SAID SO, IN PROSE, WHILE
+ *    IMPORTING THE WRONG NUMBER FROM HERE. Its header carries the
+ *    warning "194H fell from 5% to 2% with effect from 1 October 2024 —
+ *    MID-YEAR. A workspace deducting 5% in November is over-deducting",
+ *    and then it sets `rateBpsOther: TDS_194H_BPS` and imports 500. The
+ *    knowledge was in the repository. The arithmetic never read it.
+ *
+ *    Over-deducting is not the harmless direction people assume. The
+ *    broker is short 3% of their brokerage today and gets it back, if at
+ *    all, when they file a return the following year — and they raise it
+ *    with the developer, every time, because they check.
+ *
+ * ② THE THRESHOLD BEHAVED AS `per_transaction` WHERE THE PRODUCT'S OWN
+ *    SECTION TABLE DECLARES `aggregate_whole`.
+ *
+ *    `lib/tds/sections.ts` classifies 194H as `aggregate_whole` and its
+ *    comment on that mode reads "⭐ This is the one everybody gets
+ *    wrong." The old code here got it wrong: once the year crossed
+ *    ₹20,000 it deducted on the CURRENT payment only, and the payments
+ *    made earlier in the year while still below the threshold were never
+ *    caught up.
+ *
+ *    ₹15,000 in April and ₹10,000 in July is ₹25,000 of chargeable base,
+ *    not ₹10,000. The old code deducted ₹200. The right figure is ₹500.
+ *    The ₹300 gap carries interest at 1% a month under s.201(1A) and
+ *    disallows 30% of the expense under s.40(a)(ia) — so a ₹300
+ *    shortfall can cost several thousand.
+ *
+ * ⭐ THE STRUCTURAL FIX, WHICH IS THE POINT: NO RATE IS A CONSTANT ANY
+ *   MORE. Rates and thresholds are effective-dated DATA and are resolved
+ *   against the date the brokerage was credited. This is the same rule
+ *   payroll adopted in v1.23.0 — every statutory figure arrives from an
+ *   effective-dated row, so that next October's change is a row rather
+ *   than an edit that silently restates last year.
+ *
+ * ⚠️ AND `onDate` IS REQUIRED, NOT OPTIONAL WITH A DEFAULT. A rate
+ * resolved against "now" is exactly how a correction statement for a
+ * closed year gets recomputed at this year's rate. The caller has the
+ * date; it must pass it.
+ *
+ * ⚠️ NOTE FOR THE NEXT MAINTAINER: the Income-tax Act, 2025 renumbers
+ * 194H as clause 393 from 1 April 2026. The rate and the threshold are
+ * unchanged; only the citation moves. `statutoryRef` is a string in the
+ * section table for exactly this reason.
  */
-export const TDS_194H_BPS = 500; // 5%
-export const TDS_NO_PAN_BPS = 2000; // 20%, section 206AA
 
-/** Below this in a financial year, no deduction is required. */
-export const TDS_194H_THRESHOLD_MINOR = 2_000_000n; // ₹20,000
+export type DatedRate = {
+  /** ISO date the rate takes effect, inclusive. */
+  readonly from: string;
+  readonly rateBps: number;
+  readonly why: string;
+};
+
+/**
+ * ⚠️ NEWEST FIRST. `resolveDated` takes the first entry whose `from` is
+ * on or before the date asked about, so the ordering is load-bearing —
+ * see the test that asserts it rather than trusting the comment.
+ */
+export const TDS_194H_RATE_HISTORY: readonly DatedRate[] = [
+  {
+    from: "2024-10-01",
+    rateBps: 200,
+    why: "Finance (No. 2) Act 2024 reduced section 194H from 5% to 2%, mid-year.",
+  },
+  {
+    from: "2007-06-01",
+    rateBps: 500,
+    why: "The long-standing 5% rate, in force until 30 September 2024.",
+  },
+];
+
+export type DatedThreshold = {
+  readonly from: string;
+  readonly thresholdMinor: bigint;
+  readonly why: string;
+};
+
+export const TDS_194H_THRESHOLD_HISTORY: readonly DatedThreshold[] = [
+  {
+    from: "2025-04-01",
+    thresholdMinor: 2_000_000n,
+    why: "Finance Act 2025 raised the annual 194H threshold to ₹20,000.",
+  },
+  {
+    from: "2001-06-01",
+    thresholdMinor: 1_500_000n,
+    why: "The earlier ₹15,000 annual threshold.",
+  },
+];
+
+/** Section 206AA. Not a rate we invented, and not effective-dated so far. */
+export const TDS_NO_PAN_BPS = 2000; // 20%
+
+/**
+ * ⚠️ RETAINED ONLY BECAUSE `lib/tds/sections.ts` RENDERS A STATIC
+ * REFERENCE TABLE FROM IT. Nothing deducts from these — use the
+ * resolvers. They now hold the CURRENT figures rather than the 2007 ones.
+ */
+export const TDS_194H_BPS = 200; // 2%, from 1 October 2024
+export const TDS_194H_THRESHOLD_MINOR = 2_000_000n; // ₹20,000, from 1 April 2025
+
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴🔴 THIS THROWS ON A MISSING DATE, AND THAT IS THE POINT
+ * ══════════════════════════════════════════════════════════════════════
+ * The first version of this function fell back to the oldest rate when
+ * the date did not match anything. That is right for a genuinely ancient
+ * date and CATASTROPHIC for `undefined`, because `"2024-10-01" <=
+ * undefined` is false in JavaScript — so every entry misses, the fallback
+ * fires, and a caller who forgot the date silently gets 5%.
+ *
+ * ⚠️ AND IT WAS CAUGHT BY A TEST THAT KEPT PASSING. `tests/security/
+ * sales-logic.test.ts` asserted 5% of ₹15,000 and went on asserting it
+ * after the rate moved to 2%, because it called the new signature
+ * without a date and the fallback handed back exactly the stale answer
+ * it expected. A green test agreeing with a wrong constant is worse than
+ * no test: it is evidence for the wrong answer.
+ *
+ * So a date that is absent or malformed is a programming error and says
+ * so. A date that is merely older than every entry still falls back,
+ * because that is a real question with a real answer.
+ */
+function assertDate(onDate: string, what: string): void {
+  if (typeof onDate !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(onDate)) {
+    throw new Error(
+      `${what} needs the date the amount was credited, as YYYY-MM-DD. Got ${JSON.stringify(onDate)}. ` +
+        `Section 194H changed rate mid-year on 1 October 2024, so a rate resolved without a date ` +
+        `is a guess — and the guess is wrong for every credit on one side of that line.`,
+    );
+  }
+}
+
+export function resolve194hRateBps(onDate: string): number {
+  assertDate(onDate, "resolve194hRateBps");
+  const hit = TDS_194H_RATE_HISTORY.find((r) => r.from <= onDate);
+  // ⚠️ Falls back to the OLDEST rate, not the newest. A date before every
+  // entry is a data problem, and answering it with today's rate hides it.
+  return hit ? hit.rateBps : TDS_194H_RATE_HISTORY[TDS_194H_RATE_HISTORY.length - 1]!.rateBps;
+}
+
+export function resolve194hThresholdMinor(onDate: string): bigint {
+  assertDate(onDate, "resolve194hThresholdMinor");
+  const hit = TDS_194H_THRESHOLD_HISTORY.find((t) => t.from <= onDate);
+  return hit
+    ? hit.thresholdMinor
+    : TDS_194H_THRESHOLD_HISTORY[TDS_194H_THRESHOLD_HISTORY.length - 1]!.thresholdMinor;
+}
+
+/** Did the financial year this credit sits in straddle a rate change? */
+export function rateChangedDuring(fromDate: string, toDate: string): boolean {
+  return resolve194hRateBps(fromDate) !== resolve194hRateBps(toDate);
+}
 
 export type TdsResult = {
   applicable: boolean;
@@ -200,16 +353,36 @@ export type TdsResult = {
   tdsMinor: bigint;
   netMinor: bigint;
   explanation: string;
+  /** ⭐ The whole year's chargeable base, not just this credit. */
+  chargeableBaseMinor: bigint;
+  /** Non-null when the figure needs a human to look at it. */
+  caution: string | null;
 };
 
 export function computeTds(args: {
   grossMinor: bigint;
   hasPan: boolean;
-  /** Everything already paid to this partner this financial year. */
+  /**
+   * 🔴 THE DATE THE BROKERAGE IS CREDITED. Required. The rate and the
+   * threshold are both resolved against it.
+   */
+  onDate: string;
+  /** Everything already credited to this partner this financial year. */
   ytdGrossMinor?: bigint;
+  /**
+   * ⭐ WHAT HAS ALREADY BEEN DEDUCTED THIS YEAR. Without it the catch-up
+   * on a threshold crossing would be charged twice on every later bill.
+   */
+  ytdTdsMinor?: bigint;
+  /**
+   * Optional. The date of the earliest credit in `ytdGrossMinor`, used
+   * only to warn when the year straddles a rate change.
+   */
+  ytdEarliestDate?: string | null;
 }): TdsResult {
-  const { grossMinor, hasPan } = args;
-  const ytd = args.ytdGrossMinor ?? 0n;
+  const { grossMinor, hasPan, onDate } = args;
+  const ytdGross = args.ytdGrossMinor ?? 0n;
+  const ytdTds = args.ytdTdsMinor ?? 0n;
 
   if (grossMinor <= 0n) {
     return {
@@ -218,37 +391,83 @@ export function computeTds(args: {
       tdsMinor: 0n,
       netMinor: grossMinor,
       explanation: "Nothing to deduct.",
+      chargeableBaseMinor: 0n,
+      caution: null,
     };
   }
+
+  const threshold = resolve194hThresholdMinor(onDate);
 
   // ⚠️ The threshold is on the YEAR, not the payment. A partner paid
   // ₹15,000 twice has crossed it, and testing each payment separately is
   // the classic way to under-deduct and be assessed for it later.
-  if (ytd + grossMinor < TDS_194H_THRESHOLD_MINOR) {
+  if (ytdGross + grossMinor < threshold) {
     return {
       applicable: false,
       rateBps: 0,
       tdsMinor: 0n,
       netMinor: grossMinor,
       explanation:
-        `Below the ${formatPaise(TDS_194H_THRESHOLD_MINOR)} annual threshold ` +
-        `for section 194H, so no deduction applies yet.`,
+        `Below the ${formatPaise(threshold)} annual threshold for section 194H — ` +
+        `${formatPaise(ytdGross + grossMinor)} credited this year so far — ` +
+        `so no deduction applies yet.`,
+      chargeableBaseMinor: 0n,
+      caution: null,
     };
   }
 
-  const rateBps = hasPan ? TDS_194H_BPS : TDS_NO_PAN_BPS;
-  const tdsMinor = applyRateBps(grossMinor, rateBps);
+  const statutoryBps = resolve194hRateBps(onDate);
+  const rateBps = hasPan ? statutoryBps : TDS_NO_PAN_BPS;
+
+  // ══════════════════════════════════════════════════════════════════
+  // 🔴 `aggregate_whole`. THE BASE IS THE WHOLE YEAR, NOT THIS CREDIT.
+  // ══════════════════════════════════════════════════════════════════
+  // Once the year crosses the threshold, tax is due on everything
+  // credited in it — including the amounts paid out earlier while the
+  // running total was still below. Subtracting what has already been
+  // deducted turns that into a catch-up on the crossing bill and a
+  // plain per-bill deduction on every bill after it.
+  const chargeableBaseMinor = ytdGross + grossMinor;
+  const cumulative = applyRateBps(chargeableBaseMinor, rateBps);
+  const raw = cumulative - ytdTds;
+  // ⚠️ Never negative. An over-deduction earlier in the year is refunded
+  // by the return, not by a negative deduction on a later bill.
+  const tdsMinor = raw < 0n ? 0n : raw;
+
+  const caughtUp = ytdGross > 0n && ytdTds < applyRateBps(ytdGross, rateBps);
+
+  const parts: string[] = [
+    hasPan
+      ? `TDS at ${formatBps(rateBps)} under section 194H.`
+      : `TDS at ${formatBps(rateBps)} — no PAN on file, so section 206AA requires ` +
+        `the higher rate. Add the partner's PAN to reduce this to ` +
+        `${formatBps(statutoryBps)}.`,
+  ];
+  if (caughtUp) {
+    parts.push(
+      `The ${formatPaise(threshold)} annual threshold has been crossed, so tax is ` +
+        `due on the whole ${formatPaise(chargeableBaseMinor)} credited this year, ` +
+        `not just this bill. ${formatPaise(ytdTds)} has already been deducted, so ` +
+        `this bill carries the catch-up.`,
+    );
+  }
+
+  const caution =
+    args.ytdEarliestDate && rateChangedDuring(args.ytdEarliestDate, onDate)
+      ? `⚠️ The 194H rate changed part-way through this financial year. The ` +
+        `catch-up above is computed at ${formatBps(statutoryBps)} for the whole ` +
+        `year. Earlier credits were chargeable at the rate then in force — check ` +
+        `this figure with your accountant before paying it.`
+      : null;
 
   return {
     applicable: true,
     rateBps,
     tdsMinor,
     netMinor: grossMinor - tdsMinor,
-    explanation: hasPan
-      ? `TDS at ${formatBps(rateBps)} under section 194H.`
-      : `TDS at ${formatBps(rateBps)} — no PAN on file, so section 206AA ` +
-        `requires the higher rate. Add the partner's PAN to reduce this to ` +
-        `${formatBps(TDS_194H_BPS)}.`,
+    explanation: parts.join(" "),
+    chargeableBaseMinor,
+    caution,
   };
 }
 

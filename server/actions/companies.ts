@@ -23,8 +23,9 @@
 import { z } from "zod";
 import { revalidatePath } from "next/cache";
 import { and, eq, isNull, ilike, or, desc, asc, count, sql } from "drizzle-orm";
-import { db } from "@/db";
+import { db, withTenant } from "@/db";
 import { companies, contacts } from "@/db/schema";
+import { requirePermission } from "@/server/audit";
 import { requireTenantContext, TenantAccessError } from "@/server/tenant-context";
 import { requireAccess, AccessRestrictedError } from "@/server/billing/access";
 import {
@@ -109,24 +110,26 @@ export async function getCompanies(input: ListCompaniesInput = {}): Promise<
             ? companies.updatedAt
             : companies.createdAt;
 
-    const [rows, totalResult] = await Promise.all([
-      db
-        .select({
-          company: companies,
-          contactCount: sql<number>`(
-            SELECT COUNT(*)::int FROM ${contacts}
-            WHERE ${contacts.companyId} = ${companies.id}
-              AND ${contacts.tenantId} = ${ctx.tenant.id}
-              AND ${contacts.deletedAt} IS NULL
-          )`,
-        })
-        .from(companies)
-        .where(where)
-        .orderBy(params.sortDir === "asc" ? asc(sortColumn) : desc(sortColumn))
-        .limit(params.pageSize)
-        .offset((params.page - 1) * params.pageSize),
-      db.select({ value: count() }).from(companies).where(where),
-    ]);
+    const [rows, totalResult] = await withTenant(ctx.tenant.id, (tx) =>
+      Promise.all([
+        tx
+          .select({
+            company: companies,
+            contactCount: sql<number>`(
+              SELECT COUNT(*)::int FROM ${contacts}
+              WHERE ${contacts.companyId} = ${companies.id}
+                AND ${contacts.tenantId} = ${ctx.tenant.id}
+                AND ${contacts.deletedAt} IS NULL
+            )`,
+          })
+          .from(companies)
+          .where(where)
+          .orderBy(params.sortDir === "asc" ? asc(sortColumn) : desc(sortColumn))
+          .limit(params.pageSize)
+          .offset((params.page - 1) * params.pageSize),
+        tx.select({ value: count() }).from(companies).where(where),
+      ]),
+    );
 
     return {
       ok: true,
@@ -151,13 +154,15 @@ export async function getCompanyById(id: string): Promise<ActionResult<Company>>
     const ctx = await requireTenantContext();
     const parsedId = uuidSchema.parse(id);
 
-    const row = await db.query.companies.findFirst({
-      where: and(
-        eq(companies.id, parsedId),
-        eq(companies.tenantId, ctx.tenant.id),
-        isNull(companies.deletedAt),
-      ),
-    });
+    const row = await withTenant(ctx.tenant.id, (tx) =>
+      tx.query.companies.findFirst({
+        where: and(
+          eq(companies.id, parsedId),
+          eq(companies.tenantId, ctx.tenant.id),
+          isNull(companies.deletedAt),
+        ),
+      })
+    );
 
     if (!row) return fail("Company not found.");
     return { ok: true, data: row };
@@ -176,12 +181,14 @@ export async function getCompanyOptions(): Promise<
 > {
   try {
     const ctx = await requireTenantContext();
-    const rows = await db
-      .select({ id: companies.id, name: companies.name })
-      .from(companies)
-      .where(and(eq(companies.tenantId, ctx.tenant.id), isNull(companies.deletedAt)))
-      .orderBy(asc(companies.name))
-      .limit(1000);
+    const rows = await withTenant(ctx.tenant.id, (tx) =>
+      tx
+        .select({ id: companies.id, name: companies.name })
+        .from(companies)
+        .where(and(eq(companies.tenantId, ctx.tenant.id), isNull(companies.deletedAt)))
+        .orderBy(asc(companies.name))
+        .limit(1000)
+    );
     return { ok: true, data: rows };
   } catch (err) {
     return toActionError(err);
@@ -212,18 +219,43 @@ export async function createCompany(
      * it was never going to be allowed to submit.
      */
     await requireAccess("companies:create", ctx);
+    /**
+     * 🔴 THE THIRD STEP, ADDED IN v1.26.0-alpha. The comment above has
+     * prescribed this order since v0.83.2 and the code stopped after
+     * the second line — so this write was reachable by ANY member of
+     * the workspace, including the Accountant role, which the
+     * permission table grants `companies:read` and not `companies:create`.
+     *
+     * ⚠️ `requireAccess()` READS LIKE A PERMISSION CHECK AND IS NOT
+     * ONE. It takes `"companies:create"` as an argument and uses it only to
+     * look up a write exemption; what it actually answers is whether
+     * the WORKSPACE is in good billing standing. That is a property of
+     * the account, not of the person, and it is true for everybody in
+     * a paid-up workspace.
+     */
+    await requirePermission("companies:create");
 
     const data = createCompanySchema.parse(input);
 
     if (data.domain) {
-      const duplicate = await db.query.companies.findFirst({
-        where: and(
-          eq(companies.tenantId, ctx.tenant.id),
-          eq(companies.domain, data.domain),
-          isNull(companies.deletedAt),
-        ),
-        columns: { id: true },
-      });
+      /**
+       * ⚠️ HOISTED OUT OF THE CLOSURE. `if (data.domain)` narrows here,
+       * and TypeScript cannot carry that narrowing into a callback it
+       * has no way to prove runs synchronously. Binding it first keeps
+       * the guard meaningful rather than reaching for a non-null
+       * assertion, which would delete the check the `if` exists for.
+       */
+      const domain = data.domain;
+      const duplicate = await withTenant(ctx.tenant.id, (tx) =>
+        tx.query.companies.findFirst({
+          where: and(
+            eq(companies.tenantId, ctx.tenant.id),
+            eq(companies.domain, domain),
+            isNull(companies.deletedAt),
+          ),
+          columns: { id: true },
+        })
+      );
       if (duplicate) {
         return fail("Validation failed.", {
           domain: ["A company with this domain already exists."],
@@ -231,29 +263,31 @@ export async function createCompany(
       }
     }
 
-    const [created] = await db
-      .insert(companies)
-      .values({
-        tenantId: ctx.tenant.id,
-        name: data.name,
-        domain: data.domain ?? null,
-        industry: data.industry ?? null,
-        employeeCount: data.employeeCount ?? null,
-        companySize: data.companySize ?? null,
-        website: data.website ?? null,
-        phone: data.phone ?? null,
-        addressLine1: data.addressLine1 ?? null,
-        addressLine2: data.addressLine2 ?? null,
-        city: data.city ?? null,
-        state: data.state ?? null,
-        postalCode: data.postalCode ?? null,
-        country: data.country ?? null,
-        notes: data.notes ?? null,
-        customFields: data.customFields,
-        ownerId: ctx.user.id,
-        createdBy: ctx.user.id,
-      })
-      .returning();
+    const [created] = await withTenant(ctx.tenant.id, (tx) =>
+      tx
+        .insert(companies)
+        .values({
+          tenantId: ctx.tenant.id,
+          name: data.name,
+          domain: data.domain ?? null,
+          industry: data.industry ?? null,
+          employeeCount: data.employeeCount ?? null,
+          companySize: data.companySize ?? null,
+          website: data.website ?? null,
+          phone: data.phone ?? null,
+          addressLine1: data.addressLine1 ?? null,
+          addressLine2: data.addressLine2 ?? null,
+          city: data.city ?? null,
+          state: data.state ?? null,
+          postalCode: data.postalCode ?? null,
+          country: data.country ?? null,
+          notes: data.notes ?? null,
+          customFields: data.customFields,
+          ownerId: ctx.user.id,
+          createdBy: ctx.user.id,
+        })
+        .returning()
+    );
 
     if (!created) return fail("Failed to create company.");
 
@@ -275,19 +309,38 @@ export async function updateCompany(
     const ctx = await requireTenantContext();
     // Access before validation — see `createCompany`.
     await requireAccess("companies:update", ctx);
+    /**
+     * 🔴 THE THIRD STEP, ADDED IN v1.26.0-alpha. The comment above has
+     * prescribed this order since v0.83.2 and the code stopped after
+     * the second line — so this write was reachable by ANY member of
+     * the workspace, including the Accountant role, which the
+     * permission table grants `companies:read` and not `companies:update`.
+     *
+     * ⚠️ `requireAccess()` READS LIKE A PERMISSION CHECK AND IS NOT
+     * ONE. It takes `"companies:update"` as an argument and uses it only to
+     * look up a write exemption; what it actually answers is whether
+     * the WORKSPACE is in good billing standing. That is a property of
+     * the account, not of the person, and it is true for everybody in
+     * a paid-up workspace.
+     */
+    await requirePermission("companies:update");
 
     const data = updateCompanySchema.parse(input);
     const { id, ...changes } = data;
 
     if (changes.domain) {
-      const duplicate = await db.query.companies.findFirst({
-        where: and(
-          eq(companies.tenantId, ctx.tenant.id),
-          eq(companies.domain, changes.domain),
-          isNull(companies.deletedAt),
-        ),
-        columns: { id: true },
-      });
+      /** ⚠️ Same narrowing hoist as `createCompany` above. */
+      const domain = changes.domain;
+      const duplicate = await withTenant(ctx.tenant.id, (tx) =>
+        tx.query.companies.findFirst({
+          where: and(
+            eq(companies.tenantId, ctx.tenant.id),
+            eq(companies.domain, domain),
+            isNull(companies.deletedAt),
+          ),
+          columns: { id: true },
+        })
+      );
       if (duplicate && duplicate.id !== id) {
         return fail("Validation failed.", {
           domain: ["Another company already uses this domain."],
@@ -295,20 +348,22 @@ export async function updateCompany(
       }
     }
 
-    const [updated] = await db
-      .update(companies)
-      .set({ ...changes, updatedAt: new Date() })
-      .where(
-        and(
-          eq(companies.id, id),
-          // Without this predicate the WHERE would match another tenant's
-          // row by id alone. RLS would still refuse it — but relying on a
-          // single layer is how single layers become the only layer.
-          eq(companies.tenantId, ctx.tenant.id),
-          isNull(companies.deletedAt),
-        ),
-      )
-      .returning();
+    const [updated] = await withTenant(ctx.tenant.id, (tx) =>
+      tx
+        .update(companies)
+        .set({ ...changes, updatedAt: new Date() })
+        .where(
+          and(
+            eq(companies.id, id),
+            // Without this predicate the WHERE would match another tenant's
+            // row by id alone. RLS would still refuse it — but relying on a
+            // single layer is how single layers become the only layer.
+            eq(companies.tenantId, ctx.tenant.id),
+            isNull(companies.deletedAt),
+          ),
+        )
+        .returning()
+    );
 
     if (!updated) return fail("Company not found.");
 
@@ -329,21 +384,38 @@ export async function deleteCompany(id: string): Promise<ActionResult<{ id: stri
     const ctx = await requireTenantContext();
     // Access before anything else — see `createCompany`.
     await requireAccess("companies:delete", ctx);
+    /**
+     * 🔴 THE THIRD STEP, ADDED IN v1.26.0-alpha. The comment above has
+     * prescribed this order since v0.83.2 and the code stopped after
+     * the second line — so this write was reachable by ANY member of
+     * the workspace, including the Accountant role, which the
+     * permission table grants `companies:read` and not `companies:delete`.
+     *
+     * ⚠️ `requireAccess()` READS LIKE A PERMISSION CHECK AND IS NOT
+     * ONE. It takes `"companies:delete"` as an argument and uses it only to
+     * look up a write exemption; what it actually answers is whether
+     * the WORKSPACE is in good billing standing. That is a property of
+     * the account, not of the person, and it is true for everybody in
+     * a paid-up workspace.
+     */
+    await requirePermission("companies:delete");
 
     await assertImpersonationAllows("delete:company", ctx);
     const parsedId = uuidSchema.parse(id);
 
-    const [deleted] = await db
-      .update(companies)
-      .set({ deletedAt: new Date(), updatedAt: new Date() })
-      .where(
-        and(
-          eq(companies.id, parsedId),
-          eq(companies.tenantId, ctx.tenant.id),
-          isNull(companies.deletedAt),
-        ),
-      )
-      .returning({ id: companies.id });
+    const [deleted] = await withTenant(ctx.tenant.id, (tx) =>
+      tx
+        .update(companies)
+        .set({ deletedAt: new Date(), updatedAt: new Date() })
+        .where(
+          and(
+            eq(companies.id, parsedId),
+            eq(companies.tenantId, ctx.tenant.id),
+            isNull(companies.deletedAt),
+          ),
+        )
+        .returning({ id: companies.id })
+    );
 
     if (!deleted) return fail("Company not found.");
 

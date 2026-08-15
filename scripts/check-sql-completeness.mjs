@@ -96,6 +96,8 @@ for (const f of readdirSync(SCHEMA_DIR).filter((x) => x.endsWith(".ts") && !x.st
 const sqlTables = new Map();
 /** table name -> true if any file enables RLS on it */
 const sqlRls = new Set();
+const sqlForce = new Set();
+const sqlPolicy = new Set();
 
 const sqlFiles = readdirSync(SQL_DIR)
   .filter((f) => f.endsWith(".sql"))
@@ -119,6 +121,34 @@ for (const f of sqlFiles) {
     sqlRls.add(m[1].toLowerCase());
   }
 
+  /**
+   * ⭐ ENABLE IS THE WEAKEST OF THE THREE THINGS THAT HAVE TO BE TRUE.
+   *
+   * This gate asked only "does some file ENABLE row-level security on
+   * this table", and answered ✅ for 249 tables. A table can have RLS
+   * enabled and:
+   *
+   *   • no FORCE, so the table OWNER bypasses every policy — and this
+   *     application connects as the owner, which is the whole reason
+   *     v1.33.0 found what it found;
+   *   • no policy at all, which with RLS enabled denies everybody, so
+   *     the table is not protected, it is unusable;
+   *
+   * ⚠️ Both are reported separately below rather than folded into one
+   * number, because they fail in opposite directions and a single
+   * "unprotected" count would hide which.
+   */
+  for (const m of src.matchAll(
+    /ALTER TABLE\s+(?:public\.)?["']?(\w+)["']?\s+FORCE\s+ROW LEVEL SECURITY/gi,
+  )) {
+    sqlForce.add(m[1].toLowerCase());
+  }
+  for (const m of src.matchAll(
+    /CREATE POLICY\s+["']?\w+["']?\s+ON\s+(?:public\.)?["']?(\w+)["']?/gi,
+  )) {
+    sqlPolicy.add(m[1].toLowerCase());
+  }
+
   /*
    * ⚠️ Several files enable RLS inside a `DO $$ … FOREACH t IN ARRAY[…]`
    * loop with `EXECUTE format('ALTER TABLE public.%I ENABLE …', t)`. The
@@ -127,9 +157,31 @@ for (const f of sqlFiles) {
    * reporting false alarms on correctly-protected tables — which is the
    * fastest way to make a checker untrusted.
    */
-  if (/EXECUTE format\([^)]*ENABLE ROW LEVEL SECURITY/i.test(src)) {
-    for (const arr of src.matchAll(/ARRAY\s*\[([^\]]+)\]/g)) {
-      for (const q of arr[1].matchAll(/['"](\w+)['"]/g)) sqlRls.add(q[1].toLowerCase());
+  /**
+   * 🔴 THE FALLBACK USED TO READ EVERY `ARRAY[...]` IN THE FILE.
+   *
+   * If a file contained one dynamic ENABLE loop anywhere, every quoted
+   * word in every array literal in that file — column lists, foreign-key
+   * specs, trigger table lists — was marked as RLS-enabled. Nothing
+   * slipped through today, and the check was one refactor away from a
+   * false ✅ on exactly the class of bug it exists to catch.
+   *
+   * ⭐ Now it reads only the arrays inside a `DO $$ ... $$` block that
+   * actually contains the dynamic statement.
+   */
+  for (const block of src.matchAll(/DO\s*\$([a-z]*)\$([\s\S]*?)\$\1\$/gi)) {
+    const body = block[2];
+    const enables = /EXECUTE format\([^)]*ENABLE ROW LEVEL SECURITY/i.test(body);
+    const forces = /EXECUTE format\([^)]*FORCE\s+ROW LEVEL SECURITY/i.test(body);
+    const policies = /EXECUTE format\([^)]*CREATE POLICY/i.test(body);
+    if (!enables && !forces && !policies) continue;
+    for (const arr of body.matchAll(/ARRAY\s*\[([^\]]+)\]/g)) {
+      for (const q of arr[1].matchAll(/['"](\w+)['"]/g)) {
+        const t = q[1].toLowerCase();
+        if (enables) sqlRls.add(t);
+        if (forces) sqlForce.add(t);
+        if (policies) sqlPolicy.add(t);
+      }
     }
   }
 }
@@ -181,6 +233,43 @@ if (missingRls.length) {
   }
 } else {
   console.log(`\n✅ All ${schemaTenantScoped.size} tenant-scoped tables have RLS enabled in SQL.`);
+}
+
+/**
+ * 🔴 FORCE IS THE ONE THAT MATTERS ON THIS DEPLOYMENT.
+ *
+ * Without it the table OWNER bypasses every policy, and this
+ * application connects as the owner. `check:rls-writes` proved what
+ * that costs.
+ */
+const missingForce = [...schemaTenantScoped].filter((t) => !sqlForce.has(t)).sort();
+if (missingForce.length) {
+  console.log(`\n🔴 TENANT-SCOPED TABLES WITH NO "FORCE ROW LEVEL SECURITY" (${missingForce.length})`);
+  console.log("   Without FORCE the table owner ignores every policy, and this");
+  console.log("   application connects as the owner.\n");
+  for (const t of missingForce) {
+    critical++;
+    console.log(`      ${t}`);
+  }
+} else {
+  console.log(`✅ All ${schemaTenantScoped.size} are FORCED, so the owner is subject to them too.`);
+}
+
+/**
+ * ⚠️ AND A TABLE WITH RLS ENABLED AND NO POLICY IS NOT PROTECTED, IT IS
+ * UNUSABLE. Postgres denies every row to everybody. That fails loudly
+ * rather than silently, which is why it is reported after FORCE.
+ */
+const missingPolicy = [...schemaTenantScoped].filter((t) => !sqlPolicy.has(t)).sort();
+if (missingPolicy.length) {
+  console.log(`\n🔴 TENANT-SCOPED TABLES WITH RLS ENABLED AND NO POLICY (${missingPolicy.length})`);
+  console.log("   Enabled with no policy denies every row to everybody.\n");
+  for (const t of missingPolicy) {
+    critical++;
+    console.log(`      ${t}`);
+  }
+} else {
+  console.log(`✅ All ${schemaTenantScoped.size} carry at least one policy.`);
 }
 
 /* ------------------------------------------------------------------ */

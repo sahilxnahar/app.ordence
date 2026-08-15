@@ -81,17 +81,19 @@ export async function getRecentConversations(
       conditions.push(eq(auditLogs.resourceId, agentId));
     }
 
-    const rows = await db
-      .select({
-        id: auditLogs.id,
-        resourceId: auditLogs.resourceId,
-        newValue: auditLogs.newValue,
-        createdAt: auditLogs.createdAt,
-      })
-      .from(auditLogs)
-      .where(and(...conditions))
-      .orderBy(desc(auditLogs.createdAt))
-      .limit(limit);
+    const rows = await withTenant(tenantId, (tx) =>
+      tx
+        .select({
+          id: auditLogs.id,
+          resourceId: auditLogs.resourceId,
+          newValue: auditLogs.newValue,
+          createdAt: auditLogs.createdAt,
+        })
+        .from(auditLogs)
+        .where(and(...conditions))
+        .orderBy(desc(auditLogs.createdAt))
+        .limit(limit)
+    );
 
     return rows.map((r) => {
       const value = r.newValue as {

@@ -232,12 +232,57 @@ describe("🔴 the seventh gate", () => {
    * did — and it broke the moment the list legitimately shrank, which is
    * the one thing the list is supposed to do. It now checks EVERY entry.
    */
-  it("every excuse names a reason and a session", () => {
+  /**
+   * ══════════════════════════════════════════════════════════════════
+   * ⭐⭐⭐ REWRITTEN IN v1.28.0-alpha, BECAUSE THE LIST WENT EMPTY
+   * ══════════════════════════════════════════════════════════════════
+   * This asserted `keys.length > 0` — that there was ALWAYS at least one
+   * excuse. It was a fair assumption for twenty-six sessions and it
+   * failed the moment `metering` posted and `billing` was recognised as
+   * a category error rather than debt.
+   *
+   * ⚠️ AND THE LAZY FIX WOULD HAVE BEEN TO DELETE THE ASSERTION. The
+   * rule it protects still matters: an excuse without a reason and a
+   * session is an entry nobody will ever remove, because there is
+   * nothing written down to argue against.
+   *
+   * ⭐ SO IT NOW ASSERTS THE RULE RATHER THAN THE POPULATION: every
+   * excuse that exists is explained, and zero excuses is a legitimate —
+   * and, as of this version, the actual — state.
+   */
+  it("every excuse that exists names a reason and a session", () => {
+    const block = GATE.slice(GATE.indexOf("KNOWN_UNPOSTED = {"), GATE.indexOf("/** Any of these"));
+
+    /**
+     * ⚠️ EACH ENTRY'S OWN TEXT, NOT A COUNT OF THE WHOLE BLOCK.
+     *
+     * The first version counted `Session \d+\.` across the block and
+     * compared it to the number of keys. That broke the moment the block
+     * gained COMMENTARY quoting a removed entry — the prose explaining
+     * why `metering` left mentions the session it was added in, and the
+     * count went to one against zero keys.
+     *
+     * ⭐ Counting two things and hoping they line up is not the rule.
+     * The rule is that each entry explains itself, so each entry is
+     * matched with its own value.
+     */
+    const entries = [...block.matchAll(/\n {2}(?:"[a-z-]+"|[a-z-]+):\s*(?:\n\s*)?"((?:[^"\\]|\\.)*)"/g)];
+    for (const [, text] of entries) {
+      expect(text).toMatch(/Session \d+[a-z]?\./);
+      /** A reason, not just a citation. */
+      expect(text.length).toBeGreaterThan(40);
+    }
+  });
+
+  /**
+   * ⭐ AND THE LIST IS EMPTY TODAY. Worth asserting explicitly rather
+   * than leaving as an absence: if an entry comes back, this fails and
+   * whoever added it has to say so out loud.
+   */
+  it("has nothing outstanding", () => {
     const block = GATE.slice(GATE.indexOf("KNOWN_UNPOSTED = {"), GATE.indexOf("/** Any of these"));
     const keys = block.match(/\n {2}(?:"[a-z-]+"|[a-z-]+):/g) ?? [];
-    const sessions = block.match(/Session \d+[a-z]?\./g) ?? [];
-    expect(keys.length).toBeGreaterThan(0);
-    expect(sessions.length).toBe(keys.length);
+    expect(keys).toHaveLength(0);
   });
 
   it("is wired into package.json", () => {

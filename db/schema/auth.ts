@@ -90,6 +90,16 @@ export const PERMISSION_CATALOG = {
   "inventory.stock.read": "View stock balances and movements",
   "inventory.items.manage": "Create and edit stock items",
   "inventory.movements.post": "Post stock receipts, issues and transfers",
+  /**
+   * 🔴 ADDED IN v1.31.0. `stock-counts.ts` argued for a separate
+   * counting permission in prose and then used `inventory.stock.read`
+   * for it, so a `read_only` or `guest` user could open a stocktake and
+   * record quantities against it. The file's own comment says the
+   * counter and the approver must not be the same permission; they were
+   * not, but one of the two was a READ key.
+   */
+  "inventory.counts.record":
+    "Open a stocktake and record counted quantities — never the same permission as approving one",
   "inventory.reservations.manage": "Reserve and release stock",
   "inventory.warehouses.manage": "Create and edit warehouses",
 
@@ -216,6 +226,40 @@ export const PERMISSION_CATALOG = {
   "labour.timesheets.read":
     "View recorded time — site attendance, duty rosters and on-site minutes",
 
+  /* ── ⭐⭐⭐ PAYROLL — v1.23.0-alpha, batch 15 ────────────────────
+   *
+   * ══════════════════════════════════════════════════════════════════
+   * 🔴 FOUR KEYS, AND THE SPLIT BETWEEN THEM IS THE ONLY CONTROL THAT
+   * MATTERS IN A PAYROLL SYSTEM
+   * ══════════════════════════════════════════════════════════════════
+   * Everything else here — the calculations, the statutory rates, the
+   * ledger posting — can be checked by somebody afterwards. Who was
+   * allowed to change a salary and who was allowed to approve the wage
+   * bill cannot be, because by the time it is checked the money has
+   * gone.
+   *
+   * ⚠️ `payroll.read` IS DELIBERATELY NOT IN ANY DEFAULT ROLE except
+   * the two that already hold everything. Salary is the one figure in
+   * an organisation that people quit over knowing, and a key a `member`
+   * holds by default publishes everybody's pay to the sales floor.
+   *
+   * 🔴 `payroll.approve` IS SEPARATE FROM `payroll.manage` ON PURPOSE.
+   * The person who enters a raise and the person who signs off the
+   * month's wage bill must be able to be two different people. Folding
+   * them into one key means whoever edits the salaries also approves
+   * the total, which is the exact arrangement a payroll control exists
+   * to prevent — the same argument as the two stock-count keys.
+   *
+   * ⭐ AND `payroll.post` IS SEPARATE AGAIN, because posting is what
+   * makes the wage bill part of the statutory books.
+   */
+  "payroll.read":
+    "View employees, salary structures and payslips — the most sensitive data in the product",
+  "payroll.manage":
+    "Add employees, set salary structures and statutory rates, and compute a run",
+  "payroll.approve": "Sign off a computed payroll run, freezing its payslips",
+  "payroll.post": "Post an approved payroll run to the ledger",
+
   /* ── ⭐ CONTRACTING — v0.69.0 ────────────────────────────────────
    *
    * ══════════════════════════════════════════════════════════════════
@@ -252,6 +296,27 @@ export const PERMISSION_CATALOG = {
     "Record measurements against BOQ items in a measurement book",
   "construction.measurement.check":
     "⚠️ Check or reject somebody else's measurement — never held by the same person who records",
+  /**
+   * 🔴 ADDED IN v1.31.0 AFTER IT WAS FOUND MISSING BY THE COMPILER.
+   *
+   * `approveVariation` and `rejectVariation` in
+   * `server/actions/variations.ts` have always named this key, and the
+   * comment above them argues for it explicitly: "can raise a variation"
+   * and "can approve one" must be separately grantable or the
+   * segregation of duties is a matter of who happens to hold the role.
+   *
+   * ⚠️ IT WAS NEVER IN THIS CATALOGUE, so `evaluatePermission` returned
+   * `unknown_permission` and BOTH approval and rejection denied every
+   * user including the owner. The control was designed, argued for in
+   * prose, and inert.
+   *
+   * Not added to any explicit role template. `tenant_owner` and
+   * `tenant_admin` take it from `"*"`; `manager` does not hold
+   * `construction.boq.manage` either, so the person who raises a
+   * variation still cannot approve it.
+   */
+  "construction.variation.approve":
+    "⚠️ Approve or reject a BOQ variation — the money decision, and it is final",
   "contracting.rabill.read": "View running-account bills and their lines",
   "contracting.rabill.raise":
     "Assemble a running-account bill from checked, unbilled measurements",
@@ -433,6 +498,22 @@ export const PERMISSION_CATALOG = {
   "clauses:read": "View the clause library",
   "clauses:manage": "Add and approve clauses",
 
+  // ── Stored documents (v1.26.0-alpha) ─────────────────────────────
+  //
+  // 🔴 ADDED BECAUSE `check:guards` FOUND `storage.ts` UPLOADING AND
+  // DELETING FILES BEHIND AN IDENTITY CHECK ONLY, and there was no key
+  // to guard them with. `contracts:*` is the wrong one: a contract is a
+  // legal instrument with an approval and signature lifecycle, and a
+  // stored document is any attachment on any record.
+  //
+  // ⚠️ DELETE IS SEPARATE FROM CREATE, and not for symmetry. A document
+  // is frequently the ONLY copy of something — a signed acknowledgement,
+  // a site photograph taken on a day that cannot happen again — and the
+  // people who should be able to attach one are not automatically the
+  // people who should be able to remove it.
+  "documents:create": "Upload and attach documents",
+  "documents:delete": "Delete stored documents",
+
   // ── Accounting ───────────────────────────────────────────────────
   "ledgers:read": "View ledgers and balances",
   "ledgers:create": "Create ledgers",
@@ -588,6 +669,23 @@ export const PERMISSION_CATALOG = {
   "roles:manage": "Create and edit roles",
   "settings:read": "View workspace settings",
   "settings:update": "Change workspace settings",
+  /**
+   * 🔴 ADDED IN v1.31.0. `exportWorkspace` returns 26 tables — every
+   * contact, contract, document row, ledger, transaction, journal entry
+   * and invoice, plus the audit log itself — and it was gated on
+   * `settings:read`, which the `read_only` role holds.
+   *
+   * ⚠️ THE INTENT WAS ALREADY RIGHT and written down: "an ordinary
+   * member should not be able to pull the entire workspace, but this
+   * must NOT be so restricted that a customer trying to leave cannot
+   * get their data out. An owner or admin holds it, which is the right
+   * line." Only the key was wrong. This is that line, spelt correctly.
+   *
+   * It stays on the always-permitted list for a locked account: a
+   * customer must always be able to leave with their data.
+   */
+  "workspace:export":
+    "⚠️ Download a complete copy of the workspace — every record in every module",
   "billing:read": "View billing",
   "billing:manage": "Change plan and payment details",
   "audit:read": "View the audit log",
@@ -721,6 +819,14 @@ export const DANGEROUS_PERMISSIONS: readonly PermissionKey[] = [
   "units:block",
   "bookings:cancel",
   "partners:override_lock",
+
+  // v1.31.0. A variation changes the contract sum. Approving one is the
+  // decision that makes a claim payable, and it does not reverse.
+  "construction.variation.approve",
+
+  // v1.31.0. One call, and every record the workspace holds is on
+  // somebody's laptop. There is no larger single action in the product.
+  "workspace:export",
 
   // Phase 23. Publishing lends an automation the publisher's identity for
   // every unattended run it ever makes; the other two let it act outside
@@ -967,6 +1073,20 @@ export const ROLE_TEMPLATES: Readonly<Record<SystemRole, RoleTemplate>> = {
       // present — an owner or administrator signs that, not the person
       // who files against it.
       "gst:read", "gst:manage_rates", "gst:manage_parties",
+      /**
+       * ⭐⭐ THE ACCOUNTANT READS AND POSTS PAYROLL, AND DOES NOT
+       * APPROVE IT.
+       *
+       * ⚠️ They are the person who reconciles the PF challan against
+       * the ledger, so they must be able to see the wage bill and put
+       * it into the books. Signing off WHAT everybody is paid is a
+       * different decision made by a different person — the same
+       * separation as the credit ceiling and the waiver below.
+       *
+       * 🔴 AND NOT `payroll.manage`. The person who can edit a salary
+       * and the person who posts the total should not be one key.
+       */
+      "payroll.read", "payroll.post",
       // ⭐ PHASE 48 — THE ROLE THAT SETS CREDIT LIMITS. The accountant
       // knows who pays and who does not; nobody else in a company this
       // size has that in front of them daily.
@@ -1090,6 +1210,7 @@ export const ROLE_TEMPLATES: Readonly<Record<SystemRole, RoleTemplate>> = {
       "Drafts, approves and executes contracts. Deliberately has no ledger access.",
     permissions: [
       "contracts:read", "contracts:create", "contracts:update",
+      "documents:create", "documents:delete",
       "contracts:approve", "contracts:sign", "contracts:legal_hold",
       "clauses:read", "clauses:manage",
       "contacts:read", "contacts:create", "contacts:update",
@@ -1161,6 +1282,13 @@ export const ROLE_TEMPLATES: Readonly<Record<SystemRole, RoleTemplate>> = {
       "custom_objects:read", "custom_objects:create_record", "custom_objects:update_record",
       "custom_objects:delete_record",
       "contracts:read",
+      /**
+       * ⭐ MEMBERS ATTACH DOCUMENTS AND DO NOT DELETE THEM. Attaching is
+       * ordinary daily work; removing the only copy of a signed
+       * acknowledgement is not, and it is not recoverable by the person
+       * who did it.
+       */
+      "documents:create",
       // ⚠️ THE SALES EXECUTIVE. Reads inventory, works the pipeline,
       // holds a unit, creates and advances a booking.
       //

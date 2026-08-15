@@ -78,7 +78,7 @@ Set at **Cloudflare → Worker `app-ordence` → Settings → Variables and secr
 
 | # | Name | Type | Value |
 |---|---|---|---|
-| 1 | `DATABASE_URL` | 🔒 Secret | `postgresql://neondb_owner:<YOUR-NEON-PASSWORD>@ep-raspy-math-azduzr7s-pooler.c-3.ap-southeast-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require` |
+| 1 | `DATABASE_URL` | 🔒 Secret | `postgresql://ordence_app:<YOUR-ORDENCE-APP-PASSWORD>@<YOUR-NEON-POOLER-HOST>/neondb?sslmode=require&channel_binding=require` |
 | 2 | `DATABASE_URL_UNPOOLED` | 🔒 Secret | same as above **without** `-pooler` |
 | 3 | `CLERK_SECRET_KEY` | 🔒 Secret | `<YOUR-CLERK-SECRET-KEY>` |
 | 4 | `CLERK_WEBHOOK_SIGNING_SECRET` | 🔒 Secret | `<YOUR-CLERK-WEBHOOK-SIGNING-SECRET>` |
@@ -87,9 +87,20 @@ Set at **Cloudflare → Worker `app-ordence` → Settings → Variables and secr
 | 7 | `NEXT_PUBLIC_ROOT_DOMAIN` | Text | `app.ordence.com` |
 | 8 | `PLATFORM_ADMIN_EMAILS` | Text | `Sahil@ordence.com` |
 
-**Verify with `/api/diag`.** The expected lengths are 152, 145, 50, —, 55, 23,
-15, 17. A wrong length means a truncated paste or a trailing space, which is
-otherwise invisible.
+> 🔴 **USE `ordence_app`, NOT `neondb_owner`.** This table named the Neon
+> owner role until v1.32.0, which contradicts the STOP gate in
+> `docs/DEPLOY-CHECKLIST.md` and `RAILWAY-VARIABLES-PASTE.txt`. The owner
+> role carries `BYPASSRLS`, which **overrides even FORCE ROW LEVEL
+> SECURITY** — so a deployment set up from this page ran with every
+> tenant-isolation policy inert on 249 tables while every page worked
+> perfectly. That is the single most expensive line in these documents to
+> get wrong, and it is invisible from inside the application.
+
+**Verify with `/api/diag`.** It reports, for every name, whether the running
+server can see it. It no longer reports character lengths: an exact length is a
+truncated-paste oracle on a public endpoint, and the boolean answers the
+question. If a value looks right and behaves wrong, re-paste it rather than
+counting it.
 
 ### Not yet configured (optional, app degrades cleanly)
 

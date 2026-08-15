@@ -33,6 +33,7 @@
  * bigint, so every amount returned goes through `serializeAmount`.
  */
 
+import type { PermissionKey } from "@/db/schema/auth";
 import { and, desc, eq, sql } from "drizzle-orm";
 import { revalidatePath } from "next/cache";
 import { withTenant } from "@/db";
@@ -43,9 +44,17 @@ import {
   salesOrderFulfillmentLines,
   salesOrderEvents,
 } from "@/db/schema/orders";
-import { gstRegistrations } from "@/db/schema/gst";
+import { gstParties, gstRegistrations } from "@/db/schema/gst";
+import type { GstRegistrationType } from "@/db/schema/gst";
+import { projects } from "@/db/schema/sales";
+import { determinePlaceOfSupply } from "@/lib/gst/place-of-supply";
 import { requirePermission, writeAudit } from "@/server/audit";
-import { guardSalesWrite, salesFail, toSalesActionError } from "@/server/sales/guards";
+import {
+  guardSalesWrite,
+  OrderTaxRefusal,
+  salesFail,
+  toSalesActionError,
+} from "@/server/sales/guards";
 import {
   amendOrderSchema,
   cancelOrderSchema,
@@ -227,13 +236,125 @@ export async function createOrder(
           sellerStateCode = reg?.gstin ? reg.gstin.slice(0, 2) : null;
         }
 
-        const isInterState =
-          data.placeOfSupplyCode !== null &&
-          data.placeOfSupplyCode !== undefined &&
-          sellerStateCode !== null
-            ? data.placeOfSupplyCode !== sellerStateCode
-            : false;
+        /**
+         * ⭐ THE RECIPIENT'S STATUS AND STATE, READ NOT ASSUMED.
+         *
+         * 🔴 `registrationType` IS THE FIELD THE OLD CODE NEVER LOOKED AT,
+         * and it is the one that decides the SEZ case. An SEZ unit two
+         * kilometres away in our own state is an INTER-STATE supply under
+         * s.7(5)(b). Comparing state codes returns "equal" and concludes
+         * intra-state, which under-collects IGST that is paid later with
+         * interest.
+         */
+        let recipientStateCode: string | null = null;
+        let recipientRegistration: GstRegistrationType = "unregistered";
+        if (data.gstPartyId) {
+          const [party] = await tx
+            .select({
+              stateCode: gstParties.stateCode,
+              gstin: gstParties.gstin,
+              registrationType: gstParties.registrationType,
+            })
+            .from(gstParties)
+            .where(
+              and(
+                eq(gstParties.tenantId, ctx.tenant.id),
+                eq(gstParties.id, data.gstPartyId),
+              ),
+            )
+            .limit(1);
+          if (party) {
+            recipientRegistration = party.registrationType;
+            recipientStateCode =
+              party.stateCode ?? (party.gstin ? party.gstin.slice(0, 2) : null);
+          }
+        }
 
+        /**
+         * ⭐ THE SITE, FOR A WORKS CONTRACT. Section 12(3) says the place
+         * of supply for anything relating to immovable property is the
+         * LOCATION OF THE PROPERTY. Not the buyer's address, not their
+         * GSTIN. `projects.stateCode` is where we hold that fact.
+         */
+        let propertyStateCode: string | null = data.propertyStateCode ?? null;
+        if (!propertyStateCode && data.projectId) {
+          const [project] = await tx
+            .select({ stateCode: projects.stateCode })
+            .from(projects)
+            .where(
+              and(
+                eq(projects.tenantId, ctx.tenant.id),
+                eq(projects.id, data.projectId),
+              ),
+            )
+            .limit(1);
+          propertyStateCode = project?.stateCode ?? null;
+        }
+
+        /**
+         * 🔴 THE DETERMINATION. This replaces:
+         *
+         *     const isInterState = data.placeOfSupplyCode !== sellerStateCode
+         *
+         * which decided which tax applies by comparing two strings, could
+         * not express s.12(3) or s.7(5)(b) at all, and recorded every
+         * intra-UT supply as CGST + SGST.
+         *
+         * ⚠️ IT REFUSES RATHER THAN GUESSING. The engine returns a problem
+         * with a remedy when it has not been told enough — a works
+         * contract with no site, a registered buyer with no state. The old
+         * code's `: false` fallback quietly answered "intra-state" for all
+         * of those, which is the wrong tax on every invoice, e-way bill
+         * and return derived from the order.
+         *
+         * ⭐ AND THE CALLER'S `placeOfSupplyCode` IS NO LONGER TRUSTED.
+         * It was an input; it is now an assertion that is checked. A
+         * caller who could choose their own place of supply could choose
+         * their own tax treatment, and the total is identical either way,
+         * so nothing on the screen would look wrong.
+         */
+        if (!sellerStateCode) {
+          throw new OrderTaxRefusal(
+            "This order has no GST registration to be issued under, so we cannot determine the place of supply.",
+            "Pick the registration this order is billed from. The first two digits of that GSTIN are the supplier state.",
+          );
+        }
+
+        const determination = determinePlaceOfSupply({
+          supplierStateCode: sellerStateCode,
+          supplyType: data.supplyType,
+          recipientRegistration,
+          recipientStateCode,
+          propertyStateCode,
+          deliveryStateCode: data.deliveryStateCode ?? null,
+        });
+
+        if (!determination.ok) {
+          throw new OrderTaxRefusal(
+            determination.problem.message,
+            determination.problem.remedy,
+          );
+        }
+        const supply = determination.supply;
+
+        /**
+         * ⚠️ IF THE CALLER SENT A PLACE OF SUPPLY AND THE ENGINE DISAGREES,
+         * THE ENGINE WINS AND WE SAY SO. Silently overriding would hide a
+         * data problem: the usual cause is that the project's state and
+         * the buyer's state differ and somebody typed the buyer's.
+         */
+        if (
+          data.placeOfSupplyCode &&
+          data.placeOfSupplyCode !== supply.placeOfSupplyCode
+        ) {
+          throw new OrderTaxRefusal(
+            `The place of supply on this order says ${data.placeOfSupplyCode}, but ${supply.statutoryRef} makes it ${supply.placeOfSupplyCode}.`,
+            supply.explanation +
+              " Clear the place of supply field and let it be determined, or correct the underlying record it is derived from.",
+          );
+        }
+
+        const isInterState = supply.isInterState;
         const priced = priceAll(data.lines, isInterState);
         const totals = summarise(priced);
 
@@ -254,8 +375,15 @@ export async function createOrder(
             contactId: data.contactId ?? null,
             gstPartyId: data.gstPartyId ?? null,
             sellerRegistrationId: data.sellerRegistrationId ?? null,
-            placeOfSupplyCode: data.placeOfSupplyCode ?? null,
+            placeOfSupplyCode: supply.placeOfSupplyCode,
             isInterState,
+            /* ⭐ The determination is stored, not just its conclusion. */
+            supplyType: data.supplyType,
+            propertyStateCode,
+            recipientRegistration,
+            placeOfSupplyBasis: supply.basis,
+            placeOfSupplyRef: supply.statutoryRef,
+            isUnionTerritory: supply.isUnionTerritory,
             dealId: data.dealId ?? null,
             projectId: data.projectId ?? null,
             bookingId: data.bookingId ?? null,
@@ -770,7 +898,7 @@ export async function amendOrder(
 async function transition(args: {
   id: string;
   operation: string;
-  permission: string;
+  permission: PermissionKey;
   eventType: string;
   to: "cancelled" | "on_hold" | "confirmed" | "closed";
   summary: (orderNo: string) => string;

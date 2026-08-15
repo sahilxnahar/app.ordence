@@ -17,6 +17,8 @@ import { z } from "zod";
 import { withTenant } from "@/db";
 import { billingRates, timeEntries } from "@/db/schema/accounting";
 import { companies } from "@/db/schema/crm";
+import { gstParties, gstRegistrations } from "@/db/schema/gst";
+import { determinePlaceOfSupply } from "@/lib/gst/place-of-supply";
 import { salesInvoices, salesInvoiceLines } from "@/db/schema/sales-invoices";
 import { users } from "@/db/schema/core";
 import { requirePermission, writeAudit } from "@/server/audit";
@@ -82,7 +84,7 @@ export async function saveBillingRate(
 ): Promise<ActionResult<{ id: string }>> {
   try {
     const data = rateSchema.parse(input);
-    const ctx = await requirePermission("settings.manage");
+    const ctx = await requirePermission("settings:update");
 
     const id = await withTenant(
       ctx.tenant.id,
@@ -599,8 +601,31 @@ const billTimeSchema = z.object({
   chargeBasis: z
     .enum(["forward_charge", "reverse_charge", "exempt", "export_zero_rated"])
     .default("forward_charge"),
+  /**
+   * ⚠️ v1.37.0 (Batch 33): BOTH OF THESE WERE TAKEN AT FACE VALUE, AND
+   * ONE OF THEM WAS A BOOLEAN THE CLIENT CHOSE.
+   *
+   * ══════════════════════════════════════════════════════════════════
+   * 🔴 `isInterState: z.boolean()` LET THE CALLER PICK THEIR OWN TAX.
+   * ══════════════════════════════════════════════════════════════════
+   * Not the place of supply, from which the tax follows — the split
+   * itself, as a bare flag, with no relationship to any address on file.
+   * And `placeOfSupplyCode ?? "27"` defaulted the missing case to
+   * Maharashtra, so a firm in Karnataka billing a Karnataka client with
+   * the field blank raised an INTER-state invoice against a state it has
+   * no connection to.
+   *
+   * Both are now DERIVED inside the transaction from the client's GST
+   * party and the firm's own registration, through the same engine the
+   * order path uses. They remain in the schema as assertions: if a
+   * caller sends a place of supply that disagrees with the
+   * determination, it is refused rather than silently overridden.
+   */
   placeOfSupplyCode: z.string().trim().length(2).optional(),
+  /** ⚠️ Ignored for the tax split. Kept so existing callers still parse. */
   isInterState: z.boolean().default(false),
+  /** ⭐ Which of OUR registrations this is billed from. */
+  sellerRegistrationId: z.string().uuid().optional(),
   /**
    * ⭐ ONE LINE PER MATTER, or one line per entry.
    *
@@ -676,6 +701,105 @@ export async function raiseInvoiceFromTime(input: unknown): Promise<
           );
 
         if (entries.length === 0) throw new Error("None of those time entries exist.");
+
+        /* ---------------------------------------------------------- */
+        /* ⭐ v1.37.0: THE TAX SPLIT IS DETERMINED, NOT ACCEPTED       */
+        /* ---------------------------------------------------------- */
+        //
+        // 🔴 A professional-services firm is the WORST place to take a
+        // client-supplied inter-state flag, because s.12(3) bites here
+        // constantly: an architect's fee, a surveyor's report and a
+        // structural engineer's certificate are all "directly in
+        // relation to immovable property", so the place of supply is the
+        // SITE — not the client's registered office, which is what a
+        // legal or consulting CRM records.
+        //
+        // ⚠️ THE ENGINE IS ASKED FOR `services`, NOT `immovable_property`,
+        // and that is deliberate rather than an oversight. Time billing
+        // does not know whether a matter relates to a property; forcing
+        // `immovable_property` would make the engine refuse every bill
+        // until somebody typed a site state, including the ninety
+        // percent that have no site. Batch 116 gives a matter a site and
+        // this call gains the branch then. Until it does, the treatment
+        // is the s.12(2) one, which is what the old code assumed too —
+        // the difference is that it is now RECORDED as an assumption
+        // rather than produced by a flag off a form.
+
+        const [sellerReg] = data.sellerRegistrationId
+          ? await tx
+              .select({ stateCode: gstRegistrations.stateCode })
+              .from(gstRegistrations)
+              .where(
+                and(
+                  eq(gstRegistrations.tenantId, ctx.tenant.id),
+                  eq(gstRegistrations.id, data.sellerRegistrationId),
+                ),
+              )
+              .limit(1)
+          : await tx
+              .select({ stateCode: gstRegistrations.stateCode })
+              .from(gstRegistrations)
+              .where(
+                and(
+                  eq(gstRegistrations.tenantId, ctx.tenant.id),
+                  eq(gstRegistrations.isActive, true),
+                ),
+              )
+              .limit(1);
+
+        if (!sellerReg?.stateCode) {
+          throw new Error(
+            "This workspace has no active GST registration, so we cannot determine " +
+              "which tax applies to this bill. Add the firm's GSTIN under Settings " +
+              "before raising a tax invoice.",
+          );
+        }
+
+        const [clientParty] = await tx
+          .select({
+            stateCode: gstParties.stateCode,
+            gstin: gstParties.gstin,
+            registrationType: gstParties.registrationType,
+          })
+          .from(gstParties)
+          .where(
+            and(
+              eq(gstParties.tenantId, ctx.tenant.id),
+              eq(gstParties.companyId, data.companyId),
+              eq(gstParties.isActive, true),
+            ),
+          )
+          .limit(1);
+
+        const determination = determinePlaceOfSupply({
+          supplierStateCode: sellerReg.stateCode,
+          supplyType: "services",
+          recipientRegistration: clientParty?.registrationType ?? "unregistered",
+          recipientStateCode:
+            clientParty?.stateCode ??
+            (clientParty?.gstin ? clientParty.gstin.slice(0, 2) : null),
+        });
+
+        if (!determination.ok) {
+          throw new Error(
+            `${determination.problem.message} ${determination.problem.remedy}`,
+          );
+        }
+        const supply = determination.supply;
+
+        // ⚠️ A caller that sent a place of supply gets an explicit
+        // disagreement rather than a silent overwrite. The usual cause is
+        // a stale value cached in a form.
+        if (
+          data.placeOfSupplyCode &&
+          data.placeOfSupplyCode !== supply.placeOfSupplyCode
+        ) {
+          throw new Error(
+            `The place of supply sent with this bill says ${data.placeOfSupplyCode}, ` +
+              `but ${supply.statutoryRef} makes it ${supply.placeOfSupplyCode}. ` +
+              supply.explanation,
+          );
+        }
 
         /**
          * ⚠️ EVERY REFUSAL NAMES WHAT IS WRONG AND HOW MANY. "Some
@@ -782,8 +906,8 @@ export async function raiseInvoiceFromTime(input: unknown): Promise<
             hsnSacCode: data.sacCode ?? "9982",
           })),
           selection: lines.map((_, i) => ({ orderLineId: `t-${i}` })),
-          taxKind: data.isInterState ? "igst" : "cgst_sgst",
-          placeOfSupplyCode: data.placeOfSupplyCode ?? "27",
+          taxKind: supply.taxKind,
+          placeOfSupplyCode: supply.placeOfSupplyCode,
         });
 
         const [company] = await tx
@@ -806,9 +930,31 @@ export async function raiseInvoiceFromTime(input: unknown): Promise<
             invoiceDate: data.invoiceDate,
             dueDate: data.dueDate ?? null,
             customerLegalName: company?.name ?? null,
-            placeOfSupplyCode: data.placeOfSupplyCode ?? null,
-            isInterState: data.isInterState,
-            isUnionTerritory: false,
+            placeOfSupplyCode: supply.placeOfSupplyCode,
+            isInterState: supply.isInterState,
+            /**
+             * ⭐ THE COLUMNS EXISTED AND NOTHING WROTE THEM.
+             *
+             * `sales_invoices` has carried `place_of_supply_basis` and
+             * `is_union_territory` since the table was created. Every
+             * invoice raised from time billing left both at their
+             * defaults, so the working papers for a professional-services
+             * firm could not say which rule produced the tax on any bill
+             * it had ever issued — and every intra-UT bill was recorded
+             * as CGST + SGST, right money, wrong Act, wrong GSTR-1 box.
+             */
+            placeOfSupplyBasis: supply.basis,
+            /**
+             * ⚠️ THIS LINE READ `isUnionTerritory: false`, HARDCODED.
+             *
+             * A firm billing a client in Puducherry, Chandigarh or the
+             * Andamans owes CGST + UTGST. The amount is identical to
+             * CGST + SGST, so no total was ever wrong and nothing on any
+             * document looked odd — but the Act cited was wrong on every
+             * one of those bills, and they were reported in the wrong
+             * GSTR-1 box for as long as the product has existed.
+             */
+            isUnionTerritory: supply.isUnionTerritory,
             /** 🔴 SERVICES, not goods — it changes the Rule 48 copy count. */
             supplyType: "services",
             /**

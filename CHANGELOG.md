@@ -1,3 +1,202 @@
+# v1.24.0-alpha — GSTR-3B, THE SET-OFF, AND WHAT YOU ACTUALLY OWE
+
+**Repo: `app.ordence`** · 🔴 **SQL: `0077` (run BEFORE the code push)** · ⚠️ **No new variables**
+
+Batch 16. ⚠️ **Note the number: 0077, not 0076** — the third time a
+retired number has tried to come back, and the third time the gate
+refused it.
+
+- 🔴🔴 **GSTR-1 IS A STATEMENT. GSTR-3B IS THE ONE YOU PAY FROM.**
+  Ordence has built GSTR-1 since v0.9x and it settles nothing. The 3B is
+  where output tax meets input credit and whatever is left has to leave a
+  bank account by the twentieth.
+- 🔴🔴🔴 **CGST CREDIT MAY NEVER BE SET OFF AGAINST SGST, OR THE OTHER
+  WAY ROUND.** Not in any order, not as a last resort. They are different
+  governments. A set-off that treats the pools as interchangeable
+  produces a smaller, entirely plausible cash figure, and the department
+  disagrees months later with interest attached. The set-off order is
+  written as **data rather than control flow**, so it can be read against
+  the section instead of simulated in somebody's head.
+- ⭐⭐⭐ **AND A WORKED EXAMPLE IN THE TESTS CAUGHT A REAL FLAW IN MY OWN
+  FIRST VERSION.** Spending the leftover IGST credit on CGST first — the
+  obvious order — clears CGST, strands CGST credit that can never cross
+  to SGST, and pays SGST **in cash**. On the example in the test that is
+  ₹10,000 a month of avoidable cash. The remaining IGST is now allocated
+  against the shortfall each head would still have after its own credit,
+  proportionally. It is legal (any order is permitted), never worse, and
+  frequently better.
+- 🔴 **REVERSE CHARGE IS HELD OUT OF THE SET-OFF ENTIRELY.** It is
+  payable in cash by law: the credit for it arises only once it has been
+  paid, so discharging it from credit spends something that does not
+  exist yet. It is the second most common 3B error.
+
+- ⭐⭐ **THE RECLASSIFICATION JOURNAL, WHICH ALMOST NOBODY POSTS.**
+  Invoices credit Output tax, purchases debit Input tax, and left alone
+  both sides grow forever — a balance sheet showing ₹40 lakh owed and
+  ₹38 lakh receivable when the business owes ₹2 lakh. It balances, it is
+  arithmetically correct, and a lender reading it sees a company with a
+  large tax liability. One journal now clears both sides by **exactly
+  what the set-off utilised**, and leaves the cash portion in its own
+  account.
+- ⚠️ **THE AMOUNTS COME FROM THE SET-OFF, NEVER FROM THE BALANCES.**
+  Clearing "whatever is in the account" would sweep up credit the return
+  did not claim and output tax from a period already filed.
+
+- ⭐⭐⭐ **AND THE SCREEN PEOPLE WILL ACTUALLY OPEN DAILY: WHAT IS DUE.**
+  Everything owed to a government this month — GST, both TDS sections,
+  provident fund, pension, ESI and professional tax — with due dates,
+  **from actual ledger balances**. Every one of those liabilities was
+  already correct and none of them was on one page: the only way to
+  answer "what do I owe" was to open a trial balance and know which eight
+  accounts to read, which is a thing nobody does on the 6th.
+- 🔴 **IT IS NOT BEHIND A FEATURE GATE, AND THAT IS AN ETHICAL DECISION
+  RATHER THAN A COMMERCIAL ONE.** A tenant who has stopped paying us
+  still has to pay the Government, and the interest, late fees and
+  provident-fund damages that follow a missed date are not ours to hold
+  hostage. The module-registry gate refused the change until the
+  reasoning was written down, which is the gate working.
+- ⚠️ **"THE 15TH OF THE FOLLOWING MONTH", NEVER "THIRTY DAYS AFTER".**
+  The two are different dates in eleven months out of twelve, and the
+  second is how a compliance calendar quietly drifts.
+
+- 🔴 **A BUG CAUGHT IN MY OWN CODE BEFORE IT SHIPPED.** `buildGstr3b`
+  took the taxable value in its facts, used it for nothing, and did not
+  return it — so the action storing the return wrote a literal zero. A 3B
+  whose tax is right and whose taxable value is nil fails the portal's
+  own validation, and it looked entirely plausible in the database.
+- ⚠️ **AND MY OWN EDITS WENT INTO THE BUILD STAGING COPY TWICE MORE.**
+  Same trap as last session: written to the staging tree, overwritten by
+  the next sync, `tsc` green throughout because staging still had them.
+  Caught both times by tests that read the source file.
+
+**Gates:** all eight green — `tsc`, `check:boundaries`,
+`check:migrations`, `check:sql`, `check:posting` (6 of 9, unchanged —
+returns declare tax, they do not create it), `check:reachability`,
+`test:ui` (77 files, **2,832 passing**, 55 new), `next build`. RLS drill
+run as non-superuser `app_user`: 8 positives, 10 refusals, every refusal
+paired.
+
+**Deliberately not in this batch:** portal filing (needs a GSP, which
+needs the LLP), GSTR-9 and 9C (they read a year of 3Bs, so a year of them
+has to exist first), and the rule 42/43 apportionment calculator — the
+reversal figure is **entered**, because apportioning credit needs
+turnover splits Ordence does not model and a wrong reversal is a wrong
+return with interest on it.
+
+---
+
+# v1.23.0-alpha — PAYROLL, AND A JOURNAL THAT DEBITS THE GROSS
+
+**Repo: `app.ordence`** · 🔴 **SQL: `0075` (run BEFORE the code push)** · ⚠️ **No new variables**
+
+Batch 15, the largest remaining piece. `check:posting` moves from 5 of 9
+to **6 of 9**.
+
+- 🔴🔴 **THE PAYROLL JOURNAL IS THE ONE MOST OFTEN GOT WRONG, AND IT IS
+  ALWAYS WRONG IN THE SAME DIRECTION.** The wrong version debits
+  "Salaries" with the NET paid and credits the bank. It balances. It is
+  also understated by every rupee of PF, ESI, professional tax and TDS
+  withheld — money the business spent on employing people and owes to
+  somebody else. **Ordence debits the GROSS**, debits the employer's own
+  contributions on top, and credits five separate liabilities.
+- ⚠️ **AND IT NEVER TOUCHES THE BANK.** Payroll ACCRUES. What leaves the
+  bank is a later event against Salaries Payable, on the day the transfer
+  clears. Collapsing the two would claim money left the bank on a day it
+  did not.
+- 🔴 **PENSION IS ITS OWN PAYABLE, SEPARATE FROM PF.** Same challan,
+  different account head. A single netted "PF payable" balance cannot be
+  reconciled against an ECR — the same argument as the two stock variance
+  accounts in v1.18.0.
+
+- ⭐⭐⭐ **NOT ONE STATUTORY RATE IS A CONSTANT.** Every percentage,
+  ceiling and slab is a row with an effective date. **Payroll is
+  retrospective by nature:** somebody asks for last March's payslip and
+  it must produce the number they were actually paid. A rate compiled
+  into code means March gets recalculated with April's number the next
+  time anybody reissues it, and nobody notices until the employee
+  compares it with their bank statement.
+- ⚠️ **AND A MISSING RATE REFUSES RATHER THAN DEDUCTING ZERO.** A payroll
+  that quietly skips PF because nobody configured it is worse than one
+  that stops: it produces a plausible payslip and is discovered by an
+  inspector.
+
+- ⭐⭐ **ESI HAS A CLIFF, NOT A CEILING, AND THAT IS THE WHOLE TRAP.** PF
+  contributes on the ceiling when wages exceed it; ESI stops altogether.
+  Treating them alike deducts 0.75% of ₹21,000 from somebody earning
+  ₹40,000 who is not covered at all. The contribution-period continuation
+  rule is implemented too: crossing the limit mid-period keeps somebody
+  covered until the period ends, because dropping them the month they get
+  a rise loses them medical cover.
+- ⭐ **PROFESSIONAL TAX IS PER STATE, AND THREE STATES ARE SEEDED.** The
+  rest are deliberately empty: a wrong slab is worse than a missing one,
+  because a missing one says so on the payslip and a wrong one deducts a
+  confident amount that is not right. Maharashtra's February top-up is
+  included, and it is the reason the engine knows what month it is.
+
+- 🔴 **INCOME TAX IS A PROJECTION AND THE CODE SAYS SO EVERYWHERE.**
+  Monthly TDS under section 192 depends on declarations nobody has made
+  yet. Every payslip carries the projection it was built from and its
+  caveats. **The accountant's override is first-class**, because a
+  payroll system that refuses their number is one that gets bypassed with
+  a spreadsheet, after which nothing in the ledger is right.
+- ⚠️ **NO PAN MEANS A REFUSAL, NOT A GUESSED 20%.** Applying section
+  206AA to somebody who has simply not typed their PAN in yet is a very
+  expensive way to chase a data-entry gap.
+
+- ⭐⭐ **THE PAYSLIP CARRIES ITS OWN WORKING.** Every other total in this
+  product is checked by a machine or not at all; a payslip is checked by
+  a person with a calculator who is owed the money. So each line prints
+  how it was arrived at, nothing is netted, and a figure the system is
+  unsure of is a stated PROBLEM rather than a confident number. **A run
+  with any problem cannot be approved.**
+- 🔴 **APPROVAL FREEZES THE PAYSLIPS, IN THE DATABASE.** Approval is a
+  signature on a wage bill. If a payslip can still change afterwards the
+  signature attaches to nothing, and the change made after approval is
+  never a typo — it is a number somebody wanted to be different. The
+  remedy is to cancel with a reason and re-run, which leaves both on the
+  record.
+- ⚠️ **ONE LIVE RUN PER PERIOD, ENFORCED BY AN INDEX.** Two payrolls for
+  the same March both post and the wage bill doubles in the ledger with
+  nothing reporting a problem — every figure downstream then exactly
+  twice the truth and entirely plausible.
+
+- ⭐ **NO AADHAAR AND NO BANK ACCOUNT NUMBER.** Ordence accrues payroll
+  and does not disburse it, so an account number here would be a
+  credential sitting in a row every support session can read, in service
+  of a feature that does not exist. When NEFT advice files are built they
+  will read from `vault_secrets`.
+- 🔴 **FOUR PERMISSIONS, AND THE SPLIT IS THE ONLY CONTROL THAT MATTERS.**
+  The person who enters a raise and the person who signs off the month's
+  wage bill must be able to be two different people. The accountant role
+  gets `payroll.read` and `payroll.post` and deliberately not
+  `payroll.manage`.
+
+- 🔴 **A GAP FOUND IN EXISTING CODE WHILE BUILDING THIS.** v1.21.0 added
+  the period lock to `writePosting` and not to `writePropertyPosting`.
+  The DATA was never at risk — 0073's trigger sits on `transactions` and
+  refuses the insert whichever writer attempts it — but a correct refusal
+  delivered as an unhandled database exception is read as a bug, and the
+  response to a bug is to look for a way around it. Fixed.
+- ⚠️ **AND ONE OF MY OWN EDITS WAS SILENTLY LOST.** Three registry
+  changes were written into the build staging copy instead of the source
+  tree and then overwritten by the next sync. `tsc` was green because
+  staging still had them. **The reachability test caught it**, which is
+  exactly the job those tests exist to do.
+
+**Gates:** all eight green — `tsc`, `check:boundaries`, `check:migrations`,
+`check:sql`, **`check:posting` now 6 of 9**, `check:reachability`,
+`test:ui` (76 files, **2,777 passing**, 73 new), `next build`. RLS drill
+run as non-superuser `app_user`: 13 positives, 15 refusals, every refusal
+paired.
+
+**Deliberately not in this batch, and each said out loud:** NEFT advice
+files, Form 16 and 24Q, arrears, gratuity, bonus, full-and-final
+settlement, and an employee loan ledger. Every one is a real feature with
+its own rules, and half a version of any of them produces numbers that
+look right.
+
+---
+
 # v1.22.0-alpha — THE PANEL THAT COULD RECORD EVERYTHING AND STOP NOTHING
 
 **Repo: `app.ordence`** · 🔴 **SQL: `0074` (run BEFORE the code push)** · ⚠️ **No new variables**
@@ -2520,3 +2719,197 @@ no dual-axis charts; status colours reserved and always paired with a word.
 - Tenant rows are not auto-created yet — Clerk webhook lands in Phase 2 (SEC-003)
 - No Content-Security-Policy yet — needs nonce config for Clerk (SEC-002)
 - BullMQ workers cannot run on Vercel; separate host needed from Phase 3 (SEC-006)
+
+## v1.37.0-alpha — Mega-wave 1, batches 33 and 35 (partial)
+
+### 🔴 The tax was decided by comparing two strings (Batch 33)
+
+`server/actions/orders.ts:231-236` decided CGST+SGST versus IGST with
+`data.placeOfSupplyCode !== sellerStateCode`, while
+`lib/gst/place-of-supply.ts` held a complete engine covering s.12(3)
+immovable property, s.7(5)(b) SEZ, s.10(1)(a) goods movement, s.12(2)
+services and the UT/UTGST distinction. Nothing called it.
+
+The order table could not hold the engine's answer: two columns, and
+nowhere for the site of a works contract, the recipient being an SEZ
+unit, or an intra-UT supply. SQL 0080 adds six columns to `sales_orders`,
+`state_code` to `projects`, and four CHECK constraints.
+
+Three further sites found by the new gate rather than by reading:
+- `lib/inventory/transfer.ts` — its own comment named the SEZ case four
+  lines above the comparison that got it wrong.
+- `server/actions/time-billing.ts` — took `isInterState` as a
+  client-supplied boolean and defaulted place of supply to `"27"`.
+- the same file — `isUnionTerritory: false`, hardcoded.
+
+### Twelve links led to a 404 (Batch 35, partial)
+
+New `check:links` gate walks the route table. `/sales` was a 404 with
+seven working sub-sections underneath it; that one is built. Eleven
+remain, registered with a budget that may only decrease.
+
+### Gates: thirteen
+- ⭐ `check:tax-decisions` (new) — no tax split derived from a comparison
+- ⭐ `check:links` (new) — no internal link without a destination
+
+## v1.38.0-alpha — Mega-wave 1, batch 51
+
+### 🔴 One hardcoded `"0"` made every month behave like April
+
+`server/payroll/run.ts:398` passed `tdsAlreadyDeductedMinor: "0"` into a
+true-up that is otherwise correct. Every month was computed as if nothing
+had been deducted yet: roughly double the correct deduction by September,
+and in March the entire annual liability again on top of eleven months
+already paid.
+
+⚠️ It failed in the direction nobody complains about. Over-deduction is
+refunded when the employee files, so the employer never hears about it.
+
+`tdsDeductedThisFy` reads posted and approved runs in the same Indian
+financial year, strictly before the period being computed, in one query
+for the whole run.
+
+### ⭐ And a branch that could never fire
+
+`lib/payroll/statutory.ts` carries a caveat for "the year's tax is
+already withheld". With the history forced to zero, `outstanding` always
+equalled `liability`, so the condition was unsatisfiable. Correct code,
+unreachable, same shape as the place-of-supply engine one layer down.
+
+### 🔴 Batch 50 is blocked, and this is the finding
+
+Feeding real attendance into the run needs an attendance table. There
+isn't one: `labour.ts` has an `attendanceKindEnum` for construction
+labour and nothing for staff. Batch 50 cannot ship before Batch 59.
+
+## v1.39.0-alpha — Mega-wave 1, batch 36 (bank accounts)
+
+### 🔴 `insert(bankAccounts)` appeared nowhere in the tree
+
+Not "no screen". No code path at all. Reconciliation, statement import,
+matching and payment recording were all built on a table nothing could
+put a row in. The only way a workspace could have had a bank account was
+somebody typing INSERT at a psql prompt.
+
+⚠️ It looked fine from every angle: `getBankAccounts()` returns an empty
+list, indistinguishable from a workspace that has not added one yet.
+
+`createBankAccount` writes the ledger and the account in ONE transaction,
+because `bank_accounts.ledger_id` is NOT NULL and `one_per_ledger` makes
+it exclusive, so an account without its own ledger is impossible.
+
+- `accountType: "asset"` is hardcoded, not offered. An overdrawn account
+  is still an asset ledger carrying a credit balance.
+- The ledger code comes from the operator's chart of accounts.
+- Last four digits only, enforced at the schema so the full number never
+  crosses the wire.
+- Real IFSC shape, not a length check.
+- `trust` and `escrow` offered, with a warning that they cannot change.
+
+### ⭐ And a sweep that generalises it
+
+A new test walks all 256 `pgTable` exports and asserts `bankAccounts` and
+`ledgers` have writers. 52 tables have no named insert; several match
+what the master checklist already flagged as unreachable, including
+`campaigns`, `worksContracts` and `retentionReleases`.
+
+## v1.40.0-alpha — Mega-wave 2, batch 41 (support consent)
+
+### 🔴 No screen anywhere granted consent, so every visit was break-glass
+
+`server/platform/consent.ts` is complete: two modes, role rules, expiry
+per mode, and a circularity gate. `grantSupportConsent`,
+`revokeSupportConsent` and `getSupportConsentState` had zero callers.
+
+Support was never blocked. It worked through break-glass, the EMERGENCY
+path. With no way to grant consent, routine and emergency collapsed into
+one, so every legitimate visit looked like an emergency and the signal
+the emergency path carries stopped meaning anything.
+
+New: `/settings/support-access` with the live state first, both grant
+modes, immediate revocation, and the full history.
+
+⚠️ `check:guards` failed the new action file on first write and was
+right: `requireTenantContext()` answers "who are you", not "may you do
+this". The door now asks a permission and the engine still asks a role.
+
+## v1.41.0-alpha — Mega-wave 1, batch 34 (order detail)
+
+### 🔴 Eleven of twelve actions in `orders.ts` had no caller
+
+1,288 lines: confirmation with credit assessment, amendment with
+revisions, cancellation with a mandatory reason, hold, release, close,
+fulfilment, delivery. Only `listOrders` was imported anywhere.
+
+`getOrder` was the sharpest case: complete, returning the order, its
+lines and its full event history, while the orders list linked every
+order number to a route that did not exist.
+
+New `/orders/[id]` reaches SIX of the eleven: getOrder, confirmOrder,
+cancelOrder, holdOrder, releaseOrder, closeOrder.
+
+- Buttons are derived from status, mirroring the 0028 triggers rather
+  than replacing them. The database stays the authority; the screen just
+  stops offering what will be refused.
+- Cancellation and hold reasons are asked for BEFORE the action, so the
+  ten-character minimum does not teach people to type "x" ten times.
+- Fulfilled and cancelled quantities shown separately, never merged into
+  a "remaining": one owes goods, the other owes a credit note.
+
+### check:links budget 11 → 10
+
+## v1.42.0-alpha — Batch 34 complete: the product can take an order
+
+### 🔴 `createOrder` had no caller
+
+New `/orders/new`, linked from the orders list. Batch 34 is now complete:
+all six lifecycle actions plus creation are reachable.
+
+Two deliberate omissions in the form:
+
+- **It sends no place of supply.** After Batch 33 the server determines
+  it and refuses if what it was sent disagrees. A form that guessed would
+  turn that refusal into a routine obstacle, and the first fix anybody
+  reached for would be to stop sending it.
+- **It computes no money.** A running total would be a second
+  implementation of `priceLine`, in floating point, in a browser, and the
+  two would disagree by a paisa on the first multi-rate order.
+
+### ⚠️ Rupees to paise without a float
+
+`Math.round(Number("1.005") * 100)` returns 100, not 101, because
+`1.005 * 100` is `100.49999999999999`. The string is split on the decimal
+point instead, so a digit that was never converted cannot be lost.
+
+### ⭐ Projects that cannot answer s.12(3) are marked
+
+Batch 33 makes the engine refuse a works contract with no site state
+code. The project dropdown shows which projects have one, so the refusal
+is visible while choosing rather than a surprise at save time.
+
+## v1.43.0-alpha — Batch 38, first half: the GRN moves the stock
+
+### 🔴 A goods receipt wrote its own row and left the stock ledger alone
+
+`recordGoodsReceipt` wrote a `goods_receipts` row, wrote its lines,
+recomputed the purchase order status, emitted an automation event, and
+never inserted a `stock_movements` row.
+
+⚠️ So inventory could only ever go DOWN. `sales_dispatch` writes
+movements; `purchase_receipt` did not. A warehouse that received a
+hundred and sold ten showed minus ten.
+
+- Accepted quantity only. Rejected goods are on the premises and are not
+  ours: awaiting return, never bought, no credit owed.
+- Lines with no `stockItemId` are skipped, not defaulted. A service or
+  freight line has nothing to move.
+- A receipt of items with no warehouse is refused, not guessed.
+- `unitPriceMinor` added to the SELECT so the movement carries a cost.
+  Without it every receipt would be costless, and Batch 86 would later
+  value a ledger of costless receipts.
+
+### ⚠️ Still open in Batch 38
+
+`recordGoodsReceipt` and `runThreeWayMatch` still have no UI caller, and
+`recordPurchaseInvoice` has none either. The correctness half is done;
+the screens are the second half.

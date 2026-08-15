@@ -30,8 +30,8 @@ import { requirePermission, writeAudit } from "@/server/audit";
 import { toSalesActionError } from "@/server/sales/guards";
 import type { ActionResult } from "@/lib/validators/crm";
 
-const READ = "crm.contacts.read" as const;
-const WRITE = "crm.contacts.write" as const;
+const READ = "contacts:read" as const;
+const WRITE = "contacts:update" as const;
 
 const SUBJECT_TYPES = [
   "company",

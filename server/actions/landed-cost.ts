@@ -48,8 +48,8 @@ import {
 import { serializeAmount, toBigIntAmount } from "@/lib/billing/money";
 import type { ActionResult } from "@/lib/validators/crm";
 
-const READ = "purchases.invoices.read" as const;
-const WRITE = "purchases.invoices.create" as const;
+const READ = "purchases:read" as const;
+const WRITE = "purchases:record_invoice" as const;
 
 const civilDay = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "Use YYYY-MM-DD.");
 

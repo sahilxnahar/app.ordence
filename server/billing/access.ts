@@ -37,7 +37,7 @@ import "server-only";
 
 import { cache } from "react";
 import { and, eq, sql } from "drizzle-orm";
-import { db } from "@/db";
+import { db, withTenant } from "@/db";
 import { subscriptions, plans } from "@/db/schema";
 import { requireTenantContext, type TenantContext } from "@/server/tenant-context";
 import {
@@ -77,26 +77,28 @@ export const getAccessDecision = cache(async function getAccessDecision(
   const now = new Date();
 
   try {
-    const [row] = await db
-      .select({
-        status: subscriptions.status,
-        trialEndsAt: subscriptions.trialEndsAt,
-        graceEndsAt: subscriptions.graceEndsAt,
-        currentPeriodEnd: subscriptions.currentPeriodEnd,
-        failedPaymentCount: subscriptions.failedPaymentCount,
-        cancelAtPeriodEnd: subscriptions.cancelAtPeriodEnd,
-        tier: plans.tier,
-      })
-      .from(subscriptions)
-      .innerJoin(plans, eq(plans.id, subscriptions.planId))
-      .where(
-        and(
-          eq(subscriptions.tenantId, tenantContext.tenant.id),
-          sql`${subscriptions.deletedAt} IS NULL`,
-          sql`${subscriptions.status} IN ('trialing','active','past_due','unpaid','paused','cancelled')`,
-        ),
-      )
-      .limit(1);
+    const [row] = await withTenant(tenantContext.tenant.id, (tx) =>
+      tx
+        .select({
+          status: subscriptions.status,
+          trialEndsAt: subscriptions.trialEndsAt,
+          graceEndsAt: subscriptions.graceEndsAt,
+          currentPeriodEnd: subscriptions.currentPeriodEnd,
+          failedPaymentCount: subscriptions.failedPaymentCount,
+          cancelAtPeriodEnd: subscriptions.cancelAtPeriodEnd,
+          tier: plans.tier,
+        })
+        .from(subscriptions)
+        .innerJoin(plans, eq(plans.id, subscriptions.planId))
+        .where(
+          and(
+            eq(subscriptions.tenantId, tenantContext.tenant.id),
+            sql`${subscriptions.deletedAt} IS NULL`,
+            sql`${subscriptions.status} IN ('trialing','active','past_due','unpaid','paused','cancelled')`,
+          ),
+        )
+        .limit(1)
+    );
 
     return evaluateAccess({
       subscriptionStatus: row?.status ?? null,

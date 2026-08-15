@@ -26,6 +26,46 @@ const serverSchema = z.object({
   CLERK_SECRET_KEY: z.string().min(1, "CLERK_SECRET_KEY is required"),
   CLERK_WEBHOOK_SIGNING_SECRET: z.string().optional(),
 
+  /**
+   * ══════════════════════════════════════════════════════════════════
+   * 🔴 TWELVE NAMES THE CODE READS THAT THIS SCHEMA NEVER DECLARED
+   * ══════════════════════════════════════════════════════════════════
+   * The block further down asserts that the reconciliation between "what
+   * the code reads" and "what this file knows about" was completed and
+   * that "the true figure was 43". It was not complete. All four `S3_*`
+   * names, the eight AI provider keys, `CSP_REPORT_URI` and both Sentry
+   * DSNs were still absent.
+   *
+   * ⚠️ THE COST IS EXACTLY WHAT THAT BLOCK DESCRIBES. A typo in
+   * `S3_SECRET_ACCESS_KEY` produced no boot error, no build error and no
+   * runtime error — just a document vault reporting "storage is not
+   * configured", which is the same thing it says when storage genuinely
+   * is not configured. Declaring them optional does not make them
+   * required; it makes them KNOWN, so `/api/diag` can report them and a
+   * misspelling has somewhere to be noticed.
+   */
+
+  // --- Object storage (Cloudflare R2 over the S3 API) ---
+  S3_ENDPOINT: z.string().optional(),
+  S3_BUCKET: z.string().optional(),
+  S3_ACCESS_KEY_ID: z.string().optional(),
+  S3_SECRET_ACCESS_KEY: z.string().optional(),
+
+  // --- AI providers. At least one enables the assistant. ---
+  CLOUDFLARE_ACCOUNT_ID: z.string().optional(),
+  CF_AI_TOKEN: z.string().optional(),
+  GROQ_API_KEY: z.string().optional(),
+  CEREBRAS_API_KEY: z.string().optional(),
+  GOOGLE_AI_API_KEY: z.string().optional(),
+  MISTRAL_API_KEY: z.string().optional(),
+  COHERE_API_KEY: z.string().optional(),
+  GITHUB_MODELS_TOKEN: z.string().optional(),
+
+  // --- Observability ---
+  SENTRY_DSN: z.string().optional(),
+  /** ⚠️ Where CSP violation reports go. Without it, report-only mode is a no-op. */
+  CSP_REPORT_URI: z.string().optional(),
+
   // --- Upstash Redis (cache + rate limiting) ---
   UPSTASH_REDIS_REST_URL: z.string().url().optional(),
   UPSTASH_REDIS_REST_TOKEN: z.string().optional(),
@@ -221,6 +261,15 @@ const clientSchema = z.object({
    * that, which is why telemetry rows currently read "unknown".
    */
   NEXT_PUBLIC_RELEASE: z.string().optional(),
+
+  /**
+   * ⚠️ Declared here because it is read by
+   * `lib/observability/sentry-options.ts` and appeared in neither
+   * schema. A DSN is send-only and embedded in client JS by design, so
+   * it is not a secret; being undeclared still meant a typo produced
+   * silence rather than an error.
+   */
+  NEXT_PUBLIC_SENTRY_DSN: z.string().optional(),
 });
 
 /* ----------------------------- LOADERS ------------------------------- */
@@ -275,7 +324,7 @@ export function getServerEnv(): z.infer<typeof serverSchema> {
  * compiled. That is what allows a single list of environment variables to
  * be enough, instead of the same list maintained in two places.
  */
-function readRuntimeEnv(name: string): string | undefined {
+export function readRuntimeEnv(name: string): string | undefined {
   const bag = process.env as unknown as Record<string, string | undefined>;
   const value = bag[name];
   return typeof value === "string" && value.length > 0 ? value : undefined;
@@ -349,6 +398,16 @@ export function getClientEnv(): z.infer<typeof clientSchema> {
     NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY: getClerkPublishableKey(),
     NEXT_PUBLIC_CLERK_SIGN_IN_URL: readRuntimeEnv("NEXT_PUBLIC_CLERK_SIGN_IN_URL"),
     NEXT_PUBLIC_CLERK_SIGN_UP_URL: readRuntimeEnv("NEXT_PUBLIC_CLERK_SIGN_UP_URL"),
+    /**
+     * 🔴 THESE THREE WERE DECLARED AND NEVER PARSED. `clientSchema`
+     * listed `NEXT_PUBLIC_ZONE_DOMAIN` and `NEXT_PUBLIC_RELEASE`, and
+     * this object omitted both — dead validation that read as coverage.
+     * Harmless while they are optional, and exactly the shape of thing
+     * that stops being harmless the day one of them is not.
+     */
+    NEXT_PUBLIC_ZONE_DOMAIN: readRuntimeEnv("NEXT_PUBLIC_ZONE_DOMAIN"),
+    NEXT_PUBLIC_RELEASE: readRuntimeEnv("NEXT_PUBLIC_RELEASE"),
+    NEXT_PUBLIC_SENTRY_DSN: readRuntimeEnv("NEXT_PUBLIC_SENTRY_DSN"),
   });
 
   if (!parsed.success) {

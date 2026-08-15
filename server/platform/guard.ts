@@ -516,7 +516,10 @@ export async function recordPlatformAudit(entry: PlatformAuditEntry): Promise<vo
         await tx.insert(auditLogs).values({ ...values, tenantId: entry.tenantId });
       });
     } else {
-      await db.insert(platformActionLog).values({
+      await withPlatformScope(
+        `Record a platform action: ${entry.action} on ${entry.resourceType}`,
+        (tx) =>
+          tx.insert(platformActionLog).values({
         actorClerkId: entry.operator.clerkUserId,
         actorEmail: entry.operator.email,
         actorGrade: entry.operator.grade,
@@ -533,7 +536,8 @@ export async function recordPlatformAudit(entry: PlatformAuditEntry): Promise<vo
         ipAddress: entry.operator.ipAddress,
         userAgent: entry.operator.userAgent,
         requestId: entry.operator.requestId,
-      });
+          }),
+      );
     }
   } catch (err) {
     console.error("[PLATFORM AUDIT WRITE FAILED]", {

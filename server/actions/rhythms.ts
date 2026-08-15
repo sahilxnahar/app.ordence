@@ -36,8 +36,8 @@ import {
   type Signal,
 } from "@/lib/patterns/rhythm";
 
-const READ = "crm.contacts.read" as const;
-const WRITE = "crm.contacts.write" as const;
+const READ = "contacts:read" as const;
+const WRITE = "contacts:update" as const;
 
 /** ⚠️ IST, because a business day is a business day. */
 function istToday(now: Date): string {

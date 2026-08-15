@@ -47,7 +47,7 @@ import "server-only";
  */
 
 import { and, eq, gte } from "drizzle-orm";
-import { db } from "@/db";
+import { db, withPlatformScope } from "@/db";
 import { securityEvents } from "@/db/schema/secops";
 import { permissionDenials } from "@/db/schema";
 import { recordSecurityEvent } from "./record";
@@ -525,36 +525,56 @@ export async function runAnomalyDetection(options: {
       ? and(timeFilter, eq(securityEvents.tenantId, options.tenantId))
       : timeFilter;
 
-    const eventRows = await db
-      .select({
-        eventType: securityEvents.eventType,
-        tenantId: securityEvents.tenantId,
-        subjectId: securityEvents.subjectId,
-        ipPrefix: securityEvents.ipPrefix,
-        occurrenceCount: securityEvents.occurrenceCount,
-        occurredAt: securityEvents.occurredAt,
-      })
-      .from(securityEvents)
-      .where(eventWhere)
-      .limit(20_000);
-
-    const denialRows = options.tenantId
-      ? await db
+    /**
+     * 🔴 THE PERIMETER SWEEP NEEDS THE PLATFORM MARKER.
+     *
+     * The comment above already warns that running this inside a
+     * tenant context degrades it to a single-tenant run that
+     * reports nothing about the perimeter. Running it with NO
+     * context is worse: it reports nothing at all, because the
+     * policy matches no rows rather than all of them.
+     *
+     * ⚠️ An anomaly detector that silently sees zero events is the
+     * most dangerous shape of broken there is: it never alerts, so
+     * quiet reads as safe.
+     */
+    const eventRows = await withPlatformScope(
+      `Security sweep: read the perimeter across every workspace`,
+      (tx) =>
+        tx
           .select({
-            tenantId: permissionDenials.tenantId,
-            userId: permissionDenials.userId,
-            permission: permissionDenials.permission,
-            createdAt: permissionDenials.createdAt,
+            eventType: securityEvents.eventType,
+            tenantId: securityEvents.tenantId,
+            subjectId: securityEvents.subjectId,
+            ipPrefix: securityEvents.ipPrefix,
+            occurrenceCount: securityEvents.occurrenceCount,
+            occurredAt: securityEvents.occurredAt,
           })
-          .from(permissionDenials)
-          .where(
-            and(
-              gte(permissionDenials.createdAt, since),
-              eq(permissionDenials.tenantId, options.tenantId),
-            ),
-          )
+          .from(securityEvents)
+          .where(eventWhere)
           .limit(20_000)
-      : await db
+    );
+
+    /**
+     * ⚠️ ONE SCOPE, ONE QUERY, A CONDITIONAL PREDICATE.
+     *
+     * This was a ternary over two nearly identical statements, which is
+     * how the tenant-filtered branch and the platform branch came to
+     * differ by more than their `where` clause: both ran unscoped, so
+     * both returned nothing. Building the predicate first and running a
+     * single query means the two branches cannot drift again.
+     */
+    const denialWhere = options.tenantId
+      ? and(
+          gte(permissionDenials.createdAt, since),
+          eq(permissionDenials.tenantId, options.tenantId),
+        )
+      : gte(permissionDenials.createdAt, since);
+
+    const denialRows = await withPlatformScope(
+      `Security sweep: read permission denials across every workspace`,
+      (tx) =>
+        tx
           .select({
             tenantId: permissionDenials.tenantId,
             userId: permissionDenials.userId,
@@ -562,8 +582,9 @@ export async function runAnomalyDetection(options: {
             createdAt: permissionDenials.createdAt,
           })
           .from(permissionDenials)
-          .where(gte(permissionDenials.createdAt, since))
-          .limit(20_000);
+          .where(denialWhere)
+          .limit(20_000),
+    );
 
     const findings = evaluateAnomalyRules(
       { events: eventRows as Observation[], denials: denialRows as DenialObservation[] },

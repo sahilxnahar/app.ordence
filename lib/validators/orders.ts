@@ -140,10 +140,58 @@ const orderBaseSchema = z.object({
   contactId: optionalUuid,
   gstPartyId: optionalUuid,
   sellerRegistrationId: optionalUuid,
+  /**
+   * ⚠️ v1.37.0: THIS IS NO LONGER AN INPUT, IT IS AN ASSERTION.
+   *
+   * `createOrder` determines the place of supply from the facts and
+   * REFUSES if what the caller sent disagrees. It used to be taken at
+   * face value, which meant a caller could choose their own tax
+   * treatment — and since the total is identical either way, nothing on
+   * the screen would have looked wrong.
+   *
+   * Left in the schema because the UI shows the determined value back and
+   * round-trips it, and because a caller who sends a stale one deserves
+   * the explicit disagreement rather than a silent overwrite.
+   */
   placeOfSupplyCode: z
     .string()
     .trim()
     .regex(/^\d{2}$/, "Place of supply is the two-digit state code.")
+    .optional()
+    .nullable(),
+
+  /**
+   * ⭐ WHICH SECTION OF THE ACT APPLIES. Not cosmetic: `immovable_property`
+   * selects s.12(3) instead of s.12(2), and it is what a works contract
+   * or an under-construction unit is, whatever the line kinds say.
+   */
+  supplyType: z.enum(["goods", "services", "immovable_property"]).default("services"),
+
+  /**
+   * ⭐ WHERE THE SITE IS, as a GST code. Falls back to the project's
+   * `stateCode` when omitted. Under s.12(3) this IS the place of supply.
+   */
+  propertyStateCode: z
+    .string()
+    .trim()
+    .regex(/^\d{2}$/, "The property's state is a two-digit GST state code.")
+    .optional()
+    .nullable(),
+
+  /**
+   * ⚠️ DELIVERY STATE AS A CODE, SEPARATE FROM `shippingState`.
+   *
+   * `shippingState` is varchar(120) free text holding "Karnataka". For
+   * goods, s.10(1)(a) puts the place of supply where the movement
+   * terminates, and that comparison needs "29". Feeding prose to the
+   * engine does not fail loudly — it fails the `isPlaceOfSupplyCode`
+   * test and falls through to the supplier's own state, quietly making
+   * every inter-state consignment intra-state.
+   */
+  deliveryStateCode: z
+    .string()
+    .trim()
+    .regex(/^\d{2}$/, "The delivery state is a two-digit GST state code.")
     .optional()
     .nullable(),
 

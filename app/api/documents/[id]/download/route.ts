@@ -43,7 +43,7 @@ import {
   STORAGE_UNCONFIGURED_MESSAGE,
 } from "@/lib/storage/r2";
 import { and, eq, isNull } from "drizzle-orm";
-import { db } from "@/db";
+import { db, withTenant } from "@/db";
 import { documents } from "@/db/schema";
 import { requireTenantContext, TenantAccessError } from "@/server/tenant-context";
 import { pathnameBelongsToTenant, sanitizeFileName } from "@/lib/validators/storage";
@@ -69,13 +69,22 @@ export async function GET(
     const ctx = await requireTenantContext();
 
     // ---- 2. THE ROW, SCOPED TO THIS TENANT ------------------------
-    const doc = await db.query.documents.findFirst({
-      where: and(
-        eq(documents.id, id),
-        eq(documents.tenantId, ctx.tenant.id),
-        isNull(documents.deletedAt),
-      ),
-    });
+    /**
+     * ⚠️ SCOPED, NOT MERELY FILTERED. The `eq(tenantId)` predicate below
+     * is correct and was never the whole story: under a database role
+     * that does not bypass RLS this ran with no session variable, so the
+     * policy matched nothing and every download 404'd. The filter and
+     * the policy now agree instead of one standing in for the other.
+     */
+    const doc = await withTenant(ctx.tenant.id, (tx) =>
+      tx.query.documents.findFirst({
+        where: and(
+          eq(documents.id, id),
+          eq(documents.tenantId, ctx.tenant.id),
+          isNull(documents.deletedAt),
+        ),
+      }),
+    );
 
     // 404, not 403. A different status for "exists but not yours" would
     // turn this endpoint into an oracle for which document ids are real.

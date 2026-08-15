@@ -931,7 +931,34 @@ export type PropertyPostingRole =
   /** Interest charged on a late instalment. Income when charged. */
   | "delay_interest_income"
   /** Booking money kept when a buyer walks away. */
-  | "forfeiture_income";
+  | "forfeiture_income"
+  /* --- ⭐⭐ v1.25.0-alpha — cancellation and brokerage ------------- */
+  /**
+   * 🔴 WHAT IS OWED BACK TO A BUYER WHO CANCELLED, UNTIL IT LEAVES.
+   *
+   * ⚠️ NOT THE BANK, AND NOT NETTED AGAINST THE ADVANCE. A cancellation
+   * and the transfer that settles it are days or months apart, and the
+   * developer is a debtor for the whole of that gap. Posting straight to
+   * the bank on the day of cancellation shows cash leaving that has not
+   * left, and hides a real liability from the balance sheet — which for
+   * a developer with a bad quarter is exactly the liability a lender
+   * wants to see.
+   */
+  | "buyer_refund_payable"
+  /**
+   * 🔴 OUTPUT TAX ON A CANCELLED BOOKING THAT CAN NO LONGER BE REVERSED.
+   *
+   * The section 34 credit-note window closes on 30 November after the
+   * financial year of the supply. A cancellation after that cannot take
+   * the tax back, so the developer has paid GST on a sale that never
+   * happened. That is a cost, it is not creditable, and it gets its own
+   * account so "what did cancellations cost us" has an answer.
+   */
+  | "irrecoverable_output_tax"
+  /** Brokerage earned by a channel partner. An expense when incurred. */
+  | "brokerage_expense"
+  /** ⚠️ What is owed to the partner AFTER tax is withheld, not before. */
+  | "partner_payable";
 
 export type PropertyLeg = {
   /**
@@ -939,6 +966,13 @@ export type PropertyLeg = {
    * TDS receivable mean exactly the same thing whether the document was
    * a tax invoice or a demand notice — and one debt split across two
    * ledgers is a debt nobody can reconcile.
+   *
+   * ⭐ v1.25.0-alpha ADDS THE INPUT-SIDE ONES FOR THE SAME REASON. A
+   * broker's tax invoice carries credit that is claimed on the same
+   * GSTR-3B as every other purchase, and `tds_payable` is one debt to
+   * one Government whether it was withheld from a subcontractor or a
+   * broker. A property-specific twin of either would produce a return
+   * that has to be assembled by hand from two ledgers.
    */
   role:
     | PropertyPostingRole
@@ -947,7 +981,11 @@ export type PropertyLeg = {
     | "output_igst"
     | "output_cess"
     | "bank"
-    | "tds_receivable";
+    | "tds_receivable"
+    | "input_cgst"
+    | "input_sgst"
+    | "input_igst"
+    | "tds_payable";
   entryType: "debit" | "credit";
   amountMinor: bigint;
   description: string;
@@ -1089,6 +1127,233 @@ export function buildPossessionPosting(args: {
   return legs;
 }
 
+/* ================================================================== */
+/* ⭐⭐⭐ CANCELLATION — v1.25.0-alpha                                  */
+/* ================================================================== */
+
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴🔴🔴 A CANCELLATION CLOSES A BOOKING. IT DOES NOT ADJUST ONE.
+ * ══════════════════════════════════════════════════════════════════════
+ * Every balance this booking carries has to reach zero in one entry:
+ *
+ *     Dr  Advance from customers      the whole advance standing
+ *     Dr  Output CGST/SGST/IGST       whatever the credit note reverses
+ *     Dr  Irrecoverable output tax    whatever it could not
+ *           Cr  Forfeiture income     kept
+ *           Cr  Buyer refund payable  going back
+ *           Cr  Booking receivable    demands raised and never paid
+ *
+ * ⭐ AND IT BALANCES BY ARITHMETIC RATHER THAN BY CONSTRUCTION, which is
+ *   the interesting property. Demands debit the receivable with
+ *   principal + tax and credit the advance with the principal; receipts
+ *   clear the receivable. So `advance + tax − receivable` is exactly the
+ *   cash collected, and the cash collected is exactly what is kept plus
+ *   what is returned. The two sides come out equal because the ledger is
+ *   consistent — NOT because a plug was inserted to make them.
+ *
+ * ⚠️ `cancellationProblem()` IS WHAT MAKES THAT SAFE, and it runs before
+ * this. It refuses when forfeit plus refund is not the cash collected,
+ * and it refuses when the booking's own balances do not imply that cash.
+ * Without both checks the irrecoverable-tax leg becomes a plug that
+ * silently absorbs a stray receipt and calls it an expense.
+ *
+ * ⚠️ ONE APPROXIMATION, STATED: the unreversed tax is debited as a
+ * single figure rather than split back across CGST, SGST and IGST. It is
+ * an expense, not a tax account, so the split would carry no information
+ * — but it means the head-wise output balances are cleared only to the
+ * extent the credit note reverses them, which is correct: the rest is
+ * still owed to the Government and was already paid to it.
+ */
+export function buildCancellationPosting(args: {
+  advanceMinor: bigint;
+  receivableMinor: bigint;
+  forfeitMinor: bigint;
+  refundMinor: bigint;
+  reversedCgstMinor: bigint;
+  reversedSgstMinor: bigint;
+  reversedIgstMinor: bigint;
+  irrecoverableTaxMinor: bigint;
+  bookingReference: string;
+  unitLabel: string | null;
+  buyerName: string | null;
+  creditNoteNumber: string | null;
+}): PropertyLeg[] {
+  const what = args.unitLabel ? ` · ${args.unitLabel}` : "";
+  const who = args.buyerName ? ` — ${args.buyerName}` : "";
+  const ref = `Cancellation · booking ${args.bookingReference}${what}${who}`;
+  const cn = args.creditNoteNumber ? `credit note ${args.creditNoteNumber}` : "credit note";
+
+  const legs: PropertyLeg[] = [
+    ...rleg("customer_advance", "debit", args.advanceMinor, ref),
+    ...rleg("output_cgst", "debit", args.reversedCgstMinor, `CGST reversed by ${cn}`),
+    ...rleg("output_sgst", "debit", args.reversedSgstMinor, `SGST/UTGST reversed by ${cn}`),
+    ...rleg("output_igst", "debit", args.reversedIgstMinor, `IGST reversed by ${cn}`),
+    /**
+     * ⚠️ THE LEG NOBODY EXPECTS, AND THE ONE THAT MAKES THE ENTRY HONEST.
+     * Tax the section 34 window put out of reach. Zero legs are dropped,
+     * so a cancellation inside the window never sees this account at all.
+     */
+    ...rleg(
+      "irrecoverable_output_tax",
+      "debit",
+      args.irrecoverableTaxMinor,
+      `Output tax on ${args.bookingReference} outside the section 34 credit-note window`,
+    ),
+    ...rleg("forfeiture_income", "credit", args.forfeitMinor, `Forfeited — ${ref}`),
+    ...rleg("buyer_refund_payable", "credit", args.refundMinor, `Refund due — ${ref}`),
+    ...rleg(
+      "booking_receivable",
+      "credit",
+      args.receivableMinor,
+      `Demands cancelled — ${ref}`,
+    ),
+  ];
+
+  assertPropertyBalances(legs);
+  return legs;
+}
+
+/**
+ * ⭐ THE REFUND ACTUALLY LEAVING. A separate event on a separate date.
+ *
+ * ⚠️ AND IT IS SEPARATE PRECISELY BECAUSE IT OFTEN DOES NOT HAPPEN FOR
+ * MONTHS. A developer short of cash pays cancellation refunds last, and
+ * `buyer_refund_payable` is the account that says how much of that is
+ * outstanding. Folding the payment into the cancellation would make that
+ * number permanently zero and the question unanswerable.
+ */
+export function buildRefundPaymentPosting(args: {
+  amountMinor: bigint;
+  bookingReference: string;
+  buyerName: string | null;
+  paymentReference: string;
+}): PropertyLeg[] {
+  const who = args.buyerName ? ` — ${args.buyerName}` : "";
+  const ref = `Refund ${args.paymentReference} · booking ${args.bookingReference}${who}`;
+
+  const legs: PropertyLeg[] = [
+    ...rleg("buyer_refund_payable", "debit", args.amountMinor, ref),
+    ...rleg("bank", "credit", args.amountMinor, ref),
+  ];
+
+  assertPropertyBalances(legs);
+  return legs;
+}
+
+/* ================================================================== */
+/* ⭐⭐⭐ CHANNEL-PARTNER BROKERAGE — v1.25.0-alpha                     */
+/* ================================================================== */
+
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 THE BROKER IS PAID NET AND EARNS GROSS, AND THE LEDGER HAS TO SAY
+ *    BOTH
+ * ══════════════════════════════════════════════════════════════════════
+ * The wrong version — and it is the common one — debits brokerage with
+ * the amount actually transferred. It balances. It also understates the
+ * selling cost by the tax withheld, and leaves the 194H liability
+ * appearing from nowhere when the challan is paid.
+ *
+ *     Dr  Brokerage expense       what the partner EARNED
+ *     Dr  Input CGST/SGST/IGST    their GST, IF it is claimable
+ *           Cr  TDS payable       withheld under 194H
+ *           Cr  Partner payable   what will actually be transferred
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * ⭐⭐ THE `itcEligible` FLAG IS NOT A CONVENIENCE. IT IS THE 1%/5%
+ *     SCHEME.
+ * ══════════════════════════════════════════════════════════════════════
+ * A residential project taxed at 1% or 5% under Notification 3/2019 has
+ * NO input tax credit at all — that is the trade the concessional rate
+ * buys. So the broker's GST on such a project is not an asset; it is
+ * part of what the brokerage cost.
+ *
+ * ⚠️ AND GETTING IT WRONG IS EXPENSIVE IN BOTH DIRECTIONS. Claiming
+ * blocked credit is a demand with interest and penalty. Not claiming
+ * credit that was available on a 12% commercial project quietly
+ * overstates cost and understates profit, and nobody ever finds it.
+ *
+ * So the tax goes into the SAME expense account rather than a separate
+ * "GST not claimed" one — because it genuinely is part of the cost of
+ * the brokerage, which is how Section 17(5) treats blocked credit
+ * everywhere else in this file.
+ */
+export function buildBrokeragePosting(args: {
+  /** Brokerage earned, exclusive of GST. */
+  grossMinor: bigint;
+  cgstMinor: bigint;
+  sgstMinor: bigint;
+  igstMinor: bigint;
+  /** False for a 1%/5% residential project — the tax becomes cost. */
+  itcEligible: boolean;
+  /** Withheld under section 194H. */
+  tdsMinor: bigint;
+  reference: string;
+  partnerName: string;
+  bookingReference: string | null;
+}): PropertyLeg[] {
+  const on = args.bookingReference ? ` · booking ${args.bookingReference}` : "";
+  const ref = `Brokerage ${args.reference} — ${args.partnerName}${on}`;
+
+  const taxMinor = args.cgstMinor + args.sgstMinor + args.igstMinor;
+  const expenseMinor = args.itcEligible ? args.grossMinor : args.grossMinor + taxMinor;
+  const payableMinor = args.grossMinor + taxMinor - args.tdsMinor;
+
+  const legs: PropertyLeg[] = [
+    ...rleg(
+      "brokerage_expense",
+      "debit",
+      expenseMinor,
+      args.itcEligible
+        ? ref
+        : `${ref} (GST included — no input credit on a 1%/5% project)`,
+    ),
+    ...(args.itcEligible
+      ? [
+          ...rleg("input_cgst", "debit", args.cgstMinor, `CGST on ${args.reference}`),
+          ...rleg("input_sgst", "debit", args.sgstMinor, `SGST/UTGST on ${args.reference}`),
+          ...rleg("input_igst", "debit", args.igstMinor, `IGST on ${args.reference}`),
+        ]
+      : []),
+    /**
+     * ⚠️ TDS IS WITHHELD ON THE BROKERAGE, NOT ON THE GST. Section 194H
+     * applies to the commission; the tax component is not income of the
+     * broker. Deducting on the gross-of-GST figure over-deducts, and the
+     * broker cannot recover it from anyone but the department.
+     */
+    ...rleg("tds_payable", "credit", args.tdsMinor, `TDS u/s 194H — ${args.reference}`),
+    ...rleg("partner_payable", "credit", payableMinor, ref),
+  ];
+
+  assertPropertyBalances(legs);
+  return legs;
+}
+
+/**
+ * ⭐ PAYING THE PARTNER. Clears the payable, and nothing else.
+ *
+ * ⚠️ IT DOES NOT TOUCH THE TDS. That liability was created when the
+ * brokerage was booked and is discharged by a challan to the Government,
+ * not by the transfer to the broker — and netting the two is how a TDS
+ * payable balance goes to zero without a challan ever being paid.
+ */
+export function buildPartnerPaymentPosting(args: {
+  amountMinor: bigint;
+  reference: string;
+  partnerName: string;
+}): PropertyLeg[] {
+  const ref = `Partner payment ${args.reference} — ${args.partnerName}`;
+
+  const legs: PropertyLeg[] = [
+    ...rleg("partner_payable", "debit", args.amountMinor, ref),
+    ...rleg("bank", "credit", args.amountMinor, ref),
+  ];
+
+  assertPropertyBalances(legs);
+  return legs;
+}
+
 export function propertyRolesUsed(legs: readonly PropertyLeg[]): PropertyLeg["role"][] {
   return [...new Set(legs.map((l) => l.role))];
 }
@@ -1126,5 +1391,754 @@ export const PROPERTY_ROLE_META: Record<
     tallyGroup: "Indirect Income",
     accountType: "revenue",
     help: "Booking money kept when a buyer cancels. ⚠️ RERA caps what may be forfeited — check the agreement before this figure is set.",
+  },
+  buyer_refund_payable: {
+    label: "Refunds Due to Buyers",
+    tallyGroup: "Current Liabilities",
+    accountType: "liability",
+    help: "🔴 Owed to buyers whose bookings were cancelled, until the transfer actually leaves. Kept separate from trade creditors because it is money the developer is holding that is not theirs, and because how long it has been outstanding is a question a lender and a forum both ask.",
+  },
+  irrecoverable_output_tax: {
+    label: "Irrecoverable Output Tax",
+    tallyGroup: "Indirect Expenses",
+    accountType: "expense",
+    help: "GST paid on a booking that was later cancelled, after the section 34 credit-note window closed on 30 November following the year of supply. It cannot be reversed and cannot be claimed — it is a cost of the cancellation, and it has its own account so that cost is visible rather than buried in forfeiture income.",
+  },
+  brokerage_expense: {
+    label: "Brokerage & Commission",
+    tallyGroup: "Indirect Expenses",
+    accountType: "expense",
+    help: "What channel partners earned, GROSS of the TDS withheld from them. ⚠️ On a 1%/5% residential project the partner's GST is added here too, because Notification 3/2019 allows no input credit on such projects and blocked tax is cost.",
+  },
+  partner_payable: {
+    label: "Channel Partners Payable",
+    tallyGroup: "Sundry Creditors",
+    accountType: "liability",
+    help: "What will actually be transferred to the partner — brokerage plus their GST, less the tax withheld. Separate from trade creditors so brokerage owed can be read on its own, which is the figure partners chase.",
+  },
+};
+
+/* ================================================================== */
+/* ⭐⭐⭐ METERING — Batch 20, v1.28.0-alpha                            */
+/* ================================================================== */
+
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴🔴🔴 ELECTRICITY DUTY IS NOT YOUR INCOME, AND ALMOST EVERY
+ *        SUB-METERING SPREADSHEET IN INDIA TREATS IT AS IF IT WERE
+ * ══════════════════════════════════════════════════════════════════════
+ * A society, a developer or a facility recovering electricity from
+ * residents bills three things and collects one number:
+ *
+ *   • ENERGY CHARGE — units × tariff. Yours.
+ *   • FIXED CHARGE  — the sanctioned-load standing charge. Yours.
+ *   • ELECTRICITY DUTY — a STATE LEVY collected on the State's behalf.
+ *
+ * ⚠️ THE DUTY IS NOT REVENUE. It is money held for a government, exactly
+ * like GST collected on a sale. Crediting it to income overstates
+ * turnover by the duty on every unit ever billed, and — worse — hides a
+ * statutory liability that nobody is tracking, because it never appears
+ * as one.
+ *
+ * 🔴 AND IT IS OVERSTATED TURNOVER IN THE DIRECTION THAT COSTS MONEY.
+ * Income tax is computed on it, and for a society it can be the
+ * difference between mutuality and a taxable surplus.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * ⭐ EXPORT CREDIT IS A REDUCTION, NOT AN EXPENSE
+ * ══════════════════════════════════════════════════════════════════════
+ * Under net metering a consumer with solar exports units back. That
+ * credit reduces what they owe. It is contra-revenue — a debit against
+ * the same income the charge credited — and NOT a cost of sales.
+ *
+ * ⚠️ AND IT CAN EXCEED THE CHARGES. A rooftop array in a light month
+ * produces a bill that is NEGATIVE, which is not a negative receivable:
+ * it is money the biller owes the consumer. Those are different
+ * accounts and different sides of the balance sheet, and a single
+ * signed "receivable" makes a debtors listing that contains creditors.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * ⚠️ AND THERE IS DELIBERATELY NO GST LEG HERE
+ * ══════════════════════════════════════════════════════════════════════
+ * The supply of electrical energy is exempt. Whether a RECOVERY of it is
+ * a supply at all is genuinely disputed: a pure reimbursement at actual
+ * cost is generally not one, and the same recovery bundled with rent or
+ * maintenance is part of a composite supply taxed at the principal
+ * supply's rate.
+ *
+ * 🔴 THAT IS A DECISION FOR THE TENANT AND THEIR AUDITOR, NOT FOR US.
+ * Inventing an output-tax leg would be Ordence taking a position on a
+ * litigated question and putting the answer in somebody's return. If a
+ * recovery is taxable in a given workspace, it belongs on a tax invoice
+ * through the sales module, which already handles it properly.
+ */
+export type MeteringPostingRole =
+  /** Energy and fixed charges recovered. Income. */
+  | "metering_revenue"
+  /** 🔴 Collected for the STATE. A liability, never income. */
+  | "electricity_duty_payable"
+  /** Net-metering export, reducing what the consumer owes. Contra-revenue. */
+  | "metering_export_credit"
+  /** ⚠️ When the export credit exceeds the charges, this is owed to them. */
+  | "metering_consumer_credit";
+
+export type MeteringLeg = {
+  /**
+   * ⚠️ `receivable` IS THE SHARED SALES ROLE. What a consumer owes for
+   * electricity is a debtor balance like any other, and a
+   * metering-specific twin would split one customer's balance across two
+   * ledgers so that neither agreed with their statement.
+   */
+  role: MeteringPostingRole | "receivable";
+  entryType: "debit" | "credit";
+  amountMinor: bigint;
+  description: string;
+};
+
+function mleg(
+  role: MeteringLeg["role"],
+  entryType: "debit" | "credit",
+  amountMinor: bigint,
+  description: string,
+): MeteringLeg[] {
+  return amountMinor === 0n ? [] : [{ role, entryType, amountMinor, description }];
+}
+
+export function assertMeteringBalances(legs: readonly MeteringLeg[]): void {
+  assertBalances(
+    legs.map((l) => ({
+      role: "revenue" as PostingRole,
+      entryType: l.entryType,
+      amountMinor: l.amountMinor,
+      description: l.description,
+    })),
+  );
+}
+
+export type MeteringFacts = {
+  energyChargeMinor: bigint;
+  fixedChargeMinor: bigint;
+  dutyMinor: bigint;
+  exportCreditMinor: bigint;
+  /** What the period stored. Checked, never trusted. */
+  totalMinor: bigint;
+};
+
+/**
+ * ⚠️ THE STORED TOTAL IS VERIFIED AGAINST ITS OWN PARTS.
+ *
+ * `total = energy + fixed + duty − export`. The period row stores all
+ * five, computed by a database function at close. If they disagree,
+ * something recomputed one and not the others — and posting from the
+ * stored total would put a figure in the ledger that the bill the
+ * consumer received does not support.
+ *
+ * ⭐ Returns a sentence rather than throwing, for the same reason every
+ * other check in this codebase does: it lands in front of somebody
+ * posting a month of meters, and it has to say which meter.
+ */
+export function meteringProblem(f: MeteringFacts): string | null {
+  const negatives: [string, bigint][] = [
+    ["the energy charge", f.energyChargeMinor],
+    ["the fixed charge", f.fixedChargeMinor],
+    ["the electricity duty", f.dutyMinor],
+    ["the export credit", f.exportCreditMinor],
+  ];
+  for (const [label, value] of negatives) {
+    if (value < 0n) {
+      return `${label.charAt(0).toUpperCase()}${label.slice(1)} is negative. A charge is never negative — an export is recorded as export credit.`;
+    }
+  }
+
+  const derived =
+    f.energyChargeMinor + f.fixedChargeMinor + f.dutyMinor - f.exportCreditMinor;
+  if (derived !== f.totalMinor) {
+    return (
+      `This period's parts do not add up to its total. Energy, fixed charge and duty ` +
+      `less the export credit come to ${paise(derived)}, and the period says ` +
+      `${paise(f.totalMinor)}. Recalculate it before posting — the ledger has to agree ` +
+      `with the bill the consumer was given.`
+    );
+  }
+
+  return null;
+}
+
+/**
+ * ⭐ THE POSTING. Balances by arithmetic, not by construction.
+ *
+ *   Dr  Receivable            total          (or Cr consumer credit if negative)
+ *   Dr  Export credit         exported
+ *         Cr  Metering revenue    energy + fixed
+ *         Cr  Electricity duty    duty
+ *
+ * Because `total = energy + fixed + duty − export`, the two sides come
+ * out equal for any consistent period — which is exactly what
+ * `meteringProblem()` checks before this runs.
+ */
+export function buildMeteringPosting(args: {
+  facts: MeteringFacts;
+  meterLabel: string;
+  periodLabel: string;
+  consumerName: string | null;
+}): MeteringLeg[] {
+  const who = args.consumerName ? ` — ${args.consumerName}` : "";
+  const ref = `Meter ${args.meterLabel} · ${args.periodLabel}${who}`;
+  const f = args.facts;
+
+  const legs: MeteringLeg[] = [
+    ...(f.totalMinor >= 0n
+      ? mleg("receivable", "debit", f.totalMinor, ref)
+      : /**
+         * 🔴 A NEGATIVE BILL IS A PAYABLE, NOT A NEGATIVE DEBTOR. A
+         * rooftop array in a light month genuinely produces one, and
+         * carrying it as a negative receivable puts a creditor in the
+         * debtors listing where nobody looks for it.
+         */
+        mleg(
+          "metering_consumer_credit",
+          "credit",
+          -f.totalMinor,
+          `${ref} — export exceeded consumption`,
+        )),
+    ...mleg(
+      "metering_export_credit",
+      "debit",
+      f.exportCreditMinor,
+      `Net-metering export — ${ref}`,
+    ),
+    ...mleg(
+      "metering_revenue",
+      "credit",
+      f.energyChargeMinor + f.fixedChargeMinor,
+      ref,
+    ),
+    ...mleg(
+      "electricity_duty_payable",
+      "credit",
+      f.dutyMinor,
+      `Electricity duty collected for the State — ${ref}`,
+    ),
+  ];
+
+  assertMeteringBalances(legs);
+  return legs;
+}
+
+export function meteringRolesUsed(legs: readonly MeteringLeg[]): MeteringLeg["role"][] {
+  return [...new Set(legs.map((l) => l.role))];
+}
+
+export const METERING_ROLE_META: Record<
+  MeteringPostingRole,
+  { label: string; tallyGroup: string; accountType: string; help: string }
+> = {
+  metering_revenue: {
+    label: "Utility Recovery",
+    tallyGroup: "Sales Accounts",
+    accountType: "revenue",
+    help: "Energy and fixed charges recovered from consumers. ⚠️ The electricity duty on the same bill does NOT belong here — it is collected for the State.",
+  },
+  electricity_duty_payable: {
+    label: "Electricity Duty Payable",
+    tallyGroup: "Duties & Taxes",
+    accountType: "liability",
+    help: "🔴 A State levy collected on the State's behalf, exactly like GST on a sale. Crediting it to income overstates turnover by the duty on every unit ever billed and hides a statutory liability nobody is tracking.",
+  },
+  metering_export_credit: {
+    label: "Net-Metering Export Credit",
+    tallyGroup: "Sales Accounts",
+    accountType: "revenue",
+    help: "Units a consumer exported back, reducing what they owe. Contra-revenue against the recovery — not a cost of sales, and kept separate so 'how much did we credit back for solar' has an answer.",
+  },
+  metering_consumer_credit: {
+    label: "Utility Credit Owed to Consumers",
+    tallyGroup: "Current Liabilities",
+    accountType: "liability",
+    help: "⚠️ What is owed to a consumer whose export exceeded their consumption. A negative bill is a payable, not a negative debtor — carrying it as one would put a creditor in the debtors listing.",
+  },
+};
+
+function paise(minor: bigint): string {
+  const negative = minor < 0n;
+  const abs = negative ? -minor : minor;
+  return `${negative ? "-" : ""}\u20B9${(abs / 100n).toString()}.${(abs % 100n).toString().padStart(2, "0")}`;
+}
+
+/* ================================================================== */
+/* ⭐⭐⭐ PAYROLL — Batch 15, v1.23.0-alpha                             */
+/* ================================================================== */
+
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴🔴 THE PAYROLL JOURNAL IS THE ONE MOST OFTEN GOT WRONG, AND IT IS
+ * ALWAYS WRONG IN THE SAME DIRECTION
+ * ══════════════════════════════════════════════════════════════════════
+ * The wrong version debits "Salaries" with the NET paid and credits the
+ * bank. It balances. It is also understated by every rupee of PF, ESI,
+ * professional tax and TDS withheld — money the business spent on
+ * employing people and owes to somebody else.
+ *
+ * ⭐ THE RIGHT VERSION DEBITS THE GROSS. What was withheld is not a
+ * reduction of cost; it is a set of liabilities the employer holds on
+ * behalf of the employee and remits later. So:
+ *
+ *     Dr  Salaries & Wages            gross earnings
+ *     Dr  Employer PF contribution    employer's own 12%, EDLI, admin
+ *     Dr  Employer ESI contribution   employer's own 3.25%
+ *         Cr  PF payable             employee's + employer's
+ *         Cr  Pension payable        the EPS half, SEPARATELY
+ *         Cr  ESI payable            both halves
+ *         Cr  Professional tax payable
+ *         Cr  TDS payable (salary)   section 192
+ *         Cr  Salaries payable       what actually leaves the bank
+ *
+ * ⚠️ NOTE WHAT IS NOT HERE: THE BANK. Payroll ACCRUES; paying the
+ * salaries is a separate event that debits Salaries payable and credits
+ * the bank, and it happens on the day the transfer clears rather than
+ * on the last day of the month. Collapsing the two means the ledger
+ * claims money left the bank on a day it did not.
+ *
+ * 🔴 AND PENSION IS ITS OWN PAYABLE. It goes on the same challan as PF
+ * but under a different account head, and a single netted "PF payable"
+ * cannot be reconciled against an ECR. Same argument as the two stock
+ * variance accounts above: netting destroys the only answer to a
+ * question somebody will ask.
+ */
+export type PayrollPostingRole =
+  /** Gross earnings. The whole cost of the people, before withholding. */
+  | "salary_expense"
+  /** The employer's own PF, EDLI and administration charges. */
+  | "employer_pf_expense"
+  /** The employer's own ESI. */
+  | "employer_esi_expense"
+  /** Employee 12% + employer 3.67%. Owed to EPFO. */
+  | "pf_payable"
+  /** The employer's 8.33% pension share. Same challan, different head. */
+  | "pension_payable"
+  /** Both halves of ESI. */
+  | "esi_payable"
+  /** State professional tax withheld. */
+  | "professional_tax_payable"
+  /** Section 192 TDS on salary. */
+  | "tds_payable_salary"
+  /** ⭐ Net pay owed to employees. Cleared when the transfer goes out. */
+  | "salaries_payable";
+
+export type PayrollLeg = {
+  role: PayrollPostingRole;
+  entryType: "debit" | "credit";
+  amountMinor: bigint;
+  description: string;
+};
+
+export function assertPayrollBalances(legs: readonly PayrollLeg[]): void {
+  const debit = legs
+    .filter((l) => l.entryType === "debit")
+    .reduce((sum, l) => sum + l.amountMinor, 0n);
+  const credit = legs
+    .filter((l) => l.entryType === "credit")
+    .reduce((sum, l) => sum + l.amountMinor, 0n);
+  if (debit !== credit) {
+    throw new PostingImbalance(
+      `Payroll journal does not balance: debits ${debit} vs credits ${credit}.`,
+    );
+  }
+}
+
+export type PayrollPostingFacts = {
+  readonly grossMinor: bigint;
+  readonly employeePfMinor: bigint;
+  readonly employerPfMinor: bigint;
+  readonly employerPensionMinor: bigint;
+  readonly edliMinor: bigint;
+  readonly pfAdminMinor: bigint;
+  readonly employeeEsiMinor: bigint;
+  readonly employerEsiMinor: bigint;
+  readonly professionalTaxMinor: bigint;
+  readonly tdsMinor: bigint;
+  /** Loan recoveries, advances, anything withheld that is not statutory. */
+  readonly otherDeductionsMinor: bigint;
+  readonly netPayMinor: bigint;
+};
+
+/**
+ * ⭐ BUILT FROM THE RUN TOTALS, NEVER FROM THE NET.
+ *
+ * ⚠️ `otherDeductionsMinor` IS CREDITED TO `salaries_payable` RATHER
+ * THAN TO ITS OWN ACCOUNT, and that is a deliberate limitation stated
+ * out loud rather than a bug. A loan recovery genuinely belongs against
+ * the loan account, and Ordence has no employee loan ledger yet. Until
+ * it does, netting it into what is owed to the employee is honest —
+ * inventing a "sundry recoveries" account and posting to it would look
+ * like a feature and reconcile to nothing.
+ */
+export function buildPayrollPosting(args: {
+  readonly facts: PayrollPostingFacts;
+  readonly periodLabel: string;
+}): PayrollLeg[] {
+  const f = args.facts;
+  const legs: PayrollLeg[] = [];
+
+  const push = (
+    role: PayrollPostingRole,
+    entryType: "debit" | "credit",
+    amountMinor: bigint,
+    description: string,
+  ) => {
+    // ⚠️ ZERO LEGS ARE DROPPED. A business with no ESI-covered employees
+    // must not be forced to map an ESI ledger it will never use.
+    if (amountMinor !== 0n) legs.push({ role, entryType, amountMinor, description });
+  };
+
+  /* ---- The debits: what employing these people cost ---------------- */
+  push("salary_expense", "debit", f.grossMinor, `Salaries and wages — ${args.periodLabel}`);
+  push(
+    "employer_pf_expense",
+    "debit",
+    f.employerPfMinor + f.employerPensionMinor + f.edliMinor + f.pfAdminMinor,
+    `Employer provident fund, pension, EDLI and administration — ${args.periodLabel}`,
+  );
+  push(
+    "employer_esi_expense",
+    "debit",
+    f.employerEsiMinor,
+    `Employer ESI contribution — ${args.periodLabel}`,
+  );
+
+  /* ---- The credits: who is owed what ------------------------------ */
+  //
+  // 🔴 PF PAYABLE CARRIES BOTH SIDES OF THE PF PORTION PLUS EDLI AND
+  // ADMIN, because that is what one challan settles. Pension is
+  // separate, on the same challan, under its own head.
+  push(
+    "pf_payable",
+    "credit",
+    f.employeePfMinor + f.employerPfMinor + f.edliMinor + f.pfAdminMinor,
+    `Provident fund payable — ${args.periodLabel}`,
+  );
+  push(
+    "pension_payable",
+    "credit",
+    f.employerPensionMinor,
+    `Pension scheme payable — ${args.periodLabel}`,
+  );
+  push(
+    "esi_payable",
+    "credit",
+    f.employeeEsiMinor + f.employerEsiMinor,
+    `ESI payable — ${args.periodLabel}`,
+  );
+  push(
+    "professional_tax_payable",
+    "credit",
+    f.professionalTaxMinor,
+    `Professional tax payable — ${args.periodLabel}`,
+  );
+  push(
+    "tds_payable_salary",
+    "credit",
+    f.tdsMinor,
+    `TDS on salary payable — ${args.periodLabel}`,
+  );
+  push(
+    "salaries_payable",
+    "credit",
+    f.netPayMinor + f.otherDeductionsMinor,
+    `Net salaries payable — ${args.periodLabel}`,
+  );
+
+  assertPayrollBalances(legs);
+  return legs;
+}
+
+export function payrollRolesUsed(legs: readonly PayrollLeg[]): PayrollPostingRole[] {
+  return [...new Set(legs.map((l) => l.role))];
+}
+
+export const PAYROLL_ROLE_META: Record<
+  PayrollPostingRole,
+  { label: string; tallyGroup: string; accountType: string; help: string }
+> = {
+  salary_expense: {
+    label: "Salaries & Wages",
+    tallyGroup: "Indirect Expenses",
+    accountType: "expense",
+    help: "🔴 Debited with the GROSS, never the net. What was withheld from an employee is money the business spent — it is owed to somebody else, not saved.",
+  },
+  employer_pf_expense: {
+    label: "Employer PF Contribution",
+    tallyGroup: "Indirect Expenses",
+    accountType: "expense",
+    help: "The employer's own 12%, plus EDLI and administration charges. A real cost on top of salary, and roughly a seventh of the wage bill once ESI is added.",
+  },
+  employer_esi_expense: {
+    label: "Employer ESI Contribution",
+    tallyGroup: "Indirect Expenses",
+    accountType: "expense",
+    help: "The employer's own 3.25%. Only for employees below the wage limit.",
+  },
+  pf_payable: {
+    label: "Provident Fund Payable",
+    tallyGroup: "Duties & Taxes",
+    accountType: "liability",
+    help: "Employee and employer PF, EDLI and admin — what one ECR challan settles. Due by the 15th of the following month.",
+  },
+  pension_payable: {
+    label: "Pension Fund Payable",
+    tallyGroup: "Duties & Taxes",
+    accountType: "liability",
+    help: "⚠️ SEPARATE FROM PF PAYABLE ON PURPOSE. Same challan, different account head. Netting the two into one balance makes an ECR impossible to reconcile.",
+  },
+  esi_payable: {
+    label: "ESI Payable",
+    tallyGroup: "Duties & Taxes",
+    accountType: "liability",
+    help: "Both halves. Due by the 15th of the following month.",
+  },
+  professional_tax_payable: {
+    label: "Professional Tax Payable",
+    tallyGroup: "Duties & Taxes",
+    accountType: "liability",
+    help: "Withheld under State law and remitted to the State. Due dates vary by State.",
+  },
+  tds_payable_salary: {
+    label: "TDS Payable — Salary",
+    tallyGroup: "Duties & Taxes",
+    accountType: "liability",
+    help: "Section 192. ⚠️ Keep it separate from vendor TDS: it is a different section, a different challan and a different quarterly return.",
+  },
+  salaries_payable: {
+    label: "Salaries Payable",
+    tallyGroup: "Current Liabilities",
+    accountType: "liability",
+    help: "⭐ What actually leaves the bank. Payroll ACCRUES here on the last day of the month; the transfer clears it on the day it goes out. Collapsing the two would claim money left the bank on a day it did not.",
+  },
+};
+
+/* ================================================================== */
+/* ⭐⭐⭐ THE MONTHLY RETURN SET-OFF — Batch 16, v1.24.0-alpha          */
+/* ================================================================== */
+
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴🔴 EVERY MONTH THE OUTPUT AND INPUT TAX ACCOUNTS HAVE TO BE CLEARED
+ * AGAINST EACH OTHER, AND ALMOST NOBODY DOES IT
+ * ══════════════════════════════════════════════════════════════════════
+ * Invoices credit Output CGST/SGST/IGST. Purchases debit Input
+ * CGST/SGST/IGST. Left alone, both sides grow forever: a balance sheet
+ * showing ₹40 lakh of output tax owed and ₹38 lakh of input tax
+ * receivable, when the business actually owes ₹2 lakh.
+ *
+ * ⚠️ IT BALANCES, IT IS ARITHMETICALLY CORRECT, AND IT IS USELESS. A
+ * lender reading that balance sheet sees a company with a large tax
+ * liability. An auditor asks why the input tax has never been utilised.
+ * Neither is a conversation anybody wants.
+ *
+ * ⭐ SO WHEN A 3B IS FILED, ONE JOURNAL CLEARS BOTH SIDES BY EXACTLY
+ * WHAT THE SET-OFF UTILISED, and leaves the cash portion in its own
+ * account:
+ *
+ *     Dr  Output IGST / CGST / SGST      what the set-off discharged
+ *         Cr  Input IGST / CGST / SGST   the credit it was discharged with
+ *         Cr  GST Payable (cash)         the balance, which leaves the bank
+ *
+ * 🔴 THE AMOUNTS COME FROM THE SET-OFF, NOT FROM THE BALANCES. Clearing
+ * "whatever is in the account" would sweep up credit the return did not
+ * claim and output tax from a period already filed, and the ledger would
+ * then disagree with the return it is supposed to support.
+ */
+export type ReturnPostingRole =
+  /** ⚠️ THE SAME ROLE STRINGS THE SALES AND PURCHASE SIDES ALREADY USE,
+   *  so a tenant maps one ledger per head and not two. */
+  | "output_cgst"
+  | "output_sgst"
+  | "output_igst"
+  | "output_cess"
+  | "input_cgst"
+  | "input_sgst"
+  | "input_igst"
+  | "input_cess"
+  /** ⭐ What must actually be paid. Its own account, so "how much cash
+   *  does the GST return need" has an answer on the balance sheet. */
+  | "gst_payable_cash"
+  /** ⚠️ Interest and late fee are NOT tax and are never creditable. */
+  | "gst_interest"
+  | "gst_late_fee";
+
+export type ReturnLeg = {
+  role: ReturnPostingRole;
+  entryType: "debit" | "credit";
+  amountMinor: bigint;
+  description: string;
+};
+
+export function assertReturnBalances(legs: readonly ReturnLeg[]): void {
+  const debit = legs
+    .filter((l) => l.entryType === "debit")
+    .reduce((sum, l) => sum + l.amountMinor, 0n);
+  const credit = legs
+    .filter((l) => l.entryType === "credit")
+    .reduce((sum, l) => sum + l.amountMinor, 0n);
+  if (debit !== credit) {
+    throw new PostingImbalance(
+      `Return set-off journal does not balance: debits ${debit} vs credits ${credit}.`,
+    );
+  }
+}
+
+export type ReturnPostingFacts = {
+  /** Output tax discharged, by head — from the set-off, not the balance. */
+  readonly liabilityCleared: { igst: bigint; cgst: bigint; sgst: bigint; cess: bigint };
+  /** Credit utilised, by the pool it came from. */
+  readonly creditUsed: { igst: bigint; cgst: bigint; sgst: bigint; cess: bigint };
+  /** The shortfall that leaves the bank, including reverse charge. */
+  readonly cashByHead: { igst: bigint; cgst: bigint; sgst: bigint; cess: bigint };
+  readonly interestMinor: bigint;
+  readonly lateFeeMinor: bigint;
+};
+
+/**
+ * ⭐ ONE JOURNAL PER RETURN, DATED THE LAST DAY OF THE TAX PERIOD.
+ *
+ * ⚠️ NOT THE FILING DATE. A July return filed on 20 August belongs in
+ * July, or the July balance sheet shows a liability that the July return
+ * says was settled.
+ */
+export function buildReturnSetoffPosting(args: {
+  readonly facts: ReturnPostingFacts;
+  readonly periodLabel: string;
+}): ReturnLeg[] {
+  const f = args.facts;
+  const legs: ReturnLeg[] = [];
+
+  const push = (
+    role: ReturnPostingRole,
+    entryType: "debit" | "credit",
+    amountMinor: bigint,
+    description: string,
+  ) => {
+    if (amountMinor !== 0n) legs.push({ role, entryType, amountMinor, description });
+  };
+
+  /* ---- Clear the output tax that was discharged ------------------- */
+  push("output_igst", "debit", f.liabilityCleared.igst, `IGST discharged — ${args.periodLabel}`);
+  push("output_cgst", "debit", f.liabilityCleared.cgst, `CGST discharged — ${args.periodLabel}`);
+  push("output_sgst", "debit", f.liabilityCleared.sgst, `SGST discharged — ${args.periodLabel}`);
+  push("output_cess", "debit", f.liabilityCleared.cess, `Cess discharged — ${args.periodLabel}`);
+
+  /* ---- Plus the cash heads, which are also output tax being paid --- */
+  //
+  // ⚠️ THE CASH PORTION CLEARS THE SAME OUTPUT ACCOUNTS. It is not a
+  // separate expense: the liability is being settled, just with money
+  // rather than with credit.
+  push("output_igst", "debit", f.cashByHead.igst, `IGST payable in cash — ${args.periodLabel}`);
+  push("output_cgst", "debit", f.cashByHead.cgst, `CGST payable in cash — ${args.periodLabel}`);
+  push("output_sgst", "debit", f.cashByHead.sgst, `SGST payable in cash — ${args.periodLabel}`);
+  push("output_cess", "debit", f.cashByHead.cess, `Cess payable in cash — ${args.periodLabel}`);
+
+  /* ---- Interest and late fee are costs, not tax ------------------- */
+  push("gst_interest", "debit", f.interestMinor, `Interest on late tax — ${args.periodLabel}`);
+  push("gst_late_fee", "debit", f.lateFeeMinor, `Late fee — ${args.periodLabel}`);
+
+  /* ---- Release the credit that was utilised ----------------------- */
+  push("input_igst", "credit", f.creditUsed.igst, `IGST credit utilised — ${args.periodLabel}`);
+  push("input_cgst", "credit", f.creditUsed.cgst, `CGST credit utilised — ${args.periodLabel}`);
+  push("input_sgst", "credit", f.creditUsed.sgst, `SGST credit utilised — ${args.periodLabel}`);
+  push("input_cess", "credit", f.creditUsed.cess, `Cess credit utilised — ${args.periodLabel}`);
+
+  /* ---- And what has to be paid ------------------------------------ */
+  const cashTotal =
+    f.cashByHead.igst +
+    f.cashByHead.cgst +
+    f.cashByHead.sgst +
+    f.cashByHead.cess +
+    f.interestMinor +
+    f.lateFeeMinor;
+
+  push(
+    "gst_payable_cash",
+    "credit",
+    cashTotal,
+    `GST payable in cash — ${args.periodLabel}`,
+  );
+
+  assertReturnBalances(legs);
+  return legs;
+}
+
+export function returnRolesUsed(legs: readonly ReturnLeg[]): ReturnPostingRole[] {
+  return [...new Set(legs.map((l) => l.role))];
+}
+
+export const RETURN_ROLE_META: Record<
+  ReturnPostingRole,
+  { label: string; tallyGroup: string; accountType: string; help: string }
+> = {
+  output_igst: {
+    label: "Output IGST",
+    tallyGroup: "Duties & Taxes",
+    accountType: "liability",
+    help: "Already mapped for sales. The return journal DEBITS it to clear what the month discharged.",
+  },
+  output_cgst: {
+    label: "Output CGST",
+    tallyGroup: "Duties & Taxes",
+    accountType: "liability",
+    help: "Already mapped for sales. Cleared monthly rather than left to grow forever.",
+  },
+  output_sgst: {
+    label: "Output SGST / UTGST",
+    tallyGroup: "Duties & Taxes",
+    accountType: "liability",
+    help: "Already mapped for sales. Cleared monthly.",
+  },
+  output_cess: {
+    label: "Output Cess",
+    tallyGroup: "Duties & Taxes",
+    accountType: "liability",
+    help: "Already mapped for sales.",
+  },
+  input_igst: {
+    label: "Input IGST",
+    tallyGroup: "Duties & Taxes",
+    accountType: "asset",
+    help: "Already mapped for purchases. CREDITED by the return journal, by exactly what the set-off utilised — never by whatever happens to be in the account.",
+  },
+  input_cgst: {
+    label: "Input CGST",
+    tallyGroup: "Duties & Taxes",
+    accountType: "asset",
+    help: "Already mapped for purchases. ⚠️ Its balance can never be used against SGST, in the ledger or on the return.",
+  },
+  input_sgst: {
+    label: "Input SGST / UTGST",
+    tallyGroup: "Duties & Taxes",
+    accountType: "asset",
+    help: "Already mapped for purchases. ⚠️ Never usable against CGST.",
+  },
+  input_cess: {
+    label: "Input Cess",
+    tallyGroup: "Duties & Taxes",
+    accountType: "asset",
+    help: "Already mapped for purchases. Cess credit may only go against cess.",
+  },
+  gst_payable_cash: {
+    label: "GST Payable (cash)",
+    tallyGroup: "Duties & Taxes",
+    accountType: "liability",
+    help: "⭐ What the return actually needs paying in money, after credit. Its own account, so the answer to 'how much cash does GST need this month' is a balance rather than a calculation.",
+  },
+  gst_interest: {
+    label: "Interest on GST",
+    tallyGroup: "Indirect Expenses",
+    accountType: "expense",
+    help: "🔴 An expense, never tax, and never creditable. Kept separate so 'what did paying late cost us this year' has an answer.",
+  },
+  gst_late_fee: {
+    label: "GST Late Fee",
+    tallyGroup: "Indirect Expenses",
+    accountType: "expense",
+    help: "An expense, and disallowed for income tax. Separate from interest because they are different lines on the challan.",
   },
 };

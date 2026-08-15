@@ -254,7 +254,7 @@ export async function writeSystemAudit(
  *   const { allowed } = await checkPermission("periods:close");
  */
 export async function checkPermission(
-  permission: string,
+  permission: PermissionKey,
   resource?: { type?: string; id?: string },
 ): Promise<PermissionDecision & { ctx: TenantContext }> {
   const ctx = await requireTenantContext();
@@ -281,7 +281,7 @@ export async function checkPermission(
  *   const ctx = await requirePermission("transactions:post");
  */
 export async function requirePermission(
-  permission: string,
+  permission: PermissionKey,
   resource?: { type?: string; id?: string },
 ): Promise<TenantContext> {
   const result = await checkPermission(permission, resource);
@@ -293,7 +293,7 @@ export async function requirePermission(
 
 /** Require every listed permission. */
 export async function requireAllPermissions(
-  permissions: string[],
+  permissions: readonly PermissionKey[],
   resource?: { type?: string; id?: string },
 ): Promise<TenantContext> {
   let ctx: TenantContext | null = null;
@@ -313,7 +313,8 @@ async function recordDenial(
   try {
     const facts = await getRequestFacts();
 
-    await db.insert(permissionDenials).values({
+    await withTenant(ctx.tenant.id, (tx) =>
+      tx.insert(permissionDenials).values({
       tenantId: ctx.tenant.id,
       userId: ctx.user.id,
       clerkUserId: ctx.clerkUserId,
@@ -326,7 +327,8 @@ async function recordDenial(
       userAgent: facts.userAgent,
       requestId: facts.requestId,
       metadata: { reason: decision.reason },
-    });
+      }),
+    );
 
     // A blocked attempt at a dangerous permission also lands in the main audit
     // trail as a security event — that is the record a reviewer actually reads.
@@ -371,23 +373,25 @@ export async function getRecentAuditLogs(limit = 50): Promise<AuditLogRow[]> {
   const ctx = await requirePermission("audit:read");
   const { eq, desc } = await import("drizzle-orm");
 
-  const rows = await db
-    .select({
-      id: auditLogs.id,
-      action: auditLogs.action,
-      resourceType: auditLogs.resourceType,
-      resourceId: auditLogs.resourceId,
-      actorEmail: auditLogs.actorEmail,
-      actorRole: auditLogs.actorRole,
-      severity: auditLogs.severity,
-      reason: auditLogs.reason,
-      metadata: auditLogs.metadata,
-      createdAt: auditLogs.createdAt,
-    })
-    .from(auditLogs)
-    .where(eq(auditLogs.tenantId, ctx.tenant.id))
-    .orderBy(desc(auditLogs.createdAt))
-    .limit(Math.min(Math.max(1, limit), 200));
+  const rows = await withTenant(ctx.tenant.id, (tx) =>
+    tx
+      .select({
+        id: auditLogs.id,
+        action: auditLogs.action,
+        resourceType: auditLogs.resourceType,
+        resourceId: auditLogs.resourceId,
+        actorEmail: auditLogs.actorEmail,
+        actorRole: auditLogs.actorRole,
+        severity: auditLogs.severity,
+        reason: auditLogs.reason,
+        metadata: auditLogs.metadata,
+        createdAt: auditLogs.createdAt,
+      })
+      .from(auditLogs)
+      .where(eq(auditLogs.tenantId, ctx.tenant.id))
+      .orderBy(desc(auditLogs.createdAt))
+      .limit(Math.min(Math.max(1, limit), 200))
+  );
 
   return rows as AuditLogRow[];
 }

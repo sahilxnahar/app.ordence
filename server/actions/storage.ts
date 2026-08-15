@@ -39,6 +39,7 @@ import { and, eq, isNull, desc } from "drizzle-orm";
 import { deleteStoredObject, isStorageConfigured, STORAGE_UNCONFIGURED_MESSAGE } from "@/lib/storage/r2";
 import { db } from "@/db";
 import { documents, contracts, assets, deals, contacts, companies } from "@/db/schema";
+import { requirePermission } from "@/server/audit";
 import { requireTenantContext, TenantAccessError } from "@/server/tenant-context";
 import {
   assertImpersonationAllows,
@@ -115,58 +116,68 @@ async function parentBelongsToTenant(
 ): Promise<boolean> {
   switch (entityType) {
     case "contract": {
-      const row = await db.query.contracts.findFirst({
-        where: and(
-          eq(contracts.id, entityId),
-          eq(contracts.tenantId, tenantId),
-          isNull(contracts.deletedAt),
-        ),
-        columns: { id: true },
-      });
+      const row = await withTenant(tenantId, (tx) =>
+        tx.query.contracts.findFirst({
+          where: and(
+            eq(contracts.id, entityId),
+            eq(contracts.tenantId, tenantId),
+            isNull(contracts.deletedAt),
+          ),
+          columns: { id: true },
+        })
+      );
       return Boolean(row);
     }
     case "asset": {
-      const row = await db.query.assets.findFirst({
-        where: and(
-          eq(assets.id, entityId),
-          eq(assets.tenantId, tenantId),
-          isNull(assets.deletedAt),
-        ),
-        columns: { id: true },
-      });
+      const row = await withTenant(tenantId, (tx) =>
+        tx.query.assets.findFirst({
+          where: and(
+            eq(assets.id, entityId),
+            eq(assets.tenantId, tenantId),
+            isNull(assets.deletedAt),
+          ),
+          columns: { id: true },
+        })
+      );
       return Boolean(row);
     }
     case "deal": {
-      const row = await db.query.deals.findFirst({
-        where: and(
-          eq(deals.id, entityId),
-          eq(deals.tenantId, tenantId),
-          isNull(deals.deletedAt),
-        ),
-        columns: { id: true },
-      });
+      const row = await withTenant(tenantId, (tx) =>
+        tx.query.deals.findFirst({
+          where: and(
+            eq(deals.id, entityId),
+            eq(deals.tenantId, tenantId),
+            isNull(deals.deletedAt),
+          ),
+          columns: { id: true },
+        })
+      );
       return Boolean(row);
     }
     case "contact": {
-      const row = await db.query.contacts.findFirst({
-        where: and(
-          eq(contacts.id, entityId),
-          eq(contacts.tenantId, tenantId),
-          isNull(contacts.deletedAt),
-        ),
-        columns: { id: true },
-      });
+      const row = await withTenant(tenantId, (tx) =>
+        tx.query.contacts.findFirst({
+          where: and(
+            eq(contacts.id, entityId),
+            eq(contacts.tenantId, tenantId),
+            isNull(contacts.deletedAt),
+          ),
+          columns: { id: true },
+        })
+      );
       return Boolean(row);
     }
     case "company": {
-      const row = await db.query.companies.findFirst({
-        where: and(
-          eq(companies.id, entityId),
-          eq(companies.tenantId, tenantId),
-          isNull(companies.deletedAt),
-        ),
-        columns: { id: true },
-      });
+      const row = await withTenant(tenantId, (tx) =>
+        tx.query.companies.findFirst({
+          where: and(
+            eq(companies.id, entityId),
+            eq(companies.tenantId, tenantId),
+            isNull(companies.deletedAt),
+          ),
+          columns: { id: true },
+        })
+      );
       return Boolean(row);
     }
     default: {
@@ -204,6 +215,10 @@ export async function saveDocumentRecord(
     // reason outermost, so the customer is told the thing they can
     // actually act on rather than an inner detail.
     await requireAccess("documents:create", ctx);
+    /**
+     * 🔴 ADDED IN v1.26.0-alpha BY `check:guards`. Uploading a document was reachable by any member of the workspace: `requireAccess` answers whether the ACCOUNT may write, not whether this person may. The key itself is new — there was nothing to check against.
+     */
+    await requirePermission("documents:create");
     // ⚠️ ENTITLEMENT BEFORE PERMISSION. If a workspace owner on a plan
     // without this feature hits it, the true answer is "your plan does
     // not include it" — not "you lack permission", which would send the
@@ -341,29 +356,31 @@ export async function getDocuments(input: {
       })
       .parse(input);
 
-    const rows = await db
-      .select({
-        id: documents.id,
-        fileName: documents.fileName,
-        sizeBytes: documents.sizeBytes,
-        mimeType: documents.mimeType,
-        description: documents.description,
-        createdAt: documents.createdAt,
-        uploadedBy: documents.uploadedBy,
-      })
-      .from(documents)
-      .where(
-        and(
-          // Tenant predicate first. RLS enforces this independently; two
-          // checks, either sufficient alone.
-          eq(documents.tenantId, ctx.tenant.id),
-          eq(documents.entityType, params.entityType),
-          eq(documents.entityId, params.entityId),
-          isNull(documents.deletedAt),
-        ),
-      )
-      .orderBy(desc(documents.createdAt))
-      .limit(1000);
+    const rows = await withTenant(ctx.tenant.id, (tx) =>
+      tx
+        .select({
+          id: documents.id,
+          fileName: documents.fileName,
+          sizeBytes: documents.sizeBytes,
+          mimeType: documents.mimeType,
+          description: documents.description,
+          createdAt: documents.createdAt,
+          uploadedBy: documents.uploadedBy,
+        })
+        .from(documents)
+        .where(
+          and(
+            // Tenant predicate first. RLS enforces this independently; two
+            // checks, either sufficient alone.
+            eq(documents.tenantId, ctx.tenant.id),
+            eq(documents.entityType, params.entityType),
+            eq(documents.entityId, params.entityId),
+            isNull(documents.deletedAt),
+          ),
+        )
+        .orderBy(desc(documents.createdAt))
+        .limit(1000)
+    );
 
     return {
       ok: true,
@@ -411,6 +428,10 @@ export async function deleteDocument(id: string): Promise<ActionResult<{ id: str
     // reason outermost, so the customer is told the thing they can
     // actually act on rather than an inner detail.
     await requireAccess("documents:delete", ctx);
+    /**
+     * 🔴 ADDED IN v1.26.0-alpha BY `check:guards`. Deleting a document was reachable by any member. A stored document is frequently the ONLY copy of something, and this is the one action here that cannot be undone by the person who did it.
+     */
+    await requirePermission("documents:delete");
     // ⚠️ A document delete removes BYTES from blob storage as well as
     // stamping the row. Nothing about it is reversible by the customer,
     // which is the whole test the forbidden list applies.
@@ -422,13 +443,15 @@ export async function deleteDocument(id: string): Promise<ActionResult<{ id: str
     await requireFeature("storage.documents", ctx);
     const documentId = z.string().uuid("Invalid identifier.").parse(id);
 
-    const existing = await db.query.documents.findFirst({
-      where: and(
-        eq(documents.id, documentId),
-        eq(documents.tenantId, ctx.tenant.id),
-        isNull(documents.deletedAt),
-      ),
-    });
+    const existing = await withTenant(ctx.tenant.id, (tx) =>
+      tx.query.documents.findFirst({
+        where: and(
+          eq(documents.id, documentId),
+          eq(documents.tenantId, ctx.tenant.id),
+          isNull(documents.deletedAt),
+        ),
+      })
+    );
 
     // Deliberately the same message as a genuinely missing row. Telling a
     // caller "that exists but is not yours" confirms an id belongs to
@@ -464,11 +487,13 @@ export async function deleteDocument(id: string): Promise<ActionResult<{ id: str
     }
 
     // 2. The row.
-    const [deleted] = await db
-      .update(documents)
-      .set({ deletedAt: new Date(), deletedBy: ctx.user.id })
-      .where(and(eq(documents.id, documentId), eq(documents.tenantId, ctx.tenant.id)))
-      .returning({ id: documents.id });
+    const [deleted] = await withTenant(ctx.tenant.id, (tx) =>
+      tx
+        .update(documents)
+        .set({ deletedAt: new Date(), deletedBy: ctx.user.id })
+        .where(and(eq(documents.id, documentId), eq(documents.tenantId, ctx.tenant.id)))
+        .returning({ id: documents.id })
+    );
 
     if (!deleted) return fail("File not found.");
 

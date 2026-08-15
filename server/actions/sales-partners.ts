@@ -36,8 +36,21 @@ import {
   computeTds,
   cpLockDaysRemaining,
 } from "@/lib/sales/commission";
+import { financialYearWindow, toCivilDay } from "@/lib/gst/constants";
 import type { ActionResult } from "@/lib/validators/crm";
 import type { ChannelPartner } from "@/db/schema/sales";
+
+/**
+ * ⚠️ IST, NOT UTC. A booking made at 09:00 on 1 April IST is 03:30 UTC on
+ * 1 April and lands in the right year either way; one made at 02:00 IST
+ * on 1 April is 20:30 UTC on 31 MARCH, and a naive `toISOString()` files
+ * it in the previous financial year. `toCivilDay` already shifts to IST
+ * for exactly this reason, so the TDS date reuses it rather than
+ * inventing a second answer.
+ */
+function isoDay(value: Date): string {
+  return toCivilDay(value);
+}
 
 /* ------------------------------------------------------------------ */
 /* READ                                                               */
@@ -143,6 +156,7 @@ export async function getChannelPartner(input: { id: string }): Promise<
   try {
     const ctx = await requirePermission("partners:read");
     const now = new Date();
+    const { start: fyStart, end: fyEnd } = financialYearWindow(now);
 
     const found = await withTenant(ctx.tenant.id, async (tx) => {
       const [partner] = await tx
@@ -178,10 +192,26 @@ export async function getChannelPartner(input: { id: string }): Promise<
         .orderBy(asc(leads.cpLockedUntil))
         .limit(200);
 
+      /**
+       * ══════════════════════════════════════════════════════════════
+       * 🔴 TWO CORRECTIONS TO THIS QUERY IN v1.25.0-alpha
+       * ══════════════════════════════════════════════════════════════
+       * ① IT IS BOUNDED TO THE FINANCIAL YEAR. The 194H threshold is a
+       *    FINANCIAL-YEAR threshold. Accumulating every live booking a
+       *    partner has ever had crosses ₹20,000 permanently and starts
+       *    deducting on a fresh year that has earned nothing.
+       *
+       * ② IT IS ORDERED OLDEST FIRST. The running total below only
+       *    means anything in the order the year actually happened.
+       *    Newest-first accumulation charged the threshold catch-up
+       *    against the most recent booking and left April's carrying
+       *    nothing, which is the reverse of what the section says.
+       */
       const live = await tx
         .select({
           reference: bookings.reference,
           agreementValueMinor: bookings.agreementValueMinor,
+          bookedAt: bookings.bookedAt,
         })
         .from(bookings)
         .where(
@@ -189,9 +219,11 @@ export async function getChannelPartner(input: { id: string }): Promise<
             eq(bookings.channelPartnerId, partner.id),
             eq(bookings.tenantId, ctx.tenant.id),
             sql`${bookings.status} <> 'cancelled'`,
+            sql`${bookings.bookedAt} >= ${fyStart}::timestamptz`,
+            sql`${bookings.bookedAt} < ${fyEnd}::timestamptz`,
           ),
         )
-        .orderBy(desc(bookings.bookedAt))
+        .orderBy(asc(bookings.bookedAt))
         .limit(200);
 
       return { partner, locked, live };
@@ -208,6 +240,17 @@ export async function getChannelPartner(input: { id: string }): Promise<
     // paid ₹15,000 twice never crosses the ₹20,000 threshold and the
     // company under-deducts.
     let ytd = 0n;
+    /**
+     * ⭐ AND THE TAX ALREADY DEDUCTED IS CARRIED TOO, FROM v1.25.0-alpha.
+     *
+     * 🔴 194H is `aggregate_whole`: once the year crosses the threshold,
+     * tax is due on everything credited in it. `computeTds` charges the
+     * whole running base and subtracts what has been deducted already —
+     * so a running gross with no running tax would re-charge the catch-up
+     * on every row below it and show a partner a payout that shrinks
+     * further with each booking they win.
+     */
+    let ytdTds = 0n;
     const pipeline = live.map((booking) => {
       const commission = computeCommission({
         basis: partner.commissionBasis,
@@ -217,13 +260,22 @@ export async function getChannelPartner(input: { id: string }): Promise<
         agreementValueMinor: booking.agreementValueMinor,
       });
 
+      /**
+       * ⚠️ THE BOOKING DATE, NOT TODAY. This is a projection of what
+       * would be deducted on each booking in the pipeline, and a rate
+       * resolved against "now" would restate a booking made before the
+       * October 2024 rate change at today's rate.
+       */
       const tds = computeTds({
         grossMinor: commission.grossMinor,
         hasPan: Boolean(partner.panNumber),
+        onDate: isoDay(booking.bookedAt),
         ytdGrossMinor: ytd,
+        ytdTdsMinor: ytdTds,
       });
 
       ytd += commission.grossMinor;
+      ytdTds += tds.tdsMinor;
 
       return {
         bookingReference: booking.reference,

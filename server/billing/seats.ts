@@ -41,7 +41,7 @@ import "server-only";
  */
 
 import { and, eq, sql } from "drizzle-orm";
-import { db } from "@/db";
+import { db, withTenant } from "@/db";
 import { users, subscriptions, plans } from "@/db/schema";
 import {
   canTakeSeats,
@@ -97,21 +97,23 @@ export class SeatLimitError extends Error {
  * roles. That test is the only thing keeping them in step.
  */
 export async function countSeatsInUse(tenantId: string): Promise<number> {
-  const [row] = await db
-    .select({ count: sql<number>`count(*)::int` })
-    .from(users)
-    .where(
-      and(
-        eq(users.tenantId, tenantId),
-        sql`${users.deletedAt} IS NULL`,
-        sql`${users.status} = ANY(${sql.raw(
-          `ARRAY[${SEAT_CONSUMING_STATUSES.map((s) => `'${s}'`).join(",")}]::user_status[]`,
-        )})`,
-        sql`${users.role} <> ALL(${sql.raw(
-          `ARRAY[${SEAT_EXEMPT_ROLES.map((r) => `'${r}'`).join(",")}]::system_role[]`,
-        )})`,
-      ),
-    );
+  const [row] = await withTenant(tenantId, (tx) =>
+    tx
+      .select({ count: sql<number>`count(*)::int` })
+      .from(users)
+      .where(
+        and(
+          eq(users.tenantId, tenantId),
+          sql`${users.deletedAt} IS NULL`,
+          sql`${users.status} = ANY(${sql.raw(
+            `ARRAY[${SEAT_CONSUMING_STATUSES.map((s) => `'${s}'`).join(",")}]::user_status[]`,
+          )})`,
+          sql`${users.role} <> ALL(${sql.raw(
+            `ARRAY[${SEAT_EXEMPT_ROLES.map((r) => `'${r}'`).join(",")}]::system_role[]`,
+          )})`,
+        ),
+      )
+  );
 
   return row?.count ?? 0;
 }
@@ -131,22 +133,24 @@ export async function countSeatsPurchased(
   tenantId: string,
   fallbackSeatLimit: number,
 ): Promise<number> {
-  const [row] = await db
-    .select({
-      seatsPurchased: subscriptions.seatsPurchased,
-      includedSeats: plans.includedSeats,
-      status: subscriptions.status,
-    })
-    .from(subscriptions)
-    .innerJoin(plans, eq(plans.id, subscriptions.planId))
-    .where(
-      and(
-        eq(subscriptions.tenantId, tenantId),
-        sql`${subscriptions.deletedAt} IS NULL`,
-        sql`${subscriptions.status} IN ('trialing','active','past_due','unpaid','paused')`,
-      ),
-    )
-    .limit(1);
+  const [row] = await withTenant(tenantId, (tx) =>
+    tx
+      .select({
+        seatsPurchased: subscriptions.seatsPurchased,
+        includedSeats: plans.includedSeats,
+        status: subscriptions.status,
+      })
+      .from(subscriptions)
+      .innerJoin(plans, eq(plans.id, subscriptions.planId))
+      .where(
+        and(
+          eq(subscriptions.tenantId, tenantId),
+          sql`${subscriptions.deletedAt} IS NULL`,
+          sql`${subscriptions.status} IN ('trialing','active','past_due','unpaid','paused')`,
+        ),
+      )
+      .limit(1)
+  );
 
   if (!row) return Math.max(0, fallbackSeatLimit);
 

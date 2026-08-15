@@ -375,6 +375,17 @@ export default function OrdersPage() {
             What customers have agreed to buy and have not yet received.
           </p>
         </div>
+        {/*
+          ⭐ v1.42.0: THE FIRST WAY TO CREATE AN ORDER IN THIS PRODUCT.
+          `createOrder` had no caller, so this list read a table nothing
+          could write to.
+        */}
+        <Link
+          href="/orders/new"
+          className="inline-flex h-9 items-center rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground shadow-xs hover:bg-primary/90"
+        >
+          New order
+        </Link>
         <Link
           href="/receivables"
           className="text-sm text-muted-foreground hover:underline"

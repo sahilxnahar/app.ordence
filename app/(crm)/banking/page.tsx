@@ -7,8 +7,13 @@
  * removes it.
  */
 
-import { getBankAccounts, importStatement } from "@/server/actions/banking";
+import {
+  createBankAccount,
+  getBankAccounts,
+  importStatement,
+} from "@/server/actions/banking";
 import { ReconciliationWorkspace } from "@/components/banking/reconciliation-workspace";
+import { NewBankAccountForm } from "@/components/banking/new-bank-account-form";
 
 export const dynamic = "force-dynamic";
 
@@ -38,11 +43,29 @@ export default async function BankingPage() {
         </p>
       </div>
 
+      {/*
+        ⭐ v1.39.0 (Batch 36): THE FORM IS ABOVE THE WORKSPACE WHEN THERE
+        ARE NO ACCOUNTS, AND BELOW IT ONCE THERE ARE.
+
+        🔴 An empty workspace used to be indistinguishable from a new
+        workspace that had simply not added an account yet, which is
+        exactly why nobody noticed that `insert(bankAccounts)` appeared
+        nowhere in the tree. With no accounts, the first thing on the
+        page is now the thing to do about it.
+      */}
+      {result.data.accounts.length === 0 ? (
+        <NewBankAccountForm action={createBankAccount} suggestedCode="1010" />
+      ) : null}
+
       <ReconciliationWorkspace
         accounts={result.data.accounts}
         statements={result.data.statements}
         importAction={importStatement}
       />
+
+      {result.data.accounts.length > 0 ? (
+        <NewBankAccountForm action={createBankAccount} suggestedCode="1010" />
+      ) : null}
     </main>
   );
 }

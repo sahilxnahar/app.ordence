@@ -362,3 +362,29 @@ export * from "./campaigns";
  * `automationEvents` is that queue, not a second engine.
  */
 export * from "./patterns";
+
+/**
+ * ⭐⭐⭐ PAYROLL — Batch 15 (SQL 0075).
+ *
+ * 🔴 Employees are not `users` and are not `site_workers`. Both
+ * separations are load-bearing: most employees never sign in, and
+ * contract labour is paid through a vendor's RA bill rather than a
+ * payslip.
+ *
+ * ⚠️ No Aadhaar and no bank account number. Ordence ACCRUES payroll; it
+ * does not disburse it. See the file header for the full argument.
+ */
+export * from "./payroll";
+
+/**
+ * ⭐⭐⭐ THE MONTHLY RETURN — Batch 16 (SQL 0077).
+ *
+ * 🔴 One row per GSTIN per period, not per tenant. A business registered
+ * in three States files three separate 3Bs with three separate set-offs,
+ * and credit does not move between them.
+ *
+ * ⚠️ A filed return is frozen. GST provides no amendment of a filed 3B —
+ * only an adjustment in the next one — so a system that allows an edit
+ * teaches a workflow that does not exist.
+ */
+export * from "./returns";

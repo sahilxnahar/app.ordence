@@ -61,6 +61,18 @@ import {
   PLAN_TEMPLATES,
 } from "@/lib/sales/payment-plan";
 import { computeCommission } from "@/lib/sales/commission";
+import {
+  cancellationProblem,
+  forfeitureWarning,
+  irrecoverableTaxMinor,
+  creditNoteWindowCloses,
+  creditNoteWindowClosed,
+  FORFEITURE_GUIDANCE,
+} from "@/lib/sales/cancellation";
+import { bookingLedgerFacts } from "@/server/sales/booking-ledger";
+import { postCancellation, postBuyerRefund } from "@/server/accounting/post-sales";
+import { toCivilDay } from "@/lib/gst/constants";
+import { z } from "zod";
 import type { ActionResult } from "@/lib/validators/crm";
 import type { Booking, PaymentMilestone } from "@/db/schema/sales";
 
@@ -665,6 +677,637 @@ export async function cancelBooking(input: unknown): Promise<ActionResult<{ id: 
   } catch (err) {
     return toSalesActionError(err, "cancelBooking");
   }
+}
+
+/* ================================================================== */
+/* ⭐⭐⭐ THE CANCELLATION POSTING — Batch 17, v1.25.0-alpha            */
+/* ================================================================== */
+
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 WHY THIS IS A SECOND ACTION AND NOT A LEG INSIDE `cancelBooking`
+ * ══════════════════════════════════════════════════════════════════════
+ * `check-posting-coverage.mjs` has carried the same note against this
+ * file for eleven sessions, and the obvious fix is to make
+ * `cancelBooking` post. That would be wrong in three separate ways, and
+ * each of them would surface as the sales team being unable to cancel a
+ * booking:
+ *
+ *   ① DIFFERENT PERMISSIONS. Cancelling is `bookings:cancel` and belongs
+ *     to whoever runs sales. Posting to the ledger is `transactions:post`
+ *     and belongs to the accountant. Fusing them would hand every sales
+ *     executive the ability to write journal entries.
+ *
+ *   ② THE ACCOUNTS MAY NOT BE MAPPED. `buyer_refund_payable` and
+ *     `irrecoverable_output_tax` are new in this version, so on the day
+ *     of the upgrade nobody has them. A fused action would refuse the
+ *     CANCELLATION because a LEDGER ACCOUNT was missing, which is a
+ *     sentence that makes no sense to the person reading it.
+ *
+ *   ③ THE PERIOD MAY BE CLOSED. A buyer walking away in August against a
+ *     July that has been closed is entirely ordinary, and the
+ *     cancellation is a fact whether or not the entry can be dated into
+ *     July.
+ *
+ * ⭐ SO A CANCELLATION IS RECORDED IMMEDIATELY AND POSTED SEPARATELY.
+ *   `bookings.cancellation_posted_at` being null is the honest
+ *   representation of "cancelled, not yet in the books" — a real and
+ *   common state that a single fused action has no way to express.
+ */
+
+const cancellationLedgerSchema = z.object({
+  bookingId: z.string().uuid(),
+  reversedCgst: z.string().trim().optional(),
+  reversedSgst: z.string().trim().optional(),
+  reversedIgst: z.string().trim().optional(),
+  creditNoteNumber: z.string().trim().max(40).optional(),
+});
+
+export type CancellationPreview = {
+  bookingReference: string;
+  cancelledOn: string | null;
+  forfeitMinor: string;
+  refundMinor: string;
+  advanceMinor: string;
+  receivableMinor: string;
+  outputTaxMinor: string;
+  outputCgstMinor: string;
+  outputSgstMinor: string;
+  outputIgstMinor: string;
+  cashPaidMinor: string;
+  alreadyPosted: boolean;
+  hasPostings: boolean;
+  /** Null when the entry can be posted as it stands. */
+  problem: string | null;
+  /** Null when the forfeiture is within the usual limit. */
+  warning: string | null;
+  /** Section 34: when the credit-note window closes, and whether it has. */
+  creditNoteWindowCloses: string | null;
+  creditNoteWindowClosed: boolean;
+  forfeitureCapBps: number;
+};
+
+/**
+ * ⭐ EVERYTHING THE OPERATOR NEEDS TO SEE BEFORE THEY POST, INCLUDING
+ *   THE REFUSAL.
+ *
+ * ⚠️ THE REFUSAL IS COMPUTED HERE AND AGAIN AT POSTING TIME, and that is
+ * deliberate rather than sloppy. This one is so the screen can explain
+ * the problem next to the figures that caused it; the one at posting
+ * time is because a preview is a moment in the past by the time somebody
+ * presses the button.
+ */
+export async function previewCancellationPosting(input: {
+  bookingId: string;
+  reversedCgst?: string;
+  reversedSgst?: string;
+  reversedIgst?: string;
+}): Promise<ActionResult<CancellationPreview>> {
+  try {
+    const ctx = await requirePermission("transactions:post");
+    const today = toCivilDay(new Date());
+
+    const result = await withTenant(ctx.tenant.id, async (tx) => {
+      const [booking] = await tx
+        .select({
+          id: bookings.id,
+          reference: bookings.reference,
+          status: bookings.status,
+          cancelledAt: bookings.cancelledAt,
+          cancellationPostedAt: bookings.cancellationPostedAt,
+          forfeitAmountMinor: bookings.forfeitAmountMinor,
+          refundAmountMinor: bookings.refundAmountMinor,
+          agreementValueMinor: bookings.agreementValueMinor,
+        })
+        .from(bookings)
+        .where(
+          and(eq(bookings.id, input.bookingId), eq(bookings.tenantId, ctx.tenant.id)),
+        )
+        .limit(1);
+
+      if (!booking) return null;
+
+      const facts = await bookingLedgerFacts(tx, ctx.tenant.id, booking.id);
+      return { booking, facts };
+    });
+
+    if (!result) {
+      return salesFail("That booking does not exist, or you cannot see it.");
+    }
+    const { booking, facts } = result;
+
+    if (booking.status !== "cancelled") {
+      return salesFail(
+        `Booking ${booking.reference} has not been cancelled, so there is nothing to post.`,
+      );
+    }
+
+    const reversedCgstMinor = input.reversedCgst ? toMinorUnits(input.reversedCgst) : 0n;
+    const reversedSgstMinor = input.reversedSgst ? toMinorUnits(input.reversedSgst) : 0n;
+    const reversedIgstMinor = input.reversedIgst ? toMinorUnits(input.reversedIgst) : 0n;
+
+    const cancellationFacts = {
+      advanceMinor: facts.advanceMinor,
+      receivableMinor: facts.receivableMinor,
+      outputTaxMinor: facts.outputTaxMinor,
+      cashPaidMinor: facts.cashPaidMinor,
+      forfeitMinor: booking.forfeitAmountMinor ?? 0n,
+      refundMinor: booking.refundAmountMinor ?? 0n,
+      reversedCgstMinor,
+      reversedSgstMinor,
+      reversedIgstMinor,
+    };
+
+    /**
+     * ⚠️ A BOOKING WITH NOTHING IN THE LEDGER IS NOT AN ERROR, and it is
+     * commoner than the alternative. A buyer who paid a token and walked
+     * away before any demand was served has no advance, no receivable and
+     * no tax — there is genuinely nothing to post, and saying so is more
+     * useful than a refusal about an imbalance.
+     */
+    const problem = facts.hasPostings ? cancellationProblem(cancellationFacts) : null;
+
+    const closes = facts.firstSupplyDate
+      ? creditNoteWindowCloses(facts.firstSupplyDate)
+      : null;
+
+    return {
+      ok: true,
+      data: {
+        bookingReference: booking.reference,
+        cancelledOn: booking.cancelledAt ? toCivilDay(booking.cancelledAt) : null,
+        forfeitMinor: (booking.forfeitAmountMinor ?? 0n).toString(),
+        refundMinor: (booking.refundAmountMinor ?? 0n).toString(),
+        advanceMinor: facts.advanceMinor.toString(),
+        receivableMinor: facts.receivableMinor.toString(),
+        outputTaxMinor: facts.outputTaxMinor.toString(),
+        outputCgstMinor: facts.outputCgstMinor.toString(),
+        outputSgstMinor: facts.outputSgstMinor.toString(),
+        outputIgstMinor: facts.outputIgstMinor.toString(),
+        cashPaidMinor: facts.cashPaidMinor.toString(),
+        alreadyPosted: booking.cancellationPostedAt !== null,
+        hasPostings: facts.hasPostings,
+        problem,
+        warning: forfeitureWarning({
+          forfeitMinor: booking.forfeitAmountMinor ?? 0n,
+          considerationMinor: booking.agreementValueMinor,
+        }),
+        creditNoteWindowCloses: closes,
+        creditNoteWindowClosed: facts.firstSupplyDate
+          ? creditNoteWindowClosed(facts.firstSupplyDate, today)
+          : false,
+        forfeitureCapBps: FORFEITURE_GUIDANCE.capBps,
+      },
+    };
+  } catch (err) {
+    return toSalesActionError(err, "previewCancellationPosting");
+  }
+}
+
+/**
+ * ⭐⭐ POST IT. Clears every balance this booking carries, in one entry.
+ */
+export async function postBookingCancellation(
+  input: unknown,
+): Promise<ActionResult<{ bookingId: string; transactionId: string | null; note: string }>> {
+  try {
+    const data = cancellationLedgerSchema.parse(input);
+    const ctx = await requirePermission("transactions:post");
+    const now = new Date();
+
+    const reversedCgstMinor = data.reversedCgst ? toMinorUnits(data.reversedCgst) : 0n;
+    const reversedSgstMinor = data.reversedSgst ? toMinorUnits(data.reversedSgst) : 0n;
+    const reversedIgstMinor = data.reversedIgst ? toMinorUnits(data.reversedIgst) : 0n;
+
+    type Outcome =
+      | { kind: "refused"; message: string }
+      | { kind: "ok"; transactionId: string | null; note: string };
+
+    const outcome = await withTenant(
+      ctx.tenant.id,
+      async (tx): Promise<Outcome> => {
+        const [booking] = await tx
+          .select({
+            id: bookings.id,
+            reference: bookings.reference,
+            status: bookings.status,
+            cancelledAt: bookings.cancelledAt,
+            cancellationPostedAt: bookings.cancellationPostedAt,
+            forfeitAmountMinor: bookings.forfeitAmountMinor,
+            refundAmountMinor: bookings.refundAmountMinor,
+          })
+          .from(bookings)
+          .where(and(eq(bookings.id, data.bookingId), eq(bookings.tenantId, ctx.tenant.id)))
+          .limit(1);
+
+        if (!booking) {
+          return { kind: "refused", message: "That booking does not exist." };
+        }
+        if (booking.status !== "cancelled") {
+          return {
+            kind: "refused",
+            message: `Booking ${booking.reference} has not been cancelled, so there is nothing to post.`,
+          };
+        }
+        if (booking.cancellationPostedAt) {
+          return {
+            kind: "refused",
+            message: `The cancellation of booking ${booking.reference} is already in the ledger.`,
+          };
+        }
+
+        const facts = await bookingLedgerFacts(tx, ctx.tenant.id, booking.id);
+
+        if (!facts.hasPostings) {
+          return {
+            kind: "refused",
+            message:
+              `Nothing has ever been posted against booking ${booking.reference} — no demand ` +
+              `was served and no receipt landed on it. There are no balances to clear, so a ` +
+              `cancellation entry would be an empty journal.`,
+          };
+        }
+
+        const cancellationFacts = {
+          advanceMinor: facts.advanceMinor,
+          receivableMinor: facts.receivableMinor,
+          outputTaxMinor: facts.outputTaxMinor,
+          cashPaidMinor: facts.cashPaidMinor,
+          forfeitMinor: booking.forfeitAmountMinor ?? 0n,
+          refundMinor: booking.refundAmountMinor ?? 0n,
+          reversedCgstMinor,
+          reversedSgstMinor,
+          reversedIgstMinor,
+        };
+
+        const problem = cancellationProblem(cancellationFacts);
+        if (problem) return { kind: "refused", message: problem };
+
+        /**
+         * ⚠️ THE CANCELLATION DATE, NOT TODAY. The entry belongs in the
+         * period the buyer walked away in — which is also why the period
+         * lock inside `writePropertyPosting` can refuse it, and should.
+         */
+        const cancelledOn = toCivilDay(booking.cancelledAt ?? now);
+
+        const posted = await postCancellation(tx, {
+          tenantId: ctx.tenant.id,
+          userId: ctx.user.id,
+          bookingId: booking.id,
+          bookingReference: booking.reference,
+          cancelledOn,
+          unitLabel: null,
+          buyerName: null,
+          advanceMinor: facts.advanceMinor,
+          receivableMinor: facts.receivableMinor,
+          forfeitMinor: booking.forfeitAmountMinor ?? 0n,
+          refundMinor: booking.refundAmountMinor ?? 0n,
+          reversedCgstMinor,
+          reversedSgstMinor,
+          reversedIgstMinor,
+          irrecoverableTaxMinor: irrecoverableTaxMinor(cancellationFacts),
+          creditNoteNumber: data.creditNoteNumber ?? null,
+        });
+
+        if (!posted.posted) {
+          return { kind: "refused", message: describePostRefusal(posted, booking.reference) };
+        }
+
+        /**
+         * ⚠️ THE TAX REVERSAL FIGURES ARE STORED ON THE BOOKING, and the
+         * trigger `ordence_guard_posted_cancellation` freezes them from
+         * this point. The journal and the booking have to keep agreeing,
+         * and the only way to guarantee that is for neither to be
+         * editable once the other exists.
+         */
+        await tx
+          .update(bookings)
+          .set({
+            gstCreditNoteNumber: data.creditNoteNumber ?? null,
+            reversedCgstMinor,
+            reversedSgstMinor,
+            reversedIgstMinor,
+            cancellationPostedAt: now,
+            updatedAt: now,
+          })
+          .where(and(eq(bookings.id, booking.id), eq(bookings.tenantId, ctx.tenant.id)));
+
+        const stranded = irrecoverableTaxMinor(cancellationFacts);
+        return {
+          kind: "ok",
+          transactionId: posted.transactionId,
+          note:
+            stranded > 0n
+              ? `Posted. ⚠️ ${formatMinor(stranded)} of output tax could not be reversed — ` +
+                `the section 34 credit-note window has closed on it, so it is a cost of this ` +
+                `cancellation rather than a refund from the Government.`
+              : "Posted. The booking's advance, receivable and output tax are all cleared.",
+        };
+      },
+      { impersonationId: ctx.impersonationId },
+    );
+
+    if (outcome.kind === "refused") return salesFail(outcome.message);
+
+    await writeAudit(ctx, {
+      action: "create",
+      resourceType: "transaction",
+      resourceId: outcome.transactionId ?? data.bookingId,
+      newValue: {
+        kind: "booking_cancellation",
+        bookingId: data.bookingId,
+        creditNoteNumber: data.creditNoteNumber ?? null,
+      },
+      /** ⚠️ `critical`: it writes off a receivable and creates a liability. */
+      severity: "critical",
+    });
+
+    revalidatePath("/sales/bookings");
+    revalidatePath("/accounting/posting");
+    return {
+      ok: true,
+      data: {
+        bookingId: data.bookingId,
+        transactionId: outcome.transactionId,
+        note: outcome.note,
+      },
+    };
+  } catch (err) {
+    return toSalesActionError(err, "postBookingCancellation");
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* ⭐ THE REFUND ACTUALLY LEAVING                                       */
+/* ------------------------------------------------------------------ */
+
+const buyerRefundSchema = z.object({
+  bookingId: z.string().uuid(),
+  amount: z.string().trim().min(1),
+  paidOn: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "Use YYYY-MM-DD."),
+  paymentReference: z.string().trim().min(1).max(60),
+});
+
+/**
+ * ⭐ A SEPARATE EVENT, MONTHS LATER, AND THAT IS THE POINT.
+ *
+ * 🔴 A DEVELOPER SHORT OF CASH PAYS CANCELLATION REFUNDS LAST. How much
+ * is outstanding and how long it has been outstanding are questions a
+ * lender asks and a consumer forum asks, and neither has an answer if the
+ * refund is posted at the same moment as the cancellation.
+ */
+export async function recordBuyerRefund(
+  input: unknown,
+): Promise<ActionResult<{ bookingId: string; transactionId: string | null }>> {
+  try {
+    const data = buyerRefundSchema.parse(input);
+    const ctx = await requirePermission("transactions:post");
+    const now = new Date();
+    const amountMinor = toMinorUnits(data.amount);
+
+    type Outcome =
+      | { kind: "refused"; message: string }
+      | { kind: "ok"; transactionId: string | null };
+
+    const outcome = await withTenant(
+      ctx.tenant.id,
+      async (tx): Promise<Outcome> => {
+        const [booking] = await tx
+          .select({
+            id: bookings.id,
+            reference: bookings.reference,
+            status: bookings.status,
+            cancellationPostedAt: bookings.cancellationPostedAt,
+            refundAmountMinor: bookings.refundAmountMinor,
+            refundPaidAt: bookings.refundPaidAt,
+          })
+          .from(bookings)
+          .where(and(eq(bookings.id, data.bookingId), eq(bookings.tenantId, ctx.tenant.id)))
+          .limit(1);
+
+        if (!booking) return { kind: "refused", message: "That booking does not exist." };
+
+        /**
+         * 🔴 THE PAYABLE HAS TO EXIST BEFORE IT CAN BE PAID. Paying a
+         * refund on a cancellation that has not been posted debits an
+         * account with nothing in it and pushes it negative — a liability
+         * showing a debit balance, which reads as the buyer owing the
+         * developer money.
+         */
+        if (!booking.cancellationPostedAt) {
+          return {
+            kind: "refused",
+            message:
+              `The cancellation of booking ${booking.reference} has not been posted yet, so ` +
+              `there is no refund liability to settle. Post the cancellation first.`,
+          };
+        }
+        if (booking.refundPaidAt) {
+          return {
+            kind: "refused",
+            message: `A refund on booking ${booking.reference} was already recorded as paid on ${toCivilDay(booking.refundPaidAt)}.`,
+          };
+        }
+        if (amountMinor <= 0n) {
+          return { kind: "refused", message: "A refund has to be more than nothing." };
+        }
+        if (amountMinor > (booking.refundAmountMinor ?? 0n)) {
+          return {
+            kind: "refused",
+            message:
+              `This pays ${formatMinor(amountMinor)} against a refund of ` +
+              `${formatMinor(booking.refundAmountMinor ?? 0n)} agreed on the cancellation. ` +
+              `Paying more than was agreed needs the cancellation revisited, not a larger transfer.`,
+          };
+        }
+
+        const posted = await postBuyerRefund(tx, {
+          tenantId: ctx.tenant.id,
+          userId: ctx.user.id,
+          bookingId: booking.id,
+          bookingReference: booking.reference,
+          buyerName: null,
+          paidOn: data.paidOn,
+          paymentReference: data.paymentReference,
+          amountMinor,
+        });
+
+        if (!posted.posted) {
+          return { kind: "refused", message: describePostRefusal(posted, booking.reference) };
+        }
+
+        await tx
+          .update(bookings)
+          .set({
+            refundPaidAt: now,
+            refundReference: data.paymentReference,
+            updatedAt: now,
+          })
+          .where(and(eq(bookings.id, booking.id), eq(bookings.tenantId, ctx.tenant.id)));
+
+        return { kind: "ok", transactionId: posted.transactionId };
+      },
+      { impersonationId: ctx.impersonationId },
+    );
+
+    if (outcome.kind === "refused") return salesFail(outcome.message);
+
+    await writeAudit(ctx, {
+      action: "create",
+      resourceType: "transaction",
+      resourceId: outcome.transactionId ?? data.bookingId,
+      newValue: {
+        kind: "buyer_refund",
+        bookingId: data.bookingId,
+        amountMinor: amountMinor.toString(),
+        paymentReference: data.paymentReference,
+      },
+      severity: "warning",
+    });
+
+    revalidatePath("/sales/bookings");
+    return { ok: true, data: { bookingId: data.bookingId, transactionId: outcome.transactionId } };
+  } catch (err) {
+    return toSalesActionError(err, "recordBuyerRefund");
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* THE WORK LIST                                                      */
+/* ------------------------------------------------------------------ */
+
+export type CancellationRow = {
+  id: string;
+  reference: string;
+  cancelledOn: string | null;
+  cancelReason: string | null;
+  forfeitMinor: string;
+  refundMinor: string;
+  agreementValueMinor: string | null;
+  posted: boolean;
+  refundPaid: boolean;
+  refundPaidOn: string | null;
+  creditNoteNumber: string | null;
+  /** Non-null when the forfeiture is above the usual ten percent. */
+  warning: string | null;
+};
+
+/**
+ * ⭐ CANCELLED BOOKINGS AND WHERE EACH HAS GOT TO.
+ *
+ * ⚠️ IT LISTS EVERY CANCELLED BOOKING, NOT JUST THE UNPOSTED ONES. The
+ * question this screen answers is "who is still owed money", and a
+ * posted cancellation with an unpaid refund is exactly the row that
+ * matters most — it is a real liability and somebody is waiting for it.
+ * Filtering to unposted would hide the ones that have gone furthest
+ * wrong.
+ */
+export async function listCancellations(): Promise<
+  ActionResult<{ rows: CancellationRow[]; unpostedCount: number; unpaidRefundMinor: string }>
+> {
+  try {
+    const ctx = await requirePermission("bookings:read");
+
+    const rows = await withTenant(ctx.tenant.id, async (tx) =>
+      tx
+        .select({
+          id: bookings.id,
+          reference: bookings.reference,
+          cancelledAt: bookings.cancelledAt,
+          cancelReason: bookings.cancelReason,
+          forfeitAmountMinor: bookings.forfeitAmountMinor,
+          refundAmountMinor: bookings.refundAmountMinor,
+          agreementValueMinor: bookings.agreementValueMinor,
+          cancellationPostedAt: bookings.cancellationPostedAt,
+          refundPaidAt: bookings.refundPaidAt,
+          gstCreditNoteNumber: bookings.gstCreditNoteNumber,
+        })
+        .from(bookings)
+        .where(
+          and(eq(bookings.tenantId, ctx.tenant.id), eq(bookings.status, "cancelled")),
+        )
+        .orderBy(desc(bookings.cancelledAt))
+        .limit(300),
+    );
+
+    const mapped: CancellationRow[] = rows.map((r) => ({
+      id: r.id,
+      reference: r.reference,
+      cancelledOn: r.cancelledAt ? toCivilDay(r.cancelledAt) : null,
+      cancelReason: r.cancelReason,
+      forfeitMinor: (r.forfeitAmountMinor ?? 0n).toString(),
+      refundMinor: (r.refundAmountMinor ?? 0n).toString(),
+      agreementValueMinor: r.agreementValueMinor?.toString() ?? null,
+      posted: r.cancellationPostedAt !== null,
+      refundPaid: r.refundPaidAt !== null,
+      refundPaidOn: r.refundPaidAt ? toCivilDay(r.refundPaidAt) : null,
+      creditNoteNumber: r.gstCreditNoteNumber,
+      warning: forfeitureWarning({
+        forfeitMinor: r.forfeitAmountMinor ?? 0n,
+        considerationMinor: r.agreementValueMinor,
+      }),
+    }));
+
+    /**
+     * ⚠️ THE OUTSTANDING REFUND IS THE POSTED-AND-UNPAID SET. An
+     * unposted cancellation has no liability in the ledger yet, so
+     * counting it here would put a number on this screen that no
+     * account agrees with.
+     */
+    const unpaidRefundMinor = rows
+      .filter((r) => r.cancellationPostedAt !== null && r.refundPaidAt === null)
+      .reduce((sum, r) => sum + (r.refundAmountMinor ?? 0n), 0n);
+
+    return {
+      ok: true,
+      data: {
+        rows: mapped,
+        unpostedCount: mapped.filter((r) => !r.posted).length,
+        unpaidRefundMinor: unpaidRefundMinor.toString(),
+      },
+    };
+  } catch (err) {
+    return toSalesActionError(err, "listCancellations");
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* SHARED                                                             */
+/* ------------------------------------------------------------------ */
+
+/**
+ * ⚠️ A POSTING REFUSAL IS NOT AN ERROR AND MUST NOT READ LIKE ONE.
+ * `unmapped_roles` means somebody has to open the posting-accounts
+ * screen; `period_closed` means the month is shut. Both are ordinary
+ * days, and both have a next step the sentence should name.
+ */
+function describePostRefusal(
+  outcome: { posted: false; reason: string; missing?: unknown; period?: unknown },
+  reference: string,
+): string {
+  if (outcome.reason === "already_posted") {
+    return `That entry is already in the ledger for booking ${reference}.`;
+  }
+  if (outcome.reason === "unmapped_roles") {
+    const missing = Array.isArray(outcome.missing) ? outcome.missing.join(", ") : "";
+    return (
+      `These ledger accounts have not been mapped yet: ${missing}. Map them under ` +
+      `Accounting → Posting accounts, then post this again. Nothing has been written.`
+    );
+  }
+  if (outcome.reason === "period_closed") {
+    return (
+      `This entry belongs in ${String(outcome.period)}, which has been closed. Reopen ` +
+      `that period or, if it has been reported, agree a date in an open one.`
+    );
+  }
+  return `The entry could not be posted for booking ${reference}.`;
+}
+
+function formatMinor(minor: bigint): string {
+  const negative = minor < 0n;
+  const abs = negative ? -minor : minor;
+  return `${negative ? "-" : ""}₹${(abs / 100n).toString()}.${(abs % 100n).toString().padStart(2, "0")}`;
 }
 
 /* ------------------------------------------------------------------ */

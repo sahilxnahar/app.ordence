@@ -52,6 +52,7 @@ import {
   saveMeterBillingPeriod,
   closeMeterPeriod,
   setMeterPeriodFinalised,
+  postMeterBill,
 } from "@/server/actions/metering";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -74,7 +75,7 @@ type PeriodOption = {
 
 type Option = { id: string; name: string };
 
-type Panel = "none" | "meter" | "period" | "close" | "retire";
+type Panel = "none" | "meter" | "period" | "close" | "post" | "retire";
 
 const SELECT_CLASS = "h-9 w-full rounded-md border bg-background px-3 text-sm";
 
@@ -142,6 +143,13 @@ export function MeterActions({
   }
 
   const openPeriods = periods.filter((p) => !p.isFinalised);
+  /**
+   * ⚠️ FINALISED ONLY. An open period is recomputed every time a reading
+   * lands, so posting one would put a figure in the ledger that changes
+   * underneath it — and the transaction key would then refuse the
+   * corrected version, which is the worst of both.
+   */
+  const billablePeriods = periods.filter((p) => p.isFinalised);
 
   return (
     <div className="space-y-3">
@@ -166,6 +174,13 @@ export function MeterActions({
           onClick={() => setPanel(panel === "close" ? "none" : "close")}
         >
           Close a period
+        </Button>
+        <Button
+          size="sm"
+          variant={panel === "post" ? "default" : "outline"}
+          onClick={() => setPanel(panel === "post" ? "none" : "post")}
+        >
+          Post a bill
         </Button>
         <Button
           size="sm"
@@ -471,6 +486,74 @@ export function MeterActions({
                 </Button>
               </div>
             </form>
+          </CardContent>
+        </Card>
+      )}
+
+      {/* ─────────────────────────────────────────────────────────────
+          ⭐⭐⭐ POSTING A BILL — Batch 20, v1.28.0-alpha.
+
+          🔴 THE DUTY LINE IS THE POINT. A recovery spreadsheet books the
+          whole bill to income; electricity duty is a STATE LEVY
+          collected on the State's behalf, so it is a liability. Booking
+          it to revenue overstates turnover by the duty on every unit
+          ever billed and hides a statutory debt nobody is tracking.
+         ───────────────────────────────────────────────────────────── */}
+      {panel === "post" && (
+        <Card>
+          <CardHeader className="pb-3">
+            <CardTitle className="text-base">Post a bill to the ledger</CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            <p className="text-xs text-muted-foreground">
+              The recovery goes to income, the electricity duty to a liability — it is a
+              State levy you collected on the State&apos;s behalf, not your money — and any
+              net-metering export is credited back against the recovery. A month where the
+              export exceeded consumption posts as an amount owed TO the consumer rather
+              than a negative debtor.
+            </p>
+            <p className="text-xs text-muted-foreground">
+              ⚠️ No GST is added. The supply of electrical energy is exempt, and whether a
+              recovery of it is a supply at all depends on how it is billed — a pure
+              reimbursement at cost is generally not one, and the same recovery bundled
+              with rent or maintenance is part of a composite supply. That is a decision
+              for you and your auditor, and a taxable recovery belongs on a tax invoice
+              through the sales module.
+            </p>
+            {billablePeriods.length === 0 ? (
+              <p className="text-sm text-muted-foreground">
+                No finalised billing period. Close a period and freeze it first — an open
+                one is still recomputed every time a reading lands.
+              </p>
+            ) : (
+              <form
+                className="grid gap-3 sm:grid-cols-2"
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  const f = new FormData(e.currentTarget);
+                  run(
+                    () => postMeterBill({ id: f.get("id") }),
+                    "Bill posted. The duty is sitting in its own liability account, not in income.",
+                  );
+                }}
+              >
+                <div className="space-y-1">
+                  <Label htmlFor="p-period">Finalised period</Label>
+                  <select id="p-period" name="id" required className={SELECT_CLASS}>
+                    {billablePeriods.map((p) => (
+                      <option key={p.id} value={p.id}>
+                        {p.label}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div className="sm:col-span-2">
+                  <Button type="submit" size="sm" disabled={pending}>
+                    {pending ? "Working…" : "Post it"}
+                  </Button>
+                </div>
+              </form>
+            )}
           </CardContent>
         </Card>
       )}

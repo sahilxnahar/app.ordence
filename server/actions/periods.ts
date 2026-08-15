@@ -47,6 +47,13 @@ import type {
   ClosePeriodInput,
   ReopenPeriodInput,
 } from "@/lib/validators/periods";
+import { closeReadiness } from "@/server/accounting/close-readiness";
+import {
+  closeVerdict,
+  describeStranded,
+  periodHasEnded,
+} from "@/lib/accounting/close-checklist";
+import { toCivilDay } from "@/lib/gst/constants";
 import type { FinancialPeriod } from "@/db/schema";
 
 /* ------------------------------------------------------------------ */
@@ -115,17 +122,19 @@ export async function createFinancialPeriod(
 
     // Overlap check in the application, so the user gets a useful message.
     // The database has an exclusion constraint as the actual guarantee.
-    const overlapping = await db
-      .select({ id: financialPeriods.id, name: financialPeriods.name })
-      .from(financialPeriods)
-      .where(
-        and(
-          eq(financialPeriods.tenantId, ctx.tenant.id),
-          lte(financialPeriods.startDate, data.endDate),
-          gte(financialPeriods.endDate, data.startDate),
-        ),
-      )
-      .limit(1);
+    const overlapping = await withTenant(ctx.tenant.id, (tx) =>
+      tx
+        .select({ id: financialPeriods.id, name: financialPeriods.name })
+        .from(financialPeriods)
+        .where(
+          and(
+            eq(financialPeriods.tenantId, ctx.tenant.id),
+            lte(financialPeriods.startDate, data.endDate),
+            gte(financialPeriods.endDate, data.startDate),
+          ),
+        )
+        .limit(1)
+    );
 
     if (overlapping.length > 0) {
       return fail("Validation failed.", {
@@ -133,19 +142,21 @@ export async function createFinancialPeriod(
       });
     }
 
-    const [created] = await db
-      .insert(financialPeriods)
-      .values({
-        tenantId: ctx.tenant.id,
-        name: data.name,
-        startDate: data.startDate,
-        endDate: data.endDate,
-        fiscalYear: data.fiscalYear ?? null,
-        periodNumber: data.periodNumber ?? null,
-        status: "open",
-        createdBy: ctx.user.id,
-      })
-      .returning();
+    const [created] = await withTenant(ctx.tenant.id, (tx) =>
+      tx
+        .insert(financialPeriods)
+        .values({
+          tenantId: ctx.tenant.id,
+          name: data.name,
+          startDate: data.startDate,
+          endDate: data.endDate,
+          fiscalYear: data.fiscalYear ?? null,
+          periodNumber: data.periodNumber ?? null,
+          status: "open",
+          createdBy: ctx.user.id,
+        })
+        .returning()
+    );
 
     if (!created) return fail("Failed to create the period.");
 
@@ -203,34 +214,88 @@ export async function closeFinancialPeriod(
     await assertImpersonationAllows("periods:close", ctx);
     const data = closePeriodSchema.parse(input);
 
-    const period = await db.query.financialPeriods.findFirst({
-      where: and(
-        eq(financialPeriods.id, data.periodId),
-        eq(financialPeriods.tenantId, ctx.tenant.id),
-      ),
-    });
+    const period = await withTenant(ctx.tenant.id, (tx) =>
+      tx.query.financialPeriods.findFirst({
+        where: and(
+          eq(financialPeriods.id, data.periodId),
+          eq(financialPeriods.tenantId, ctx.tenant.id),
+        ),
+      })
+    );
 
     if (!period) return fail("Period not found.");
     if (period.status === "closed" || period.status === "locked") {
       return fail(`This period is already ${period.status}.`);
     }
 
-    /* ---- 1. Verify the books balance for this period -------------- */
-    const totals = await db
-      .select({
-        totalDebits: sql<string>`COALESCE(SUM(CASE WHEN ${journalEntries.entryType} = 'debit'  THEN ${journalEntries.amount} ELSE 0 END), 0)::text`,
-        totalCredits: sql<string>`COALESCE(SUM(CASE WHEN ${journalEntries.entryType} = 'credit' THEN ${journalEntries.amount} ELSE 0 END), 0)::text`,
-        entryCount: sql<number>`COUNT(*)::int`,
-      })
-      .from(journalEntries)
-      .innerJoin(transactions, eq(transactions.id, journalEntries.transactionId))
-      .where(
-        and(
-          eq(journalEntries.tenantId, ctx.tenant.id),
-          gte(transactions.transactionDate, period.startDate),
-          lte(transactions.transactionDate, period.endDate),
-        ),
+    /**
+     * ⭐ A MONTH THAT HAS NOT ENDED CANNOT BE FINAL — v1.27.0-alpha.
+     *
+     * ⚠️ THIS IS NOT A SMALLER MISTAKE THAN SEALING OVER UNPOSTED
+     * DOCUMENTS. It is the same mistake with a guaranteed outcome:
+     * everything that happens for the rest of the month is stranded by
+     * construction, and there is no version of the facts under which
+     * the attestation is true when it is made.
+     */
+    const today = toCivilDay(new Date());
+    if (!periodHasEnded({ endDate: period.endDate }, today)) {
+      return fail(
+        `"${period.name}" runs to ${period.endDate} and today is ${today}. A period ` +
+          `cannot be declared final before it has ended — everything recorded for the ` +
+          `rest of it would be locked out of the month it happened in.`,
       );
+    }
+
+    /* ---- 0. ⭐⭐⭐ IS ANYTHING FROM THIS MONTH STILL NOT POSTED? ---- */
+    /**
+     * ══════════════════════════════════════════════════════════════
+     * 🔴 THE CHECK THAT WAS MISSING FOR NINETEEN BATCHES
+     * ══════════════════════════════════════════════════════════════
+     * Everything below this — the balance check, the snapshot, the
+     * audit record — has been careful since v0.5.0. And a period with
+     * eleven unposted July documents BALANCES PERFECTLY, because the
+     * missing entries are missing from both sides. Zero equals zero.
+     *
+     * ⚠️ SO THE SEAL WENT ON BOOKS THAT WERE INTERNALLY CONSISTENT AND
+     * INCOMPLETE, and `0073`'s period lock then refused those documents
+     * from the month they belong to, permanently.
+     *
+     * ⭐ IT RUNS BEFORE THE BALANCE CHECK, deliberately. A month with
+     * missing documents will usually balance, so reporting the balance
+     * first would tell somebody the books are fine and then refuse.
+     */
+    const blockers = await closeReadiness(ctx.tenant.id, {
+      startDate: period.startDate,
+      endDate: period.endDate,
+    });
+    const verdict = closeVerdict(blockers);
+
+    if (!verdict.ready && !data.strandDocumentsReason) {
+      return fail(
+        `${verdict.headline} ${describeStranded(verdict.blocking)}. ` +
+          `${verdict.overrideWarning} ` +
+          `Post them first, or close with a written reason if they genuinely do not belong in this month.`,
+      );
+    }
+
+    /* ---- 1. Verify the books balance for this period -------------- */
+    const totals = await withTenant(ctx.tenant.id, (tx) =>
+      tx
+        .select({
+          totalDebits: sql<string>`COALESCE(SUM(CASE WHEN ${journalEntries.entryType} = 'debit'  THEN ${journalEntries.amount} ELSE 0 END), 0)::text`,
+          totalCredits: sql<string>`COALESCE(SUM(CASE WHEN ${journalEntries.entryType} = 'credit' THEN ${journalEntries.amount} ELSE 0 END), 0)::text`,
+          entryCount: sql<number>`COUNT(*)::int`,
+        })
+        .from(journalEntries)
+        .innerJoin(transactions, eq(transactions.id, journalEntries.transactionId))
+        .where(
+          and(
+            eq(journalEntries.tenantId, ctx.tenant.id),
+            gte(transactions.transactionDate, period.startDate),
+            lte(transactions.transactionDate, period.endDate),
+          ),
+        )
+    );
 
     const summary = totals[0];
     const debits = Number(summary?.totalDebits ?? 0);
@@ -248,42 +313,46 @@ export async function closeFinancialPeriod(
     }
 
     /* ---- 2. Snapshot every ledger balance ------------------------- */
-    const ledgerRows = await db
-      .select({
-        ledgerId: ledgers.id,
-        code: ledgers.code,
-        balance: ledgers.currentBalance,
-      })
-      .from(ledgers)
-      .where(eq(ledgers.tenantId, ctx.tenant.id));
+    const ledgerRows = await withTenant(ctx.tenant.id, (tx) =>
+      tx
+        .select({
+          ledgerId: ledgers.id,
+          code: ledgers.code,
+          balance: ledgers.currentBalance,
+        })
+        .from(ledgers)
+        .where(eq(ledgers.tenantId, ctx.tenant.id))
+    );
 
     /* ---- 3. Lock it ----------------------------------------------- */
-    const [closed] = await db
-      .update(financialPeriods)
-      .set({
-        status: "closed",
-        closedAt: new Date(),
-        closedBy: ctx.user.id,
-        closingNotes: data.closingNotes ?? null,
-        closingBalances: {
-          totalDebits: debits.toFixed(2),
-          totalCredits: credits.toFixed(2),
-          entryCount,
-          ledgerBalances: ledgerRows.map((l) => ({
-            ledgerId: l.ledgerId,
-            code: l.code,
-            balance: l.balance,
-          })),
-        },
-        updatedAt: new Date(),
-      })
-      .where(
-        and(
-          eq(financialPeriods.id, period.id),
-          eq(financialPeriods.tenantId, ctx.tenant.id),
-        ),
-      )
-      .returning();
+    const [closed] = await withTenant(ctx.tenant.id, (tx) =>
+      tx
+        .update(financialPeriods)
+        .set({
+          status: "closed",
+          closedAt: new Date(),
+          closedBy: ctx.user.id,
+          closingNotes: data.closingNotes ?? null,
+          closingBalances: {
+            totalDebits: debits.toFixed(2),
+            totalCredits: credits.toFixed(2),
+            entryCount,
+            ledgerBalances: ledgerRows.map((l) => ({
+              ledgerId: l.ledgerId,
+              code: l.code,
+              balance: l.balance,
+            })),
+          },
+          updatedAt: new Date(),
+        })
+        .where(
+          and(
+            eq(financialPeriods.id, period.id),
+            eq(financialPeriods.tenantId, ctx.tenant.id),
+          ),
+        )
+        .returning()
+    );
 
     if (!closed) return fail("Failed to close the period.");
 
@@ -302,10 +371,26 @@ export async function closeFinancialPeriod(
         entriesLocked: entryCount,
         wasBalanced,
         forcedUnbalanced: !wasBalanced && data.forceUnbalanced,
+        /**
+         * ⭐ THE STRANDED DOCUMENTS ARE NAMED IN THE AUDIT RECORD, by
+         * module and count, not merely counted. "Closed with 11
+         * stranded" is a fact somebody has to go and reconstruct; "3
+         * sales invoices, 8 vendor payments" is where to look.
+         */
+        strandedCount: verdict.strandedCount,
+        stranded: verdict.strandedCount > 0 ? describeStranded(verdict.blocking) : null,
+        strandDocumentsReason: data.strandDocumentsReason ?? null,
       }),
-      reason: data.closingNotes ?? `Period "${closed.name}" closed.`,
-      // An unbalanced forced close is exactly the event an auditor must find.
-      severity: wasBalanced ? "notice" : "critical",
+      reason:
+        data.strandDocumentsReason ??
+        data.closingNotes ??
+        `Period "${closed.name}" closed.`,
+      /**
+       * An unbalanced forced close is exactly the event an auditor must
+       * find — and so is a close that knowingly left documents out of
+       * the month they happened in.
+       */
+      severity: wasBalanced && verdict.strandedCount === 0 ? "notice" : "critical",
     });
 
     revalidatePath("/accounting");
@@ -319,6 +404,106 @@ export async function closeFinancialPeriod(
         totalDebits: debits.toFixed(2),
         totalCredits: credits.toFixed(2),
         wasBalanced,
+      },
+    };
+  } catch (err) {
+    return toActionError(err);
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* ⭐⭐⭐ THE PRE-CLOSE CHECK — v1.27.0-alpha                           */
+/* ------------------------------------------------------------------ */
+
+export type CloseReadinessView = {
+  periodName: string;
+  startDate: string;
+  endDate: string;
+  hasEnded: boolean;
+  ready: boolean;
+  headline: string;
+  strandedCount: number;
+  overrideWarning: string | null;
+  blocking: {
+    key: string;
+    source: string;
+    count: number;
+    headline: string;
+    consequence: string;
+    where: string;
+    amountMinor: string | null;
+    oldest: string | null;
+  }[];
+  advisory: {
+    key: string;
+    source: string;
+    count: number;
+    headline: string;
+    consequence: string;
+    where: string;
+    amountMinor: string | null;
+    oldest: string | null;
+  }[];
+};
+
+/**
+ * ⭐ WHAT WOULD HAPPEN IF THIS PERIOD WERE CLOSED RIGHT NOW.
+ *
+ * ⚠️ GATED ON `periods:read`, NOT ON `periods:close`. Seeing what is
+ * outstanding is how somebody knows what to POST, and the people who
+ * post are deliberately not the people who close — the Accountant role
+ * holds `transactions:post` and does not hold `periods:close`. Gating
+ * the checklist on the closing permission would show the list only to
+ * the person who cannot act on it.
+ */
+export async function getCloseReadiness(input: {
+  periodId: string;
+}): Promise<ActionResult<CloseReadinessView>> {
+  try {
+    const ctx = await requirePermission("periods:read");
+    const periodId = uuidSchema.parse(input.periodId);
+
+    const period = await withTenant(ctx.tenant.id, (tx) =>
+      tx.query.financialPeriods.findFirst({
+        where: and(
+          eq(financialPeriods.id, periodId),
+          eq(financialPeriods.tenantId, ctx.tenant.id),
+        ),
+      })
+    );
+    if (!period) return fail("Period not found.");
+
+    const blockers = await closeReadiness(ctx.tenant.id, {
+      startDate: period.startDate,
+      endDate: period.endDate,
+    });
+    const verdict = closeVerdict(blockers);
+    const today = toCivilDay(new Date());
+
+    const shape = (b: (typeof verdict.blocking)[number]) => ({
+      key: b.key,
+      source: b.source,
+      count: b.count,
+      headline: b.headline,
+      consequence: b.consequence,
+      where: b.where,
+      amountMinor: b.amountMinor === null ? null : b.amountMinor.toString(),
+      oldest: b.oldest,
+    });
+
+    return {
+      ok: true,
+      data: {
+        periodName: period.name,
+        startDate: period.startDate,
+        endDate: period.endDate,
+        hasEnded: periodHasEnded({ endDate: period.endDate }, today),
+        ready: verdict.ready,
+        headline: verdict.headline,
+        strandedCount: verdict.strandedCount,
+        overrideWarning: verdict.overrideWarning,
+        blocking: verdict.blocking.map(shape),
+        advisory: verdict.advisory.map(shape),
       },
     };
   } catch (err) {
@@ -356,12 +541,14 @@ export async function reopenFinancialPeriod(
     await assertImpersonationAllows("periods:reopen", ctx);
     const data = reopenPeriodSchema.parse(input);
 
-    const period = await db.query.financialPeriods.findFirst({
-      where: and(
-        eq(financialPeriods.id, data.periodId),
-        eq(financialPeriods.tenantId, ctx.tenant.id),
-      ),
-    });
+    const period = await withTenant(ctx.tenant.id, (tx) =>
+      tx.query.financialPeriods.findFirst({
+        where: and(
+          eq(financialPeriods.id, data.periodId),
+          eq(financialPeriods.tenantId, ctx.tenant.id),
+        ),
+      })
+    );
 
     if (!period) return fail("Period not found.");
     if (period.status === "open") return fail("This period is already open.");
@@ -369,22 +556,24 @@ export async function reopenFinancialPeriod(
       return fail("This period is permanently locked and cannot be reopened.");
     }
 
-    const [reopened] = await db
-      .update(financialPeriods)
-      .set({
-        status: "open",
-        reopenedAt: new Date(),
-        reopenedBy: ctx.user.id,
-        reopenReason: data.reason,
-        updatedAt: new Date(),
-      })
-      .where(
-        and(
-          eq(financialPeriods.id, period.id),
-          eq(financialPeriods.tenantId, ctx.tenant.id),
-        ),
-      )
-      .returning();
+    const [reopened] = await withTenant(ctx.tenant.id, (tx) =>
+      tx
+        .update(financialPeriods)
+        .set({
+          status: "open",
+          reopenedAt: new Date(),
+          reopenedBy: ctx.user.id,
+          reopenReason: data.reason,
+          updatedAt: new Date(),
+        })
+        .where(
+          and(
+            eq(financialPeriods.id, period.id),
+            eq(financialPeriods.tenantId, ctx.tenant.id),
+          ),
+        )
+        .returning()
+    );
 
     if (!reopened) return fail("Failed to reopen the period.");
 
@@ -417,11 +606,13 @@ export async function reopenFinancialPeriod(
 export async function getFinancialPeriods(): Promise<ActionResult<FinancialPeriod[]>> {
   try {
     const ctx = await requirePermission("periods:read");
-    const rows = await db
-      .select()
-      .from(financialPeriods)
-      .where(eq(financialPeriods.tenantId, ctx.tenant.id))
-      .orderBy(desc(financialPeriods.startDate));
+    const rows = await withTenant(ctx.tenant.id, (tx) =>
+      tx
+        .select()
+        .from(financialPeriods)
+        .where(eq(financialPeriods.tenantId, ctx.tenant.id))
+        .orderBy(desc(financialPeriods.startDate))
+    );
     return { ok: true, data: rows };
   } catch (err) {
     return toActionError(err);
@@ -439,18 +630,20 @@ export async function isDateLocked(
     const ctx = await requirePermission("periods:read");
     const parsed = z.string().date().parse(date);
 
-    const rows = await db
-      .select({ name: financialPeriods.name, status: financialPeriods.status })
-      .from(financialPeriods)
-      .where(
-        and(
-          eq(financialPeriods.tenantId, ctx.tenant.id),
-          lte(financialPeriods.startDate, parsed),
-          gte(financialPeriods.endDate, parsed),
-          ne(financialPeriods.status, "open"),
-        ),
-      )
-      .limit(1);
+    const rows = await withTenant(ctx.tenant.id, (tx) =>
+      tx
+        .select({ name: financialPeriods.name, status: financialPeriods.status })
+        .from(financialPeriods)
+        .where(
+          and(
+            eq(financialPeriods.tenantId, ctx.tenant.id),
+            lte(financialPeriods.startDate, parsed),
+            gte(financialPeriods.endDate, parsed),
+            ne(financialPeriods.status, "open"),
+          ),
+        )
+        .limit(1)
+    );
 
     const hit = rows[0];
     return {
