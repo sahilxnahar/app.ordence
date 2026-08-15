@@ -71,6 +71,8 @@ import {
 import { priceLine, summarise, type LinePricing } from "@/lib/orders/pricing";
 import { serializeAmount, toBigIntAmount } from "@/lib/billing/money";
 import { assessOrderCredit, assessApprovalAuthority } from "@/server/credit/position";
+/** 🔴 Batch 40 — the hold gate. `server-only`; see the file's own header. */
+import { creditGateForConfirmation, CreditHoldRefusal } from "@/lib/credit/enforce";
 import { approveOrderCreditSchema } from "@/lib/validators/credit";
 import type { ActionResult } from "@/lib/validators/crm";
 
@@ -538,6 +540,42 @@ export async function confirmOrder(
         let needsCreditApproval = false;
 
         if (order.companyId) {
+          /**
+           * ══════════════════════════════════════════════════════════
+           * 🔴🔴 THE HOLD REFUSES THE WRITE — v1.46.0 (Batch 40, 0083)
+           * ══════════════════════════════════════════════════════════
+           * ⚠️ BEFORE THE LIMIT ARITHMETIC, AND IT THROWS.
+           *
+           * The limit check below routes an over-limit order to
+           * `pending_approval`, which is right: the business answer to
+           * "₹40,000 over" is almost never no. A HOLD IS A DIFFERENT
+           * SENTENCE — a bounced cheque, an open dispute — and routing
+           * it into the same approval queue makes it indistinguishable
+           * from the routine over-limit traffic somebody clears at five
+           * o'clock. It would be enforcement that looks like
+           * enforcement and stops nothing.
+           *
+           * 🔴 SO IT THROWS, INSIDE THIS TRANSACTION, AND THE
+           * CONFIRMATION ROLLS BACK. Hiding the confirm button for a
+           * held customer is a mistake guard; this action is a
+           * browser-reachable RPC endpoint and `curl` has never
+           * rendered a button.
+           *
+           * The way past it is a recorded override against THIS order —
+           * `recordCreditHoldOverride` in `server/actions/credit.ts` —
+           * with a reason and a named actor, raised before the
+           * confirmation rather than explained after it. The gate
+           * consumes it in this same transaction.
+           */
+          const holdGate = await creditGateForConfirmation({
+            tx,
+            tenantId: ctx.tenant.id,
+            companyId: order.companyId,
+            orderId: order.id,
+            orderNo: order.orderNo,
+          });
+          creditMessage = holdGate.heldMessage;
+
           const decision = await assessOrderCredit({
             tx,
             tenantId: ctx.tenant.id,
@@ -546,7 +584,18 @@ export async function confirmOrder(
             orderTotalMinor: toBigIntAmount(order.totalMinor),
           });
           needsCreditApproval = decision.outcome === "approval_required";
-          creditMessage = decision.message;
+          /**
+           * ⚠️ THE OVERRIDE SENTENCE IS KEPT IN FRONT OF THE LIMIT
+           * SENTENCE, NOT REPLACED BY IT. An order confirmed past a
+           * hold on a signed override must say so in the event detail
+           * and the audit row; overwriting it with "within limit" —
+           * which is often true, because a hold is not about the
+           * arithmetic — would erase the only trace on the order itself
+           * that a hold was crossed.
+           */
+          creditMessage = creditMessage
+            ? `${creditMessage} ${decision.message}`
+            : decision.message;
         }
 
         /**
@@ -635,6 +684,18 @@ export async function confirmOrder(
       },
     };
   } catch (err) {
+    /**
+     * 🔴 THE CREDIT REFUSAL IS CAUGHT BY NAME, AND IT HAS TO BE.
+     *
+     * `toSalesActionError` recognises its own typed refusals, Zod errors
+     * and Postgres error codes; a plain `Error` falls through to
+     * "Something went wrong. Please try again." A hold refusal arriving
+     * as that sentence reads as an outage — the salesperson retries,
+     * retries again, and phones support to say orders are broken, while
+     * "this account is on hold because a cheque bounced" sits in a
+     * server log nobody at the counter can see.
+     */
+    if (err instanceof CreditHoldRefusal) return salesFail(err.message);
     return toSalesActionError(err, "confirmOrder");
   }
 }

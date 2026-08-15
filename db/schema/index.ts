@@ -402,3 +402,20 @@ export * from "./leave";
  * teaches a workflow that does not exist.
  */
 export * from "./returns";
+
+/**
+ * ⭐⭐⭐ COST CENTRES AND BUDGETS — Batch 68 (SQL 0084).
+ *
+ * ⚠️ EXPORTED AFTER `./accounting`, WHICH IT REFERENCES. `budget_lines`
+ * hangs off `ledgers` and `financial_periods`, and the dependency runs
+ * one way only — `accounting.ts` deliberately does NOT reference
+ * `cost_centres` back, which is why `journal_entries.cost_centre_id`
+ * carries its foreign key in the migration rather than in Drizzle.
+ *
+ * 🔴 THE COST CENTRE IS ON THE JOURNAL **LINE**. A header dimension
+ * cannot record one invoice split across two departments, and
+ * `journal_entries` is append-only, so retrofitting the grain later
+ * means reversing and re-posting a year of history rather than running
+ * an UPDATE.
+ */
+export * from "./budgets";

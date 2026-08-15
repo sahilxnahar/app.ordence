@@ -40,6 +40,7 @@
 
 import { COMPANY_SIZES, createCompanySchema } from "@/lib/validators/crm";
 import { upsertPartySchema } from "@/lib/validators/gst";
+import { OPENING_IMPORT_ENTITIES } from "./opening-entities";
 import type { ImportEntityDefinition } from "./types";
 
 /* ------------------------------------------------------------------ */
@@ -553,6 +554,29 @@ export type ImportEntityKey = keyof typeof IMPORT_ENTITIES;
 export const IMPORT_ENTITY_KEYS = Object.keys(IMPORT_ENTITIES) as ImportEntityKey[];
 
 /**
+ * ══════════════════════════════════════════════════════════════════════
+ * ⭐⭐ BATCH 58 — TWO LISTS FOR THE SCREENS, ONE ALLOWLIST FOR THE SERVER
+ * ══════════════════════════════════════════════════════════════════════
+ * `IMPORT_ENTITIES` is what the general import picker offers: lists you
+ * load because you have them. The opening-balance entities are a one-time
+ * migration with an ORDER to it, and they get their own screen — see the
+ * note at the foot of `lib/import/opening-entities.ts`.
+ *
+ * ⚠️ BUT THERE IS EXACTLY ONE ALLOWLIST ON THE WRITE PATH, and it is this
+ * one. Two registries the server switched between would be two places an
+ * entity could be reachable from, and the second one is the one nobody
+ * remembers to guard. `server/actions/import.ts` resolves through
+ * `ALL_IMPORT_ENTITIES` and through `isImportEntityKey`, which is
+ * membership in it — never a dynamic lookup on a caller's string.
+ */
+export const ALL_IMPORT_ENTITIES = {
+  ...IMPORT_ENTITIES,
+  ...OPENING_IMPORT_ENTITIES,
+} as const satisfies Record<string, ImportEntityDefinition>;
+
+export type AnyImportEntityKey = keyof typeof ALL_IMPORT_ENTITIES;
+
+/**
  * ⚠️ A TYPE GUARD, BECAUSE THE KEY ARRIVES FROM A BROWSER.
  *
  * `IMPORT_ENTITIES[input.entity]` on an unchecked string is a prototype
@@ -560,6 +584,6 @@ export const IMPORT_ENTITY_KEYS = Object.keys(IMPORT_ENTITIES) as ImportEntityKe
  * membership against the known keys first means an unrecognised value is
  * a refusal rather than an object with a `columns` property nobody meant.
  */
-export function isImportEntityKey(value: unknown): value is ImportEntityKey {
-  return typeof value === "string" && Object.hasOwn(IMPORT_ENTITIES, value);
+export function isImportEntityKey(value: unknown): value is AnyImportEntityKey {
+  return typeof value === "string" && Object.hasOwn(ALL_IMPORT_ENTITIES, value);
 }

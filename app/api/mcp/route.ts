@@ -39,6 +39,7 @@ import {
   describeForModel,
 } from "@/lib/mcp/registry";
 import { resolveSession, dispatchTool } from "@/server/mcp/dispatch";
+import { readJsonWithLimit, RequestTooLargeError } from "@/lib/edge/body-limit";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -114,10 +115,24 @@ export async function POST(req: NextRequest) {
   if (!session) return unauthorized();
 
   /* ---- 3. parse ---- */
+  //
+  // ⚠️ SIZE-BOUNDED — Batch 31. `/api/mcp` is public in `middleware.ts`
+  // ("no browser session required", not "unauthenticated") and reachable
+  // by any client holding a token. `await req.json()` buffers the whole
+  // body into the isolate before a single field is validated, so an
+  // oversized payload costs us the memory whether or not the token is
+  // any good.
+  //
+  // ⚠️ A SIZE FAILURE IS -32600 (invalid request), NOT -32700 (parse
+  // error). Telling an MCP client its JSON is malformed when the JSON is
+  // fine and merely too big sends its author to debug the wrong thing.
   let body: JsonRpcRequest;
   try {
-    body = (await req.json()) as JsonRpcRequest;
-  } catch {
+    body = await readJsonWithLimit<JsonRpcRequest>(req, "/api/mcp");
+  } catch (err) {
+    if (err instanceof RequestTooLargeError) {
+      return rpcError(null, -32600, err.message, 413);
+    }
     return rpcError(null, -32700, "Parse error — the body is not valid JSON.");
   }
 

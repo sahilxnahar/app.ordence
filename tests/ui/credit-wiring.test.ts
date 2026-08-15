@@ -156,8 +156,22 @@ describe("🔴 money stays bigint across the driver boundary", () => {
 
   it("every money column in the schema is mode: bigint", () => {
     const schema = code(CREDIT_SCHEMA);
+    /**
+     * 🔴 THE ASSERTION THAT MATTERS IS THE ABSENCE, NOT THE COUNT.
+     *
+     * ⚠️ THIS LINE PINNED `.toBe(2)` UNTIL v1.46.0 AND WAS WRONG TO.
+     * Batch 40 added five more money columns to this schema — the
+     * exposure and limit as they stood on a hold and on an override, and
+     * the amount due on a dunning record — every one of them correctly
+     * `mode: "bigint"`, and the exact count failed for it. A number that
+     * can only go up is a number that fails on good news, and the cheap
+     * way to make it pass is to stop adding the columns.
+     *
+     * A FLOOR is the honest form: at least the two that were here, and
+     * no `mode: "number"` anywhere.
+     */
     expect(schema).not.toContain('mode: "number"');
-    expect(schema.match(/mode: "bigint"/g)?.length).toBe(2);
+    expect(schema.match(/mode: "bigint"/g)?.length ?? 0).toBeGreaterThanOrEqual(2);
   });
 });
 

@@ -45,13 +45,13 @@ import {
 import { requirePermission, writeAudit } from "@/server/audit";
 import { toSalesActionError } from "@/server/sales/guards";
 import { postPayrollRun } from "@/server/accounting/post-sales";
+import { computeRun, daysInPeriod, daysOnRollsIn, writeRun } from "@/server/payroll/run";
 import {
-  computeRun,
-  daysInPeriod,
-  daysOnRollsIn,
-  writeRun,
-  type AttendanceInput,
-} from "@/server/payroll/run";
+  loadRunAttendance,
+  splitLopForPayslip,
+  type RunLopRow,
+} from "@/server/payroll/attendance-bridge";
+import { formatDays, parseDaysOrZero } from "@/lib/leave/days";
 import { PAYROLL_ROLE_META } from "@/lib/accounting/sales-posting";
 import { STARTER_COMPONENTS, STARTER_RATES } from "@/lib/payroll/starter";
 import type { ActionResult } from "@/lib/validators/crm";
@@ -468,17 +468,32 @@ export async function openPayrollRun(
   }
 }
 
+/**
+ * ⭐⭐⭐ v1.47.0 (BATCH 50): THE SCHEMA NO LONGER ACCEPTS ATTENDANCE.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 IT USED TO, AND THE BOARD SENT `attendance: []` EVERY TIME
+ * ══════════════════════════════════════════════════════════════════════
+ * So every run paid every salaried person a full month whatever the
+ * register said, and loss of pay could not be entered at all. That is the
+ * defect this batch exists to fix, and the fix is NOT to have the browser
+ * send the right array instead of an empty one.
+ *
+ * ⚠️ BECAUSE THE FIELD WAS ALSO A HOLE. A `"use server"` export is a
+ * public endpoint. `attendance` was an array of
+ * `{employeeId, payableDays, lopDays}` that was shape-validated and then
+ * believed — so a crafted request could dock any employee any number of
+ * days, or send zero days of loss of pay for somebody the register says
+ * was absent all month, and the wage bill would be computed from it with
+ * nothing anywhere recording that the figure did not come from the
+ * register. Approval then froze it.
+ *
+ * ⭐ `computeRun()` READS THE REGISTER ITSELF, INSIDE THE TRANSACTION
+ * THAT WRITES THE PAYSLIPS. The only thing this endpoint now takes is
+ * which run to compute.
+ */
 const computeSchema = z.object({
   runId: z.string().uuid(),
-  attendance: z
-    .array(
-      z.object({
-        employeeId: z.string().uuid(),
-        payableDays: z.number().min(0).max(31),
-        lopDays: z.number().min(0).max(31),
-      }),
-    )
-    .default([]),
 });
 
 export async function computePayrollRun(
@@ -492,7 +507,16 @@ export async function computePayrollRun(
 
     const outcome = await withTenant(
       ctx.tenant.id,
-      async (tx): Promise<Outcome<{ employeeCount: number; problemCount: number }>> => {
+      async (
+        tx,
+      ): Promise<
+        Outcome<{
+          employeeCount: number;
+          problemCount: number;
+          assumption: string;
+          lopDays: string;
+        }>
+      > => {
       const [run] = await tx
         .select()
         .from(payrollRuns)
@@ -515,7 +539,6 @@ export async function computePayrollRun(
         runId: d.runId,
         periodStart,
         periodEnd,
-        attendance: d.attendance as AttendanceInput[],
       });
 
       const staff = await tx
@@ -539,24 +562,14 @@ export async function computePayrollRun(
           staff.map((s) => [s.id, { name: s.fullName, code: s.employeeCode }]),
         ),
         daysInMonth: days,
-        attendance: d.attendance as AttendanceInput[],
-        defaultPayableDays: new Map(
-          staff.map((s) => [
-            s.id,
-            daysOnRollsIn(
-              String(s.joinedOn),
-              s.leftOn === null ? null : String(s.leftOn),
-              periodStart,
-              periodEnd,
-              days,
-            ),
-          ]),
-        ),
       });
 
       return {
         employeeCount: computed.totals.employeeCount,
         problemCount: computed.totals.withProblems,
+        /* ⭐ Said back to the operator, so the assumption is not silent. */
+        assumption: computed.attendance.assumption,
+        lopDays: formatDays(computed.attendance.totalLopCentidays),
       };
       },
     );
@@ -567,13 +580,279 @@ export async function computePayrollRun(
     return {
       ok: true,
       data: {
-        ...outcome,
+        employeeCount: outcome.employeeCount,
+        problemCount: outcome.problemCount,
         note:
           outcome.problemCount > 0
             ? `${outcome.problemCount} payslip${outcome.problemCount === 1 ? "" : "s"} carry a problem. The run cannot be approved until every one is resolved.`
-            : "Every payslip computed without a problem.",
+            : `Every payslip computed without a problem. ${outcome.lopDays} days of loss of pay charged. ${outcome.assumption}`,
       },
     };
+  } catch (error) {
+    return toSalesActionError(error, "payroll");
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* THE LOSS-OF-PAY POSITION, BEFORE ANYBODY SIGNS                      */
+/* ------------------------------------------------------------------ */
+
+export interface LopPositionRow {
+  readonly employeeId: string;
+  readonly employeeName: string;
+  readonly employeeCode: string;
+  readonly payableDays: number;
+  /** Formatted days, `"1.50"`. ⚠️ A string because a float is not a day. */
+  readonly lopDays: string;
+  readonly chargedDays: number;
+  readonly unchargedDays: string;
+  readonly fromRegisterDays: string;
+  readonly fromApprovedUnpaidDays: string;
+  readonly approvedPaidDays: string;
+  readonly unregularisedDays: string;
+  readonly registerDayCount: number;
+  readonly capped: boolean;
+  readonly source: string;
+}
+
+/**
+ * ⭐⭐⭐ WHO IS LOSING PAY THIS MONTH, AND WHY, BEFORE THE RUN IS
+ * APPROVED.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 THE POINT IS THAT IT IS SEEN BEFORE THE SIGNATURE, NOT AFTER
+ * ══════════════════════════════════════════════════════════════════════
+ * A deduction discovered on a payslip has already been paid, already been
+ * remitted, and is already an argument with an employee who is holding
+ * the piece of paper. The same figure shown on the run board is a
+ * question somebody can answer by opening the attendance register.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * ⭐⭐ AND AN APPROVED OR POSTED RUN IS READ FROM ITS OWN PAYSLIPS
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 NOT RE-READ FROM THE REGISTER. Approval freezes the payslips — the
+ * database refuses a change to any of them. If this screen went back to
+ * `staff_attendance` afterwards it would show the CURRENT register beside
+ * a FROZEN wage bill, and the two would diverge the first time anybody
+ * regularised an absence for last month. Somebody reconciling a payslip
+ * would then be reading a number that was never used to pay anybody, on
+ * a screen that gives no hint of it.
+ *
+ * So: `draft` and `computed` read the register live, because that is what
+ * the next compute will charge. Everything else reads what was actually
+ * charged, and says so.
+ */
+export async function getPayrollLopPosition(input: unknown): Promise<
+  ActionResult<{
+    live: boolean;
+    status: string;
+    periodStart: string;
+    periodEnd: string;
+    rows: readonly LopPositionRow[];
+    employeesInRun: number;
+    employeesWithRecords: number;
+    employeesAssumedFullMonth: number;
+    unregularisedCount: number;
+    unchargeableCount: number;
+    totalLopDays: string;
+    assumption: string;
+  }>
+> {
+  try {
+    const ctx = await requirePermission(READ);
+    const parsed = z.object({ runId: z.string().uuid() }).safeParse(input);
+    if (!parsed.success) return { ok: false, error: "Pick a payroll run." };
+    const runId = parsed.data.runId;
+
+    type Position = {
+      live: boolean;
+      status: string;
+      periodStart: string;
+      periodEnd: string;
+      rows: LopPositionRow[];
+      employeesInRun: number;
+      employeesWithRecords: number;
+      employeesAssumedFullMonth: number;
+      unregularisedCount: number;
+      unchargeableCount: number;
+      totalLopDays: string;
+      assumption: string;
+    };
+
+    const outcome = await withTenant(
+      ctx.tenant.id,
+      async (tx): Promise<Outcome<Position>> => {
+        const [run] = await tx
+          .select({
+            id: payrollRuns.id,
+            status: payrollRuns.status,
+            periodStart: payrollRuns.periodStart,
+            periodEnd: payrollRuns.periodEnd,
+          })
+          .from(payrollRuns)
+          .where(and(eq(payrollRuns.tenantId, ctx.tenant.id), eq(payrollRuns.id, runId)))
+          .limit(1);
+        if (!run) return { error: "No such payroll run." };
+
+        const status = String(run.status);
+        const periodStart = String(run.periodStart);
+        const periodEnd = String(run.periodEnd);
+        const live = status === "draft" || status === "computed";
+
+        if (!live) {
+          /* ⭐ THE FROZEN POSITION: what this run actually charged. */
+          const rows = await tx
+            .select({
+              employeeId: payslips.employeeId,
+              employeeName: payslips.employeeName,
+              employeeCode: payslips.employeeCode,
+              payableDays: payslips.payableDays,
+              lopDays: payslips.lopDays,
+            })
+            .from(payslips)
+            .where(and(eq(payslips.tenantId, ctx.tenant.id), eq(payslips.runId, runId)));
+
+          const charged = rows
+            .map((r) => ({
+              employeeId: String(r.employeeId),
+              employeeName: String(r.employeeName),
+              employeeCode: String(r.employeeCode),
+              payableDays: Number(r.payableDays ?? 0),
+              lopCentidays: parseDaysOrZero(r.lopDays),
+            }))
+            .filter((r) => r.lopCentidays > 0)
+            .sort((a, b) => a.employeeName.localeCompare(b.employeeName));
+
+          let total = 0;
+          for (const r of charged) total += r.lopCentidays;
+
+          return {
+            live: false,
+            status,
+            periodStart,
+            periodEnd,
+            rows: charged.map((r) => ({
+              employeeId: r.employeeId,
+              employeeName: r.employeeName,
+              employeeCode: r.employeeCode,
+              payableDays: r.payableDays,
+              lopDays: formatDays(r.lopCentidays),
+              /* ⚠️ Whole days, without a float — see `splitLopForPayslip`. */
+              chargedDays: splitLopForPayslip(r.lopCentidays).wholeDays,
+              unchargedDays: "0.00",
+              fromRegisterDays: "0.00",
+              fromApprovedUnpaidDays: "0.00",
+              approvedPaidDays: "0.00",
+              unregularisedDays: "0.00",
+              registerDayCount: 0,
+              capped: false,
+              source: "frozen",
+            })),
+            employeesInRun: rows.length,
+            employeesWithRecords: charged.length,
+            employeesAssumedFullMonth: rows.length - charged.length,
+            unregularisedCount: 0,
+            unchargeableCount: 0,
+            totalLopDays: formatDays(total),
+            assumption: `This run is ${status}. What is shown is what it actually charged, read from its own payslips — not from the attendance register, which may have moved since.`,
+          };
+        }
+
+        /**
+         * ⚠️ THE SAME POPULATION `computeRun()` USES — everybody on the
+         * rolls at any point inside the period, not everybody active
+         * today. Somebody who left on the 20th is owed twenty days.
+         */
+        const staff = await tx
+          .select({
+            id: employees.id,
+            fullName: employees.fullName,
+            employeeCode: employees.employeeCode,
+            joinedOn: employees.joinedOn,
+            leftOn: employees.leftOn,
+            workStateCode: employees.workStateCode,
+          })
+          .from(employees)
+          .where(
+            and(
+              eq(employees.tenantId, ctx.tenant.id),
+              sql`${employees.joinedOn} <= ${periodEnd}::date`,
+              sql`(${employees.leftOn} IS NULL OR ${employees.leftOn} >= ${periodStart}::date)`,
+            ),
+          );
+
+        const days = daysInPeriod(periodStart, periodEnd);
+        const payableDaysByEmployee = new Map<string, number>(
+          staff.map((s) => [
+            String(s.id),
+            Math.min(
+              daysOnRollsIn(
+                String(s.joinedOn),
+                s.leftOn === null ? null : String(s.leftOn),
+                periodStart,
+                periodEnd,
+                days,
+              ),
+              days,
+            ),
+          ]),
+        );
+
+        const position = await loadRunAttendance(tx, {
+          tenantId: ctx.tenant.id,
+          periodStart,
+          periodEnd,
+          payableDaysByEmployee,
+          workStateByEmployee: new Map(
+            staff.map((s) => [String(s.id), s.workStateCode === null ? null : String(s.workStateCode)]),
+          ),
+        });
+
+        const nameById = new Map(
+          staff.map((s) => [
+            String(s.id),
+            { name: String(s.fullName), code: String(s.employeeCode) },
+          ]),
+        );
+
+        const rows = position.rows
+          .map((r: RunLopRow) => ({
+            employeeId: r.employeeId,
+            employeeName: nameById.get(r.employeeId)?.name ?? "Unknown",
+            employeeCode: nameById.get(r.employeeId)?.code ?? "-",
+            payableDays: r.payableDays,
+            lopDays: formatDays(r.totalLopCentidays),
+            chargedDays: r.chargedLopDays,
+            unchargedDays: formatDays(r.unrepresentableCentidays),
+            fromRegisterDays: formatDays(r.registerCentidays),
+            fromApprovedUnpaidDays: formatDays(r.approvedUnpaidCentidays),
+            approvedPaidDays: formatDays(r.approvedPaidCentidays),
+            unregularisedDays: formatDays(r.unregularisedCentidays),
+            registerDayCount: r.registerDayCount,
+            capped: r.cappedAtPayableDays,
+            source: r.source,
+          }))
+          .sort((a, b) => a.employeeName.localeCompare(b.employeeName));
+
+        return {
+          live: true,
+          status,
+          periodStart,
+          periodEnd,
+          rows,
+          employeesInRun: position.employeesInRun,
+          employeesWithRecords: position.employeesWithRegisterRows,
+          employeesAssumedFullMonth: position.employeesAssumedFullMonth.length,
+          unregularisedCount: position.unregularisedEmployeeIds.length,
+          unchargeableCount: position.fractionalEmployeeIds.length,
+          totalLopDays: formatDays(position.totalLopCentidays),
+          assumption: position.assumption,
+        };
+      },
+    );
+
+    if (outcome.error !== undefined) return { ok: false, error: outcome.error };
+    return { ok: true, data: outcome };
   } catch (error) {
     return toSalesActionError(error, "payroll");
   }

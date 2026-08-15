@@ -23,6 +23,16 @@ import "server-only";
  * A March run computed in September uses March's provident fund
  * ceiling. Reading today's would produce a different payslip from the
  * one the employee is holding, and the employee is right.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * ⭐⭐⭐ v1.47.0 (BATCH 50): AND ATTENDANCE IS READ FOR THE PERIOD TOO
+ * ══════════════════════════════════════════════════════════════════════
+ * `attendance` used to be an argument, and the run board hardcoded it to
+ * `[]` — so every run paid every salaried person a full month whatever
+ * the register said. `computeRun()` now reads `staff_attendance` and the
+ * approved leave register through `server/payroll/attendance-bridge.ts`,
+ * in this transaction, and carries the position out in `ComputeOutcome`
+ * so the payslips are written from the same numbers they were priced on.
  */
 
 import { and, eq, gte, inArray, isNull, lt, lte, or, sql } from "drizzle-orm";
@@ -43,6 +53,12 @@ import {
   type RunTotals,
   type StructureLine,
 } from "@/lib/payroll/payslip";
+import { formatDays } from "@/lib/leave/days";
+import {
+  loadRunAttendance,
+  type RunAttendance,
+  type RunLopRow,
+} from "@/server/payroll/attendance-bridge";
 import {
   pickEffective,
   type EsiRules,
@@ -55,9 +71,34 @@ import {
 type Tx = Parameters<Parameters<typeof withTenant>[1]>[0];
 
 /* ------------------------------------------------------------------ */
-/* ATTENDANCE, SUPPLIED BY THE CALLER                                  */
+/* ATTENDANCE, READ FROM THE REGISTER                                  */
 /* ------------------------------------------------------------------ */
 
+/**
+ * ⭐ THE SHAPE THE COMPUTE CONSUMES. Unchanged since Batch 15, and
+ * `lib/leave/attendance.ts#PayrollAttendanceRow` is pinned to it field
+ * for field by `tests/ui/leave.test.ts`.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 v1.47.0 (BATCH 50): IT IS NO LONGER SUPPLIED BY THE CALLER.
+ * ══════════════════════════════════════════════════════════════════════
+ * It used to arrive from `computePayrollRun`, which took it from the
+ * browser. Two things were wrong with that and only one of them was the
+ * hardcoded `attendance: []`:
+ *
+ *   ① THE BOARD SENT AN EMPTY ARRAY, so every run paid every salaried
+ *      person a full month whatever the register said.
+ *
+ *   ② A `"use server"` EXPORT IS A PUBLIC ENDPOINT. `attendance` was a
+ *      validated-but-trusted array of `{employeeId, payableDays, lopDays}`
+ *      — so anybody who could reach the endpoint could post any loss of
+ *      pay against any employee UUID, and the wage bill would be computed
+ *      from it with nothing anywhere recording that the figure did not
+ *      come from the attendance register.
+ *
+ * `computeRun()` now reads `staff_attendance` and the approved leave
+ * register itself, inside the transaction that writes the payslips.
+ */
 export interface AttendanceInput {
   readonly employeeId: string;
   readonly payableDays: number;
@@ -248,6 +289,15 @@ function asTaxSlabs(
 export interface ComputeOutcome {
   readonly totals: RunTotals;
   readonly slips: readonly { employeeId: string; result: PayslipResult }[];
+  /**
+   * ⭐ THE LOSS-OF-PAY POSITION THE RUN WAS COMPUTED FROM, CARRIED OUT
+   * WITH THE ANSWER. `writeRun()` needs it and the caller needs it, and
+   * re-reading it would be a second read of a table that can change
+   * between the two.
+   */
+  readonly attendance: RunAttendance;
+  /** Days on the rolls per employee, from `daysOnRollsIn()`. */
+  readonly payableDaysByEmployee: ReadonlyMap<string, number>;
 }
 
 /** ⚠️ Calendar days, from the period itself. Never a fixed thirty. */
@@ -367,7 +417,6 @@ export async function computeRun(
     runId: string;
     periodStart: string;
     periodEnd: string;
-    attendance: readonly AttendanceInput[];
   },
 ): Promise<ComputeOutcome> {
   const rates = await loadRates(tx, args.tenantId, args.periodEnd);
@@ -434,7 +483,45 @@ export async function computeRun(
     structureByEmployee.set(row.employeeId, list);
   }
 
-  const attendanceByEmployee = new Map(args.attendance.map((a) => [a.employeeId, a]));
+  /**
+   * ⭐⭐ THE DAYS EACH PERSON WAS ON THE ROLLS, DERIVED HERE AND NOWHERE
+   * ELSE. Attendance never computes it: somebody who joined on the 12th
+   * has 20 payable days whether or not anybody ticked a box for the 12th,
+   * and `daysOnRollsIn()` already gets the joiner and leaver cases right.
+   */
+  const payableDaysByEmployee = new Map<string, number>(
+    staff.map((p) => [
+      p.id,
+      Math.min(
+        daysOnRollsIn(
+          String(p.joinedOn),
+          p.leftOn === null ? null : String(p.leftOn),
+          args.periodStart,
+          args.periodEnd,
+          days,
+        ),
+        days,
+      ),
+    ]),
+  );
+
+  /**
+   * ⭐⭐⭐ v1.47.0 (BATCH 50): THE REGISTER IS READ, IN HERE, IN THIS
+   * TRANSACTION.
+   *
+   * 🔴 THIS REPLACES `attendance: []`. Read outside the transaction that
+   * writes the payslips, attendance can change between the read and the
+   * write — somebody regularising an absence while the run computes — and
+   * the payslip would then state a loss of pay the register no longer
+   * holds, with no way afterwards to tell which of the two is the lie.
+   */
+  const attendance = await loadRunAttendance(tx, {
+    tenantId: args.tenantId,
+    periodStart: args.periodStart,
+    periodEnd: args.periodEnd,
+    payableDaysByEmployee,
+    workStateByEmployee: new Map(staff.map((p) => [p.id, p.workStateCode ?? null])),
+  });
 
   /**
    * ⭐ ONE QUERY FOR THE WHOLE RUN, NOT ONE PER EMPLOYEE. A payroll of
@@ -452,7 +539,7 @@ export async function computeRun(
   const slips: { employeeId: string; result: PayslipResult }[] = [];
 
   for (const person of staff) {
-    const supplied = attendanceByEmployee.get(person.id);
+    const position = attendance.byEmployee.get(person.id);
 
     /**
      * ⭐ AN EMPLOYEE WITH NO ATTENDANCE ROW IS PAID THE FULL MONTH.
@@ -461,11 +548,17 @@ export async function computeRun(
      * SAFER FOR THE BUSINESS AND WRONG FOR THE PEOPLE. Most salaried
      * staff are never marked present at all; absence of a record means
      * nothing happened, and nothing happening is a normal month.
+     *
+     * 🔴 BUT IT IS NO LONGER SILENT. The assumption is written onto the
+     * payslip below, and counted on the board above the approve button.
+     * "Not a full month of loss of pay" and "a full month of pay nobody
+     * checked" are both defensible; being unable to tell which one you
+     * got is not.
      */
-    const payableDays = supplied?.payableDays ?? daysOnRollsIn(person.joinedOn, person.leftOn, args.periodStart, args.periodEnd, days);
-    const lopDays = supplied?.lopDays ?? 0;
+    const payableDays = payableDaysByEmployee.get(person.id) ?? days;
+    const lopDays = position?.chargedLopDays ?? 0;
 
-    const result = buildPayslip({
+    const built = buildPayslip({
       employee: {
         stateCode: person.workStateCode,
         pfExempt: person.pfExempt,
@@ -502,10 +595,91 @@ export async function computeRun(
       tdsAlreadyDeductedMinor: String(alreadyDeducted.get(person.id) ?? 0n),
     });
 
+    /**
+     * ⭐⭐ THE ATTENDANCE STORY IS ADDED TO THE PAYSLIP HERE, BEFORE THE
+     * TOTALS ARE STRUCK, AND NOT AT WRITE TIME.
+     *
+     * 🔴 `totalRun()` COUNTS THE SLIPS THAT CARRY A PROBLEM, and that
+     * count is what disables the approve button and what
+     * `approvePayrollRun` re-checks. A problem appended in `writeRun()`
+     * would be printed on the payslip and would NOT block approval, which
+     * is the worst of both: the objection is on the record and nobody had
+     * to answer it.
+     */
+    const result = withAttendanceStory(built, position, days);
+
     slips.push({ employeeId: person.id, result });
   }
 
-  return { totals: totalRun(slips.map((s) => s.result)), slips };
+  return {
+    totals: totalRun(slips.map((s) => s.result)),
+    slips,
+    attendance,
+    payableDaysByEmployee,
+  };
+}
+
+/**
+ * ⭐⭐ WHY THIS PAYSLIP SAYS WHAT IT SAYS ABOUT DAYS, IN WORDS.
+ *
+ * Four things can be true of one person's month and each one is a
+ * sentence somebody may have to answer for:
+ *
+ *   ⚠️ NOTHING RECORDED — paid in full on an assumption. A note.
+ *   ⚠️ CHARGED FROM AN APPROVED APPLICATION rather than from the
+ *      register. A note, because the money came from a decision rather
+ *      than from an observation and the two are reconciled differently.
+ *   🔴 AN UNEXPLAINED ABSENCE — charged, and named, because it is a
+ *      conversation and not an accounting entry.
+ *   🔴 A FRACTION OF A DAY THAT COULD NOT BE CHARGED — a PROBLEM, which
+ *      blocks approval. See `splitLopForPayslip()` for why the engine
+ *      cannot take it and why rounding it away is not an option.
+ */
+function withAttendanceStory(
+  slip: PayslipResult,
+  position: RunLopRow | undefined,
+  daysInMonth: number,
+): PayslipResult {
+  if (position === undefined) {
+    return {
+      ...slip,
+      notes: [
+        ...slip.notes,
+        `Nothing was recorded in the attendance register for this period and no leave was approved, so a full month of ${daysInMonth} days has been paid on the assumption that nothing happened.`,
+      ],
+    };
+  }
+
+  const notes = [...slip.notes];
+  const problems = [...slip.problems];
+
+  if (position.approvedUnpaidCentidays > 0) {
+    notes.push(
+      `${formatDays(position.approvedUnpaidCentidays)} days of this loss of pay come from approved UNPAID leave for days the attendance register has no entry for. Approving unpaid leave is a decision that the days are not paid; recording them in the register as well would not change the figure.`,
+    );
+  }
+  if (position.approvedPaidCentidays > 0) {
+    notes.push(
+      `${formatDays(position.approvedPaidCentidays)} days of approved PAID leave fall in this period and cost nothing. They are stated so that a short payslip is not blamed on them.`,
+    );
+  }
+  if (position.unregularisedCentidays > 0) {
+    notes.push(
+      `${formatDays(position.unregularisedCentidays)} days are marked absent with no leave type against them. They have been charged because the register says so, but nobody has said why the person was away.`,
+    );
+  }
+  if (position.cappedAtPayableDays) {
+    notes.push(
+      "The recorded loss of pay exceeded the days this person was on the rolls this period and has been capped at those days. Nobody can lose more pay than they were owed.",
+    );
+  }
+  if (position.unrepresentableCentidays > 0) {
+    problems.push(
+      `The register holds ${formatDays(position.totalLopCentidays)} days of loss of pay for this person, and only the ${position.chargedLopDays} whole days of it have been charged — the payslip calculation cannot yet pro-rate a part day. The remaining ${formatDays(position.unrepresentableCentidays)} of a day is NOT on this payslip. Record the part day as a whole day in the attendance register if that is what was meant, or leave this run unapproved.`,
+    );
+  }
+
+  return { ...slip, notes, problems };
 }
 
 /**
@@ -548,13 +722,20 @@ export async function writeRun(
     outcome: ComputeOutcome;
     employeeNames: ReadonlyMap<string, { name: string; code: string }>;
     daysInMonth: number;
-    attendance: readonly AttendanceInput[];
-    defaultPayableDays: ReadonlyMap<string, number>;
   },
 ): Promise<void> {
   await tx.delete(payslips).where(eq(payslips.runId, args.runId));
 
-  const attendanceByEmployee = new Map(args.attendance.map((a) => [a.employeeId, a]));
+  /**
+   * ⭐ THE DAYS COME OUT OF THE OUTCOME, NOT OUT OF A SECOND ARGUMENT.
+   *
+   * 🔴 THEY USED TO BE PASSED IN SEPARATELY FROM WHAT WAS COMPUTED, so
+   * the `payableDays` and `lopDays` PRINTED on the payslip and the ones
+   * the money was PRO-RATED BY were two different values that happened to
+   * agree. A caller that passed one and not the other would produce a
+   * payslip whose own header disagreed with its own arithmetic.
+   */
+  const attendanceByEmployee = args.outcome.attendance.byEmployee;
 
   for (const slip of args.outcome.slips) {
     const who = args.employeeNames.get(slip.employeeId);
@@ -569,9 +750,18 @@ export async function writeRun(
       employeeCode: who?.code ?? "-",
       daysInMonth: args.daysInMonth,
       payableDays: String(
-        attendance?.payableDays ?? args.defaultPayableDays.get(slip.employeeId) ?? args.daysInMonth,
+        attendance?.payableDays ??
+          args.outcome.payableDaysByEmployee.get(slip.employeeId) ??
+          args.daysInMonth,
       ),
-      lopDays: String(attendance?.lopDays ?? 0),
+      /**
+       * ⚠️ THE CHARGED FIGURE, NOT THE RECORDED ONE. Where they differ,
+       * `withAttendanceStory()` has already put a PROBLEM on this payslip
+       * naming the difference, so the run cannot be approved. Printing
+       * the recorded figure here instead would state a deduction the
+       * arithmetic did not make.
+       */
+      lopDays: String(attendance?.chargedLopDays ?? 0),
       grossMinor: r.grossEarningsMinor.toString(),
       pfWagesMinor: r.pfWagesMinor.toString(),
       employeePfMinor: r.employeePfMinor.toString(),

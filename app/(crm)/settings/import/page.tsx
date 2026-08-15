@@ -28,6 +28,7 @@
  * same shape `app/(crm)/orders/new/page.tsx` uses.
  */
 
+import Link from "next/link";
 import { UploadCloud } from "lucide-react";
 import { ImportWizard } from "@/components/settings/import-wizard";
 import { commitImport, previewImport } from "@/server/actions/import";
@@ -86,6 +87,29 @@ export default function ImportPage() {
         Rows that fail do not stop the ones that work. If 18 rows out of 1,000 have
         a problem, the other 982 are imported and those 18 come back as a file you
         can fix and upload again.
+      </p>
+
+      {/*
+        ⭐⭐ BATCH 58 — THE ONE IMPORT THAT IS NOT A LIST, LINKED FROM
+        WHERE PEOPLE LOOK FOR IT.
+
+        ⚠️ SOMEBODY MIGRATING WILL COME HERE FIRST, because "import" is
+        the word they have in mind, and they will find companies and GST
+        parties and conclude their opening balances cannot be entered.
+        That conclusion is the exact defect Batch 58 fixed, so the pointer
+        has to be on this page rather than only in the settings tabs.
+      */}
+      <p className="rounded-lg border bg-card p-4 text-sm text-muted-foreground">
+        <strong className="font-medium text-foreground">
+          Moving across mid-year?
+        </strong>{" "}
+        Your opening trial balance, unpaid customer invoices, unpaid vendor bills
+        and stock on hand go in through{" "}
+        <Link href="/settings/opening-balances" className="underline underline-offset-2">
+          Opening balances
+        </Link>
+        . They describe one moment rather than four lists, they have an order, and
+        that screen explains it.
       </p>
 
       <ImportWizard preview={previewImport} commit={commitImport} />

@@ -41,6 +41,7 @@
 
 import { alignToHeader, parseCsv, unguardFormulaPrefix } from "./csv";
 import { describeMissingHeaders, mapHeaders } from "./mapping";
+import { coerceQuantityThousandths, describeAtomicRefusal } from "./opening";
 import {
   coerceBoolean,
   coerceCivilDay,
@@ -86,6 +87,13 @@ function coerceCell(raw: string, column: ImportColumn): CoercionResult {
       return coerceInteger(raw, column.bounds);
     case "money":
       return coerceMoneyMinor(raw);
+    /*
+     * ⭐ BATCH 58. Integer thousandths, through the same BigInt string
+     * parse the money coercion uses — `0.1 + 0.2 !== 0.3`, and a stock
+     * ledger out by a millionth on every movement stops reconciling.
+     */
+    case "quantity":
+      return coerceQuantityThousandths(raw);
     case "boolean":
       return coerceBoolean(raw);
     case "date":
@@ -283,15 +291,80 @@ export function planImport(
       payload: parsedPayload,
       naturalKey,
       label: entity.rowLabel(parsedPayload),
+      /*
+       * ⭐ BATCH 58. What this row REFERS to — an account code, a
+       * customer, a warehouse. Named here, resolved against the database
+       * by `server/actions/import.ts` once for the whole file and for
+       * both runs. Naming it in the pure layer is what keeps the preview
+       * and the commit reading the same list.
+       */
+      lookups: entity.lookups?.(parsedPayload),
     });
   }
+
+  /*
+   * ══════════════════════════════════════════════════════════════════
+   * ⭐⭐ BATCH 58 — THE TWO WHOLE-FILE RULES, AND THE ORDER IS THE POINT
+   * ══════════════════════════════════════════════════════════════════
+   * Both run BELOW every row decision and neither knows which run it is
+   * in, so a preview and a commit reach the same verdict about the same
+   * file.
+   *
+   * 1. ATOMIC ENTITIES REFUSE THE WHOLE FILE IF ANY ROW FAILED. The
+   *    reasoning is on `atomic` in `types.ts`: an opening trial balance
+   *    is ONE journal entry, and importing 38 of its 40 lines produces a
+   *    ledger that does not balance rather than 95% of an opening
+   *    position.
+   *
+   *    ⚠️ THE REFUSAL IS WRITTEN AS ROW ERRORS AND NOT AS `fatal`. A
+   *    fatal empties `rows`, which takes the failed-rows CSV with it —
+   *    and that download is the entire mechanism by which the customer
+   *    finds the two lines that were wrong. Marking every clean row
+   *    instead means nothing is written (the server only writes rows
+   *    with no errors), the counts are honest, and the CSV they download
+   *    has all forty rows in it with the real reasons on the real
+   *    offenders.
+   *
+   * 2. THE FILE RULE — the balance check — runs ONLY on a file whose
+   *    rows all read cleanly. Arithmetic over a file containing an
+   *    unreadable amount produces a difference that is an artefact of
+   *    the unreadable cell, and "you are ₹4,000 out" sends the customer
+   *    hunting for an error that does not exist.
+   */
+  const badRows = rows.filter((row) => row.errors.length > 0).length;
+
+  if (entity.atomic && badRows > 0) {
+    const refusal = describeAtomicRefusal(entity.noun.many, badRows, rows.length);
+    return {
+      entityKey: entity.key,
+      headers,
+      assignments: mapping.assignments,
+      unrecognisedHeaders: mapping.unrecognisedHeaders,
+      rows: rows.map((row) =>
+        row.errors.length > 0
+          ? row
+          : { ...row, payload: undefined, errors: [{ column: null, message: refusal }] },
+      ),
+      fatal: null,
+    };
+  }
+
+  const fileFatal = badRows === 0 ? (entity.fileRule?.(rows) ?? null) : null;
 
   return {
     entityKey: entity.key,
     headers,
     assignments: mapping.assignments,
     unrecognisedHeaders: mapping.unrecognisedHeaders,
-    rows,
-    fatal: null,
+    /*
+     * ⚠️ `rows` IS EMPTIED WHEN THE FILE RULE REFUSES, which is the
+     * contract `fatal` has carried since Batch 57 and is right here: an
+     * unbalanced trial balance has no failed ROWS to hand back. Every
+     * line in it is individually fine. What is wrong is the total, and
+     * the message carries the difference in rupees and which side is
+     * short — which is the whole of what the customer needs to find it.
+     */
+    rows: fileFatal ? [] : rows,
+    fatal: fileFatal,
   };
 }

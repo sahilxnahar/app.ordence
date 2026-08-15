@@ -1,3 +1,53 @@
+# v1.47.0-alpha — THE WAVE THAT WAS CUT SHORT, LANDED WHOLE
+
+**Repo: `app.ordence`** · 🔴 **SQL: `0083`, `0084`, `0085` — all three run BEFORE the code push, in that order** · ⚠️ **No new variables**
+
+Eight file-disjoint tracks. Three were interrupted near the end and their
+work was completed by hand during integration. **29 of 128 batches,
+enumerated from the files rather than from memory, which corrects a
+running tally that had drifted 4.5 high. Mega-wave 1 is complete.**
+
+- 🔴🔴 **BATCH 50 · `attendance: []` IS GONE.** Payroll now reads
+  `staff_attendance` and approved leave through a new bridge, entirely in
+  **centidays**, and the LOP position is visible and reviewable BEFORE the
+  run is approved. `computePayrollRun` no longer accepts an `attendance`
+  array from the browser at all: shape-validated and believed, it let a
+  crafted request dock any employee any number of days with nothing
+  recording that the figure never came from the register.
+- 🔴🔴 **A HALF-DAY LOP ABORTS THE ENTIRE PAYROLL COMPUTE.**
+  `lib/payroll/payslip.ts:216` does `BigInt(worked)` where `worked` can be
+  `30.5`. `BigInt(30.5)` is a **RangeError**, not a rounding. Unreachable
+  while `attendance: []` stood; reachable the moment Batch 50 lands.
+  Mitigated, not fixed: only whole days are charged and the remainder
+  becomes a stated problem blocking approval.
+- 🔴 **BATCH 40 · A CREDIT HOLD REFUSES THE WRITE**, inside
+  `confirmOrder`'s own transaction, not by hiding a button. Exposure is
+  billed plus unbilled; the billed half is checked two ways that share no
+  source and the figure is structurally ABSENT from the payload when they
+  disagree. Dunning **queues and sends nothing** — stated in the migration
+  header, the module header, the table comment, and asserted by tests.
+- 🔴 **BATCH 30 · UNDER IMPERSONATION, THE CUSTOMER'S AUDIT LOG RECORDS
+  OUR STAFF'S ACTIONS UNDER THEIR OWN EMPLOYEE'S NAME.** `ctx.user` is the
+  session subject, a real user row in the customer's tenant.
+  `ctx.operatorEmail` is on the context and is never persisted. The
+  comment at `server/audit.ts:352` asserts the opposite of its own code.
+  Worked around on the page, not fixed at the source.
+- 🔴 **BATCH 76 · `payroll_runs` HAS NO DATE OF PAYMENT.** The whole
+  Payment of Wages Act is about that day and it is the first column an
+  inspector reads. The wage register prints it blank-and-named rather
+  than passing off `posted_at` as the day money moved. The loans register
+  **refuses to generate** rather than print an empty correctly-headed form.
+- ⭐ **BATCH 58 · opening balances**, riding Batch 57's import framework.
+  ⭐ **BATCH 68 · cost centres on the journal LINE, not the header**, with
+  budget-versus-actual. ⭐ **BATCH 109 · appraisals and an org chart that
+  refuses a cycle in the reporting hierarchy.** ⭐ **BATCH 31 · per-tenant
+  rate limits, body size caps and pagination bounds enforced in the query.**
+- ⚠️ **Fifteen gates green. 122 test files, 4,347 passing (+499).**
+- ⚠️ **New: `WHICH-MIGRATIONS-ARE-APPLIED-neon-safe.sql`**, a read-only
+  file that reports which of 0001 to 0085 are on a database and the exact
+  list to run, in order. Every migration is matched to an object only that
+  migration creates, so no file can be reported applied because another
+  happened to create the same thing.
 # v1.46.0-alpha — EIGHT BATCHES IN ONE RUN
 
 **Repo: `app.ordence`** · 🔴 **SQL: `0082_leave_and_attendance.sql` (run BEFORE the code push)** · ⚠️ **No new variables**
