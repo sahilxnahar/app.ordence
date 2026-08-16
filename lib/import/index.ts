@@ -43,9 +43,46 @@ export type { RowOutcome } from "./report";
 export {
   IMPORT_ENTITIES,
   IMPORT_ENTITY_KEYS,
+  ALL_IMPORT_ENTITIES,
   isImportEntityKey,
 } from "./entities";
-export type { ImportEntityKey } from "./entities";
+export type { ImportEntityKey, AnyImportEntityKey } from "./entities";
+
+/* ---------------------------------------------------------------- */
+/* ⭐⭐ BATCH 58 — OPENING BALANCES                                    */
+/* ---------------------------------------------------------------- */
+
+export {
+  OPENING_IMPORT_ENTITIES,
+  OPENING_IMPORT_ENTITY_KEYS,
+} from "./opening-entities";
+export type { OpeningImportEntityKey } from "./opening-entities";
+
+export {
+  OPENING_KEY_PREFIX,
+  openingBatchKey,
+  coerceQuantityThousandths,
+  totalTrialBalance,
+  describeImbalance,
+  describeDisagreeingDates,
+  disagreeingAsAtDates,
+  describeAtomicRefusal,
+  rupeesOf,
+} from "./opening";
+export type { OpeningKeyKind, TrialBalanceTotals } from "./opening";
+
+/**
+ * ⚠️ THE SCHEMAS ARE EXPORTED, AND THAT IS THE POINT OF EXPORTING THEM.
+ * There is no single-record opening-balance form today. When one is
+ * built it must import these rather than restate the rules beside itself
+ * — see the header of `opening-schemas.ts`.
+ */
+export {
+  openingLedgerLineSchema,
+  openingCustomerInvoiceSchema,
+  openingVendorBillSchema,
+  openingStockLineSchema,
+} from "./opening-schemas";
 
 export type {
   DuplicateMode,
@@ -53,6 +90,8 @@ export type {
   ImportColumn,
   ImportColumnKind,
   ImportEntityDefinition,
+  ImportLookup,
+  ImportLookupKind,
   ImportNaturalKey,
   ImportPlan,
   ImportReport,

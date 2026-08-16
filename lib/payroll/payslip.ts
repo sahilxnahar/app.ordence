@@ -213,8 +213,18 @@ export function buildPayslip(args: {
     } else {
       // ⚠️ MULTIPLY BEFORE DIVIDE. The other order loses paise on every
       // line and the payslip then does not add up to its own total.
-      amount = roundToRupee((full * BigInt(worked)) / BigInt(days));
-      workingNote = `${worked} of ${days} days paid${args.attendance.lopDays > 0 ? ` (${args.attendance.lopDays} day${args.attendance.lopDays === 1 ? "" : "s"} loss of pay)` : ""}.`;
+      // ⭐ HALF-DAY LOP IS CHARGED AS WHOLE DAYS.
+      // worked can be fractional (e.g. 30.5) due to half-day loss of pay.
+      // We floor it to charge only whole days, and the fractional remainder
+      // is reported as a problem so a human can acknowledge it.
+      const wholeWorked = Math.floor(worked);
+      if (wholeWorked < worked) {
+        problems.push(
+          `This employee has a fractional loss of pay (${args.attendance.lopDays} days). The remainder is charged as whole days, but please verify this assumption.`,
+        );
+      }
+      amount = roundToRupee((full * BigInt(wholeWorked)) / BigInt(days));
+      workingNote = `${wholeWorked} of ${days} days paid${args.attendance.lopDays > 0 ? ` (${args.attendance.lopDays} day${args.attendance.lopDays === 1 ? "" : "s"} loss of pay)` : ""}.`;
     }
 
     lines.push({

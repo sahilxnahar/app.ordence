@@ -41,7 +41,17 @@ export type ImportColumnKind =
   | "money"
   | "boolean"
   | "date"
-  | "enum";
+  | "enum"
+  /**
+   * ⭐ BATCH 58. A physical quantity, held as INTEGER THOUSANDTHS for
+   * exactly the reason money is held as integer paise: `0.1 + 0.2` is
+   * not `0.3` in binary floating point, and a stock ledger that is out
+   * by a millionth of a kilogram on every movement stops reconciling
+   * after a few thousand of them. `stock_movements.quantity` is
+   * `numeric(18,3)`, so three decimal places is the storage precision as
+   * well as the arithmetic one.
+   */
+  | "quantity";
 
 export type ImportColumn = {
   /** Key in the payload handed to the entity's Zod schema. */
@@ -143,7 +153,79 @@ export type DuplicateMode =
  * a dynamic resolver is one migration away from letting a crafted entity
  * string reach `users` or the vault.
  */
-export type ImportTableKey = "companies" | "gst_parties";
+export type ImportTableKey =
+  | "companies"
+  | "gst_parties"
+  /**
+   * ⭐⭐ BATCH 58 — THE OPENING-BALANCE DESTINATIONS.
+   *
+   * ⚠️ `transactions` IS THE LEDGER ITSELF, AND IT IS THE ONLY ENTRY IN
+   * THIS UNION THAT IS WRITTEN AS ONE DOCUMENT FOR THE WHOLE FILE. An
+   * opening trial balance is a single balanced journal entry — see
+   * `atomic` and `batchKey` below. The other three write one row each,
+   * exactly like `companies` does.
+   */
+  | "transactions"
+  | "sales_invoices"
+  | "vendor_ledger_entries"
+  | "stock_movements";
+
+/* ------------------------------------------------------------------ */
+/* LOOKUPS — THINGS A ROW REFERS TO BUT DOES NOT CREATE                */
+/* ------------------------------------------------------------------ */
+
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * ⭐⭐ BATCH 58 — A ROW CAN REFER TO SOMETHING THAT MUST ALREADY EXIST
+ * ══════════════════════════════════════════════════════════════════════
+ * The two Batch 57 entities were self-contained: everything a `companies`
+ * row needed was in the row. An opening trial balance line is not — it
+ * names an ACCOUNT CODE, and that account either exists in the
+ * workspace's chart of accounts or the line means nothing. Same for an
+ * opening customer invoice (a company), an opening vendor bill (a vendor
+ * code) and opening stock (an SKU and a warehouse).
+ *
+ * 🔴 AND THE RESOLUTION MUST HAPPEN IN THE PREVIEW, NOT AT THE WRITE.
+ * The obvious implementation resolves the code inside the insert and
+ * lets a miss become a foreign-key violation — which means the dry run
+ * reports "412 will be created" and the real run creates 380. That is
+ * exactly the drift constraint 1 forbids, and it is the failure mode
+ * that makes a customer stop reading the preview.
+ *
+ * So a lookup is DECLARED by the entity, resolved once for the whole
+ * file by `server/actions/import.ts`, and an unresolved lookup turns the
+ * row into an ordinary reported error — in BOTH runs, from one call site.
+ *
+ * ⚠️ THE KIND IS A STRING DISCRIMINANT, for exactly the reason `table`
+ * is one: putting a Drizzle table here would drag the database into the
+ * client bundle and undo the purity that makes the wizard able to build
+ * a blank template.
+ */
+export type ImportLookupKind =
+  /** `ledgers.code`, active and not deleted. */
+  | "ledger_by_code"
+  /** `companies.name`, case- and whitespace-insensitive, not deleted. */
+  | "company_by_name"
+  /** `vendors.code` — "V-0042". Unique per workspace. */
+  | "vendor_by_code"
+  /** `stock_items.sku`, active. */
+  | "stock_item_by_sku"
+  /** `warehouses.code`, active. */
+  | "warehouse_by_code";
+
+export type ImportLookup = {
+  kind: ImportLookupKind;
+  /** Already canonicalised — lower-cased where the match is insensitive. */
+  value: string;
+  /**
+   * The payload field the resolved uuid is written into before the write
+   * runs. `writeRow` reads the id from here and never re-resolves it,
+   * so the thing that was previewed is the thing that is written.
+   */
+  into: string;
+  /** What the failed-rows CSV says when nothing matched. Written for a human. */
+  missing: string;
+};
 
 export type ImportEntityDefinition = {
   key: string;
@@ -198,6 +280,117 @@ export type ImportEntityDefinition = {
 
   /** A short human label for a row in the report — the company's name. */
   rowLabel: (parsed: Record<string, unknown>) => string;
+
+  /* ---------------------------------------------------------------- */
+  /* ⭐⭐ BATCH 58 ADDITIONS. Every one is OPTIONAL and every one has a  */
+  /*    default that reproduces Batch 57 behaviour exactly, so the two  */
+  /*    original entities did not change by one character.             */
+  /* ---------------------------------------------------------------- */
+
+  /**
+   * Things this row REFERS to that must already exist. See `ImportLookup`.
+   * Runs on the PARSED payload, post-Zod, and is pure — it only says what
+   * to look up, never how.
+   */
+  lookups?: (parsed: Record<string, unknown>) => readonly ImportLookup[];
+
+  /**
+   * ══════════════════════════════════════════════════════════════════
+   * 🔴 ALL-OR-NOTHING, AND IT IS A DELIBERATE INVERSION OF CONSTRAINT 2
+   * ══════════════════════════════════════════════════════════════════
+   * `lib/import/report.ts` argues at length that partial success is the
+   * design and not the failure mode, and it is right for a list of
+   * companies: 900 of 1000 rows is what the customer wants.
+   *
+   * 🔴 IT IS THE OPPOSITE FOR AN OPENING TRIAL BALANCE. That file is ONE
+   * journal entry. Importing 38 of its 40 lines does not give the
+   * customer 95% of their opening position — it gives them a ledger that
+   * does not balance, which the database's own deferred constraint
+   * trigger would refuse anyway, and which every report built on it
+   * would be wrong about forever.
+   *
+   * ⚠️ AND THE REFUSAL IS EXPRESSED AS ROW ERRORS, NOT AS A `fatal`. A
+   * fatal empties `rows`, which would take the failed-rows CSV away with
+   * it — and the failed-rows download is the entire mechanism by which
+   * the customer finds the two lines that were wrong. So every otherwise
+   * valid row is marked with a whole-row error saying the file was
+   * refused as a whole, the counts read "40 errors", nothing is written,
+   * and the CSV they download has all forty rows in it with the two real
+   * reasons on the two real offenders.
+   */
+  atomic?: boolean;
+
+  /**
+   * A rule over the WHOLE FILE, run after every row has been planned.
+   * Returns a sentence to refuse the file with, or `null`.
+   *
+   * 🔴 THIS IS WHERE "AN OPENING TRIAL BALANCE THAT DOES NOT BALANCE IS
+   * REFUSED" LIVES. It is not expressible per row: no single line of an
+   * unbalanced trial balance is wrong, and marking one would be a lie
+   * about which one. The message names the difference in rupees and
+   * which side is short, because "does not balance" without the number
+   * is a message that cannot be acted on.
+   *
+   * ⚠️ IT RUNS ONLY WHEN EVERY ROW READ CLEANLY. Arithmetic over a file
+   * with an unreadable amount in it is arithmetic over a number nobody
+   * has, and reporting "you are ₹4,000 out" when the truth is "row 12 is
+   * unreadable" sends the customer to look for a ₹4,000 error that does
+   * not exist.
+   */
+  fileRule?: (rows: readonly ImportRowPlan[]) => string | null;
+
+  /**
+   * ══════════════════════════════════════════════════════════════════
+   * 🔴 THE IDEMPOTENCY KEY FOR A FILE THAT BECOMES ONE DOCUMENT
+   * ══════════════════════════════════════════════════════════════════
+   * `naturalKey` identifies a ROW. That is the right question for a
+   * company and the wrong one for an opening trial balance, where the
+   * thing that must not happen twice is not "this account line" but
+   * "this opening entry". Entering the opening position twice must not
+   * double the books, and the account codes are the same both times.
+   *
+   * ⭐ SO THE KEY IS `OPENING:TB:<as-at date>`, WRITTEN INTO
+   * `transactions.transaction_number`, WHICH THE DATABASE ALREADY HOLDS
+   * UNIQUE PER TENANT (`transactions_tenant_number_unique`). Our check is
+   * a courtesy that produces a readable outcome; the index is what makes
+   * two people pressing the button at once safe. Same reasoning as
+   * `salesTransactionKey` in `server/accounting/post-sales.ts`, and
+   * deliberately the same SHAPE so a human reading a trial balance can
+   * tell at a glance where a transaction came from.
+   *
+   * ⚠️ THE DATE IS IN THE KEY. Two different opening dates are two
+   * different opening positions — a workspace that goes live on 1 April
+   * and then imports a corrected position as at 30 June has two entries
+   * and should. What the key stops is the SAME position posted twice.
+   */
+  batchKey?: (rows: readonly ImportRowPlan[]) => ImportNaturalKey | null;
+
+  /**
+   * Which duplicate modes this entity accepts. Defaults to all three.
+   *
+   * 🔴 AN OPENING JOURNAL ENTRY HAS NO `update`. `journal_entries` is
+   * append-only by design — the schema says so in a comment where
+   * `updatedAt` and `deletedAt` would have been. A posted entry is
+   * corrected by REVERSING it and posting a new one, which is an
+   * accounting act with its own audit trail, not by an importer quietly
+   * rewriting the numbers under a transaction somebody has already
+   * reconciled against. Offering "overwrite" here would be offering an
+   * operation the ledger cannot perform.
+   */
+  duplicateModes?: readonly DuplicateMode[];
+
+  /**
+   * One sentence naming the matching rule, in the customer's words, for
+   * the screen that asks about duplicates.
+   *
+   * ⚠️ IT LIVES ON THE ENTITY BECAUSE THE ALTERNATIVE IS A TERNARY IN A
+   * COMPONENT. `components/settings/import-wizard.tsx` has exactly that
+   * — `entityKey === "companies" ? "…domain…" : "…GSTIN…"` — so every
+   * entity added after the second one is described to the customer as a
+   * GST party. That is a wrong sentence about their data shown at the
+   * moment they choose what happens to it.
+   */
+  duplicateRule?: string;
 };
 
 /* ------------------------------------------------------------------ */
@@ -219,6 +412,12 @@ export type ImportRowPlan = {
   payload?: Record<string, unknown>;
   naturalKey?: ImportNaturalKey | null;
   label?: string;
+  /**
+   * ⭐ BATCH 58 — what this row refers to. Computed by the pure layer,
+   * resolved against the database by `server/actions/import.ts` once for
+   * the whole file, for both runs, from one call site.
+   */
+  lookups?: readonly ImportLookup[];
 };
 
 export type HeaderAssignment = {

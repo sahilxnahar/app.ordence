@@ -18,6 +18,32 @@ next-env.d.ts
 .vscode/
 .idea/
 
+# ==========================================
+# macOS AppleDouble metadata — v0.83.1
+# ==========================================
+# ⚠️ Over a thousand of these were sitting in the tree, uncommitted-but-
+# untracked and INVISIBLE IN FINDER. macOS writes a `._foo.tsx` sidecar
+# next to `foo.tsx` when a file with extended attributes is copied to a
+# non-HFS volume — which is what every `ordence-v*` zip and tarball
+# round-trip did.
+#
+# They matter because they are hidden on a Mac and ORDINARY FILES ON
+# LINUX. Pushed to GitHub, Railway checks out `app/platform/._page.tsx` —
+# a binary blob wearing a .tsx extension — alongside the real one.
+#
+# TypeScript and Next both happen to skip dotfiles, so this was noise
+# rather than a build break. "Happens to" is not a guarantee worth
+# depending on across a toolchain upgrade.
+._*
+.AppleDouble
+.LSOverride
+Icon?
+.Spotlight-V100
+.Trashes
+
+# Local backup zips produced by scripts/ — never commit a 5 MB artefact.
+ordence-full-backup-*.zip
+
 # debug logs
 npm-debug.log*
 yarn-debug.log*
@@ -59,3 +85,11 @@ secrets.json
 
 # Vitest JUnit output — generated, never committed.
 test-results/
+
+# Wrangler / miniflare LOCAL state — v0.73.0-alpha
+#
+# ⚠️ 12 files of miniflare cache (metadata.sqlite, -wal, -shm for
+# CacheObject, R2BucketObject and the observability trace store) were
+# being committed. They are a local dev artifact of `wrangler dev`, they
+# differ per machine, and they are pure noise in a diff.
+.wrangler/

@@ -56,6 +56,51 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # ══════════════════════════════════════════════════════════════════
+      # ⭐ STATIC GATES — v0.84.0. THESE RUN FIRST BECAUSE THEY ARE FREE.
+      # ══════════════════════════════════════════════════════════════════
+      # Both were added after incidents that every existing gate missed.
+      #
+      #   Server boundaries: a recursive `sed` stripped `import
+      #   "server-only"` from SIXTY-SIX files, including tenant-context,
+      #   billing/access, platform/guard and both payment providers. tsc
+      #   passed. The build passed. The whole security suite would have
+      #   passed. The guard has no runtime behaviour — deleting it removes
+      #   only the alarm, so nothing had a symptom.
+      #
+      #   Migration numbering: three files were added as 0062/0072/0076
+      #   while the highest real one was 0045. SQL-FILES is applied in
+      #   numeric order, so that is the execution order — and nothing in
+      #   the pipeline reads SQL filenames.
+      #
+      # They take under a second. Running them before `npm ci`-dependent
+      # steps would be faster still, but they need the repo only.
+      - name: Server boundary census
+        run: node scripts/check-server-boundaries.mjs
+
+      - name: Migration numbering
+        run: node scripts/check-migrations.mjs
+
+      # ⭐ SQL completeness — v0.84.0
+      #
+      # Cross-checks `db/schema/*.ts` against `SQL-FILES/*.sql` and asks
+      # the one question that decides tenant safety from source alone:
+      # does SOME SQL file enable RLS on every tenant-scoped table,
+      # whoever created it?
+      #
+      # ⚠️ "Which file CREATES it" is the WRONG question, and asking it
+      # produced a 49-table false alarm on the first run. `contacts`,
+      # `users`, `tenants` and 46 others are created by `drizzle-kit
+      # push`; the SQL files then ALTER them to add policies. That split
+      # is the intended design. Only the RLS question separates safe from
+      # unsafe.
+      #
+      # It also reports tables present in SQL but absent from the Drizzle
+      # schema — those are one `db:push` away from being DROPPED, which
+      # is how the four tables from 0046 were found unregistered.
+      - name: SQL completeness
+        run: node scripts/check-sql-completeness.mjs
+
       - name: TypeScript strict check
         run: npx tsc --noEmit
 
@@ -332,6 +377,32 @@ jobs:
             exit 1
           fi
           echo "✅ $COUNT tables protected"
+
+      - name: ⭐ Exhaustive RLS coverage — every tenant table, no exceptions
+        # ══════════════════════════════════════════════════════════════
+        # 🔴 THE STEP BELOW ("Verify RLS coverage") IS A FLOOR, AND A
+        #    FLOOR CANNOT SEE WHAT WAS DONE WRONG.
+        # ══════════════════════════════════════════════════════════════
+        # It asserts `count(*) >= 100`. Four tenant-scoped tables were
+        # added — deployment_releases, deployment_backups,
+        # security_batches, flow_submissions — each with a `tenant_id`
+        # column and NO row-level security at all. The count stayed above
+        # 100, so the floor passed, and every tenant could read every
+        # other tenant's rows.
+        #
+        # This step asks the opposite question: for EVERY table carrying
+        # a tenant_id, is RLS enabled, FORCED, policied on
+        # app_current_tenant_id(), and free of app_platform_scope() in
+        # WITH CHECK? One failure fails the run. No thresholds.
+        #
+        # ⚠️ It also fails when it cannot run. A check that reports
+        # nothing found is not a check that passed — the same confusion
+        # that let the `.next/static` leak scan report ✅ on a directory
+        # it never read.
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/ameya_test
+          DATABASE_URL_UNPOOLED: postgresql://postgres:postgres@localhost:5432/ameya_test
+        run: node scripts/check-rls-coverage.mjs
 
       - name: ⭐ Verify the security state survived the schema push
         # `drizzle-kit push` DROPS RLS policies — it treats anything not in

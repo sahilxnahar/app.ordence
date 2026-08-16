@@ -1,3 +1,5 @@
+import { chainScopeFor, nextChainLink, type AuditChainHead } from "@/lib/audit/chain";
+import { isChainRace } from "@/server/audit";
 import "server-only";
 
 /**
@@ -507,37 +509,153 @@ export async function recordPlatformAudit(entry: PlatformAuditEntry): Promise<vo
     userAgent: entry.operator.userAgent,
     requestId: entry.operator.requestId,
     impersonationId: entry.impersonationId ?? null,
+    tenantId: entry.tenantId ?? null,
   };
-
+  
+  const tenantId = entry.tenantId;
+  const scope = chainScopeFor(tenantId);
+  
   try {
-    if (entry.tenantId) {
+    if (tenantId) {
       const { withTenant } = await import("@/db");
-      await withTenant(entry.tenantId, async (tx) => {
-        await tx.insert(auditLogs).values({ ...values, tenantId: entry.tenantId });
-      });
+      const { desc, and, eq, isNotNull } = await import("drizzle-orm");
+      const { MAX_CHAIN_ATTEMPTS } = await import("@/server/audit");
+      
+      for (let attempt = 1; attempt <= MAX_CHAIN_ATTEMPTS; attempt++) {
+        try {
+          await withTenant(tenantId, async (tx) => {
+            const [row] = await tx
+              .select({ chainSeq: auditLogs.chainSeq, rowHash: auditLogs.rowHash })
+              .from(auditLogs)
+              .where(and(eq(auditLogs.tenantId, tenantId), isNotNull(auditLogs.chainSeq)))
+              .orderBy(desc(auditLogs.chainSeq))
+              .limit(1);
+              
+            const head: AuditChainHead =
+              row?.chainSeq != null && row.rowHash != null
+                ? { chainSeq: row.chainSeq, rowHash: row.rowHash }
+                : null;
+                
+            const link = nextChainLink({ scope, head, content: values });
+            
+            await tx.insert(auditLogs).values({
+              ...(values as typeof auditLogs.$inferInsert),
+              tenantId: tenantId,
+              chainSeq: link.chainSeq,
+              prevHash: link.prevHash,
+              contentHash: link.contentHash,
+              rowHash: link.rowHash,
+            });
+          });
+          return; // Success
+        } catch (err) {
+          if (!isChainRace(err) || attempt === MAX_CHAIN_ATTEMPTS) {
+            // Fallback to unchained write if chained write fails
+            const { withTenant } = await import("@/db");
+            await withTenant(tenantId, async (tx) => {
+              await tx.insert(auditLogs).values({ ...(values as typeof auditLogs.$inferInsert), tenantId: tenantId });
+            });
+            console.error("[PLATFORM AUDIT CHAIN DEGRADED]", {
+              tenantId,
+              action: entry.action,
+              resourceType: entry.resourceType,
+              actor: entry.operator.email,
+              error: err instanceof Error ? err.message : String(err),
+            });
+            return;
+          }
+        }
+      }
     } else {
-      await withPlatformScope(
-        `Record a platform action: ${entry.action} on ${entry.resourceType}`,
-        (tx) =>
-          tx.insert(platformActionLog).values({
-        actorClerkId: entry.operator.clerkUserId,
-        actorEmail: entry.operator.email,
-        actorGrade: entry.operator.grade,
-        action: entry.action,
-        resourceType: entry.resourceType,
-        resourceId: entry.resourceId ?? null,
-        justification: entry.reason,
-        metadata: entry.metadata ?? {},
-        resultCount:
-          typeof entry.metadata?.resultCount === "number"
-            ? entry.metadata.resultCount
-            : null,
-        severity: entry.severity ?? "notice",
-        ipAddress: entry.operator.ipAddress,
-        userAgent: entry.operator.userAgent,
-        requestId: entry.operator.requestId,
-          }),
-      );
+      const { withPlatformScope } = await import("@/db");
+      const { desc, and, eq, isNotNull } = await import("drizzle-orm");
+      const { MAX_CHAIN_ATTEMPTS } = await import("@/server/audit");
+      
+      for (let attempt = 1; attempt <= MAX_CHAIN_ATTEMPTS; attempt++) {
+        try {
+          await withPlatformScope(
+            `Record a platform action: ${entry.action} on ${entry.resourceType}`,
+            async (tx) => {
+              const [row] = await tx
+                .select({ chainSeq: platformActionLog.chainSeq, rowHash: platformActionLog.rowHash })
+                .from(platformActionLog)
+                .where(isNotNull(platformActionLog.chainSeq))
+                .orderBy(desc(platformActionLog.chainSeq))
+                .limit(1);
+                
+              const head: AuditChainHead =
+                row?.chainSeq != null && row.rowHash != null
+                  ? { chainSeq: row.chainSeq, rowHash: row.rowHash }
+                  : null;
+                  
+              const content = {
+                actorClerkId: entry.operator.clerkUserId,
+                actorEmail: entry.operator.email,
+                actorGrade: entry.operator.grade,
+                action: entry.action,
+                resourceType: entry.resourceType,
+                resourceId: entry.resourceId ?? null,
+                justification: entry.reason,
+                metadata: entry.metadata ?? {},
+                resultCount:
+                  typeof entry.metadata?.resultCount === "number"
+                    ? entry.metadata.resultCount
+                    : null,
+                severity: entry.severity ?? "notice",
+                ipAddress: entry.operator.ipAddress,
+                userAgent: entry.operator.userAgent,
+                requestId: entry.operator.requestId,
+              };
+                  
+              const link = nextChainLink({ scope, head, content });
+              
+              await tx.insert(platformActionLog).values({
+                ...content,
+                chainSeq: link.chainSeq,
+                prevHash: link.prevHash,
+                contentHash: link.contentHash,
+                rowHash: link.rowHash,
+              });
+            },
+          );
+          return; // Success
+        } catch (err) {
+          if (!isChainRace(err) || attempt === MAX_CHAIN_ATTEMPTS) {
+            // Fallback to unchained write if chained write fails
+            const { withPlatformScope } = await import("@/db");
+            await withPlatformScope(
+              `Record a platform action: ${entry.action} on ${entry.resourceType}`,
+              (tx) =>
+                tx.insert(platformActionLog).values({
+                  actorClerkId: entry.operator.clerkUserId,
+                  actorEmail: entry.operator.email,
+                  actorGrade: entry.operator.grade,
+                  action: entry.action,
+                  resourceType: entry.resourceType,
+                  resourceId: entry.resourceId ?? null,
+                  justification: entry.reason,
+                  metadata: entry.metadata ?? {},
+                  resultCount:
+                    typeof entry.metadata?.resultCount === "number"
+                      ? entry.metadata.resultCount
+                      : null,
+                  severity: entry.severity ?? "notice",
+                  ipAddress: entry.operator.ipAddress,
+                  userAgent: entry.operator.userAgent,
+                  requestId: entry.operator.requestId,
+                }),
+            );
+            console.error("[PLATFORM AUDIT CHAIN DEGRADED]", {
+              tenantId,
+              action: entry.action,
+              resourceType: entry.resourceType,
+              actor: entry.operator.email,
+              error: err instanceof Error ? err.message : String(err),
+            });
+            return;
+          }
+        }
+      }
     }
   } catch (err) {
     console.error("[PLATFORM AUDIT WRITE FAILED]", {
@@ -549,3 +667,5 @@ export async function recordPlatformAudit(entry: PlatformAuditEntry): Promise<vo
     });
   }
 }
+
+

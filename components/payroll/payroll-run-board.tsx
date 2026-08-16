@@ -15,6 +15,22 @@
  * ⚠️ AND THE APPROVE BUTTON IS DISABLED WHILE ANY PROBLEM REMAINS,
  * which the server re-checks anyway. The button is a courtesy; the
  * refusal in `approvePayrollRun` is the control.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴🔴 v1.47.0 (BATCH 50): THIS FILE USED TO SEND `attendance: []`
+ * ══════════════════════════════════════════════════════════════════════
+ * `onCompute({ runId, attendance: [] })` was hardcoded, so every run paid
+ * every salaried person a full month whatever the attendance register
+ * said, and loss of pay could not be entered at all. It was hardcoded
+ * because there was no table to read from; migration 0082 built one.
+ *
+ * ⚠️ THE FIX IS NOT "SEND THE RIGHT ARRAY INSTEAD". A `"use server"`
+ * export is a public endpoint, and a browser-supplied array of
+ * `{employeeId, lopDays}` is a browser deciding what everybody is paid.
+ * `computeRun()` reads `staff_attendance` and the approved leave register
+ * itself, inside the transaction that writes the payslips, and this
+ * screen's job is to SHOW that position before anybody signs it — which
+ * is what `LopPositionPanel` immediately below the problems is for.
  */
 
 import { useState, useTransition } from "react";
@@ -24,6 +40,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
+import { LopPositionPanel } from "@/components/payroll/lop-position";
 
 export type PayslipView = {
   id: string;
@@ -102,7 +119,11 @@ export function PayrollRunBoard({
   canManage: boolean;
   canApprove: boolean;
   canPost: boolean;
-  onCompute: (input: { runId: string; attendance: [] }) => Promise<
+  /**
+   * ⚠️ TAKES A RUN AND NOTHING ELSE. It used to take `attendance` as
+   * well — see the header. The register is read on the server.
+   */
+  onCompute: (input: { runId: string }) => Promise<
     Result<{ employeeCount: number; problemCount: number; note: string }>
   >;
   onApprove: (input: { runId: string; note: string }) => Promise<Result<{ note: string }>>;
@@ -115,6 +136,13 @@ export function PayrollRunBoard({
   const [reason, setReason] = useState("");
   const [open, setOpen] = useState<"approve" | "cancel" | null>(null);
   const [expanded, setExpanded] = useState<string | null>(null);
+  /**
+   * ⚠️ `router.refresh()` RE-RENDERS THE SERVER COMPONENTS AND DOES NOT
+   * RE-RUN A CLIENT COMPONENT'S OWN FETCH. Without this counter the
+   * loss-of-pay panel would keep showing the position from before the
+   * recompute, which is the one moment somebody is looking at it.
+   */
+  const [lopKey, setLopKey] = useState(0);
 
   const withProblems = slips.filter((s) => s.problems.length > 0);
   const editable = run.status === "draft" || run.status === "computed";
@@ -127,6 +155,7 @@ export function PayrollRunBoard({
         setNote("");
         setReason("");
         toast.success(success(result.data));
+        setLopKey((k) => k + 1);
         router.refresh();
       } else {
         toast.error(result.error);
@@ -168,6 +197,16 @@ export function PayrollRunBoard({
           </CardContent>
         </Card>
       ) : null}
+
+      {/* ---------------------------------------------------------- */}
+      {/* 🔴 THE LOSS-OF-PAY POSITION, BEFORE THE MONEY AND BEFORE     */}
+      {/* THE APPROVE BUTTON. Rendered whether or not anybody is       */}
+      {/* losing pay: a panel that appears only when there is          */}
+      {/* something to see teaches the reader that its absence means   */}
+      {/* nothing happened, and the state this batch exists to make    */}
+      {/* visible is the one where nothing was recorded at all.        */}
+      {/* ---------------------------------------------------------- */}
+      <LopPositionPanel runId={run.id} refreshKey={lopKey} />
 
       {/* ---------------------------------------------------------- */}
       {/* THE TOTALS                                                  */}
@@ -228,9 +267,7 @@ export function PayrollRunBoard({
               <Button
                 size="sm"
                 disabled={pending}
-                onClick={() =>
-                  act(onCompute({ runId: run.id, attendance: [] }), (d) => d.note)
-                }
+                onClick={() => act(onCompute({ runId: run.id }), (d) => d.note)}
               >
                 {run.status === "draft" ? "Compute" : "Recompute"}
               </Button>

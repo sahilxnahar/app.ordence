@@ -28,11 +28,18 @@
  * counter.
  */
 
-import { and, eq } from "drizzle-orm";
+import { and, eq, isNull } from "drizzle-orm";
 import { revalidatePath } from "next/cache";
 import { withTenant } from "@/db";
-import { customerCreditProfiles, approvalLimits } from "@/db/schema/credit";
+import {
+  approvalLimits,
+  creditDunningLog,
+  creditHoldEvents,
+  creditHoldOverrides,
+  customerCreditProfiles,
+} from "@/db/schema/credit";
 import { companies } from "@/db/schema/crm";
+import { salesOrders } from "@/db/schema/orders";
 import { writeAudit, requirePermission } from "@/server/audit";
 import { guardSalesWrite, salesFail, toSalesActionError } from "@/server/sales/guards";
 import { loadCreditProfile, loadExposureOrders } from "@/server/credit/position";
@@ -44,7 +51,36 @@ import {
   setCreditHoldSchema,
   setCreditTermsSchema,
 } from "@/lib/validators/credit";
-import { serializeAmount } from "@/lib/billing/money";
+/* 🔴 Batch 40 — holds as events, overrides, and the dunning ladder. */
+import {
+  creditBoardSchema,
+  placeCreditHoldSchema,
+  recordCreditHoldOverrideSchema,
+  releaseCreditHoldSchema,
+  runDunningSweepSchema,
+} from "@/lib/credit/validators";
+import {
+  creditHeadroom,
+  reconcileCreditPosition,
+  EXPOSURE_SCOPE_NOTE,
+} from "@/lib/credit/headroom";
+import { assessAutoHold } from "@/lib/credit/hold";
+import { describeSweep, planDunning } from "@/lib/credit/dunning";
+import { loadActiveHold } from "@/lib/credit/enforce";
+import {
+  loadChaseableInvoices,
+  loadCreditSubjects,
+  loadDunningLadder,
+  loadInvoiceFacts,
+  loadOrderCommitments,
+  loadRecordedDunning,
+} from "@/lib/credit/queries";
+import {
+  serializeReconciliation,
+  type SerializedReconciliation,
+} from "@/lib/reconciliation/gate";
+import { todayInIndia } from "@/lib/accounting/periods";
+import { serializeAmount, toBigIntAmount } from "@/lib/billing/money";
 import type { ActionResult } from "@/lib/validators/crm";
 
 const FEATURE_ORDERS = "sales.orders" as const;
@@ -493,4 +529,689 @@ export async function getCreditPosition(input: unknown): Promise<
   } catch (err) {
     return toSalesActionError(err, "getCreditPosition");
   }
+}
+
+/* ================================================================== */
+/* 🔴 BATCH 40 — HOLDS AS EVENTS, OVERRIDES, AND THE DUNNING SWEEP     */
+/* ================================================================== */
+
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * ⚠️ EVERY EXPORT BELOW IS A BROWSER-REACHABLE RPC ENDPOINT, and every
+ * one of them reaches a TIER-2 guard in ONE hop — `guardSalesWrite` for
+ * the writes, `requirePermission` for the read. `check:guards` walks one
+ * hop only, and a guard two calls deep is a guard the checker cannot see
+ * and an attacker does not have to pass.
+ *
+ * ⚠️ AND NO EXPORT TAKES A TENANT. The database reads live in
+ * `lib/credit/queries.ts`, which is `import "server-only"` precisely
+ * because its functions DO take one.
+ * ══════════════════════════════════════════════════════════════════════
+ */
+
+/**
+ * Place a MANUAL credit hold.
+ *
+ * 🔴 THIS IS THE WRITE THAT STOPS ORDERS. `confirmOrder` reads the row
+ * this inserts, inside its own transaction, and throws. It is not a
+ * routing decision and it does not put anything in an approval queue —
+ * see the header of `lib/credit/hold.ts` for why a hold refuses where an
+ * over-limit order does not.
+ *
+ * ⚠️ IT IS AN INSERT, NOT AN UPDATE OF A BOOLEAN. 0048's
+ * `customer_credit_profiles.on_hold` is now a mirror maintained by a
+ * trigger; writing it directly would be silently reverted by the next
+ * hold event on that customer, which works in testing and drifts in
+ * production.
+ *
+ * ⚠️ `ON CONFLICT DO NOTHING` AGAINST THE PARTIAL UNIQUE INDEX. Two
+ * people pressing "hold" on the same stale screen must not produce two
+ * holds, and the second one must not see an error — the account is on
+ * hold, which is what they wanted.
+ */
+export async function placeCreditHold(
+  input: unknown,
+): Promise<ActionResult<{ companyId: string; alreadyHeld: boolean }>> {
+  try {
+    const data = placeCreditHoldSchema.parse(input);
+    const ctx = await guardSalesWrite({
+      operation: "credit:manage",
+      feature: FEATURE_ORDERS,
+      permission: "sales.credit.manage",
+      resource: { type: "company", id: data.companyId },
+    });
+
+    const outcome = await withTenant(
+      ctx.tenant.id,
+      async (tx) => {
+        const [company] = await tx
+          .select({ id: companies.id, name: companies.name })
+          .from(companies)
+          .where(and(eq(companies.tenantId, ctx.tenant.id), eq(companies.id, data.companyId)))
+          .limit(1);
+        if (!company) throw new Error("That customer no longer exists.");
+
+        const existing = await loadActiveHold(tx, ctx.tenant.id, data.companyId);
+
+        /**
+         * ⭐ THE FIGURES AS THEY STAND, RECORDED ON THE HOLD. "He was
+         * ₹40,000 over when we stopped him" is the fact a bad-debt review
+         * needs, and it is unrecoverable six months later from a table
+         * whose numbers have moved on.
+         */
+        const position = await computeCreditPosition(tx, ctx.tenant.id, [data.companyId]);
+        const mine = position.get(data.companyId) ?? null;
+
+        const inserted = await tx
+          .insert(creditHoldEvents)
+          .values({
+            tenantId: ctx.tenant.id,
+            companyId: data.companyId,
+            source: "manual",
+            reason: data.reason,
+            placedBy: ctx.user.id,
+            exposureAtHoldMinor: mine?.exposure.totalMinor ?? null,
+            limitAtHoldMinor: mine?.limitMinor ?? null,
+          })
+          .onConflictDoNothing()
+          .returning({ id: creditHoldEvents.id });
+
+        await writeAudit(ctx, {
+          action: "create",
+          resourceType: "credit_hold",
+          resourceId: data.companyId,
+          newValue: {
+            company: company.name,
+            source: "manual",
+            reason: data.reason,
+            alreadyHeld: existing !== null,
+          },
+          /**
+           * ⚠️ `critical`, NOT `warning`. Placing a hold stops a customer
+           * trading with this workspace entirely. Whatever severity
+           * threshold a workspace has set its alerts to, this is above it.
+           */
+          severity: "critical",
+        });
+
+        return { alreadyHeld: inserted.length === 0 };
+      },
+      { impersonationId: ctx.impersonationId },
+    );
+
+    revalidatePath("/receivables/credit");
+    /**
+     * ⚠️ `/companies/[id]/statement`, NOT `/crm/companies/[id]`. The two
+     * calls above in `setCreditTerms` and `setCreditHold` revalidate a
+     * route that does not exist in `app/` — a silent no-op, so the
+     * customer's own screen keeps a stale hold badge until it is
+     * reloaded. Reported rather than fixed here: those lines belong to
+     * v0.89.0's surface and changing them is not this batch's diff.
+     */
+    revalidatePath(`/companies/${data.companyId}/statement`);
+    revalidatePath("/orders");
+    return { ok: true, data: { companyId: data.companyId, alreadyHeld: outcome.alreadyHeld } };
+  } catch (err) {
+    return toSalesActionError(err, "placeCreditHold");
+  }
+}
+
+/**
+ * Lift a hold.
+ *
+ * ⚠️ IT TAKES THE HOLD ID, NOT THE COMPANY. Two people on the same stale
+ * screen would otherwise both "lift the hold", and the second would
+ * silently lift a DIFFERENT hold placed in between — for a different
+ * reason, by somebody else, thirty seconds ago.
+ *
+ * ⚠️ THE UPDATE CARRIES `isNull(releasedAt)`. That predicate is the
+ * compare-and-set: two concurrent releases both read an open hold, both
+ * reach the UPDATE, and exactly one row matches. Without it the second
+ * would overwrite the first's `releasedBy` with its own, and the record
+ * would name the wrong person.
+ */
+export async function releaseCreditHold(
+  input: unknown,
+): Promise<ActionResult<{ holdId: string; released: boolean }>> {
+  try {
+    const data = releaseCreditHoldSchema.parse(input);
+    const ctx = await guardSalesWrite({
+      operation: "credit:manage",
+      feature: FEATURE_ORDERS,
+      permission: "sales.credit.manage",
+      resource: { type: "credit_hold", id: data.holdId },
+    });
+
+    const released = await withTenant(
+      ctx.tenant.id,
+      async (tx) => {
+        const rows = await tx
+          .update(creditHoldEvents)
+          .set({
+            releasedAt: new Date(),
+            releasedBy: ctx.user.id,
+            releaseReason: data.reason ?? null,
+          })
+          .where(
+            and(
+              eq(creditHoldEvents.tenantId, ctx.tenant.id),
+              eq(creditHoldEvents.id, data.holdId),
+              isNull(creditHoldEvents.releasedAt),
+            ),
+          )
+          .returning({ id: creditHoldEvents.id, companyId: creditHoldEvents.companyId });
+
+        const row = rows[0];
+
+        await writeAudit(ctx, {
+          action: "update",
+          resourceType: "credit_hold",
+          resourceId: data.holdId,
+          newValue: {
+            released: row !== undefined,
+            reason: data.reason ?? null,
+            companyId: row?.companyId ?? null,
+          },
+          severity: "critical",
+        });
+
+        return row !== undefined;
+      },
+      { impersonationId: ctx.impersonationId },
+    );
+
+    revalidatePath("/receivables/credit");
+    revalidatePath("/orders");
+    return { ok: true, data: { holdId: data.holdId, released } };
+  } catch (err) {
+    return toSalesActionError(err, "releaseCreditHold");
+  }
+}
+
+/**
+ * 🔴 RECORD AN OVERRIDE SO ONE ORDER MAY GO OUT PAST A HOLD.
+ *
+ * ⚠️ GATED ON `sales.orders.approve_credit`, NOT `sales.credit.manage`.
+ *
+ * This is not credit administration — it is the act of overruling a
+ * refusal, which is the same kind of act as approving an order over its
+ * limit and belongs to the same people. A salesperson who could both
+ * place and override a hold has neither.
+ *
+ * ⚠️ THE ACTOR IS THE SESSION AND CAN NEVER BE AN ARGUMENT. A field
+ * naming the actor is a field an attacker fills in with somebody senior,
+ * and the record then carries a signature that person never gave.
+ *
+ * ⭐ IT RECORDS; IT DOES NOT CONFIRM. The order still has to be
+ * confirmed, by whoever confirms orders, and `confirmOrder` consumes
+ * this row inside its own transaction. Splitting the two means the
+ * signature exists before the shipment does, in that order, which is the
+ * order a reviewer will read them in.
+ */
+export async function recordCreditHoldOverride(
+  input: unknown,
+): Promise<ActionResult<{ orderId: string; overrideId: string }>> {
+  try {
+    const data = recordCreditHoldOverrideSchema.parse(input);
+    const ctx = await guardSalesWrite({
+      operation: "orders:approve_credit",
+      feature: FEATURE_ORDERS,
+      permission: "sales.orders.approve_credit",
+      resource: { type: "sales_order", id: data.orderId },
+    });
+
+    const outcome = await withTenant(
+      ctx.tenant.id,
+      async (tx) => {
+        const [order] = await tx
+          .select({
+            id: salesOrders.id,
+            orderNo: salesOrders.orderNo,
+            companyId: salesOrders.companyId,
+          })
+          .from(salesOrders)
+          .where(and(eq(salesOrders.tenantId, ctx.tenant.id), eq(salesOrders.id, data.orderId)))
+          .limit(1);
+
+        if (!order) throw new Error("That order no longer exists.");
+        if (!order.companyId) {
+          throw new Error(
+            "This order has no customer account on it, so there is no hold to override. A counter sale with no company record cannot run up an account.",
+          );
+        }
+
+        const hold = await loadActiveHold(tx, ctx.tenant.id, order.companyId);
+        if (!hold) {
+          /**
+           * ⚠️ REFUSED RATHER THAN RECORDED. An override written against
+           * a customer who is not on hold is a signature waiting for a
+           * hold to be placed later — it would sit there and release the
+           * first refusal that came along, weeks after the person who
+           * signed it stopped thinking about this order.
+           */
+          throw new Error(
+            `${order.orderNo} does not need an override — this customer is not on hold. If the order is over its credit limit, that is an approval, not an override.`,
+          );
+        }
+
+        const position = await computeCreditPosition(tx, ctx.tenant.id, [order.companyId]);
+        const mine = position.get(order.companyId) ?? null;
+
+        const [row] = await tx
+          .insert(creditHoldOverrides)
+          .values({
+            tenantId: ctx.tenant.id,
+            companyId: order.companyId,
+            orderId: order.id,
+            holdEventId: hold.id,
+            actorUserId: ctx.user.id,
+            reason: data.reason,
+            exposureAtOverrideMinor: mine?.exposure.totalMinor ?? null,
+            limitAtOverrideMinor: mine?.limitMinor ?? null,
+          })
+          .returning({ id: creditHoldOverrides.id });
+
+        if (!row) throw new Error("The override could not be written.");
+
+        await writeAudit(ctx, {
+          action: "create",
+          resourceType: "credit_hold_override",
+          resourceId: order.id,
+          newValue: {
+            orderNo: order.orderNo,
+            holdReason: hold.reason,
+            reason: data.reason,
+            exposureMinor: mine ? serializeAmount(mine.exposure.totalMinor) : null,
+          },
+          severity: "critical",
+        });
+
+        return { overrideId: row.id };
+      },
+      { impersonationId: ctx.impersonationId },
+    );
+
+    revalidatePath("/receivables/credit");
+    revalidatePath(`/orders/${data.orderId}`);
+    return { ok: true, data: { orderId: data.orderId, overrideId: outcome.overrideId } };
+  } catch (err) {
+    return toSalesActionError(err, "recordCreditHoldOverride");
+  }
+}
+
+/* ================================================================== */
+/* THE DUNNING SWEEP                                                   */
+/* ================================================================== */
+
+/**
+ * ⭐⭐ WORK OUT WHICH REMINDERS ARE DUE AND RECORD THEM.
+ *
+ * 🔴 IT QUEUES. IT DOES NOT SEND. There is no SMTP call, no Resend call
+ * and no webhook anywhere below. Every row is written with `delivery:
+ * "queued"` and whatever eventually delivers them writes `sent` or
+ * `failed` back. Recording `sent` here because the row is "about to" go
+ * out would produce a collections call opening with "we have written to
+ * you three times" against a customer who can prove otherwise.
+ *
+ * 🔴 AND IT IS SAFE TO RUN TWICE. `ON CONFLICT DO NOTHING` against
+ * `credit_dunning_log_once_per_stage_key` is the guarantee — not the
+ * `alreadyRecorded` set, which is a read-then-write two containers can
+ * both pass in the same millisecond.
+ */
+export async function runDunningSweep(input: unknown): Promise<
+  ActionResult<{
+    asOf: string;
+    queued: number;
+    suppressed: number;
+    holdsPlaced: number;
+    skipped: { invoiceNumber: string; why: string }[];
+    summary: string;
+    preview: boolean;
+  }>
+> {
+  try {
+    const data = runDunningSweepSchema.parse(input);
+    const ctx = await guardSalesWrite({
+      operation: "credit:manage",
+      feature: FEATURE_ORDERS,
+      permission: "sales.credit.manage",
+    });
+
+    /**
+     * 🔴 CLAMPED TO TODAY IN INDIA, NEVER `toISOString()`. India is
+     * UTC+5:30, so between midnight and 05:30 IST a UTC date is
+     * YESTERDAY — and a sweep that thinks it is yesterday silently fails
+     * to fire the stage that came due at midnight.
+     *
+     * ⚠️ AND A FUTURE `asOf` IS CLAMPED, NOT REJECTED. Rejecting sends
+     * somebody to edit an invoice's due date to make the ladder fire,
+     * which corrupts the document to fix the job.
+     */
+    const today = todayInIndia();
+    const asOf = data.asOf && data.asOf <= today ? data.asOf : today;
+    const preview = data.preview === true;
+
+    const result = await withTenant(
+      ctx.tenant.id,
+      async (tx) => {
+        const ladder = await loadDunningLadder(tx, ctx.tenant.id, data.ladderId);
+        if (!ladder) {
+          return {
+            asOf,
+            queued: 0,
+            suppressed: 0,
+            holdsPlaced: 0,
+            skipped: [] as { invoiceNumber: string; why: string }[],
+            summary:
+              "No active dunning ladder is configured, so nobody has been chased. A default ladder shipped by us would be the schedule most workspaces chase on, chosen by nobody — set the ages that suit this business.",
+            preview,
+          };
+        }
+
+        const [invoices, alreadyRecorded] = await Promise.all([
+          loadChaseableInvoices(tx, ctx.tenant.id),
+          loadRecordedDunning(tx, ctx.tenant.id),
+        ]);
+
+        const plan = planDunning({
+          asOf,
+          invoices,
+          stages: ladder.stages,
+          alreadyRecorded,
+        });
+
+        const queued = plan.actions.filter((a) => a.delivery === "queued").length;
+        const suppressed = plan.actions.length - queued;
+        let holdsPlaced = 0;
+
+        if (!preview && plan.actions.length > 0) {
+          await tx
+            .insert(creditDunningLog)
+            .values(
+              plan.actions.map((a) => ({
+                tenantId: ctx.tenant.id,
+                companyId: a.companyId,
+                invoiceId: a.invoiceId,
+                ladderId: ladder.id,
+                stageId: a.stageId,
+                stageNo: a.stageNo,
+                daysPastDue: a.daysPastDue,
+                channel: a.channel,
+                templateKey: a.templateKey,
+                recipientName: a.recipientName,
+                recipientEmail: a.recipientEmail,
+                recipientPhone: a.recipientPhone,
+                amountDueMinor: a.amountDueMinor,
+                delivery: a.delivery,
+                failureReason: a.suppressionReason,
+                nextActionOn: a.nextActionOn,
+                createdBy: ctx.user.id,
+              })),
+            )
+            /**
+             * 🔴 THE IDEMPOTENCY GUARANTEE. A quiet no-op on the second
+             * run rather than an exception — a sweep that dies on invoice
+             * 40 of 300 because another container got there first is a
+             * sweep that never finishes.
+             */
+            .onConflictDoNothing();
+
+          /**
+           * ⭐ THE RUNGS THAT PLACE A HOLD. `ON CONFLICT DO NOTHING`
+           * again, against the one-active-hold index: a customer with
+           * four invoices reaching the final stage on the same night gets
+           * one hold, not four.
+           */
+          const holdRungs = plan.actions.filter(
+            (a) => a.delivery === "queued" && a.placesHold,
+          );
+          for (const rung of holdRungs) {
+            const placed = await tx
+              .insert(creditHoldEvents)
+              .values({
+                tenantId: ctx.tenant.id,
+                companyId: rung.companyId,
+                source: "automatic",
+                reason: `${rung.invoiceNumber} is ${rung.daysPastDue} days past due and reached "${rung.stageLabel}". Placed by the dunning ladder; it will not lift itself.`,
+                /**
+                 * ⚠️ `placedBy` IS NULL AND THE CHECK CONSTRAINT ALLOWS
+                 * IT ONLY FOR `automatic`. The sweep has no user, and
+                 * naming the person who pressed the button would put
+                 * their signature on a decision the ladder made.
+                 */
+                exposureAtHoldMinor: null,
+                limitAtHoldMinor: null,
+              })
+              .onConflictDoNothing()
+              .returning({ id: creditHoldEvents.id });
+            if (placed.length > 0) holdsPlaced += 1;
+          }
+
+          await writeAudit(ctx, {
+            action: "create",
+            resourceType: "dunning_sweep",
+            resourceId: ladder.id,
+            newValue: {
+              ladder: ladder.name,
+              asOf,
+              queued,
+              suppressed,
+              holdsPlaced,
+              skipped: plan.skipped.length,
+            },
+            severity: "warning",
+          });
+        }
+
+        return {
+          asOf,
+          queued,
+          suppressed,
+          holdsPlaced,
+          skipped: plan.skipped.map((s) => ({
+            invoiceNumber: s.invoiceNumber,
+            why: s.why,
+          })),
+          summary: preview
+            ? `Preview only — nothing has been written. ${describeSweep(plan)}`
+            : describeSweep(plan),
+          preview,
+        };
+      },
+      { impersonationId: ctx.impersonationId },
+    );
+
+    if (!preview) revalidatePath("/receivables/credit");
+    return { ok: true, data: result };
+  } catch (err) {
+    return toSalesActionError(err, "runDunningSweep");
+  }
+}
+
+/* ================================================================== */
+/* THE BOARD                                                           */
+/* ================================================================== */
+
+/**
+ * Every customer whose credit position is worth a second look.
+ *
+ * ⚠️ READ PATH, SO `requirePermission` ALONE — no entitlement gate. A
+ * gate on a `get*` produces the worst upgrade prompt there is: a page
+ * that will not render, rather than a page that renders and refuses the
+ * button.
+ *
+ * ⚠️ MONEY LEAVES AS A STRING. `JSON.stringify` throws on a bigint and
+ * every amount here is one.
+ *
+ * 🔴 AND `figures` IS STRUCTURALLY ABSENT WHEN THE RECONCILIATION
+ * BREACHES. Not present behind a boolean — absent, so a screen that
+ * ignored the gate would fail to compile rather than quietly print an
+ * unverified ceiling.
+ */
+export async function getCreditControlBoard(input: unknown): Promise<
+  ActionResult<{
+    rows: {
+      companyId: string;
+      companyName: string;
+      limitMinor: string | null;
+      exposureMinor: string;
+      billedMinor: string;
+      unbilledMinor: string;
+      figures: { headroomMinor: string | null; overLimit: boolean } | null;
+      onHold: boolean;
+      holdId: string | null;
+      holdSource: "manual" | "automatic" | null;
+      holdReason: string | null;
+      autoHoldEnabled: boolean;
+      autoHoldNote: string;
+      reconciliation: SerializedReconciliation;
+    }[];
+    scopeNote: string;
+  }>
+> {
+  try {
+    creditBoardSchema.parse(input ?? {});
+    const ctx = await requirePermission("sales.credit.read");
+
+    const rows = await withTenant(ctx.tenant.id, async (tx) => {
+      const subjects = await loadCreditSubjects(tx, ctx.tenant.id);
+      const position = await computeCreditPosition(
+        tx,
+        ctx.tenant.id,
+        subjects.map((s) => s.companyId),
+        subjects,
+      );
+
+      return subjects.map((s) => {
+        const p = position.get(s.companyId);
+        const headroom = p?.headroom ?? null;
+        const auto = assessAutoHold({
+          autoHoldEnabled: s.autoHoldEnabled,
+          activeHold: s.activeHold,
+          limitMinor: s.creditLimitMinor,
+          exposureMinor: p?.exposure.totalMinor ?? 0n,
+        });
+
+        return {
+          companyId: s.companyId,
+          companyName: s.companyName,
+          limitMinor: s.creditLimitMinor === null ? null : serializeAmount(s.creditLimitMinor),
+          exposureMinor: serializeAmount(p?.exposure.totalMinor ?? 0n),
+          billedMinor: serializeAmount(p?.exposure.billedMinor ?? 0n),
+          unbilledMinor: serializeAmount(p?.exposure.unbilledMinor ?? 0n),
+          figures:
+            headroom?.figures == null
+              ? null
+              : {
+                  headroomMinor:
+                    headroom.figures.headroomMinor === null
+                      ? null
+                      : serializeAmount(headroom.figures.headroomMinor),
+                  overLimit: headroom.figures.overLimit,
+                },
+          onHold: s.activeHold !== null,
+          holdId: s.activeHold?.id ?? null,
+          holdSource: s.activeHold?.source ?? null,
+          holdReason: s.activeHold?.reason ?? null,
+          autoHoldEnabled: s.autoHoldEnabled,
+          autoHoldNote: auto.note,
+          reconciliation: serializeReconciliation(
+            headroom?.reconciliation ??
+              reconcileCreditPosition({
+                companyLabel: s.companyName,
+                invoices: [],
+                exposure: {
+                  billedMinor: 0n,
+                  unbilledMinor: 0n,
+                  totalMinor: 0n,
+                  openInvoices: 0,
+                  liveOrders: 0,
+                },
+              }),
+          ),
+        };
+      });
+    });
+
+    return { ok: true, data: { rows, scopeNote: EXPOSURE_SCOPE_NOTE } };
+  } catch (err) {
+    return toSalesActionError(err, "getCreditControlBoard");
+  }
+}
+
+/* ================================================================== */
+/* SHARED — NOT EXPORTED, AND THAT IS DELIBERATE                       */
+/* ================================================================== */
+
+/**
+ * ⚠️ NOT EXPORTED. Every export of this file is a browser-reachable RPC
+ * endpoint, and this function takes a `tenantId` and an open
+ * transaction. Exporting it — even "just for a test" — would publish the
+ * single route past row-level security. The tests exercise
+ * `lib/credit/headroom.ts` instead, which is where the judgement lives.
+ */
+async function computeCreditPosition(
+  tx: Parameters<Parameters<typeof withTenant>[1]>[0],
+  tenantId: string,
+  companyIds: readonly string[],
+  subjects?: readonly { companyId: string; companyName: string; creditLimitMinor: bigint | null }[],
+): Promise<
+  Map<
+    string,
+    {
+      exposure: ReturnType<typeof creditHeadroom>["exposure"];
+      headroom: ReturnType<typeof creditHeadroom>;
+      limitMinor: bigint | null;
+    }
+  >
+> {
+  const out = new Map<
+    string,
+    {
+      exposure: ReturnType<typeof creditHeadroom>["exposure"];
+      headroom: ReturnType<typeof creditHeadroom>;
+      limitMinor: bigint | null;
+    }
+  >();
+  if (companyIds.length === 0) return out;
+
+  const [invoicesByCompany, ordersByCompany] = await Promise.all([
+    loadInvoiceFacts(tx, tenantId, companyIds),
+    loadOrderCommitments(tx, tenantId, companyIds),
+  ]);
+
+  const known = new Map(subjects?.map((s) => [s.companyId, s]) ?? []);
+
+  for (const companyId of companyIds) {
+    const subject = known.get(companyId);
+    let limitMinor: bigint | null = subject?.creditLimitMinor ?? null;
+
+    if (!subject) {
+      const [row] = await tx
+        .select({ creditLimitMinor: customerCreditProfiles.creditLimitMinor })
+        .from(customerCreditProfiles)
+        .where(
+          and(
+            eq(customerCreditProfiles.tenantId, tenantId),
+            eq(customerCreditProfiles.companyId, companyId),
+          ),
+        )
+        .limit(1);
+      limitMinor =
+        row?.creditLimitMinor === null || row?.creditLimitMinor === undefined
+          ? null
+          : toBigIntAmount(row.creditLimitMinor);
+    }
+
+    const headroom = creditHeadroom({
+      companyLabel: subject?.companyName ?? companyId,
+      ceiling: { creditLimitMinor: limitMinor },
+      invoices: invoicesByCompany.get(companyId) ?? [],
+      orders: ordersByCompany.get(companyId) ?? [],
+    });
+
+    out.set(companyId, { exposure: headroom.exposure, headroom, limitMinor });
+  }
+
+  return out;
 }

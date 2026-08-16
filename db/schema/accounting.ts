@@ -284,6 +284,48 @@ export const journalEntries = pgTable(
     referenceType: referenceTypeEnum("reference_type").default("journal").notNull(),
     referenceId: uuid("reference_id"),
 
+    /**
+     * ══════════════════════════════════════════════════════════════════
+     * 🔴🔴 THE COST CENTRE DIMENSION — Batch 68, SQL 0084
+     * ══════════════════════════════════════════════════════════════════
+     * ⚠️ THIS IS THE ONLY CHANGE BATCH 68 MAKES TO THIS FILE: one
+     * nullable column and one index. Everything else about cost centres
+     * lives in `db/schema/budgets.ts`.
+     *
+     * 🔴 IT IS ON THE LINE AND NOT ON `transactions`, AND THAT CANNOT BE
+     * CHANGED LATER. One electricity bill split ₹80,000 to Production
+     * and ₹40,000 to Head Office is ONE invoice, ONE payable and TWO
+     * cost centres; a header dimension can only record it by inventing a
+     * second invoice the supplier never issued, or by coding the whole
+     * bill to one department. `journal_entries` is append-only, so
+     * re-grading a year of history later is not an UPDATE — it is a
+     * reversal and a re-post of every affected transaction. The full
+     * argument is in the header of `db/schema/budgets.ts`.
+     *
+     * ⭐ NULLABLE, AND NULL IS A BUCKET WITH A NAME. The vendor leg of
+     * that invoice belongs to no department and must not be forced into
+     * one; and until the posting path accepts a cost centre, EVERY line
+     * in every workspace is NULL. `lib/accounting/cost-centre.ts` gives
+     * that bucket a label and a subtotal on every screen, because a
+     * departmental P&L that quietly sums to less than the P&L is the one
+     * error nobody double-checks.
+     *
+     * ⚠️ NO `.references()` HERE, ON PURPOSE. `budgets.ts` imports this
+     * file for `ledgers` and `financial_periods`; a Drizzle reference
+     * back would make the two modules circular. The foreign key is real
+     * and is created in 0084 §2 — as a COMPOSITE key on
+     * (cost_centre_id, tenant_id), so one tenant cannot point a journal
+     * line at another tenant's cost centre. RLS hides that row on read
+     * and does nothing at all about the write.
+     *
+     * ⚠️ AND IT CANNOT BE CORRECTED IN PLACE. The append-only trigger
+     * blocks UPDATE on this table, so a line coded to the wrong cost
+     * centre is fixed the way every other posting error is fixed: a
+     * reversal and a re-post. That is a feature — it is what stops last
+     * quarter's departmental result changing after it was explained.
+     */
+    costCentreId: uuid("cost_centre_id"),
+
     /** Party this leg relates to, for statements of account. */
     counterpartyType: varchar("counterparty_type", { length: 40 }),
     counterpartyId: uuid("counterparty_id"),
@@ -314,6 +356,13 @@ export const journalEntries = pgTable(
     referenceIdx: index("journal_entries_reference_idx").on(t.tenantId, t.referenceType, t.referenceId),
     counterpartyIdx: index("journal_entries_counterparty_idx").on(t.tenantId, t.counterpartyId),
     reconciledIdx: index("journal_entries_reconciled_idx").on(t.tenantId, t.isReconciled),
+    /**
+     * ⭐ THE DEPARTMENTAL P&L QUERY — Batch 68. Grouping the whole
+     * journal by cost centre over a date window without this index is a
+     * sequential scan of every line the tenant has ever posted, on a
+     * screen somebody opens once a month and waits for.
+     */
+    costCentreIdx: index("journal_entries_cost_centre_idx").on(t.tenantId, t.costCentreId),
   }),
 );
 

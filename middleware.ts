@@ -24,6 +24,15 @@ import {
   generateRequestId,
 } from "@/lib/tenant";
 import { buildCsp, cspHeaderName, generateNonce } from "@/lib/security/csp";
+import {
+  checkEdgeLimit,
+  edgeLimitHeaders,
+  edgeLimitBody,
+  edgeLimitStatus,
+  type EdgeLimitDecision,
+} from "@/lib/edge/limits";
+import { isRateLimitExempt } from "@/lib/edge/budgets";
+import { checkDeclaredBodySize, bodyTooLargeBody } from "@/lib/edge/body-limit";
 
 /* ------------------------------------------------------------------ */
 /* RUNTIME ENVIRONMENT                                                 */
@@ -317,6 +326,148 @@ function cspReportUri(): string | undefined {
   return readRuntimeEnv("CSP_REPORT_URI");
 }
 
+/**
+ * ⭐ OBSERVE-ONLY MODE FOR THE CAPACITY LIMITER — Batch 31.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * ⚠️ A NEW LIMIT SHIPPED STRAIGHT TO ENFORCE IS A GUESS WITH A BLAST
+ *    RADIUS.
+ * ══════════════════════════════════════════════════════════════════════
+ * The per-plan budgets in `lib/edge/budgets.ts` are reasoned, not
+ * measured — nothing in this product has ever counted requests per
+ * workspace, so there is no observed peak to set them against. Turning
+ * them on blind means the first evidence that a number is too low is a
+ * customer unable to work at month end.
+ *
+ * `EDGE_LIMIT_MODE=observe` counts everything, publishes the position in
+ * the response headers, and refuses nothing. Run it for a week, read
+ * `x-ratelimit-remaining` off real traffic, then set the numbers and
+ * remove the variable.
+ *
+ * ⚠️ ENFORCE IS THE DEFAULT AND THE UNSET VALUE. A limiter whose safe
+ * mode is the default is a limiter that is off in production the day
+ * somebody forgets a variable — which is the failure this whole batch
+ * exists to remove. Observe mode must be asked for, explicitly, by name.
+ */
+function limitsObserveOnly(): boolean {
+  return readRuntimeEnv("EDGE_LIMIT_MODE") === "observe";
+}
+
+/* ------------------------------------------------------------------ */
+/* PER-TENANT CAPACITY LIMITING                                        */
+/* ------------------------------------------------------------------ */
+
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * ⭐ WHY THE GATE SITS *AFTER* AUTH AND NOT BEFORE IT — Batch 31
+ * ══════════════════════════════════════════════════════════════════════
+ * The bucket is the WORKSPACE, because the costs this bounds — Neon
+ * compute, Worker CPU, a shared connection pool — are incurred per
+ * workspace and paid for by everyone else on the instance. There is no
+ * workspace to key on until `auth()` has returned an organisation, so a
+ * gate placed earlier would have nothing to count against except the
+ * client's own hostname or headers, both of which the client chooses.
+ * Keying on those makes the limit opt-in: rotate the value, get a fresh
+ * budget, every request is the first request.
+ *
+ * The cost of the ordering is that a flood of UNAUTHENTICATED requests is
+ * not counted here. That is deliberate and already covered: anonymous
+ * surfaces are bounded by the IP-keyed policies in
+ * `lib/security/rate-limit.ts`, which is the right key for a caller who
+ * has no identity, and Clerk refuses them before any database work.
+ *
+ * ⚠️ THIS ADDS A NETWORK ROUND TRIP TO EVERY AUTHENTICATED REQUEST.
+ * Upstash over REST from the edge is single-digit to low-tens of
+ * milliseconds. It is paid deliberately: the alternative — sampling, or
+ * limiting only `/api` — leaves the page and server-action traffic that
+ * makes up most of the load entirely uncounted, which is the hole this
+ * batch exists to close. The plan lookup is memoised in-process for a
+ * minute so it is not a second round trip per request.
+ */
+async function edgeLimitGate(
+  req: NextRequest,
+  requestId: string,
+  identity: Parameters<typeof checkEdgeLimit>[0]["identity"],
+  surface: "app" | "api" | "platform",
+): Promise<{ refusal: NextResponse | null; headers: Record<string, string> }> {
+  /**
+   * ⚠️ HEALTH CHECKS, WEBHOOKS AND CRON ARE NEVER COUNTED.
+   *
+   * Most of them are already `isPublicRoute` and never reach this
+   * function. The check is repeated here anyway because "it is exempt
+   * because it happens to be public" is a coincidence, and the day
+   * someone makes `/api/workers` require a session, Railway's health
+   * probe starts getting 429s, Railway reads that as an unhealthy
+   * container, kills it, and the replacement inherits the same counter
+   * out of shared Redis. That is a crash loop the deploy cannot escape,
+   * caused by the rate limiter. It has happened here before.
+   */
+  if (isRateLimitExempt(req.nextUrl.pathname)) {
+    return { refusal: null, headers: {} };
+  }
+
+  const decision: EdgeLimitDecision = await checkEdgeLimit({ surface, identity });
+  const headers = edgeLimitHeaders(decision);
+
+  if (decision.allowed) return { refusal: null, headers };
+
+  if (limitsObserveOnly()) {
+    /**
+     * Counted, published, not enforced. The mode is renamed in the
+     * header rather than hidden, so a response that WOULD have been
+     * refused is visible in DevTools and in any log that keeps headers —
+     * which is the entire value of observe mode.
+     */
+    return {
+      refusal: null,
+      headers: { ...headers, "x-ordence-limit-mode": `observe:${decision.mode}` },
+    };
+  }
+
+  const status = edgeLimitStatus(decision);
+  const isApiPath = req.nextUrl.pathname.startsWith("/api/");
+
+  /**
+   * ⚠️ A BROWSER NAVIGATION GETS TEXT, NOT JSON. A JSON body rendered
+   * into a browser window as the response to clicking a link is a wall
+   * of punctuation that tells the person nothing. They get the sentence;
+   * an API client gets the machine-readable shape. Both carry
+   * `Retry-After`, because that is what makes a well-behaved client back
+   * off instead of hot-looping on the endpoint we are protecting.
+   */
+  const body = edgeLimitBody(decision);
+  const refusal = isApiPath
+    ? new NextResponse(JSON.stringify({ error: { ...body.error, requestId } }), {
+        status,
+        headers: {
+          ...headers,
+          "content-type": "application/json",
+          "x-request-id": requestId,
+          "cache-control": "no-store",
+        },
+      })
+    : new NextResponse(body.error.message, {
+        status,
+        headers: {
+          ...headers,
+          "content-type": "text/plain; charset=utf-8",
+          "x-request-id": requestId,
+          "cache-control": "no-store",
+        },
+      });
+
+  return { refusal, headers };
+}
+
+/** Copy the observability headers onto whatever response we return. */
+function withLimitHeaders(
+  res: NextResponse,
+  headers: Record<string, string>,
+): NextResponse {
+  for (const [name, value] of Object.entries(headers)) res.headers.set(name, value);
+  return res;
+}
+
 async function run(auth: ClerkAuth, req: NextRequest) {
   const requestId = generateRequestId();
 
@@ -328,6 +479,58 @@ async function run(auth: ClerkAuth, req: NextRequest) {
     headers.delete(header);
   }
   headers.set(TENANT_HEADERS.requestId, requestId);
+
+  /* -- 1a. ⭐ REQUEST SIZE — REFUSED BEFORE A BYTE IS READ — Batch 31 --
+   *
+   * ══════════════════════════════════════════════════════════════════
+   * 🔴 THE CHEAPEST CHECK IN THE REQUEST, SO IT RUNS FIRST
+   * ══════════════════════════════════════════════════════════════════
+   * Before this, an oversized body was buffered by the route handler
+   * (`await req.json()`) and only then validated — so the memory was
+   * already allocated by the time anything could object, and on the
+   * assistant route the bytes had already become prompt tokens somebody
+   * charges us for.
+   *
+   * Reading one header costs nothing and happens before Clerk, before
+   * the tenant lookup and before any route is chosen.
+   *
+   * ⚠️ THIS RUNS ON UNAUTHENTICATED REQUESTS TOO, ON PURPOSE. The size
+   * of a body is not a secret and refusing a 60 MB payload from an
+   * anonymous caller is precisely when refusing is most valuable. It is
+   * placed above the auth gate for that reason and not by accident.
+   *
+   * ⚠️ `Content-Length` IS A CLAIM. A chunked request omits it and a
+   * hostile client can lie, so this is the cheap half of a two-part
+   * control — `readJsonWithLimit()` in `lib/edge/body-limit.ts` counts
+   * the bytes that actually arrive, in the route, and that is the half
+   * that holds. Middleware cannot do the measured check: consuming the
+   * body here would leave the route nothing to read.
+   *
+   * ⚠️ THE CAP IS PER PATH PREFIX, NOT GLOBAL, AND THAT IS LOAD-BEARING.
+   * `/api/upload/put` legitimately streams tens of megabytes. A single
+   * global cap would have refused every document a customer uploads,
+   * with a 413 indistinguishable from a browser bug.
+   */
+  if (req.method !== "GET" && req.method !== "HEAD") {
+    const sizeVerdict = checkDeclaredBodySize(
+      req.nextUrl.pathname,
+      req.headers.get("content-length"),
+    );
+    if (!sizeVerdict.ok) {
+      // 413 with a STATED REASON and the limit, never a stack trace: the
+      // caller has to know the ceiling to comply with it, and a 500 from
+      // an unhandled parse error tells them nothing and tells an
+      // attacker our framework.
+      return new NextResponse(JSON.stringify(bodyTooLargeBody(sizeVerdict)), {
+        status: 413,
+        headers: {
+          "content-type": "application/json",
+          "x-request-id": requestId,
+          "cache-control": "no-store",
+        },
+      });
+    }
+  }
 
   /* -- 1b. ⭐ CONTENT-SECURITY-POLICY — v0.67.0 ------------------------
    *
@@ -482,7 +685,32 @@ async function run(auth: ClerkAuth, req: NextRequest) {
     }
     headers.set(TENANT_HEADERS.userId, userId);
     headers.set(TENANT_HEADERS.tenantRole, "platform_super_admin");
-    return forward();
+
+    /**
+     * ⭐ THE STAFF CONSOLE HAS ITS OWN BUCKET AND ITS OWN FAILURE MODE.
+     *
+     * ⚠️ NOT THE TENANT BUCKET. A staff member has no workspace, so
+     * there is nothing tenant-shaped to key on — and if there were, the
+     * bucket would be wrong anyway: the two surfaces have opposite blast
+     * radii. Throttling a customer wrongly breaks one workspace's day;
+     * failing to count the console means a compromised staff session can
+     * read every workspace in the product at network speed.
+     *
+     * Keyed per staff USER rather than per console, so one operator
+     * running an export cannot throttle their colleagues during an
+     * incident.
+     *
+     * ⚠️ THIS IS THE SURFACE THAT FAILS CLOSED. See `FAIL_MODE` in
+     * lib/edge/budgets.ts for the argument and for the escape hatch.
+     */
+    const staffGate = await edgeLimitGate(
+      req,
+      requestId,
+      { kind: "staff", userId },
+      "platform",
+    );
+    if (staffGate.refusal) return staffGate.refusal;
+    return withLimitHeaders(forward(), staffGate.headers);
   }
 
   /* -- 6. Require an active organization ------------------------------- */
@@ -513,7 +741,26 @@ async function run(auth: ClerkAuth, req: NextRequest) {
   headers.set(TENANT_HEADERS.tenantRole, orgRole ?? "org:member");
   if (orgSlug) headers.set(TENANT_HEADERS.tenantSlug, orgSlug);
 
-  return forward();
+  /* -- 9. ⭐ PER-TENANT CAPACITY BUDGET — Batch 31 ---------------------
+   *
+   * ⚠️ `orgId` COMES FROM `auth()`, WHICH IS THE SAME PLACE STEP 7 GOT
+   * THE VALUE IT USED TO REFUSE A CROSS-TENANT REQUEST. It is not a
+   * header (every `x-tenant-*` was deleted in step 1), not the hostname
+   * (client-supplied, and step 7 exists precisely because it can
+   * disagree with the session) and not a query parameter. If the bucket
+   * key were any of those, a caller could reset their own budget by
+   * changing a string, and the limit would be advisory.
+   *
+   * ⚠️ TWO SURFACES, TWO BUCKETS. A browser session and a scripted API
+   * client have different natural rates and different failure modes —
+   * a person waits, a script retries — so a shared bucket would let one
+   * runaway integration lock a workspace's own staff out of the CRM.
+   */
+  const surface = req.nextUrl.pathname.startsWith("/api/") ? "api" : "app";
+  const gate = await edgeLimitGate(req, requestId, { kind: "tenant", orgId }, surface);
+  if (gate.refusal) return gate.refusal;
+
+  return withLimitHeaders(forward(), gate.headers);
 };
 
 /**
