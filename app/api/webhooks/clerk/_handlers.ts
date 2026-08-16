@@ -17,4 +17,4 @@ export {
   handleUserCreated,
   handleUserUpdated,
   handleSignInAttemptFailed,
-} from "./route";
+} from "./_webhook";

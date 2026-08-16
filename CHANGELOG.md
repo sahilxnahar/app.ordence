@@ -1,3 +1,32 @@
+# v1.53.0-alpha — THE BUILD FIX, AND THE GATE THAT SHOULD HAVE CAUGHT IT
+
+**Repo: `app.ordence`** · 🔴 **SQL: unchanged from v1.52.0 (`0086`–`0090`, all BEFORE the push)** · ⚠️ **No new variables**
+
+- 🔴 **RAILWAY BUILD FAILURE FIXED.** `app/api/webhooks/clerk/route.ts`
+  exported three handler functions so `_handlers.ts` could re-export them
+  for the evidence tests. A Next.js `route.ts` may export only the HTTP
+  verbs and Next's config fields; anything else is a **build error**, and
+  the deploy went red.
+  ⚠️ **Every gate was green when it shipped.** `tsc --noEmit` passed, all
+  4,467 tests passed. That rule is enforced by types Next.js GENERATES
+  during `next build`, so it does not exist until a full production build
+  runs — and that build is OOM-killed on the machines this is developed
+  on. The failure could only surface on Railway.
+  **The implementation did not move.** It is `_webhook.ts`, byte for byte;
+  `route.ts` is now three lines that re-export `POST`.
+- ⭐ **NEW SIXTEENTH GATE: `check:route-exports`.** Static, no build, no
+  memory. It reads every route file's exports against the list Next.js
+  accepts. Verified by reintroducing the exact defect: it reports
+  `"handleUserCreated" is not a valid Route export field` and exits 1.
+- 🔴 **The rate limiter was importing the Node build of `@upstash/redis`
+  into the Edge Runtime.** `next build` warned that `process.version` is
+  unsupported there, and a warning is why it survived: the build goes
+  green and the per-tenant limit is the thing that silently does not work
+  in the runtime it was written for. Now `@upstash/redis/cloudflare`.
+- ⭐ **`check:boundaries` caught the consequence unprompted.** Once the
+  implementation left the route file it became an ordinary module, and the
+  census asked it to declare itself. It now imports `server-only`.
+- ⚠️ **Sixteen gates green. 128 test files, 4,467 passing.**
 # v1.52.0-alpha — THE MERGE AND THE THIRD GUARD PUT BACK
 
 **Repo: `app.ordence`** · 🔴 **SQL: `0086`, `0087`, `0088`, `0089`, `0090` — all BEFORE the code push** · ⚠️ **No new variables**

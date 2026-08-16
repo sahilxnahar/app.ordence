@@ -171,7 +171,12 @@ describe("check:rls-writes is wired in", () => {
 /* ================================================================== */
 
 describe("the Clerk webhook writes inside a scope", () => {
-  const hook = read("app/api/webhooks/clerk/route.ts");
+  // ⚠️ READS `_webhook.ts`, NOT `route.ts`. The implementation moved out
+  // of the route file because Next.js refuses any non-route export from a
+  // `route.ts`, and the evidence handlers had to be importable. The route
+  // file is now a three-line wrapper; the code this test is about is in
+  // `_webhook.ts`.
+  const hook = read("app/api/webhooks/clerk/_webhook.ts");
 
   /**
    * 🔴 THE ONE THAT MATTERS MOST. Without this, a correctly configured

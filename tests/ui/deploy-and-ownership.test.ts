@@ -331,7 +331,10 @@ describe("the deployment documents", () => {
 /* ================================================================== */
 
 describe("workspace ownership", () => {
-  const hook = read("app/api/webhooks/clerk/route.ts");
+  // ⚠️ READS `_webhook.ts`. The implementation moved out of the
+  // route file because Next.js refuses any non-route export from a
+  // `route.ts`; the route file is now a three-line wrapper.
+  const hook = read("app/api/webhooks/clerk/_webhook.ts");
 
   /** The premise: only an owner can pay. */
   it("keeps billing:manage out of tenant_admin", () => {

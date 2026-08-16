@@ -45,7 +45,26 @@
  */
 
 import { Ratelimit } from "@upstash/ratelimit";
-import { Redis } from "@upstash/redis";
+/**
+ * ⚠️ `@upstash/redis/cloudflare`, NOT `@upstash/redis`.
+ *
+ * The default entrypoint resolves to `nodejs.mjs`, which touches
+ * `process.version`. This module is imported by `middleware.ts`, which
+ * runs in the Edge Runtime, and `next build` says so out loud:
+ *
+ *     A Node.js API is used (process.version at line: 240) which is not
+ *     supported in the Edge Runtime.
+ *     Import trace: ./node_modules/@upstash/redis/nodejs.mjs
+ *                   ./lib/edge/limits.ts
+ *
+ * ⭐ IT IS ONLY A WARNING, WHICH IS WHY IT SURVIVED. The build completes
+ * and the deploy goes green, and the rate limiter is the thing that
+ * silently does not work in the runtime it was written for , which is
+ * how a per-tenant limit becomes no limit at all with nothing to read.
+ * The `/cloudflare` build is the same client over `fetch`, which is what
+ * the Edge Runtime has.
+ */
+import { Redis } from "@upstash/redis/cloudflare";
 import type { PlanTier } from "@/db/schema/core";
 import {
   budgetFor,
