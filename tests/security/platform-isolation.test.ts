@@ -312,10 +312,11 @@ describe("the console is invisible to tenants", () => {
         c.query(
           `INSERT INTO platform_impersonation_sessions
              (tenant_id, tenant_slug, staff_id, actor_clerk_id, actor_email,
-              mode, scope, justification, expires_at)
+              mode, scope, justification, expires_at, break_glass_reason)
            VALUES ($1,$2,$3,'clerk_forged','forged@example.com','break_glass',
                    'read_only','forged evidence of an access event',
-                   now() + interval '10 minutes')`,
+                   now() + interval '10 minutes',
+                   'forged evidence of an access event that never happened')`,
           [fx.tenantA, fx.slugA, fx.staffId],
         ),
       ),
@@ -568,7 +569,10 @@ describe("impersonation evidence cannot be tampered with", () => {
 
   it("closing a session ONCE is permitted — the one legal transition", async () => {
     const sessionId = await createSession({ mode: "standing_consent", scope: "read_write" });
-    const result = await withoutTenant(async (c) =>
+    // Closing is a platform write, so it needs the platform-scope
+    // marker — the policy's WITH CHECK is `app_platform_scope()`
+    // (0079), not a blanket `IS NULL` any more.
+    const result = await asPlatform(async (c) =>
       c.query(
         `UPDATE platform_impersonation_sessions
          SET ended_at = now(), ended_reason = 'operator_ended'
@@ -581,7 +585,7 @@ describe("impersonation evidence cannot be tampered with", () => {
 
   it("⭐ a CLOSED session cannot be re-opened or re-closed", async () => {
     const sessionId = await createSession({ mode: "standing_consent", scope: "read_write" });
-    await withoutTenant(async (c) =>
+    await asPlatform(async (c) =>
       c.query(
         `UPDATE platform_impersonation_sessions
          SET ended_at = now(), ended_reason = 'operator_ended' WHERE id = $1`,
@@ -591,7 +595,7 @@ describe("impersonation evidence cannot be tampered with", () => {
 
     await expectGuard(
       () =>
-        withoutTenant(async (c) =>
+        asPlatform(async (c) =>
           c.query("UPDATE platform_impersonation_sessions SET ended_at = NULL WHERE id = $1", [
             sessionId,
           ]),
@@ -624,14 +628,18 @@ describe("session constraints are enforced by the engine", () => {
     // the customer's agreement may look and may not touch. A bug in
     // `resolveScope()` cannot widen it.
     const error = await expectError(() =>
-      withoutTenant(async (c) =>
+      // The INSERT must cross RLS, so it goes through the platform-scope
+      // marker (`WITH CHECK app_platform_scope()`); the constraint then
+      // catches the read-write break-glass combination the marker permits.
+      asPlatform(async (c) =>
         c.query(
           `INSERT INTO platform_impersonation_sessions
              (tenant_id, tenant_slug, staff_id, actor_clerk_id, actor_email,
-              mode, scope, justification, expires_at)
+              mode, scope, justification, expires_at, break_glass_reason)
            VALUES ($1,$2,$3,'clerk_x','x@ordence.example','break_glass','read_write',
                    'emergency access to a workspace that is on fire',
-                   now() + interval '15 minutes')`,
+                   now() + interval '15 minutes',
+                   'emergency access to a workspace that is on fire')`,
           [fx.tenantA, fx.slugA, fx.staffId],
         ),
       ),
@@ -642,7 +650,7 @@ describe("session constraints are enforced by the engine", () => {
 
   it("⭐ a session longer than the 60-minute ceiling is refused", async () => {
     const error = await expectError(() =>
-      withoutTenant(async (c) =>
+      asPlatform(async (c) =>
         c.query(
           `INSERT INTO platform_impersonation_sessions
              (tenant_id, tenant_slug, staff_id, actor_clerk_id, actor_email,
@@ -660,7 +668,7 @@ describe("session constraints are enforced by the engine", () => {
 
   it('a justification of "fix" is refused', async () => {
     const error = await expectError(() =>
-      withoutTenant(async (c) =>
+      asPlatform(async (c) =>
         c.query(
           `INSERT INTO platform_impersonation_sessions
              (tenant_id, tenant_slug, staff_id, actor_clerk_id, actor_email,
@@ -677,7 +685,7 @@ describe("session constraints are enforced by the engine", () => {
 
   it("a consented session must point at a consent row", async () => {
     const error = await expectError(() =>
-      withoutTenant(async (c) =>
+      asPlatform(async (c) =>
         c.query(
           `INSERT INTO platform_impersonation_sessions
              (tenant_id, tenant_slug, staff_id, actor_clerk_id, actor_email,

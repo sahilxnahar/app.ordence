@@ -173,13 +173,17 @@ beforeAll(async () => {
     );
 
     // Break-glass against the OTHER tenant, which has no consent at all.
+    // break_glass_reason is THE constraint column (`platform_impersonation_break_glass_is_explained`
+    // demands >= 50 characters of it); `justification` is a different, optional column.
     await c.query(
       `INSERT INTO platform_impersonation_sessions
          (id, tenant_id, tenant_slug, staff_id, actor_clerk_id, actor_email,
-          mode, scope, consent_id, justification, started_at, expires_at)
+          mode, scope, consent_id, justification, started_at, expires_at,
+          break_glass_reason)
        VALUES ($1,$2,$3,$4,$5,$6,'break_glass','read_only',NULL,
                'SEV-1 nobody at the customer is reachable and billing is down',
-               now(), now() + interval '15 minutes')`,
+               now(), now() + interval '15 minutes',
+               'SEV-1 nobody at the customer is reachable and billing is down')`,
       [breakGlassSession, tenantB, slugB, staffId, staffClerkId, staffEmail],
     );
 
@@ -534,14 +538,15 @@ describe("3. a session without consent is refused", () => {
           c.query(
             `INSERT INTO platform_impersonation_sessions
                (tenant_id, tenant_slug, staff_id, actor_clerk_id, actor_email,
-                mode, scope, justification, expires_at)
+                mode, scope, justification, expires_at, break_glass_reason)
              VALUES ($1,$2,$3,$4,$5,'break_glass','read_write',
                      'SEV-1 and I would like to be able to change things',
-                     now() + interval '15 minutes')`,
+                     now() + interval '15 minutes',
+                     'SEV-1 and I would like to be able to change things')`,
             [fx.tenantB, fx.slugB, fx.staffId, fx.staffClerkId, fx.staffEmail],
           ),
         ),
-      /breakglass_is_read_only|violates check constraint/i,
+      /breakglass_is_read_only/i,
     );
   });
 

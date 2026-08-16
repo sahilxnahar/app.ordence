@@ -55,6 +55,7 @@ import {
 } from "@/lib/payroll/payslip";
 import { formatDays } from "@/lib/leave/days";
 import {
+  CENTIDAYS_PER_DAY,
   loadRunAttendance,
   type RunAttendance,
   type RunLopRow,
@@ -556,7 +557,24 @@ export async function computeRun(
      * got is not.
      */
     const payableDays = payableDaysByEmployee.get(person.id) ?? days;
-    const lopDays = position?.chargedLopDays ?? 0;
+
+    /**
+     * 🔴🔴 THE FRACTION, NOT THE FLOOR. THIS LINE IS REAL MONEY.
+     *
+     * ⚠️ IT USED TO READ `position?.chargedLopDays ?? 0`, which is the
+     * WHOLE-DAY label the approval board prints. A half day of loss of
+     * pay floors to 0 there — so the register said half a day was lost,
+     * the board said half a day was lost, and the payslip charged
+     * nothing. The error is always in the employer's favour on the way
+     * in and the employee's on the way out, and it is invisible on both
+     * screens because both screens are showing the correct half day.
+     *
+     * `chargedLopCentidays` is the exact register figure in hundredths
+     * of a day. `buildPayslip` scales it straight back to centidays for
+     * the pro-rating, so dividing by a hundred here loses nothing: the
+     * 0.5 that goes in comes out as 0.5 and is charged as exactly half.
+     */
+    const lopDays = (position?.chargedLopCentidays ?? 0) / CENTIDAYS_PER_DAY;
 
     const built = buildPayslip({
       employee: {
@@ -673,9 +691,24 @@ function withAttendanceStory(
       "The recorded loss of pay exceeded the days this person was on the rolls this period and has been capped at those days. Nobody can lose more pay than they were owed.",
     );
   }
+  // ⭐ THE PART-DAY PROBLEM IS GONE, AND THAT IS THE FIX, NOT AN
+  // OMISSION. Before this, a half-day absence could not be pro-rated:
+  // the bridge floored it to whole days, the fraction was reported as a
+  // blocking problem, and a half-day absence could stop a payroll run.
+  // The payslip now computes in centidays, so the fraction that was
+  // once "unrepresentable" is charged as exactly its fraction —
+  // 29.5/30, never 29/30 — and nothing remains to be blocked.
+  // 🔴 AND THE GUARD BELOW IS A REAL BACKSTOP AGAIN.
+  // `unrepresentableCentidays` was hardcoded to 0 in the bridge for a
+  // while, which meant this refusal could not fire whatever the
+  // arithmetic did — a guard fed a constant is decoration. It is now
+  // DERIVED, by replaying the payslip's own centidays round trip in
+  // `chargeableLopCentidays()`. Zero is still the answer for every value
+  // this product can hold; the point is that nothing claims so. If it is
+  // ever non-zero, the agreement has broken and THAT is a problem:
   if (position.unrepresentableCentidays > 0) {
     problems.push(
-      `The register holds ${formatDays(position.totalLopCentidays)} days of loss of pay for this person, and only the ${position.chargedLopDays} whole days of it have been charged — the payslip calculation cannot yet pro-rate a part day. The remaining ${formatDays(position.unrepresentableCentidays)} of a day is NOT on this payslip. Record the part day as a whole day in the attendance register if that is what was meant, or leave this run unapproved.`,
+      `The register and the payslip no longer agree: the register holds ${formatDays(position.totalLopCentidays)} days of loss of pay but ${formatDays(position.chargedLopCentidays)} have been charged, and the payslip cannot yet account for the ${formatDays(position.unrepresentableCentidays)} of a day between them. Do not approve this run.`,
     );
   }
 
@@ -760,8 +793,16 @@ export async function writeRun(
        * naming the difference, so the run cannot be approved. Printing
        * the recorded figure here instead would state a deduction the
        * arithmetic did not make.
+       *
+       * 🔴 AND IN CENTIDAYS, NOT WHOLE DAYS. This used to print
+       * `chargedLopDays`, the floored whole-day label — so a payslip
+       * whose money was pro-rated by half a day stated `0.00` days of
+       * loss of pay in its own header, and every register built from
+       * `payslips.lop_days` (see `lib/registers/build.ts`) reported the
+       * half day as nothing. `lop_days` is `numeric(6,2)`, so
+       * `formatDays()` writes the fraction exactly: "0.50".
        */
-      lopDays: String(attendance?.chargedLopDays ?? 0),
+      lopDays: formatDays(attendance?.chargedLopCentidays ?? 0),
       grossMinor: r.grossEarningsMinor.toString(),
       pfWagesMinor: r.pfWagesMinor.toString(),
       employeePfMinor: r.employeePfMinor.toString(),

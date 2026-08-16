@@ -1,6 +1,6 @@
 /**
  * Ordence — The picker: which register, which rules, which period
- * Version: v1.48.0-alpha · Batch 76
+ * Version: v1.50.0-alpha · Batch 76
  *
  * ══════════════════════════════════════════════════════════════════════
  * ⭐ A PLAIN `GET` FORM, AND THAT IS A DECISION RATHER THAN LAZINESS

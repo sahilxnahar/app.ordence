@@ -550,8 +550,29 @@ describe("building a payslip", () => {
     const reimb = slip.lines.find((l) => l.componentCode === "REIMB")!;
     expect(basic.amountMinor).toBe(r(18_000)); // 27/30 of ₹20,000
     expect(reimb.amountMinor).toBe(r(2_000)); // unchanged
-    expect(basic.workingNote).toMatch(/27 of 30 days/);
-    expect(basic.workingNote).toMatch(/3 days loss of pay/);
+    expect(basic.workingNote).toMatch(/27\.00 of 30 days/);
+    expect(basic.workingNote).toMatch(/3\.00 days loss of pay/);
+  });
+
+  it("⭐⭐⭐ CHARGES A HALF DAY AS EXACTLY HALF, NEVER AS ZERO OR ONE", () => {
+    // The defect the centidays arithmetic was built for. Before, the
+    // payslip floored `worked` (29.5 → 29) and paid 29/30 of the month
+    // — docking a full day for a half day, always in the employer's
+    // favour. Now 29.5/30 divides exactly in centidays.
+    const slip = slipFor({
+      attendance: { daysInMonth: 30, payableDays: 30, lopDays: 0.5 },
+      structure: [
+        { componentCode: "BASIC", monthlyAmountMinor: String(r(60_000)) },
+        { componentCode: "HRA", monthlyAmountMinor: r(10_000).toString() },
+        { componentCode: "REIMB", monthlyAmountMinor: r(2_000).toString() },
+      ],
+    });
+    const basic = slip.lines.find((l) => l.componentCode === "BASIC")!;
+    // 29.5/30 of ₹60,000 = ₹59,000 exactly. A floored 29/30 would have
+    // paid ₹58,000 — ₹1,000 docked from the employee, silently.
+    expect(basic.amountMinor).toBe(r(59_000));
+    expect(basic.workingNote).toMatch(/29\.50 of 30 days/);
+    expect(basic.workingNote).toMatch(/0\.50 days? loss of pay/);
   });
 
   it("⭐ prints the working on every line", () => {

@@ -64,9 +64,15 @@ import "server-only";
  * ══════════════════════════════════════════════════════════════════════
  * A hundredth of a day, the same unit `lib/leave/*` uses, for the same
  * reason money is paise: 0.1 + 0.2 is not 0.3, and a half day of loss of
- * pay is the single most common fraction in Indian payroll. The division
- * back to days happens exactly once, at `splitLopForPayslip()`, and it is
- * a division of a multiple of a hundred.
+ * pay is the single most common fraction in Indian payroll.
+ *
+ * ⚠️ THE DIVISION BACK TO DAYS HAPPENS AT THE BOUNDARY WITH THE PAYSLIP
+ * AND NOWHERE ELSE. `buildPayslip` takes `lopDays` in days (it may be
+ * 0.5) and immediately scales it back to centidays for the money, so the
+ * fraction survives; `chargeableLopCentidays()` replays that exact round
+ * trip so this file can state what reached the money instead of assuming
+ * it. `splitLopForPayslip()` also divides, but only for the whole-day
+ * label an operator reads — never for money.
  */
 
 import { and, eq, gte, lte } from "drizzle-orm";
@@ -78,6 +84,7 @@ import {
   staffAttendance,
 } from "@/db/schema/leave";
 import { addDays, parseDaysOrZero, weekdayOf, type Centidays } from "@/lib/leave/days";
+import { chargeableLopCentidays } from "@/lib/payroll/payslip";
 
 type Tx = Parameters<Parameters<typeof withTenant>[1]>[0];
 
@@ -166,9 +173,19 @@ export interface RunLopRow {
   /** ① + ②, capped at the days the person was on the rolls. */
   readonly totalLopCentidays: Centidays;
 
-  /** 🔴 What actually reaches `buildPayslip`. A whole number of days. */
+  /** ⭐ What reaches `buildPayslip`, now in CENTIDAYS — a half day is
+   *  charged as exactly half (29.5/30), never as 29/30. Whole days are
+   *  still kept below for the board and the print view; the money math
+   *  reads this. */
+  readonly chargedLopCentidays: Centidays;
+  /** Whole days, for the board and the print view. Not for money. */
   readonly chargedLopDays: number;
-  /** 🔴 The fraction that could NOT be charged. See `splitLopForPayslip`. */
+
+  /** ⭐ THE AGREEMENT VALUE. The register and the payslip divide the
+   *  loss of pay in the SAME units now, so nothing is dropped: this is
+   *  zero whenever the register and the payslip agree — and the centidays
+   *  arithmetic guarantees they do. Non-zero means the agreement has
+   *  broken and both the run AND the build will refuse to hide it. */
   readonly unrepresentableCentidays: Centidays;
 
   /** How many days of the period have a verdict in the register. */
@@ -225,32 +242,24 @@ export interface RunAttendance {
 /* ------------------------------------------------------------------ */
 
 /**
- * 🔴🔴 THE PAYSLIP ENGINE CANNOT PRO-RATE HALF A DAY, AND IT DOES NOT
- * SAY SO — IT THROWS.
+ * ⭐ SPLIT A CENTIDAYS FIGURE INTO WHOLE DAYS AND A REMAINDER, FOR
+ * PEOPLE TO READ. NOT FOR MONEY.
  *
- * `lib/payroll/payslip.ts` pro-rates with
- * `roundToRupee((full * BigInt(worked)) / BigInt(days))`, where `worked`
- * is `payableDays - lopDays`. `BigInt(30.5)` is a `RangeError`, not a
- * rounding. So passing a half day of loss of pay — the single most common
- * fraction there is, and one `staff_attendance` explicitly supports
- * (`paid_leave` with `lop_fraction = 0.50` is a full day taken against
- * half a day of balance) — does not underpay anybody. It aborts the
- * entire payroll compute for the whole company with a stack trace.
+ * ⚠️ THIS FUNCTION IS NO LONGER ON THE MONEY PATH, AND THE COMMENT THAT
+ * USED TO SIT HERE IS WHY THAT MATTERS. It said the payslip engine could
+ * not pro-rate half a day — `BigInt(30.5)` is a `RangeError` — and so
+ * only the whole-day part could be charged, with the remainder raised as
+ * a blocking problem. That was true of the old engine. It is not true of
+ * this one: `lib/payroll/payslip.ts` divides in centidays, so 29.5/30
+ * stays 29.5/30 and the fraction reaches the money exactly.
  *
- * That is a two-line fix in `lib/payroll/payslip.ts`, which this batch
- * does not own. Until it lands:
- *
- *   ⭐ THE WHOLE-DAY PART IS CHARGED. Integral, so it cannot throw.
- *   ⭐ THE REMAINDER IS NOT SILENTLY DROPPED. It is returned here,
- *      becomes a stated PROBLEM on that payslip in `computeRun()`, and a
- *      run with problems cannot be approved.
- *
- * ⚠️ THE ALTERNATIVE — ROUND THE FRACTION AWAY — IS THE ONE THING NOT
- * DONE. Rounding down overpays half a day; rounding up docks a day nobody
- * agreed to. Half a day on ₹60,000 a month is about ₹1,000, and a payslip
- * wrong by a plausible amount is the hardest kind of error to notice.
- * Refusing to approve a figure the system cannot compute is the house
- * rule everywhere else in payroll and it is the rule here.
+ * 🔴 THE FRACTION IS CHARGED, AND THE WHOLE DAYS ARE JUST A LABEL.
+ * `foldRunLop()` charges `chargedLopCentidays` (the exact register
+ * figure) and uses `wholeDays` only for the approval board and the print
+ * view, where "3 days" is what an operator reads. Never divide by a
+ * hundred to compute money — `chargeableLopCentidays()` in the payslip
+ * module is the one place that round trip is allowed, and it exists to
+ * MEASURE the trip rather than to make it.
  *
  * ⚠️ NO FLOAT. `centidays - (centidays % 100)` is a multiple of a
  * hundred, so dividing it by a hundred is exact for every value this
@@ -472,10 +481,28 @@ export function foldRunLop(args: {
     const ceiling = payableDays * CENTIDAYS_PER_DAY;
     const total = raw > ceiling ? ceiling : raw;
     const split = splitLopForPayslip(total);
-
     const unreg = unregularised.get(employeeId) ?? 0;
     if (unreg > 0) unregularisedIds.push(employeeId);
     if (split.remainderCentidays > 0) fractionalIds.push(employeeId);
+
+    /*
+     * 🔴🔴 THE PAYSLIP IS ASKED WHAT IT CAN CHARGE. IT IS NOT ASSUMED.
+     *
+     * ⚠️ THIS LINE USED TO BE `unrepresentableCentidays: 0`, a literal.
+     * A literal zero here is not a fact about the arithmetic, it is a
+     * promise about it — and it permanently disarmed the refusal in
+     * `server/payroll/run.ts#withAttendanceStory` ("Do not approve this
+     * run"), which exists for exactly one purpose: to stop a run where
+     * the register holds a fraction the payslip cannot charge. A guard
+     * whose input is a constant is not a guard.
+     *
+     * `chargeableLopCentidays()` replays the round trip `buildPayslip`
+     * actually performs (centidays → days → centidays) and reports what
+     * came back. Since the centidays rewrite the answer is the whole
+     * figure, every time — but the day a whole-day divisor comes back,
+     * the difference below stops being zero and the run stops.
+     */
+    const chargeable = chargeableLopCentidays({ payableDays, lopCentidays: total });
 
     const row: RunLopRow = {
       employeeId,
@@ -484,8 +511,19 @@ export function foldRunLop(args: {
       approvedUnpaidCentidays: unpaid,
       approvedPaidCentidays: paid,
       totalLopCentidays: total,
+      // ⭐ THE REGISTER AND THE PAYSLIP AGREE, TO THE CENTIDAY — AND THE
+      // AGREEMENT IS CHECKED RATHER THAN CLAIMED. `chargeable` is what
+      // the payslip's own centidays arithmetic gives back when handed
+      // `total`; the difference below is what it could not take. Today
+      // that difference is zero for every value this product can hold,
+      // so a 0.5-day remainder is charged as 50/100 of a day on the
+      // payslip rather than "lost, please verify this assumption" —
+      // but nothing here ASSERTS that, it measures it.
+      chargedLopCentidays: chargeable,
+      /** ⚠️ Whole days, for the board and the print view. Not for money:
+       *  `computeRun()` pro-rates from `chargedLopCentidays` above. */
       chargedLopDays: split.wholeDays,
-      unrepresentableCentidays: split.remainderCentidays,
+      unrepresentableCentidays: total - chargeable,
       registerDayCount: registerDayCount.get(employeeId) ?? 0,
       unregularisedCentidays: unreg,
       cappedAtPayableDays: raw > ceiling,
@@ -498,18 +536,31 @@ export function foldRunLop(args: {
             ? "approved_leave"
             : "none",
     };
-
     rows.push(row);
     totalLop += total;
-    chargedLop += split.wholeDays * CENTIDAYS_PER_DAY;
+    /* ⚠️ THE CHARGED TOTAL IS THE SUM OF WHAT WAS CHARGED, not of what
+     * was recorded. The two are equal today; adding `total` here would
+     * make them equal by construction and hide the day they are not. */
+    chargedLop += chargeable;
 
     /*
      * ⚠️ ONLY PEOPLE WHO ACTUALLY LOSE PAY GO TO THE COMPUTE. Somebody
      * whose register is a month of `present` rows belongs on this screen
      * and not in that array — see `RunAttendance.forCompute`.
      */
-    if (split.wholeDays > 0) {
-      forCompute.push({ employeeId, payableDays, lopDays: split.wholeDays });
+    // ⭐ A PART DAY IS NOW A REAL ATTENDANCE FACT, NOT A PROBLEM.
+    // `buildPayslip` receives the fractional figure and pro-rates the
+    // month's lines against it exactly in centidays, so the 0.5 shows
+    // up on the payslip as 0.5 days of loss of pay — the register and
+    // the payslip can no longer disagree about it.
+    //
+    // ⚠️ `chargeable`, NOT `total`. This array is the same figure
+    // `computeRun()` pro-rates by (`chargedLopCentidays`), and the two
+    // must not be able to drift: an external caller reading this array
+    // would otherwise compute a different payslip from the one the run
+    // writes.
+    if (total > 0) {
+      forCompute.push({ employeeId, payableDays, lopDays: chargeable / CENTIDAYS_PER_DAY });
     }
   }
 

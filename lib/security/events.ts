@@ -85,6 +85,23 @@ export const SECURITY_EVENT_TYPES = [
   "auth.login_failed",
   "auth.brute_force_suspected",
   "auth.session_anomaly",
+  /**
+   * Wave 8 (Hardening II): an identity exists after a Clerk sign-up —
+   * distinct from the user row the tenant provisions, because this fires
+   * before any workspace exists and therefore BEFORE any RLS context.
+   */
+  "auth.account_created",
+  /**
+   * Wave 8: Clerk rotated a credential. The session that performed the
+   * change is revoked by Clerk's own SDK; the EVENT is recorded so a
+   * reviewer can see the rotation and what else changed with it.
+   */
+  "auth.password_changed",
+  /**
+   * Wave 8: a lockout engaged or re-engaged after repeated failures —
+   * the lock itself, not the failures (those are `auth.login_failed`).
+   */
+  "auth.account_locked",
 
   /* --- Webhooks (public, unauthenticated surfaces) ----------------- */
   /** HMAC did not verify. The single most important row in this table. */
@@ -183,6 +200,9 @@ export const DEFAULT_SEVERITY: Record<SecurityEventType, SecuritySeverity> = {
   "auth.login_failed": "info",
   "auth.brute_force_suspected": "critical",
   "auth.session_anomaly": "warning",
+  "auth.account_created": "info",
+  "auth.password_changed": "info",
+  "auth.account_locked": "warning",
 
   "webhook.signature_invalid": "critical",
   "webhook.replay_suspected": "warning",
@@ -357,6 +377,9 @@ export const SECURITY_EVENT_LABELS: Record<SecurityEventType, string> = {
   "auth.login_failed": "Failed sign-in",
   "auth.brute_force_suspected": "Possible brute-force attempt",
   "auth.session_anomaly": "Unusual session behaviour",
+  "auth.account_created": "Account created via Clerk sign-up",
+  "auth.password_changed": "Password rotated — prior sessions suspect",
+  "auth.account_locked": "Account locked after repeated failures",
   "webhook.signature_invalid": "Webhook signature verification failed",
   "webhook.replay_suspected": "Possible webhook replay",
   "webhook.secret_missing": "Webhook signing secret not configured",

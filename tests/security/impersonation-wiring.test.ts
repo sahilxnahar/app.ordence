@@ -86,6 +86,31 @@ vi.mock("@/db", () => {
         };
       },
       /**
+       * The chain head read in `appendChainedAuditRow()`: an empty result
+       * means a brand-new chain, which is exactly the starting state the
+       * stamp tests need — the chained path completes with a single
+       * insert instead of degrading to the unchained fallback.
+       */
+      select() {
+        return {
+          from() {
+            return {
+              where() {
+                return {
+                  orderBy() {
+                    return {
+                      async limit() {
+                        return [];
+                      },
+                    };
+                  },
+                };
+              },
+            };
+          },
+        };
+      },
+      /**
        * Present so the REFUSAL path runs to completion rather than
        * falling into its own best-effort catch. A gate whose recording
        * throws still refuses — but a test that never exercised the

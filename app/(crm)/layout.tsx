@@ -40,7 +40,9 @@ import { Sidebar } from "@/components/layout/sidebar";
 import { IndustryProvider } from "@/components/layout/industry-provider";
 import { NotificationBell } from "@/components/layout/notification-bell";
 import { CommandBar } from "@/components/layout/command-bar";
-
+import { ThemeToggle } from "@/components/layout/theme-toggle";
+import { MobileSidebar, MobileMenuTrigger, SearchTriggerBridge } from "@/components/layout/mobile-sidebar";
+import { SearchTrigger } from "@/components/layout/search-trigger";
 export const dynamic = "force-dynamic";
 
 export default async function CrmLayout({
@@ -142,9 +144,15 @@ export default async function CrmLayout({
         the cost of it being here is one keydown listener.
       */}
       <CommandBar />
+      <SearchTriggerBridge />
 
       <div className="flex h-screen overflow-hidden">
         <Sidebar
+          sections={sections}
+          industryLabel={template.label}
+          tenantName={tenant.name}
+        />
+        <MobileSidebar
           sections={sections}
           industryLabel={template.label}
           tenantName={tenant.name}
@@ -153,6 +161,7 @@ export default async function CrmLayout({
         <div className="flex min-w-0 flex-1 flex-col">
           <header className="flex h-14 shrink-0 items-center justify-between border-b border-border px-5">
             <div className="flex items-center gap-3">
+              <MobileMenuTrigger />
               <OrganizationSwitcher
                 hidePersonal
                 afterSelectOrganizationUrl="/dashboard"
@@ -163,11 +172,32 @@ export default async function CrmLayout({
               <span className="hidden text-sm text-muted-foreground sm:inline">
                 {user.firstName ?? user.email}
               </span>
+              {/*
+                Dark mode toggle — Wave 8b (v1.50.0-alpha). The palette
+                choice is a user preference saved on the device; it is
+                shown here next to the identity controls because the top
+                bar is the one place every authenticated screen shares.
+              */}
+              <ThemeToggle />
               <UserButton />
             </div>
           </header>
+          {/*
+            Site search to the top — Wave 8b. The global command bar
+            (⌘K) opens from this control; see components/layout/
+            search-trigger.tsx for why it is a button and not a second
+            search implementation.
+          */}
+          <div className="flex shrink-0 items-center border-b border-border px-5 py-2">
+            <SearchTrigger />
+          </div>
 
-          <main className="flex-1 overflow-y-auto">{children}</main>
+          {/*
+            #main-content is the skip-link target: components/layout/
+            accessibility.tsx renders the skip anchor, and the anchor's
+            href must resolve to exactly this id.
+          */}
+          <main id="main-content" className="flex-1 overflow-y-auto">{children}</main>
         </div>
       </div>
     </IndustryProvider>

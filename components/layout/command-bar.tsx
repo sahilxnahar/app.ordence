@@ -129,6 +129,13 @@ export function CommandBar() {
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
+  /* ---- SearchTrigger: the visible top-bar control opens this palette */
+  useEffect(() => {
+    const handler = () => setOpen(true);
+    window.addEventListener("ordence:open-search", handler);
+    return () => window.removeEventListener("ordence:open-search", handler);
+  }, []);
+
   /* ---- Reset on close --------------------------------------------- */
   useEffect(() => {
     if (!open) {

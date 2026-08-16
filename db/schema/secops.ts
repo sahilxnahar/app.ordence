@@ -3,7 +3,17 @@
  * Version: v0.12.0-alpha
  *
  * ══════════════════════════════════════════════════════════════════════
- * ONE TABLE. THE ARGUMENT FOR THAT IS THE POINT OF THIS HEADER.
+ * ONE TABLE — UNTIL WAVE 8 (v1.50.0-alpha).
+ *
+ * The original argument above still stands for everything that was
+ * considered at the time, but Hardening II added `login_lockouts`: a
+ * lockout is not a user action, not an anomaly, and not a trip — it is
+ * a second kind of perimeter state with its own RLS shape (tenant-
+ * attributed reads, platform-flagged writes) and its own lifetime
+ * semantics (expired rows are kept as evidence). Merging it into
+ * `security_events` would have forced a decision column onto every
+ * alert row and blurred the stream the SIEM consumes. Splitting it out
+ * cost one table and preserved both arguments.
  * ══════════════════════════════════════════════════════════════════════
  * Phase 20 adds `security_events` and nothing else. The obvious second and
  * third tables were both considered and both rejected:
@@ -94,6 +104,7 @@ import {
   jsonb,
   integer,
   index,
+  unique,
 } from "drizzle-orm/pg-core";
 import { relations, sql } from "drizzle-orm";
 import { tenants, users } from "./core";
@@ -247,3 +258,64 @@ export const securityEventsRelations = relations(securityEvents, ({ one }) => ({
 
 export type SecurityEventRow = typeof securityEvents.$inferSelect;
 export type NewSecurityEventRow = typeof securityEvents.$inferInsert;
+
+/* ------------------------------------------------------------------ */
+/* LOGIN LOCKOUTS (Wave 8 / SQL 0089)                                  */
+/* ------------------------------------------------------------------ */
+
+/**
+ * The platform's own failed-attempt lockout evidence.
+ *
+ * Clerk enforces its hosted sign-in lockout natively; this table exists
+ * because the security census demands a DATABASE FACT a reviewer can
+ * query — which identifier was locked, when, after how many failures,
+ * and when the window expires — and because anything the platform itself
+ * serves (API surfaces, worker retries) must re-check a lockout against
+ * its own data rather than trusting a third-party widget's memory.
+ *
+ * One row per failing identifier, upserted by lib/security/lockout.ts.
+ * `lockedUntil IS NULL` means "not currently locked"; a non-NULL value
+ * in the past means the window has expired but the row remains — an
+ * ended lockout is still audit evidence, and the administrator release
+ * action is the only path that clears the window.
+ *
+ * RLS (SQL 0089): tenant-attributed rows are readable only by that
+ * tenant; every write requires the opt-in platform scope, the same
+ * deliberate marker as security_events. The application role holds
+ * table-level SELECT plus column-granted INSERT/UPDATE on the lockout
+ * API's fields — no DELETE, ever.
+ */
+export const loginLockouts = pgTable(
+  "login_lockouts",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    /**
+     * The failing identifier, lowercased. Collisions on case are collapsed
+     * by the UNIQUE constraint at the SQL level; normalizing here keeps the
+     * drizzle reads consistent with that reality.
+     */
+    email: text("email").notNull(),
+    failedAttempts: integer("failed_attempts").notNull().default(0),
+    /** NULL means "not currently locked". A past value means "expired, evidence kept". */
+    lockedUntil: timestamp("locked_until", { withTimezone: true }),
+    lockedReason: text("locked_reason"),
+    lastFailureAt: timestamp("last_failure_at", { withTimezone: true }),
+    tenantId: uuid("tenant_id").references(() => tenants.id, { onDelete: "set null" }),
+    actorUserId: uuid("actor_user_id").references(() => users.id, { onDelete: "set null" }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (t) => ({
+    emailUnique: unique("login_lockouts_email_unique").on(t.email),
+    lastFailureIdx: index("login_lockouts_last_failure_idx").on(t.lastFailureAt),
+    lockedIdx: index("login_lockouts_locked_idx").on(t.lockedUntil),
+  }),
+);
+
+export const loginLockoutsRelations = relations(loginLockouts, ({ one }) => ({
+  tenant: one(tenants, { fields: [loginLockouts.tenantId], references: [tenants.id] }),
+  actor: one(users, { fields: [loginLockouts.actorUserId], references: [users.id] }),
+}));
+
+export type LoginLockoutRow = typeof loginLockouts.$inferSelect;
+export type NewLoginLockoutRow = typeof loginLockouts.$inferInsert;

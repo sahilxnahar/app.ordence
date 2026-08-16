@@ -340,7 +340,9 @@ export async function recordSecurityEvent(
 
     return true;
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
+    const message = err instanceof Error
+      ? (err.cause instanceof Error ? `${err.message} :: ${err.cause.message}` : err.message)
+      : String(err);
 
     // Loud, structured, and it names the event that was lost — so the gap in
     // the table has a corresponding line in the log drain.

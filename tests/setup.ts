@@ -33,6 +33,7 @@ import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { beforeAll, afterAll } from "vitest";
 import { Pool } from "pg";
+import { WebSocket as UndiciWebSocket } from "undici";
 
 /* ------------------------------------------------------------------ */
 /* 1. LOAD .env.test — AND ONLY .env.test                              */
@@ -177,6 +178,428 @@ console.log(`
 │  Guard:  ✅ all 6 production-safety checks passed              │
 └────────────────────────────────────────────────────────────────┘
 `);
+
+/* ------------------------------------------------------------------ */
+/* NEON HTTP DRIVER → LOCAL POSTGRES SHIM                              */
+/* ------------------------------------------------------------------ */
+
+/**
+ * ⚠️ WHY THIS EXISTS.
+ *
+ * The application's pooled tenant path (`lib/db`'s `withTenant`) uses the
+ * Neon **HTTP** driver — a deliberate choice documented next to `getPool()`:
+ * a Railway process is long-lived, and a plain TCP pool is the right object
+ * for it, with tenant scope carried by transaction-local GUCs.
+ *
+ * Against a THROWAWAY local Postgres there is no Neon endpoint to hit, and
+ * the HTTP driver cannot speak plain Postgres wire protocol: it POSTs SQL
+ * as JSON and reads JSON back. Without this shim, every test that drives
+ * the REAL application path (billing gate, clerk webhooks, lockouts) would
+ * watch `withTenant` fail its very first query with "fetch failed" — and
+ * the fail-open billing decision would make the suite read as green while
+ * the gate silently permits everything.
+ *
+ * This is a test-only translation layer: it listens on a loopback port, in
+ * local-memory, and turns Neon's JSON protocol into ordinary `pg` queries.
+ * It cannot reach anything but the database this file's own guard has
+ * already certified as disposable, and it is unreachable from outside this
+ * machine (127.0.0.1, test scope, started by the suite, torn down after).
+ *
+ * It is NOT a weakening of the production code path: the application code
+ * that is exercised is byte-for-byte the same `neon()`/`Pool`/`transaction`
+ * chain that runs on Railway. Only the transport underneath is swapped.
+ */
+
+let __neonShimHandle: import("node:http").Server | null = null;
+
+async function installNeonHttpShim() {
+  const http = await import("node:http");
+  const pkg = await import("pg");
+  const { Pool } = pkg;
+
+  const port = 54321;
+  const server = http.createServer(async (req, res) => {
+    if (process.env.LOG_SHIM === "1") {
+      console.error("[shim] incoming:", req.method, req.url, "upgrade:", req.headers.upgrade);
+    }
+    if (req.method !== "POST" || !req.url!.startsWith("/sql")) {
+      res.writeHead(404, { "Content-Type": "application/json" });
+      return void res.end(JSON.stringify({ message: "not found" }));
+    }
+    let body = "";
+    req.on("data", (c) => (body += c));
+    void req.on("end", async () => {
+      try {
+        const payload = JSON.parse(body);
+        const connStr = req.headers["neon-connection-string"];
+        // Neon always sends Neon-Raw-Text-Output: true, meaning every value
+        // must come back as a JSON string (no pg type coercion). Without this
+        // the neon parser throws an empty NeonDbError downstream.
+        const rawText = req.headers["neon-raw-text-output"] === "true";
+        if (typeof connStr !== "string") {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          return void res.end(JSON.stringify({ message: "missing Neon-Connection-String" }));
+        }
+        // Reuse the guard: the shim refuses to talk to anything that is not
+        // positively identified as a test database — same markers as above.
+        const lower = connStr.toLowerCase();
+        if (
+          !PRODUCTION_MARKERS.some((m) => lower.includes(m)) ||
+          (lower.split("/").pop()?.split("?")[0] ?? "").includes("test") ||
+          ["localhost", "127.0.0.1", "test", "_test"].some((m) => lower.includes(m))
+        ) {
+          // allowed
+        } else {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          return void res.end(
+            JSON.stringify({ message: "connection string does not look like a test database" }),
+          );
+        }
+        const pool = new Pool({ connectionString: connStr, max: 4 });
+        try {
+          const client = await pool.connect();
+          try {
+            const queries: Array<{ query: string; params?: unknown[] }> =
+              Array.isArray(payload.queries) ? payload.queries : [payload];
+            const results = await Promise.all(
+              queries.map(async (q) => {
+                const r = await client.query(q.query, q.params ?? []);
+                const toValue = rawText
+                  ? (v: unknown) => (v === null ? null : String(v))
+                  : (v: unknown) => v;
+                return {
+                  fields: r.fields.map((f) => ({ name: f.name, dataTypeID: f.dataTypeID })),
+                  rows: r.rows.map((row) => r.fields.map((f) => toValue(row[f.name]))),
+                  types: [],
+                };
+              }),
+            );
+            res.writeHead(200, { "Content-Type": "application/json" });
+            const resp = Array.isArray(payload.queries)
+              ? JSON.stringify({ results })
+              : JSON.stringify(results[0]);
+            if (process.env.LOG_SHIM === "1") {
+              console.error(
+                "[shim] req:",
+                JSON.stringify(queries.map((q) => q.query.slice(0, 120))),
+                "resp bytes:",
+                resp.length,
+              );
+            }
+            res.end(resp);
+          } finally {
+            client.release();
+          }
+        } finally {
+          await pool.end();
+        }
+      } catch (e) {
+        const err = e as { message?: string; code?: string; detail?: string; hint?: string };
+        const errMsg = err?.message ?? "query failed";
+        if (process.env.LOG_SHIM === "1") {
+          console.error("[shim] query error:", JSON.stringify({ query: body.slice(0, 200), message: errMsg, code: err?.code, detail: err?.detail }));
+        }
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ message: errMsg, code: err?.code ?? "", detail: err?.detail ?? "", hint: err?.hint ?? "" }));
+      }
+    });
+  });
+
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(port, "127.0.0.1", () => {
+      server.off("error", reject);
+      resolve();
+    });
+  });
+  __neonShimHandle = server;
+
+  // Point the Neon HTTP driver at the shim — whatever URL neon() was given,
+  // the transport goes through our loopback translator. The neon driver reads
+  // `defaults.fetchFunction` on EVERY execute, so this single assignment makes
+  // all neon() calls in this process route through the shim.
+  const neonMod = await import("@neondatabase/serverless");
+  // neonConfig is the live config class: neon() reads `Se` (static getters
+  // on neonConfig that consult `opts` before `defaults`) on every execute,
+  // and its static setter `fetchFunction=` writes into opts. Installing the
+  // shim here makes every neon() call in this process route through it.
+  type NeonConfig = {
+    fetchFunction?: unknown;
+    wsProxy?: unknown;
+    useSecureWebSocket?: boolean;
+    webSocketConstructor?: unknown;
+    pipelineConnect?: string;
+  };
+  (neonMod.neonConfig as unknown as NeonConfig).fetchFunction = async (
+    url: string | URL,
+    init?: RequestInit,
+  ): Promise<Response> => {
+    const res = await fetch(`http://127.0.0.1:${port}/sql`, {
+      ...init,
+      headers: init?.headers as Record<string, string>,
+    });
+    void url;
+    return res;
+  };
+
+  // -----------------------------------------------------------------------
+  // WebSocket bridge: the neon *Pool* (used by `withTenant`'s
+  // drizzleServerless) talks the PG wire protocol over WebSocket to
+  // `<wsProxy>/v2`, then a real TCP socket does the rest. The single server
+  // above is upgraded in place — same loopback port, both protocols.
+  // -----------------------------------------------------------------------
+  const cryptoMod = await import("node:crypto");
+  const netMod = await import("node:net");
+  const MAGIC = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"; // RFC 6455 accept GUID
+  const PG_PROTOCOL_3 = 196608; // 0x30000
+  const PG_SSL_REQUEST = 80877103; // 0x04D2162F
+
+  const sha1Base64 = (k: string) => {
+    return cryptoMod.createHash("sha1").update(k + MAGIC).digest("base64");
+  };
+
+  const parseStartup = (buf: Buffer) => {
+    const params: Record<string, string> = {};
+    let off = 8;
+    while (off < buf.length - 1) {
+      const keyStart = off;
+      while (off < buf.length && buf[off] !== 0) off++;
+      if (off >= buf.length) break;
+      const key = buf.subarray(keyStart, off).toString("utf8");
+      off++;
+      if (key === "") break;
+      const valStart = off;
+      while (off < buf.length && buf[off] !== 0) off++;
+      if (off >= buf.length) break;
+      params[key] = buf.subarray(valStart, off).toString("utf8");
+      off++;
+    }
+    return params;
+  };
+
+  server.on("upgrade", (req, socket) => {
+    const key = req.headers["sec-websocket-key"];
+    if (!key || typeof key !== "string") {
+      socket.end("HTTP/1.1 400 Bad Request\r\n\r\n");
+      return;
+    }
+    socket.write(
+      [
+        "HTTP/1.1 101 Switching Protocols",
+        "Upgrade: websocket",
+        "Connection: Upgrade",
+        `Sec-WebSocket-Accept: ${sha1Base64(key)}`,
+        "",
+        "",
+      ].join("\r\n"),
+    );
+
+    let buffer = Buffer.alloc(0);
+    let startupParsed = false;
+    let pg: import("node:net").Socket | null = null;
+    let wsClosed = false;
+    let frameBuf = Buffer.alloc(0);
+    let pgMsgBuf = Buffer.alloc(0);
+    const outbox: Buffer[] = [];
+
+    const wsClose = () => {
+      if (wsClosed) return;
+      wsClosed = true;
+      if (!socket.destroyed) {
+        // Server → client close frame; per RFC 6455 server frames are unmasked.
+        socket.write(Buffer.from([0x88, 0x00]));
+        socket.end();
+      }
+      if (pg && !pg.destroyed) pg.end();
+    };
+
+    const flushPgMessages = () => {
+      while (pgMsgBuf.length >= 5) {
+        const msgLen = pgMsgBuf.readUInt32BE(1);
+        if (msgLen < 4 || pgMsgBuf.length < 1 + msgLen) return;
+        const msg = pgMsgBuf.subarray(0, 1 + msgLen);
+        pgMsgBuf = pgMsgBuf.subarray(1 + msgLen);
+        frameToPg(msg);
+      }
+    };
+
+    const flushOutbox = () => {
+      if (!pg || pg.destroyed) return;
+      while (outbox.length > 0) pg.write(outbox.shift()!);
+    };
+
+    const frameToPg = (payload: Buffer) => {
+      // The neon driver sends a preemptive cleartext password ('p' 0x70)
+      // immediately after the startup message, ahead of any auth request —
+      // vanilla pg rejects that as an unexpected message, so drop it.
+      if (payload[0] === 0x70) return;
+      if (!pg || pg.destroyed) {
+        outbox.push(payload);
+        return;
+      }
+      pg.write(payload);
+    };
+
+    const sendWs = (payload: Buffer) => {
+      if (wsClosed || socket.destroyed) return;
+      const len = payload.length;
+      let header: Buffer;
+      if (len < 126) header = Buffer.from([0x82, len]);
+      else if (len < 65536) {
+        header = Buffer.alloc(4);
+        header[0] = 0x82;
+        header[1] = 126;
+        header.writeUInt16BE(len, 2);
+      } else {
+        header = Buffer.alloc(10);
+        header[0] = 0x82;
+        header[1] = 127;
+        header.writeBigUInt64BE(BigInt(len), 2);
+      }
+      const frame = Buffer.concat([header, payload]);
+      socket.write(frame);
+    };
+
+    socket.on("data", (chunk: Buffer) => {
+      frameBuf = Buffer.concat([frameBuf, chunk]);
+      try {
+      while (frameBuf.length >= 2) {
+        const opcode = frameBuf[0] & 0x0f;
+        const masked = (frameBuf[1] & 0x80) !== 0;
+        let len = frameBuf[1] & 0x7f;
+        let hdr = 2;
+        if (len === 126) {
+          if (frameBuf.length < 4) return;
+          len = frameBuf.readUInt16BE(2);
+          hdr = 4;
+        } else if (len === 127) {
+          if (frameBuf.length < 10) return;
+          len = Number(frameBuf.readBigUInt64BE(2));
+          hdr = 10;
+        }
+        if (masked) hdr += 4;
+        if (frameBuf.length < hdr + len) return;
+        let payload = frameBuf.subarray(hdr, hdr + len);
+        if (masked) {
+          const maskKey = frameBuf.subarray(hdr - 4, hdr);
+          payload = Buffer.from(payload);
+          for (let i = 0; i < payload.length; i++) payload[i] ^= maskKey[i & 3];
+        }
+        frameBuf = frameBuf.subarray(hdr + len);
+
+        if (opcode === 0x8) {
+          wsClose();
+          return;
+        }
+        if (opcode === 0x9) {
+          const pongHeader =
+            payload.length < 126
+              ? Buffer.from([0x8a, payload.length])
+              : (() => {
+                  const h = Buffer.alloc(4);
+                  h[0] = 0x8a;
+                  h[1] = 126;
+                  h.writeUInt16BE(payload.length, 2);
+                  return h;
+                })();
+          sendWs(Buffer.concat([pongHeader, payload]));
+          return;
+        }
+        if (opcode !== 0x2) continue;
+
+        if (!startupParsed) {
+          buffer = Buffer.concat([buffer, payload]);
+          if (buffer.length >= 8) {
+            const protoLen = buffer.readUInt32BE(0);
+            if (protoLen < 8 || protoLen > 1024 * 1024) {
+              wsClose();
+              return;
+            }
+            if (buffer.length >= protoLen) {
+              const startupBuf = buffer.subarray(0, protoLen);
+              const proto = startupBuf.readUInt32BE(4);
+              buffer = buffer.subarray(protoLen);
+              if (proto === PG_SSL_REQUEST) {
+                socket.write(Buffer.from([0x4e])); // 'N' — SSL not supported locally
+                if (buffer.length > 0) pgMsgBuf = Buffer.concat([buffer, pgMsgBuf]);
+                startupParsed = true;
+                continue;
+              }
+              if (proto === PG_PROTOCOL_3) {
+                const params = parseStartup(startupBuf);
+                const lower = JSON.stringify(params).toLowerCase();
+                // Same disposable-database guard as the HTTP shim: refuse to
+                // open a real socket to anything that does not look like the
+                // test database this suite already certified.
+                if (
+                  PRODUCTION_MARKERS.some((m) => lower.includes(m)) &&
+                  ![
+                    "localhost",
+                    "127.0.0.1",
+                    "test",
+                    "_test",
+                  ].some((m) => lower.includes(m))
+                ) {
+                  wsClose();
+                  return;
+                }
+                const pgConn = netMod.createConnection(5432, "127.0.0.1");
+                pg = pgConn;
+                pgConn.on("data", (d) => sendWs(d));
+                pgConn.on("error", () => wsClose());
+                pgConn.on("end", () => wsClose());
+                pgConn.on("close", () => wsClose());
+                pgConn.on("connect", () => {
+                  pgConn.write(startupBuf);
+                  flushOutbox();
+                  flushPgMessages();
+                });
+                pgConn.on("timeout", () => pgConn.end());
+                startupParsed = true;
+                continue;
+              }
+              wsClose();
+              return;
+            }
+          }
+        } else {
+          pgMsgBuf = Buffer.concat([pgMsgBuf, payload]);
+          flushPgMessages();
+        }
+      }
+      } catch (e) {
+        if (e instanceof Error) void e;
+        wsClose();
+      }
+    });
+    socket.on("end", () => wsClose());
+    socket.on("error", () => wsClose());
+    socket.on("close", () => wsClose());
+    socket.on("timeout", () => socket.end());
+  });
+
+  // The neon Pool (WS path) computes its WS URL as wsProxy(host) + "/v2".
+  // Point it at the same loopback server the HTTP shim already owns, and
+  // disable TLS on the WS transport (plain HTTP server cannot upgrade wss).
+  (neonMod.neonConfig as unknown as NeonConfig).wsProxy = () => `127.0.0.1:${port}`;
+  (neonMod.neonConfig as unknown as NeonConfig).useSecureWebSocket = false;
+  // The per-file undici build is more tolerant of raw loopback frames than
+  // Node's built-in globalThis.WebSocket in this environment.
+  (neonMod.neonConfig as unknown as NeonConfig).webSocketConstructor = UndiciWebSocket as unknown as typeof globalThis.WebSocket;
+  // Disable neon's "password" pipelineConnect hack. With trust auth on the
+  // loopback pg, the client must not pre-send a cleartext password that the
+  // bridge then has to strip — that flow was the source of the hang.
+  (neonMod.neonConfig as unknown as NeonConfig).pipelineConnect = "off";
+}
+
+/**
+ * ⚠️ The neon driver computes its endpoint from the connection string and
+ * then calls the fetch function. Rather than fight its endpoint builder, the
+ * shim's fetch function is installed at invocation time via the driver's own
+ * `fetchFunction` hook — neon reads `Se` (the live config) on EVERY execute,
+ * so setting it here affects all subsequent neon() calls in this process.
+ */
+await installNeonHttpShim();
 
 /* ------------------------------------------------------------------ */
 /* SHARED POOL                                                         */

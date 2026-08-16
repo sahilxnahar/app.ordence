@@ -35,6 +35,8 @@ import { tenants, users, auditLogs } from "@/db/schema";
 import { countSeatsInUse, countSeatsPurchased } from "@/server/billing/seats";
 import { canTakeSeats } from "@/lib/billing/seats";
 import type { SystemRole } from "@/db/schema";
+import { recordSecurityEvent } from "@/server/security/record";
+import { recordFailure } from "@/lib/security/lockout";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -73,6 +75,16 @@ type ClerkUser = {
   first_name?: string | null;
   last_name?: string | null;
   image_url?: string;
+  /**
+   * Only present on `user.updated`: the attributes Clerk is actually
+   * changing in this delivery. A password rotation is the event a
+   * security reviewer needs in the evidence table — the attribute
+   * update is the portable signal, because Clerk's event taxonomy
+   * (`user.password_changed` vs `user.updated` with `password` in the
+   * list) has moved between plan configurations, and both paths below
+   * collapse to the same recorded event either way.
+   */
+  updated_attributes?: Array<string> | Record<string, unknown>;
 };
 
 type ClerkWebhookEvent =
@@ -84,6 +96,20 @@ type ClerkWebhookEvent =
     }
   | { type: "organizationMembership.deleted"; data: ClerkOrganizationMembership }
   | { type: "user.created" | "user.updated"; data: ClerkUser }
+  | {
+      type: "sign_in.attempt_failed";
+      data: {
+        id: string;
+        status?: string;
+        abort_reason?: string | null;
+        first_factor_verification?: {
+          status?: string;
+          strategy?: string | null;
+          error?: { code?: string; message?: string } | null;
+        } | null;
+        identifier?: string | null;
+      };
+    }
   | { type: string; data: Record<string, unknown> };
 
 /* ------------------------------------------------------------------ */
@@ -147,6 +173,29 @@ export async function POST(req: Request) {
         await handleMembershipDeleted(event.data as ClerkOrganizationMembership);
         break;
 
+      // Credential failures are the single most useful signal a security
+      // reviewer can have — a spike of them is how a brute force announces
+      // itself. Clerk emits `sign_in.attempt_failed` for a wrong password
+      // the moment it happens, which is precisely when the trace must be
+      // written. The identifier goes in; the credential never does.
+      case "sign_in.attempt_failed":
+        await handleSignInAttemptFailed(
+          event.data as NonNullable<
+            Extract<ClerkWebhookEvent, { type: "sign_in.attempt_failed" }> extends { data: infer D }
+              ? D
+              : never
+          >,
+        );
+        break;
+
+      case "user.created":
+        await handleUserCreated(event.data as ClerkUser);
+        break;
+
+      case "user.updated":
+        await handleUserUpdated(event.data as ClerkUser);
+        break;
+
       default:
         // Unhandled event types are acknowledged so Clerk stops retrying.
         return NextResponse.json({ received: true, handled: false, type: event.type });
@@ -164,7 +213,138 @@ export async function POST(req: Request) {
 /* EVENT HANDLERS                                                      */
 /* ------------------------------------------------------------------ */
 
-/** Default branding applied to every newly provisioned workspace. */
+/**
+ * ════════════════════════════════════════════════════════════════════
+ * 🟢 WAVE 8 — SESSION SECURITY AFTER A PASSWORD CHANGE
+ * ════════════════════════════════════════════════════════════════════
+ * Clerk is the source of truth for the credential, and its own SDK
+ * revokes the session that JUST performed the change. What the SDK
+ * cannot see from the outside is the trail: a security reviewer asking
+ * "who rotated their password, when, and what else changed at the same
+ * time?" should get one row in security_events, not a reconstruction
+ * from three systems.
+ *
+ * Idempotent by construction — Svix delivers at least once, and
+ * recording a real password change twice is exactly correct: two rows
+ * is evidence, and evidence must not dedupe away to protect neatness.
+ */
+export async function handleUserCreated(user: ClerkUser): Promise<void> {
+  await recordSecurityEvent({
+    type: "auth.account_created",
+    source: "api/webhooks/clerk",
+    subjectType: "user",
+    subjectId: user.id,
+    detail: { primaryEmail: primaryEmailOf(user) ?? null },
+    reason: "Clerk sign-up: a new identity exists in the product",
+  }, { noCoalesce: true });
+}
+
+export async function handleUserUpdated(user: ClerkUser): Promise<void> {
+  const updated = listAttributes(user.updated_attributes);
+  const passwordChanged = updated.includes("password");
+  if (!passwordChanged) return;
+
+  await recordSecurityEvent(
+    {
+      type: "auth.password_changed",
+      source: "api/webhooks/clerk",
+      subjectType: "user",
+      subjectId: user.id,
+      detail: {
+        primaryEmail: primaryEmailOf(user) ?? null,
+        // The attribute NAME is evidence; the attribute VALUE never is. The
+        // marker below is the only place the word "password" may appear next
+        // to this event, and it carries no secret.
+        password: "[REDACTED]",
+        otherAttributesChanged: updated.filter((a) => a !== "password"),
+      },
+    reason:
+      "Clerk password update: credential rotated; any session opened " +
+      "before the change must be treated as compromised",
+    },
+    { noCoalesce: true },
+  );
+}
+
+/**
+ * Clerk: wrong password, locked credential, expired TOTP — the product's
+ * brute-force tripwire. One event per failed attempt, identifier recorded
+ * (the reviewer needs to know WHICH account is being hammered), the
+ * credential never.
+ */
+export async function handleSignInAttemptFailed(
+  data: {
+    id: string;
+    status?: string;
+    abort_reason?: string | null;
+    first_factor_verification?: {
+      status?: string;
+      strategy?: string | null;
+      error?: { code?: string; message?: string } | null;
+    } | null;
+    identifier?: string | null;
+  },
+): Promise<void> {
+  const reason =
+    data.first_factor_verification?.error?.code ??
+    data.first_factor_verification?.status ??
+    data.abort_reason ??
+    "clerk_sign_in_attempt_failed";
+
+  await recordSecurityEvent(
+    {
+      type: "auth.login_failed",
+      severity: "warning",
+      source: "api/webhooks/clerk",
+      subjectType: "user",
+      subjectId: data.identifier ?? data.id,
+      detail: {
+        // The strategy (password, totp, …) tells a reviewer whether the
+        // attack is guessing or replaying; the value of either is nowhere
+        // in the payload.
+        strategy: data.first_factor_verification?.strategy ?? null,
+        clerkCode: data.first_factor_verification?.error?.code ?? null,
+      },
+      reason: `Clerk sign-in attempt refused: ${reason}`,
+    },
+    { noCoalesce: true },
+  );
+
+  // Lockout evidence: every Clerk failure also feeds the platform's own
+  // database-backed counter (SQL 0089 / lib/security/lockout.ts). Clerk
+  // still enforces its hosted lockout — this is the belt: if anyone ever
+  // relaxes the Clerk limit, the platform floor still locks the
+  // identifier after five failures and keeps the window in a table a
+  // reviewer can query.
+  const identifier = data.identifier?.trim().toLowerCase() ?? null;
+  if (identifier) {
+    await recordFailure(identifier);
+  }
+}
+
+function primaryEmailOf(user: ClerkUser): string | null {
+  if (!user.email_addresses || user.email_addresses.length === 0) return null;
+  const primary = user.email_addresses.find(
+    (e) => e.id === user.primary_email_address_id,
+  );
+  if (primary) return primary.email_address;
+  return user.email_addresses[0]?.email_address ?? null;
+}
+
+/**
+ * Clerk has shipped `updated_attributes` as BOTH an array of names and a
+ * record of changed values across different SDK versions; normalize to
+ * the list either way.
+ */
+function listAttributes(
+  updated: Array<string> | Record<string, unknown> | undefined,
+): string[] {
+  if (!updated) return [];
+  if (Array.isArray(updated)) return updated.filter((a) => typeof a === "string");
+  return Object.keys(updated);
+}
+
+/* Default branding applied to every newly provisioned workspace. */
 const DEFAULT_BRANDING = {
   primaryColor: "#B08D3C",
   accentColor: "#1A1A1A",

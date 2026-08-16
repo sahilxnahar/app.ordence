@@ -1847,7 +1847,18 @@ describe("the section catalogue", () => {
       "@/lib/sales/commission"
     );
     const gross = R(100_000);
-    const old = computeTds({ grossMinor: gross, hasPan: true, ytdGrossMinor: 0n });
+    // 2025-05-01: the same credit date resolveTdsRate() resolves against
+    // two lines below — rate (2%, current) and threshold (₹20,000, current)
+    // must come from the same day or the two engines are not comparing
+    // like for like. Picked after the April 2025 threshold rise so the
+    // section catalogue's imported CURRENT constant (₹20,000) and the
+    // date-resolved threshold agree.
+    const old = computeTds({
+      grossMinor: gross,
+      hasPan: true,
+      onDate: "2025-05-01",
+      ytdGrossMinor: 0n,
+    });
 
     const verdict = assessThresholdFor({
       section: "194H",
@@ -1863,7 +1874,7 @@ describe("the section catalogue", () => {
         panStatus: "valid",
         isSpecifiedPerson206ab: false,
       },
-      day: "2024-08-15",
+      day: "2025-05-01",
     });
     expect(tdsOn(verdict.chargeableBaseMinor, rate.rateBps!)).toBe(old.tdsMinor);
     expect(gross).toBeGreaterThan(TDS_194H_THRESHOLD_MINOR);

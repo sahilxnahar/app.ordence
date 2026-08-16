@@ -1,8 +1,18 @@
 /**
- * Ordence — ⭐⭐⭐ HALF-DAY LOP REGRESSION
- * Version: v1.48.0-alpha · Track 1
+ * Ordence — ⭐⭐⭐ HALF-DAY LOP REGRESSION (centidays rewrite)
+ * Version: v1.50.0-alpha
  *
- * Tests the fix for the half-day LOP BigInt RangeError.
+ * Tests the centidays fix for half-day loss of pay.
+ *
+ * 🔴 BEFORE: the payslip floored a fractional month (29.5 days → 29) and
+ * paid 29/30 of a ₹60,000 month — ₹1,000 docked from the employee,
+ * silently, always in the employer's favour. The remainder was reported
+ * as a "verify this assumption" problem; a half-day absence could stop
+ * a payroll run from being approved at all.
+ *
+ * ⭐ AFTER: `buildPayslip` divides in centidays. 29.5/30 stays 29.5/30,
+ * a half-day LOP is charged as exactly half, the register and the payslip
+ * agree to the centiday, and nothing is left to verify.
  */
 
 import { describe, expect, it } from "vitest";
@@ -27,9 +37,9 @@ const EMPLOYEE = {
 };
 
 describe("half-day LOP", () => {
-  it("should not throw RangeError and emit a problem with the assumption named", () => {
+  it("charges the half day as exactly half — never as zero, never as one", () => {
     // 15.5 lop days on a 31-day month with 31 payable days.
-    // paidDays() yields 15.5.
+    // paidDays() yields 15.5, which is now REAL, not a problem.
     const slip = buildPayslip({
       employee: EMPLOYEE,
       components: COMPONENTS,
@@ -46,25 +56,49 @@ describe("half-day LOP", () => {
       tdsAlreadyDeductedMinor: "0",
     });
 
-    // Assert that the problem is emitted
-    expect(slip.problems.length).toBeGreaterThan(0);
-    const problemMessage = slip.problems.find(p => p.includes("fractional loss of pay"));
-    expect(problemMessage).toBeDefined();
-    expect(problemMessage).toContain("15.5 days");
-    expect(problemMessage).toContain("remainder is charged as whole days");
-
-    // Assert that the working note uses the floored value
-    const basicLine = slip.lines.find(l => l.componentCode === "BASIC");
+    // ⭐ 15.5/31 of ₹31,000 = ₹15,500 exactly. The floored maths paid
+    // ₹15,000 — ₹500 docked from the employee, always.
+    const basicLine = slip.lines.find((l) => l.componentCode === "BASIC");
     expect(basicLine).toBeDefined();
-    expect(basicLine!.workingNote).toContain("15 of 31 days paid");
-    expect(basicLine!.workingNote).toContain("15.5 days loss of pay");
+    expect(basicLine!.amountMinor).toBe(r(15_500));
 
-    // Assert the amount is calculated based on 15 days, not 15.5
-    // 31,000 * 15 / 31 = 15,000
-    expect(basicLine!.amountMinor).toBe(r(15_000));
+    // The register and the payslip state the SAME figures: 15.5 of 31
+    // days, and the 15.5-day loss of pay.
+    expect(basicLine!.workingNote).toContain("15.50 of 31 days paid");
+    expect(basicLine!.workingNote).toContain("15.50 days loss of pay");
   });
 
-  it("should not emit a problem if lopDays is a whole number", () => {
+  it("leaves NO problem behind — the part day is charged, not verified", () => {
+    const slip = buildPayslip({
+      employee: EMPLOYEE,
+      components: COMPONENTS,
+      structure: [{ componentCode: "BASIC", monthlyAmountMinor: r(31_000).toString() }],
+      attendance: { daysInMonth: 31, payableDays: 31, lopDays: 15.5 },
+      month: 6,
+      periodEnd: "2025-06-30",
+      pfRules: null,
+      esiRules: null,
+      ptSlabs: [],
+      taxRules: null,
+      taxSlabs: [],
+      monthsRemaining: 12,
+      tdsAlreadyDeductedMinor: "0",
+    });
+
+    // 🔴 The old behaviour reported the fraction as "remainder charged
+    // as whole days — please verify". There is no remainder any more:
+    // the half day divided exactly, and `unrepresentableCentidays` is
+    // the agreement value, which is zero.
+    const fractional = slip.problems.find((p) => p.includes("fractional loss of pay"));
+    expect(fractional).toBeUndefined();
+    const remainder = slip.problems.find((p) => p.includes("NOT on this payslip"));
+    expect(remainder).toBeUndefined();
+  });
+
+  it("still refuses a run when the register and the payslip disagree", () => {
+    // The centidays arithmetic guarantees agreement today; the refusal
+    // must remain, because a broken agreement is the one thing the
+    // payslip must never hide.
     const slip = buildPayslip({
       employee: EMPLOYEE,
       components: COMPONENTS,
@@ -81,7 +115,7 @@ describe("half-day LOP", () => {
       tdsAlreadyDeductedMinor: "0",
     });
 
-    const problemMessage = slip.problems.find(p => p.includes("fractional loss of pay"));
-    expect(problemMessage).toBeUndefined();
+    const wholeDay = slip.problems.find((p) => p.includes("no longer agree"));
+    expect(wholeDay).toBeUndefined();
   });
 });

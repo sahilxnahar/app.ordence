@@ -429,7 +429,42 @@ function endpointCount() {
 /* ② THE STATIC HALF — RUNS WITH NO DATABASE                           */
 /* ================================================================== */
 
-const TABLES = tenantScopedTables();
+/**
+ * ⭐ PLATFORM-EVIDENCE TABLES ARE OUT OF SCOPE FOR THIS PROBE.
+ *
+ * The harness seeds every probed table with one row per tenant, then
+ * proves tenant B cannot touch tenant A's row. That ownership model
+ * does not apply to platform-evidence tables: their write policy is
+ * `WITH CHECK app_platform_scope()` — NO tenant session can own a row,
+ * ever. The harness insert would legitimately 42501 and crash the run
+ * (which is exactly how `login_lockouts` was found: the table landed in
+ * the probe list and broke the harness on a correct policy).
+ *
+ * These tables are not untested: `check-rls-coverage.mjs` demands their
+ * boundaries by name (OPT_IN_PLATFORM_WRITE), and `check-rls-writes.mjs`
+ * demands that every cross-tenant read in them goes through
+ * `withPlatformScope`. Keeping the tenant-ownership harness pointed at
+ * them would make the harness RED FOR CORRECTNESS — which is the
+ * failure direction a gate must never take.
+ *
+ * Adding a table here is a visible decision, kept in lockstep with the
+ * same named set in `check-rls-coverage.mjs`.
+ */
+const PLATFORM_EVIDENCE_TABLES = new Set([
+  // 0079 opt-in platform-write tables — all platform evidence:
+  "error_events",
+  "platform_entitlement_history",
+  "platform_impersonation_sessions",
+  "platform_tenant_flags",
+  "security_events",
+  "tenant_health_events",
+  "web_vital_events",
+  // 0089 login lockout evidence — credential-attack counters are
+  //      platform evidence: a lockout belongs to no tenant.
+  "login_lockouts",
+]);
+
+const TABLES = tenantScopedTables().filter((t) => !PLATFORM_EVIDENCE_TABLES.has(t));
 const { policies, rls, helpers } = migrationFacts();
 const ENDPOINTS = endpointCount();
 
@@ -661,8 +696,26 @@ async function execute() {
       IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '${PROBE_ROLE}') THEN
         CREATE ROLE ${PROBE_ROLE} LOGIN PASSWORD '${PROBE_PASSWORD}' NOSUPERUSER NOBYPASSRLS;
       END IF;
+      /*
+       * Only superusers are implicit members of the roles they create.
+       * A CREATEROLE-bearing admin (the Neon-safe configuration) must be
+       * an explicit member before SET ROLE works; if the admin already
+       * has the membership (superuser) this no-ops.
+       */
     END $do$;
   `);
+  /*
+   * Only superusers are implicit members of the roles they create.
+   * A CREATEROLE-bearing admin (the Neon-safe configuration) must be
+   * an explicit member before SET ROLE works; the grant here can fail
+   * only when the admin already holds the membership, in which case
+   * failing quietly is exactly right.
+   */
+  try {
+    await admin.query(`GRANT ${PROBE_ROLE} TO CURRENT_USER`);
+  } catch {
+    /* membership already held (superuser admin) — no action needed */
+  }
   await admin.query(`GRANT USAGE ON SCHEMA ${PROBE_SCHEMA} TO ${PROBE_ROLE}`);
   /**
    * ⚠️ OWNERSHIP, NOT A GRANT, AND THAT IS THE HARDEST CONFIGURATION TO

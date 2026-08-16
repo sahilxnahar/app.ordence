@@ -2,19 +2,20 @@ import type { NextConfig } from "next";
 import { withSentryConfig } from "@sentry/nextjs";
 
 /**
- * Security headers applied to every response.
- * Ref: Blueprint Part "Browser Security Headers".
+ * ⭐⭐⭐ SINGLE SOURCE OF TRUTH — Wave 7 (Hardening I)
+ *
+ * The hard transport headers are owned by `lib/edge/security-headers.ts`.
+ * The edge middleware reads the SAME array at runtime for the responses it
+ * synthesises itself (413, 429, 404, 401, 403, redirects), so the two
+ * surfaces can never drift: one array, two read sites, and one
+ * consistency test — `tests/security/security-headers-consistency.test.ts`.
+ *
+ * This file only re-exports it into the build-time `headers()` config.
+ * CSP is deliberately not in that array — it is a per-request nonce
+ * policy built by `lib/security/csp.ts` and attached by the middleware.
  */
-const securityHeaders = [
-  { key: "X-DNS-Prefetch-Control", value: "on" },
-  { key: "Strict-Transport-Security", value: "max-age=63072000; includeSubDomains; preload" },
-  { key: "X-Content-Type-Options", value: "nosniff" },
-  { key: "X-Frame-Options", value: "SAMEORIGIN" },
-  { key: "Referrer-Policy", value: "strict-origin-when-cross-origin" },
-  { key: "Permissions-Policy", value: "camera=(), microphone=(), geolocation=(), interest-cohort=()" },
-  { key: "Cross-Origin-Opener-Policy", value: "same-origin" },
-  { key: "X-Permitted-Cross-Domain-Policies", value: "none" },
-];
+import { SECURITY_HEADERS, PORTAL_OVERRIDE_HEADERS } from "@/lib/edge/security-headers";
+const securityHeaders = SECURITY_HEADERS;
 
 const nextConfig: NextConfig = {
   reactStrictMode: true,
@@ -55,9 +56,7 @@ const nextConfig: NextConfig = {
         source: "/portal/:path*",
         headers: [
           ...securityHeaders,
-          { key: "Referrer-Policy", value: "no-referrer" },
-          { key: "X-Robots-Tag", value: "noindex, nofollow, noarchive, nosnippet" },
-          { key: "X-Frame-Options", value: "DENY" },
+          ...PORTAL_OVERRIDE_HEADERS,
           { key: "Cache-Control", value: "private, no-store, max-age=0, must-revalidate" },
         ],
       },

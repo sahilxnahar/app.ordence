@@ -39,6 +39,7 @@ import {
   type TaxRules,
   type TaxSlab,
 } from "./statutory";
+import { formatDays } from "@/lib/leave/days";
 
 /* ------------------------------------------------------------------ */
 /* WHAT AN EMPLOYEE IS PAID                                            */
@@ -95,9 +96,69 @@ export interface AttendanceFacts {
   readonly payableDays: number;
 }
 
-export function paidDays(a: AttendanceFacts): number {
+/**
+ * ⚠️ ONLY THE TWO FIELDS THAT DECIDE WORKED DAYS.
+ *
+ * `AttendanceFacts` satisfies this, so every existing caller is
+ * unchanged; `chargeableLopCentidays()` below can ask the question
+ * without inventing a `daysInMonth` it does not have and does not use.
+ */
+export type WorkedDaysFacts = Pick<AttendanceFacts, "payableDays" | "lopDays">;
+
+export function paidDays(a: WorkedDaysFacts): number {
+  // ⭐ FRACTIONAL DAYS SURVIVE. `lopDays` can be 0.5 (a half-day absence,
+  // charged in centidays by `splitLopForPayslip`), so `paid` can be 29.5.
+  // The caller converts to centidays before any bigint arithmetic; the
+  // clamp below is in days only because a payslip can never show
+  // negative worked days — the centidays math never sees a negative.
   const paid = a.payableDays - a.lopDays;
   return paid < 0 ? 0 : paid;
+}
+
+/** ⭐ A hundredth of a day. The unit `lib/leave/*` counts loss of pay in. */
+const CENTIDAYS_PER_DAY = 100;
+
+/**
+ * 🔴🔴 HOW MANY CENTIDAYS OF LOSS OF PAY THIS PAYSLIP CAN ACTUALLY
+ * CHARGE — MEASURED, NEVER ASSERTED.
+ *
+ * The attendance register counts loss of pay in whole centidays, but
+ * `buildPayslip` receives it as a NUMBER OF DAYS (`lopDays`, which may
+ * be 0.5) and converts back with `Math.round(worked * 100)`. That round
+ * trip is the only place in the whole path where a fraction the register
+ * holds could fail to reach the money, so it is the only honest place to
+ * ask "how much of it survived?". This function performs exactly the
+ * round trip `buildPayslip` performs and reports the answer.
+ *
+ * ⚠️ WHY THIS EXISTS AT ALL, GIVEN THE ANSWER IS ALWAYS THE WHOLE THING
+ * TODAY. `server/payroll/attendance-bridge.ts` used to publish
+ * `unrepresentableCentidays: 0` as a literal. That is an assertion
+ * dressed as a measurement, and it permanently disarmed the refusal in
+ * `server/payroll/run.ts#withAttendanceStory` ("Do not approve this
+ * run") that exists precisely to catch a fraction the payslip cannot
+ * represent. Since the centidays rewrite the true answer IS zero — but
+ * it has to be DERIVED, so that the day somebody reintroduces a
+ * whole-day divisor the guard fires instead of staying quiet.
+ *
+ * ⚠️ NO MONEY IN HERE. Centidays are a quantity, so integer arithmetic
+ * and `Math.round` are the right tools; paise never touch a float
+ * anywhere in this file.
+ */
+export function chargeableLopCentidays(args: {
+  readonly payableDays: number;
+  readonly lopCentidays: number;
+}): number {
+  const payableCentidays = Math.round(args.payableDays * CENTIDAYS_PER_DAY);
+  /* Exactly the value `computeRun()` hands `buildPayslip` as `lopDays`. */
+  const lopDays = args.lopCentidays / CENTIDAYS_PER_DAY;
+  /* Exactly what `buildPayslip` then does with it, clamp included. */
+  const workedCentidays = Math.round(
+    paidDays({ payableDays: args.payableDays, lopDays }) * CENTIDAYS_PER_DAY,
+  );
+  const charged = payableCentidays - workedCentidays;
+  if (charged < 0) return 0;
+  /* ⚠️ It can never charge MORE than the register recorded either. */
+  return charged > args.lopCentidays ? args.lopCentidays : charged;
 }
 
 /* ------------------------------------------------------------------ */
@@ -213,18 +274,19 @@ export function buildPayslip(args: {
     } else {
       // ⚠️ MULTIPLY BEFORE DIVIDE. The other order loses paise on every
       // line and the payslip then does not add up to its own total.
-      // ⭐ HALF-DAY LOP IS CHARGED AS WHOLE DAYS.
-      // worked can be fractional (e.g. 30.5) due to half-day loss of pay.
-      // We floor it to charge only whole days, and the fractional remainder
-      // is reported as a problem so a human can acknowledge it.
-      const wholeWorked = Math.floor(worked);
-      if (wholeWorked < worked) {
-        problems.push(
-          `This employee has a fractional loss of pay (${args.attendance.lopDays} days). The remainder is charged as whole days, but please verify this assumption.`,
-        );
-      }
-      amount = roundToRupee((full * BigInt(wholeWorked)) / BigInt(days));
-      workingNote = `${wholeWorked} of ${days} days paid${args.attendance.lopDays > 0 ? ` (${args.attendance.lopDays} day${args.attendance.lopDays === 1 ? "" : "s"} loss of pay)` : ""}.`;
+      //
+      // ⭐ CENTIDAYS, BECAUSE A HALF DAY IS A REAL INDIAN PAYROLL QUANTITY.
+      // `worked` may be fractional (29.5: a half-day absence) due to the
+      // register counting loss of pay in hundredths of a day. bigint
+      // cannot hold a fraction, and flooring 29.5 to 29 pays 29/30 of a
+      // ₹60,000 month — about ₹1,000 taken from the employee, silently,
+      // always in the employer's favour. Scale both sides of the
+      // division by 100 and the fraction survives exactly: 29.5/30 stays
+      // 29.5/30, no rounding, no direction of the error.
+      const workedCentidays = BigInt(Math.round(worked * 100));
+      const dayCentidays = BigInt(days * 100);
+      amount = roundToRupee((full * workedCentidays) / dayCentidays);
+      workingNote = `${formatDays(Number(workedCentidays))} of ${days} days paid${args.attendance.lopDays > 0 ? ` (${formatDays(Math.round(args.attendance.lopDays * 100))} day${args.attendance.lopDays === 1 ? "" : "s"} loss of pay)` : ""}.`;
     }
 
     lines.push({

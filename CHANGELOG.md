@@ -1,4 +1,46 @@
+# v1.52.0-alpha — THE MERGE AND THE THIRD GUARD PUT BACK
+
+**Repo: `app.ordence`** · 🔴 **SQL: `0086`, `0087`, `0088`, `0089`, `0090` — all BEFORE the code push** · ⚠️ **No new variables**
+
+Manus's v1.51.0 test-harness work merged with the repair pass, and one
+production guard restored that v1.51.0 deleted.
+
+- 🔴🔴 **0090 DROPPED THE ONLY GUARD REFUSING AN INSERT INTO A CLOSED
+  PERIOD, IN A FILE TITLED "message normalization" THAT SAID IT CHANGED
+  NOTHING.** `transactions_period_lock` (0005) fires on UPDATE and DELETE
+  only. `ordence_guard_closed_period` (0073) is the only one covering
+  INSERT, and 0090 dropped it, because a test expected the header to land
+  and only the leg to be refused. The database was stricter than the test.
+  **Restored, with the reasoning written into the file.**
+- 🔴 **0089 no longer leaks across tenants.** `FOR ALL USING (true)` was
+  OR'd with the read policy and erased it; proven on PostgreSQL 16 and
+  proven fixed the same way. `VERIFY-0089` rewritten to test behaviour
+  rather than policy shape, and a DRILL added that reproduces the leak on
+  purpose before showing the shipped clause refusing it.
+- 🔴 **The payroll half-day now reaches the arithmetic.** `run.ts` passed
+  the floored figure, so the centidays code never saw a fraction and a
+  0.5-day loss of pay charged nothing. `unrepresentableCentidays` is
+  derived again rather than hardcoded to 0, so the refusal at `run.ts`
+  is a live guard instead of dead code.
+- ⭐ **Both lockout reads are platform-scoped**, so `check:rls-writes` is
+  green. Fixed independently by two authors the same way.
+- ⭐ **New: `CHECK-EVERYTHING-neon-safe.sql`** — one read-only file, five
+  result tabs: migration status, what to run in order, gaps, tenant
+  isolation, and the connection's own flags.
+- ⚠️ **Fifteen gates green. 128 test files, 4,467 passing.**
 # v1.48.0-alpha — THE REPAIR WAVE, RUN UNDER INTEGRATION
+## v1.51.0-alpha — Hardening III (stabilization)
+**Repo: `app.ordence`** · 🔴 **SQL: 0090_period_close_message_normalization.sql** (applied locally before code work) · ⚠️ **No new variables**
+Test-harness stabilization wave, no product features: the neon driver's WebSocket path now works against the disposable local PostgreSQL through a loopback WebSocket-to-PG bridge in `tests/setup.ts` (RFC 6455 framing, PG startup parsing, pg-message reassembly, outbox queue, drop of neon's preemptive cleartext password). `billing-gate.test.ts` and the whole security suite now run green end-to-end through `withTenant`'s real neon Pool/WS transport. No product code shipped in this wave; the pg_hba trust rules are local-only and never cross into Neon (throwaway PostgreSQL 16 only).
+
+---
+
+## v1.50.0-alpha — Hardening II + UX
+**Repo: `app.ordence`** · 🔴 **SQL: 0089_hardening_login_lockouts.sql** (with 0088 pending from Wave 8) · ⚠️ **No new variables**
+CSRF verification with origin binding and server-action digest presence checks, session-reset evidence on password rotation, failed sign-in evidence through the Clerk webhook, DB-backed login lockouts (`login_lockouts`, opt-in platform write), reset-link/upload-ticket expiry guarantees (10-minute upload tickets, enforced at verification), enumeration-prevention audit (no server-side email existence checks exist), 0087 function-surface correction (the application function EXECUTE grants the app role actually needs), and the Wave 8b UX set: dark mode with system fallback, cookie banner, top-bar site search, mobile menus, loading and hover states, scroll progress, copy buttons, print stylesheet, sticky headers, skip-to-content, password visibility toggle, UTM capture, form success/error states, confirmation modals, last-updated dates, expandable FAQ and the back-to-top floating control. **15 of 15 gates green; 4,442 UI tests passing; tsc clean.**
+
+---
+
 **Repo: `app.ordence`** · 🔴 **SQL: none new — this run fixes code and one pre-existing SQL policy from v1.47** · ⚠️ **No new variables**
 The four interrupt-damaged batches from the mega-wave (opening balances,
 cost centres and budgets, appraisals and the org chart, the platform

@@ -45,3 +45,71 @@
   * { @apply border-border; }
   body { @apply bg-background text-foreground antialiased; }
 }
+
+/* ══════════════════════════════════════════════════════════════════════
+   PRINT STYLESHEET — WAVE 8b (v1.50.0-alpha)
+
+   Invoices, quotes, payslips and receipts go through `(print)` and have
+   their own print-aware markup; this layer is the FALLBACK for every
+   other page the user might print — the dashboard, a settings screen,
+   an audit trail. The job of a fallback print sheet is narrow:
+
+     1. Do not burn ink on chrome (sidebar, headers, buttons, banners).
+     2. Do not force a page of near-black background (dark mode) onto
+        paper — print always in light token values.
+     3. Keep the content readable: real link targets, no widowed tables.
+
+   Any page that needs a REAL printed document should render through
+   `(print)` instead of leaning on this.
+   ══════════════════════════════════════════════════════════════════════ */
+
+@media print {
+  :root,
+  html,
+  body,
+  .dark {
+    color-scheme: light;
+    background: #fff;
+    color: #111;
+  }
+
+  /* The chrome: every layout bar, banner and floating control. */
+  nav,
+  header,
+  footer,
+  aside,
+  [role="dialog"],
+  [role="region"][aria-label="Cookie notice"],
+  [aria-hidden="true"],
+  .no-print,
+  button,
+  form button {
+    display: none !important;
+  }
+
+  main,
+  main * {
+    background: transparent !important;
+  }
+
+  /* Content keeps its shape but sheds the screen affordances. */
+  main {
+    overflow: visible !important;
+    flex: none !important;
+    height: auto !important;
+  }
+
+  /* Table rows must not break across pages mid-record. */
+  tr {
+    page-break-inside: avoid;
+    break-inside: avoid;
+  }
+
+  /* The reader of a printed page cannot hover for the destination. */
+  a[href]::after {
+    content: " (" attr(href) ")";
+    font-size: 0.75em;
+    color: #555;
+    word-break: break-all;
+  }
+}

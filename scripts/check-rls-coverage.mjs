@@ -31,6 +31,9 @@
  *   3. A policy whose USING clause references `app_current_tenant_id`.
  *   4. Platform scope, if present, appears in USING and NEVER in
  *      WITH CHECK — read across tenants for support, never write.
+ *      One narrow exception: the seven opt-in platform-evidence tables
+ *      from `0079_rls_opt_in_and_telemetry.sql` write through
+ *      `app_platform_scope()` by design (see OPT_IN_PLATFORM_WRITE).
  *
  * Zero exceptions, zero thresholds. One unprotected table fails the run.
  *
@@ -58,6 +61,35 @@ if (!URL) {
  */
 const NOT_TENANT_SCOPED = new Set(["tenants", "plans"]);
 
+/**
+ * ⚠️ PLATFORM-EVIDENCE TABLES THAT WRITE THROUGH THE OPT-IN MARKER.
+ *
+ * `0079_rls_opt_in_and_telemetry.sql` moved these seven tables' WITH CHECK
+ * from the blanket `app_current_tenant_id() IS NULL` to
+ * `app_platform_scope()` — the opt-in design: anything written into a
+ * tenant's workspace on the platform's own behalf must first declare
+ * platform scope inside a transaction, with a reason recorded at the
+ * service layer. `0089_hardening_login_lockouts.sql` adds `login_lockouts`,
+ * a platform-security table, to the same design. A plain HTTP session with no tenant set could otherwise
+ * write platform evidence silently (a worker, a cron, a forgotten
+ * `withTenant`).
+ *
+ * The read boundary is UNTOUCHED: every table here still has a USING
+ * clause that denies cross-tenant reads. This list only permits the
+ * marker on the WRITE side. Name the tables explicitly so that adding
+ * to this list is a visible decision.
+ */
+const OPT_IN_PLATFORM_WRITE = new Set([
+  "login_lockouts",
+  "error_events",
+  "platform_entitlement_history",
+  "platform_impersonation_sessions",
+  "platform_tenant_flags",
+  "security_events",
+  "tenant_health_events",
+  "web_vital_events",
+]);
+
 const pool = new Pool({ connectionString: URL });
 let failures = 0;
 const fail = (m) => {
@@ -74,7 +106,14 @@ try {
       COALESCE(bool_or(p.qual::text LIKE '%app_current_tenant_id%'), false)
                                                        AS has_tenant_policy,
       COALESCE(bool_or(p.with_check::text LIKE '%app_platform_scope%'), false)
-                                                       AS cross_tenant_write
+                                                       AS marker_write,
+      COALESCE(
+        bool_or(
+          (p.qual::text LIKE '%app_current_tenant_id%')
+          OR (p.qual::text LIKE '%tenant_id%')
+        ),
+        false
+      )                                              AS has_tenant_read_policy
     FROM pg_class c
     JOIN pg_namespace n  ON n.oid = c.relnamespace
     JOIN pg_attribute a  ON a.attrelid = c.oid
@@ -110,8 +149,22 @@ try {
     if (!t.has_tenant_policy) {
       fail(`${t.table_name} has RLS enabled but no policy referencing app_current_tenant_id() — RLS with no policy denies everything, which fails closed but breaks the table.`);
     }
-    if (t.cross_tenant_write) {
+    if (t.marker_write && !OPT_IN_PLATFORM_WRITE.has(t.table_name)) {
       fail(`${t.table_name} allows app_platform_scope() in WITH CHECK — that permits a cross-tenant WRITE. Platform scope belongs in USING only.`);
+    }
+    if (OPT_IN_PLATFORM_WRITE.has(t.table_name)) {
+      // The opt-in marker is only legitimate while the READ boundary
+      // still holds. If the USING clause lost its tenant reference,
+      // the table silently became a cross-tenant window in both
+      // directions.
+      if (!t.has_tenant_read_policy) {
+        fail(`${t.table_name} is an opt-in platform-write table but its USING clause no longer references the tenant — a cross-tenant READ hole.`);
+      }
+      if (!t.marker_write) {
+        fail(
+          `${t.table_name} is a documented opt-in platform-write table, but its WITH CHECK no longer requires the platform-scope marker — the marker can be removed by accident just as easily as a policy. If the marker was deliberately removed, remove the table from OPT_IN_PLATFORM_WRITE and say why.`,
+        );
+      }
     }
   }
 

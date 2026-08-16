@@ -33,6 +33,9 @@ import {
 } from "@/lib/edge/limits";
 import { isRateLimitExempt } from "@/lib/edge/budgets";
 import { checkDeclaredBodySize, bodyTooLargeBody } from "@/lib/edge/body-limit";
+import { applySecurityHeaders } from "@/lib/edge/security-headers";
+import { decidePreflight } from "@/lib/edge/cors";
+import { verifyCsrf } from "@/lib/security/csrf";
 
 /* ------------------------------------------------------------------ */
 /* RUNTIME ENVIRONMENT                                                 */
@@ -227,6 +230,26 @@ const isPublicRoute = createRouteMatcher([
 /** Routes that require platform-staff privileges, not just any session. */
 const isPlatformAdminRoute = createRouteMatcher(["/platform(.*)"]);
 
+/**
+ * ⭐⭐⭐ SESSION COOKIES — DELEGATED TO CLERK, STATED ON PURPOSE — Wave 7
+ *
+ * This product sets NO cookies of its own. Every session cookie on any
+ * Ordence response is Clerk's — `__session`, `__clerk_db_jwt` and the
+ * handshake pair — and the Clerk Next.js SDK already sets them
+ * `Secure`, `HttpOnly` and `SameSite=Lax` by default, so the flags a
+ * cookie audit looks for are on every session cookie today.
+ *
+ * ⚠️ DELEGATION IS NOT AN EXCUSE. `CLERK_SESSION_COOKIE_SECURE=true`
+ * is the env flag that pins Secure even when the SDK's default would
+ * relax (some SDK versions read the request protocol and go `Secure`
+ * only under TLS; a reverse proxy terminating TLS can look like plain
+ * HTTP). Set it in production as a belt with the braces, and the
+ * deploy file repeats it. If this app ever issues its own cookie —
+ * the portal token moved to URLs on purpose so that would be a
+ * deliberate decision with its own flags — that is the one place to
+ * add flags, and the cookie banner batch (Wave 8) is where any new
+ * cookie should first be argued for.
+ */
 export default clerkMiddleware(
   async (auth, req: NextRequest) => {
     try {
@@ -283,16 +306,18 @@ export default clerkMiddleware(
       console.error("[middleware] threw:", message);
 
       if (req.nextUrl.pathname === "/api/diag") {
-        return new NextResponse(
-          JSON.stringify(
-            { ok: false, stage: "middleware", error: message, settingsPresent: presentSettings() },
-            null,
-            2,
+        return applySecurityHeaders(
+          new NextResponse(
+            JSON.stringify(
+              { ok: false, stage: "middleware", error: message, settingsPresent: presentSettings() },
+              null,
+              2,
+            ),
+            { status: 500, headers: { "content-type": "application/json" } },
           ),
-          { status: 500, headers: { "content-type": "application/json" } },
         );
       }
-      return new NextResponse("Internal Server Error", { status: 500 });
+      return applySecurityHeaders(new NextResponse("Internal Server Error", { status: 500 }));
     }
   },
   () => clerkKeys(),
@@ -437,24 +462,28 @@ async function edgeLimitGate(
    */
   const body = edgeLimitBody(decision);
   const refusal = isApiPath
-    ? new NextResponse(JSON.stringify({ error: { ...body.error, requestId } }), {
-        status,
-        headers: {
-          ...headers,
-          "content-type": "application/json",
-          "x-request-id": requestId,
-          "cache-control": "no-store",
-        },
-      })
-    : new NextResponse(body.error.message, {
-        status,
-        headers: {
-          ...headers,
-          "content-type": "text/plain; charset=utf-8",
-          "x-request-id": requestId,
-          "cache-control": "no-store",
-        },
-      });
+    ? applySecurityHeaders(
+        new NextResponse(JSON.stringify({ error: { ...body.error, requestId } }), {
+          status,
+          headers: {
+            ...headers,
+            "content-type": "application/json",
+            "x-request-id": requestId,
+            "cache-control": "no-store",
+          },
+        }),
+      )
+    : applySecurityHeaders(
+        new NextResponse(body.error.message, {
+          status,
+          headers: {
+            ...headers,
+            "content-type": "text/plain; charset=utf-8",
+            "x-request-id": requestId,
+            "cache-control": "no-store",
+          },
+        }),
+      );
 
   return { refusal, headers };
 }
@@ -479,6 +508,47 @@ async function run(auth: ClerkAuth, req: NextRequest) {
     headers.delete(header);
   }
   headers.set(TENANT_HEADERS.requestId, requestId);
+
+  /* -- 1b. CSRF — ORIGIN BINDING + SERVER-ACTION DIGEST — Wave 8 ----
+   *
+   * See the top of `lib/security/csrf.ts` for the threat model. Two
+   * properties, verified before a single byte of the body is consumed
+   * and before Clerk or the tenant lookup run:
+   *
+   *   1. An explicit `Origin` must resolve to a host we serve.
+   *   2. A POST carrying a server-action content type without the
+   *      `Server-Action` digest header is refused — that header is
+   *      Next.js's own CSRF contract and its absence on such a POST
+   *      is the fingerprint of a cross-site replay.
+   *
+   * 403, one line, no leak. The public webhook surfaces opt out of the
+   * digest check individually — they carry their own signatures (Svix,
+   * HMAC) and must never be refused for lacking ours.
+   */
+  const csrfVerdict = verifyCsrf({
+    method: req.method,
+    origin: req.headers.get("origin"),
+    referer: req.headers.get("referer"),
+    requestHost: req.headers.get("host"),
+    contentType: req.headers.get("content-type"),
+    serverActionHeader: req.headers.get("server-action"),
+    expectActionDigest: true,
+  });
+  if (!csrfVerdict.ok) {
+    return applySecurityHeaders(
+      new NextResponse(
+        JSON.stringify({ error: "Cross-site request refused." }),
+        {
+          status: 403,
+          headers: {
+            "content-type": "application/json",
+            "x-request-id": requestId,
+            "cache-control": "no-store",
+          },
+        },
+      ),
+    );
+  }
 
   /* -- 1a. ⭐ REQUEST SIZE — REFUSED BEFORE A BYTE IS READ — Batch 31 --
    *
@@ -521,14 +591,16 @@ async function run(auth: ClerkAuth, req: NextRequest) {
       // caller has to know the ceiling to comply with it, and a 500 from
       // an unhandled parse error tells them nothing and tells an
       // attacker our framework.
-      return new NextResponse(JSON.stringify(bodyTooLargeBody(sizeVerdict)), {
-        status: 413,
-        headers: {
-          "content-type": "application/json",
-          "x-request-id": requestId,
-          "cache-control": "no-store",
-        },
-      });
+      return applySecurityHeaders(
+        new NextResponse(JSON.stringify(bodyTooLargeBody(sizeVerdict)), {
+          status: 413,
+          headers: {
+            "content-type": "application/json",
+            "x-request-id": requestId,
+            "cache-control": "no-store",
+          },
+        }),
+      );
     }
   }
 
@@ -561,6 +633,38 @@ async function run(auth: ClerkAuth, req: NextRequest) {
    */
   headers.delete("content-security-policy");
   headers.delete("content-security-policy-report-only");
+
+  /* -- 0. ⭐⭐⭐ CORS — DENY-BY-DEFAULT — Wave 7 ----------------------
+   *
+   * ════════════════════════════════════════════════════════════════
+   * A browser script on evil.example can issue credentialed fetches to
+   * this app; the browser only delivers the response if WE put
+   * Access-Control-Allow-* headers on it. The safe default is silence.
+   *
+   * Only OPTION preflights are answered here. Actual GET/POST requests
+   * pass through untouched — their responses carry NO CORS headers,
+   * which means the browser refuses to expose them to any script whose
+   * origin is not this app's. A preflight from an origin not on the
+   * allowlist (default: EMPTY — nobody is listed) gets a bare 204 with
+   * no CORS headers, and the browser ends the exchange there.
+   *
+   * The allowlist lives in CORS_ALLOWED_ORIGINS, one entry per listed
+   * integration; adding an origin is a deliberate, reviewable change.
+   */
+  if (req.method === "OPTIONS") {
+    const decision = decidePreflight(req.headers.get("origin"));
+    if (decision.preflight) {
+      return applySecurityHeaders(
+        new NextResponse(null, {
+          status: decision.preflight.status,
+          headers: decision.preflight.headers,
+        }),
+      );
+    }
+    /* Not listed — say nothing. The plain 204 carries no CORS headers
+     * and the credentialed cross-origin request dies at the browser. */
+    return new NextResponse(null, { status: 204 });
+  }
 
   const isApi = req.nextUrl.pathname.startsWith("/api/");
   const csp = isApi
@@ -616,7 +720,7 @@ async function run(auth: ClerkAuth, req: NextRequest) {
     if (!path.startsWith("/platform") && !path.startsWith("/api")) {
       const url = req.nextUrl.clone();
       url.pathname = `/platform${path === "/" ? "" : path}`;
-      return withCsp(NextResponse.rewrite(url, { request: { headers } }));
+      return applySecurityHeaders(withCsp(NextResponse.rewrite(url, { request: { headers } })));
     }
   } else if (path.startsWith("/platform") && platformHost()) {
     /**
@@ -633,7 +737,13 @@ async function run(auth: ClerkAuth, req: NextRequest) {
      * 404 rather than 403 once it IS configured: a host that does not
      * serve the console should not confirm the console exists.
      */
-    return new NextResponse("Not found", { status: 404 });
+    /**
+     * ⭐ A refused 404 carries the hard headers too — an attacker probing
+     * for the console on the wrong host gets a blank page that looks
+     * exactly like any other refused response. A bare 404 looks like a
+     * plain Next.js surface, and that difference is evidence.
+     */
+    return applySecurityHeaders(new NextResponse("Not found", { status: 404 }));
   }
 
   if (locator.kind === "subdomain") {
@@ -653,7 +763,15 @@ async function run(auth: ClerkAuth, req: NextRequest) {
    * nonce policy to those costs a `getRandomValues` call and buys
    * nothing.
    */
-  const forward = () => withCsp(NextResponse.next({ request: { headers } }));
+  /**
+   * ⭐ THE FORWARD PATH ALSO GETS THE HARD HEADERS HERE — the app's
+   * `headers()` in `next.config.ts` sets them for rendered responses,
+   * but setting them on the middleware's own `NextResponse` as well is
+   * what makes them apply to the refused and redirected paths that
+   * never reach the renderer. On the forward path the two sets are
+   * idempotent: same keys, same values, so nothing doubles up.
+   */
+  const forward = () => applySecurityHeaders(withCsp(NextResponse.next({ request: { headers } })));
 
   /* -- 3. Public routes ------------------------------------------------ */
   if (isPublicRoute(req)) {
@@ -670,7 +788,7 @@ async function run(auth: ClerkAuth, req: NextRequest) {
     }
     const signIn = new URL("/sign-in", req.url);
     signIn.searchParams.set("redirect_url", req.nextUrl.pathname + req.nextUrl.search);
-    return NextResponse.redirect(signIn);
+    return applySecurityHeaders(NextResponse.redirect(signIn));
   }
 
   /* -- 5. Platform-admin routes ---------------------------------------- */
@@ -681,7 +799,7 @@ async function run(auth: ClerkAuth, req: NextRequest) {
     if (!isPlatformAdmin) {
       return req.nextUrl.pathname.startsWith("/api/")
         ? jsonError(403, "forbidden", "Platform staff only.", requestId)
-        : NextResponse.redirect(new URL("/dashboard", req.url));
+        : applySecurityHeaders(NextResponse.redirect(new URL("/dashboard", req.url)));
     }
     headers.set(TENANT_HEADERS.userId, userId);
     headers.set(TENANT_HEADERS.tenantRole, "platform_super_admin");
@@ -720,7 +838,7 @@ async function run(auth: ClerkAuth, req: NextRequest) {
     }
     // Send the user somewhere they can create or pick an org.
     if (req.nextUrl.pathname !== "/onboarding") {
-      return NextResponse.redirect(new URL("/onboarding", req.url));
+      return applySecurityHeaders(NextResponse.redirect(new URL("/onboarding", req.url)));
     }
     headers.set(TENANT_HEADERS.userId, userId);
     return forward();
@@ -732,7 +850,7 @@ async function run(auth: ClerkAuth, req: NextRequest) {
   if (locator.kind === "subdomain" && orgSlug && locator.slug !== orgSlug) {
     return req.nextUrl.pathname.startsWith("/api/")
       ? jsonError(403, "tenant_mismatch", "Session does not belong to this workspace.", requestId)
-      : NextResponse.redirect(new URL("/access-denied", req.url));
+      : applySecurityHeaders(NextResponse.redirect(new URL("/access-denied", req.url)));
   }
 
   /* -- 8. Inject server-trusted context -------------------------------- */
@@ -787,10 +905,21 @@ export function presentSettings(): Record<string, boolean> {
 
 /** Uniform JSON error shape — never leaks internals to the caller. */
 function jsonError(status: number, code: string, message: string, requestId: string) {
-  return new NextResponse(JSON.stringify({ error: { code, message, requestId } }), {
-    status,
-    headers: { "content-type": "application/json", "x-request-id": requestId },
-  });
+  /**
+   * ⭐⭐⭐ THE HARD HEADERS ARE SET HERE, NOT IN EACH CALLER — Wave 7.
+   *
+   * Every JSON refusal this file produces (401, 403, 404s) flows through
+   * this one function, so a refused API call carries HSTS, nosniff,
+   * SAMEORIGIN, Referrer-Policy and COOP exactly like a rendered page.
+   * A refusal without them would tell a probe the request never reached
+   * a hardened surface; a refusal WITH them is just a refusal.
+   */
+  return applySecurityHeaders(
+    new NextResponse(JSON.stringify({ error: { code, message, requestId } }), {
+      status,
+      headers: { "content-type": "application/json", "x-request-id": requestId },
+    }),
+  );
 }
 
 export const config = {

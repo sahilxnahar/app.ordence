@@ -88,7 +88,7 @@ beforeAll(async () => {
     ] as const) {
       await c.query(
         `INSERT INTO tenants (id, clerk_org_id, slug, name, status, plan_tier)
-         VALUES ($1,$2,$3,$4,'active','professional')`,
+         VALUES ($1,$2,$3,$4,'active','advanced')`,
         [id, `org_${id}`, `bg-${id.slice(0, 8)}`, name],
       );
     }
@@ -101,7 +101,7 @@ beforeAll(async () => {
      */
     await c.query(
       `INSERT INTO plans (id, code, name, tier, interval, amount_minor)
-       VALUES ($1,$2,$3,'professional','monthly',499900)
+       VALUES ($1,$2,$3,'advanced','monthly',499900)
        ON CONFLICT DO NOTHING`,
       [planId, `bg_plan_${planId.slice(0, 8)}`, "Billing Gate Plan"],
     );

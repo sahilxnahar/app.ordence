@@ -5,6 +5,10 @@ import { Providers } from "./providers";
 import "./globals.css";
 import { WebVitalsReporter } from "@/components/telemetry/web-vitals-reporter";
 import { getClerkPublishableKey, getClerkPaths } from "@/lib/env";
+import { ThemeScript } from "@/components/layout/theme-provider";
+import { BackToTop, ScrollProgressBar, SkipToContent } from "@/components/layout/accessibility";
+import { CookieBanner } from "@/components/layout/cookie-banner";
+import { useUtmReport } from "@/components/layout/forms";
 
 export const metadata: Metadata = {
   title: "Ordence",
@@ -29,6 +33,8 @@ export const metadata: Metadata = {
  * is what this application wants regardless of the build.
  */
 export const dynamic = "force-dynamic";
+
+// Cookie banner — Wave 8b: honest scope (session cookies + device-local preferences).
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   /*
@@ -104,7 +110,14 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
       afterSignOutUrl="/"
     >
       <html lang="en" suppressHydrationWarning>
+        {/*
+          Theme script MUST run before hydration: it reads the persisted
+          choice and paints `.dark` on <html> so the first frame is the
+          right palette. See components/layout/theme-provider.tsx.
+        */}
+        <ThemeScript />
         <body>
+          <SkipToContent />
           <Providers>{children}</Providers>
 
           {/*
@@ -135,8 +148,31 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
             down is not monitoring.
           */}
           <WebVitalsReporter />
+          {/*
+            Cookie banner: honest scope (session cookies + device-local
+            preferences only), one key, no tracking. See the component.
+          */}
+          <CookieBanner />
+          {/*
+            Scroll progress: thin bar at the very top of the viewport.
+            Passive scroll listener; no layout shift.
+          */}
+          <ScrollProgressBar />
+          <BackToTop />
+          <UtmCapture />
         </body>
       </html>
     </ClerkProvider>
   );
+}
+
+/**
+ * Client-only UTM capture: copies the tags into memory for the badge
+ * and fires a fire-and-forget telemetry beacon. Never persists — the
+ * moment attribution outlives the session it has become tracking, and
+ * this app does not do that.
+ */
+function UtmCapture() {
+  useUtmReport();
+  return null;
 }

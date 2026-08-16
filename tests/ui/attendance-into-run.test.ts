@@ -499,7 +499,11 @@ describe("loss of pay is counted in centidays", () => {
     }
   });
 
-  it("reports the part day it could not charge, per person", () => {
+  it("charges the part day exactly, and sends the fraction to the compute", () => {
+    // ⭐ THE FIX: 50 centidays is no longer "unrepresentable". The half
+    // day travels to the payslip as 0.5 days, which the centidays math
+    // divides as exactly half — the register and the payslip agree, and
+    // the fraction is charged, never dropped or floored.
     const out = foldRunLop({
       payableDaysByEmployee: wholeMonth("a"),
       register: [
@@ -514,18 +518,25 @@ describe("loss of pay is counted in centidays", () => {
       leaveDays: [],
     });
     expect(out.fractionalEmployeeIds).toEqual(["a"]);
-    expect(out.rows[0]?.unrepresentableCentidays).toBe(50);
+    /* The register's exact figure is what reaches the payslip — nothing dropped. */
+    expect(out.rows[0]?.unrepresentableCentidays).toBe(0);
+    expect(out.rows[0]?.chargedLopCentidays).toBe(50);
     expect(out.rows[0]?.chargedLopDays).toBe(0);
-    /* Nothing chargeable, so nothing is sent to the compute. */
-    expect(out.forCompute).toEqual([]);
+    /* ⭐ THE HALF DAY IS NOW REAL ATTENDANCE FACTS, NOT A PROBLEM. */
+    expect(out.forCompute).toEqual([{ employeeId: "a", payableDays: 31, lopDays: 0.5 }]);
   });
 
-  /** ⭐ And that difference is a PROBLEM on the payslip, which blocks approval. */
-  it("turns the uncharged part day into a payslip problem, not a note", () => {
+  /** ⭐ THE PART DAY AGREEMENT CANNOT BREAK SILENTLY. The payslip divides in
+   *  centidays now, so an uncharged part day no longer exists: the story only
+   *  refuses a run when the register and the payslip DISAGREE (unrepresentable
+   *  centidays non-zero), which today never happens and staying zero is itself
+   *  a guarantee. The refusal is the safety net, and it must stay a PROBLEM,
+   *  not soften into a note. */
+  it("still blocks approval when the register and the payslip disagree", () => {
     const code = codeOnly(RUN);
     const story = code.slice(code.indexOf("function withAttendanceStory"));
     expect(story).toContain("problems.push(");
-    expect(story).toMatch(/unrepresentableCentidays\s*>\s*0[\s\S]{0,80}problems\.push/);
+    expect(story).toMatch(/unrepresentableCentidays\s*>\s*0[\s\S]{0,120}problems\.push/);
     /*
      * 🔴 The totals are struck AFTER the story is added, or the problem
      * would print on the payslip and not block the approve button.
@@ -537,14 +548,23 @@ describe("loss of pay is counted in centidays", () => {
   it("never parses a day figure as a float", () => {
     const code = codeOnly(BRIDGE);
     expect(code).not.toContain("parseFloat");
+    /*
+     * ⭐ FRACTIONS NOW FLOW — `lopDays` passed to the compute may be 0.5,
+     * so `Number(...)` near lop figures is legitimate (the payslip must
+     * see the half day, or the register and the payslip can no longer
+     * agree). What stays forbidden is float PARSING: nothing reads a
+     * string as a float near a day figure.
+     */
     expect(code).not.toMatch(/Number\(\s*\w*[lL]op/);
     /*
-     * ⚠️ A CEILING, NOT A COUNT. One division by a hundred is the single
-     * conversion out of centidays; fewer would be better and more is a
-     * regression.
+     * ⚠️ TWO DIVISIONS OUT OF CENTIDAYS: the half-century one for whole
+     * days and the single one that turns centidays into the fractional
+     * day figure the payslip pro-rates against. Any third would mean a
+     * day figure left the bridge as something other than centidays or
+     * the agreed fractional days — more is a regression.
      */
     const divisions = code.match(/\/\s*CENTIDAYS_PER_DAY|\/\s*100\b/g) ?? [];
-    expect(divisions.length).toBeLessThanOrEqual(1);
+    expect(divisions.length).toBeLessThanOrEqual(2);
   });
 
   /**
