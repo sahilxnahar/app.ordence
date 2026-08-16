@@ -39,7 +39,7 @@ BEGIN
   THEN
     DROP POLICY IF EXISTS tenant_health_events_platform_only ON tenant_health_events;
     CREATE POLICY tenant_health_events_platform_only ON tenant_health_events
-      USING      (app_platform_scope())
+      USING      (app_current_tenant_id() IS NULL OR app_platform_scope())
       WITH CHECK (app_current_tenant_id() IS NULL);
   END IF;
 
@@ -49,7 +49,7 @@ BEGIN
   THEN
     DROP POLICY IF EXISTS platform_entitlement_history_platform_only ON platform_entitlement_history;
     CREATE POLICY platform_entitlement_history_platform_only ON platform_entitlement_history
-      USING      (app_platform_scope())
+      USING      (app_current_tenant_id() IS NULL OR app_platform_scope())
       WITH CHECK (app_current_tenant_id() IS NULL);
   END IF;
 END
