@@ -133,7 +133,16 @@ async function getRequestFacts(): Promise<RequestFacts> {
  */
 type AuditRowContent = Record<string, unknown>;
 
-const MAX_CHAIN_ATTEMPTS = 4;
+/**
+ * How many times a chain append retries against a genuine race on the
+ * head before degrading to an unchained (flagged) row. Exported because
+ * `server/platform/guard.ts`'s `recordPlatformAudit()` appends to the
+ * SAME chains (`audit_logs` per tenant, one `platform_action_log` chain)
+ * and a writer that retries against a different window than the unique
+ * index enforces would fork chains under load. ONE constant, both
+ * writers.
+ */
+export const MAX_CHAIN_ATTEMPTS = 4;
 
 /**
  * Append one row to a tenant's audit chain.
@@ -239,7 +248,7 @@ async function appendChainedAuditRow(
  * collision retried — so the constraint name has to match too. The two
  * names come straight from 0081 section 3.
  */
-function isChainRace(err: unknown): boolean {
+export function isChainRace(err: unknown): boolean {
   const e = err as { code?: unknown; constraint?: unknown; message?: unknown };
   const code = typeof e?.code === "string" ? e.code : "";
   const text = `${typeof e?.constraint === "string" ? e.constraint : ""} ${
@@ -343,7 +352,9 @@ async function appendUnchainedAuditRow(
  */
 export async function writeAudit(
   ctx: Pick<TenantContext, "tenant" | "user" | "role" | "clerkUserId"> &
-    Partial<Pick<TenantContext, "impersonationId">>,
+    Partial<
+      Pick<TenantContext, "impersonationId" | "operatorEmail" | "impersonationScope">
+    >,
   entry: AuditEntry,
 ): Promise<void> {
   try {
@@ -378,6 +389,38 @@ export async function writeAudit(
      * tenant work and NULL is the honest value for them.
      */
     const impersonationId = ctx.impersonationId ?? null;
+
+    /**
+     * ══════════════════════════════════════════════════════════════
+     * ⭐ THE ACTOR IS THE HUMAN TYPING — v1.48.0
+     * ══════════════════════════════════════════════════════════════
+     * Under impersonation, `ctx.user` is the CUSTOMER's employee — the
+     * face being reproduced — and `ctx.operatorEmail` is the real human
+     * behind the keyboard, our staff member. Before this line the actor
+     * columns named the customer's own user, so our engineer's work was
+     * indistinguishable from the customer's work: attribution without
+     * accountability. The defect named in the release notes.
+     *
+     * The rule: `actorEmail`/`actorRole` ALWAYS name the human who acted.
+     * The customer identity is preserved in `metadata` so the customer
+     * audit view can still say "your workspace was acted upon as
+     * <customer user>". Both, not either — same doctrine as the
+     * impersonation stamp above.
+     *
+     * ⚠️ THE CONTENT OBJECT BELOW IS THE ONE OBJECT THAT IS BOTH HASHED
+     * AND INSERTED. These two fields are part of the digest; changing
+     * what an actor column holds therefore CHANGES the chain for every
+     * impersonated row going forward — which is what it should do, and
+     * why the verifier will now report a discontinuity at the first
+     * impersonated action after this deploy. That is correct behaviour:
+     * the discontinuity IS the fix being visible in the chain.
+     */
+    const operatorEmail = ctx.operatorEmail ?? null;
+    const isImpersonatedSession = impersonationId !== null;
+    const actorEmail =
+      isImpersonatedSession && operatorEmail ? operatorEmail : ctx.user.email;
+    const actorRole =
+      isImpersonatedSession && operatorEmail ? "platform_operator" : ctx.role;
 
     /**
      * ══════════════════════════════════════════════════════════════
@@ -446,16 +489,33 @@ export async function writeAudit(
      */
     const content = {
       tenantId: ctx.tenant.id,
-      actorUserId: ctx.user.id,
+      actorUserId: isImpersonatedSession ? null : ctx.user.id,
       actorClerkId: ctx.clerkUserId,
-      actorEmail: ctx.user.email,
-      actorRole: ctx.role,
+      actorEmail,
+      actorRole,
       action: entry.action,
       resourceType: entry.resourceType,
       resourceId: entry.resourceId ?? null,
       oldValue: entry.oldValue ?? null,
       newValue: entry.newValue ?? null,
-      metadata: entry.metadata ?? {},
+      metadata: {
+        /**
+         * ⭐ THE REPRODUCED IDENTITY, IN METADATA — v1.48.0.
+         *
+         * ⚠️ WHY METADATA AND NOT TOP-LEVEL COLUMNS: `audit_logs` has no
+         * `actor_was_reproduced_*` columns, and this release ships with NO
+         * new SQL. The hashed content and the inserted row are the same
+         * object — adding fields that the schema has no columns for would
+         * break INSERT, and the schema change would have to wait for the
+         * next SQL batch. JSONB metadata is fully hashed (it is part of
+         * `content`), so nothing is unattested: the reproduced identity is
+         * in the digest, queryable, and visible in the customer audit
+         * view exactly where other circumstances live.
+         */
+        ...(entry.metadata ?? {}),
+        actorWasReproducedUserId: isImpersonatedSession ? ctx.user.id : null,
+        actorWasReproducedEmail: isImpersonatedSession ? ctx.user.email : null,
+      },
       severity: entry.severity ?? "info",
       reason: entry.reason ?? null,
       impersonationId,

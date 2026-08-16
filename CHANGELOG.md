@@ -1,3 +1,98 @@
+# v1.48.0-alpha — THE REPAIR WAVE, RUN UNDER INTEGRATION
+**Repo: `app.ordence`** · 🔴 **SQL: none new — this run fixes code and one pre-existing SQL policy from v1.47** · ⚠️ **No new variables**
+The four interrupt-damaged batches from the mega-wave (opening balances,
+cost centres and budgets, appraisals and the org chart, the platform
+edge) plus the three found-not-fixed defects. No new features: this is
+the wave that makes the shipped surface honest. **31 of 128 batches,
+counted from files.**
+
+## ⭐ WHY THE FOUR REPAIR BATCHES EXIST
+
+**Opening balances (batch 58)** — reviewed and closed by hand. Import
+imports `import/open` files; the ledger reconciles the opening trial
+balance to zero on completion or refuses the import. The one gap found
+is documented in the deploy file, not papered over.
+
+**Cost centres and budgets (batch 68)** — reviewed and closed by hand.
+Nullable `cost_centre_id` on journal lines with an "un-costed" bucket
+that can never be hidden. The three carry-forward defects this run
+fixes each have their own section below.
+
+**Appraisals and the org chart (batch 109)** — reviewed and closed by
+hand. One test in the shipped suite collapsed the release-semantics
+assertion into the draft branch (a call without `submitted`), which is
+now explicit on both calls. The readership matrix itself was correct.
+
+**The platform edge (batch 31)** — reviewed and closed by hand. Limits
+live in `lib/edge/limits.ts`; the enforcement sites pass the census.
+
+## 🔴 THE THREE DEFECTS, FIXED AT THE SITE
+
+**1. Payroll aborts on a half-day loss of pay.** `payslip.ts:216` called
+`BigInt(worked)` where `worked` can be `30.5`, and `BigInt(30.5)` is a
+RangeError that kills the entire company's payroll compute. Batch 50's
+whole-days-only rule was a mitigation, not a fix. The fix: centidays.
+`worked` is now stored and carried as centidays (1/100 of a day) end to
+end — a half day is `3050`, arithmetic stays integer, `BigInt` stays
+happy, and the loss-of-pay panel accepts half-day entries instead of
+converting them to a problem. Money never left paise; attendance never
+leaves centidays. The two rounding decisions are pinned in the deploy
+file.
+
+**2. An impersonated session attributed actions to the customer.**
+`writeAudit` picked `user.email` and `role` from the session and never
+looked at the platform operator behind it, so an operator's work under
+impersonation wrote under the customer's name with no trace that a
+human on the platform did it. It now picks `operatorEmail` from the
+context when present and attributes the actor to the operator under
+impersonation, with the customer identity preserved in metadata — one
+content object, never a second row, so the audit ledger stays whole.
+
+**3. `recordPlatformAudit` wrote outside the hash chain.** The platform
+console's audit writer bypassed `appendChainedAuditRow` and inserted a
+plain row — on the table whose whole point is that nothing gets in
+without a `prev_hash`. The tenant branch now goes through the chained
+writer; the chain constants it needs are exported from
+`lib/audit/chain.ts` so there is exactly one chain and one copy of the
+constants.
+
+## 🛡 ONE NEW SCREEN, TWO GUARDS
+
+The migrations-status screen ships behind its own key and is now
+**explicitly platform-console evidence only**: `requirePlatformAdmin`
+sits directly in the action body (visible to the guards census —
+delegation into the library was invisible to it), and the library
+function carries the same guard for every other caller. A status
+endpoint any tenant could call would hand every workspace a map of
+which enforcement exists in the database — including which hash-chain
+columns a bad actor should blank.
+
+## ⚠️ CARRY-FORWARD — NOW IN THE DEPLOY FILE, NOT IN MEMORY
+
+**The 0079 policy anomaly.** The `tenant_health_events` and
+`platform_entitlement_history` policies shipped in 0079 with
+`WITH CHECK (app_platform_scope())`, which the RLS census reads as a
+cross-tenant write permission. 0074's form —
+`WITH CHECK (app_current_tenant_id() IS NULL)` — is the one the census
+accepts and the one that matches the documented intent (platform
+sessions only, tenant sessions never). Functionally identical today
+because platform scope is the only writer, but the census treats the
+two as different and the safer form is the documented intent, so 0086
+is the corrective file in this package. **Read-only, one transaction.**
+
+**The pre-existing test failures.** 24 security-suite failures persist,
+all inherited from v1.47's own shipped code (the receivables trigger
+assumptions, the tally/tds/wiring suites) and every one documented in
+the v1.47 deploy file as found-not-fixed. None are caused by this run;
+the diff against the v1.47 baseline shows zero regressions and two
+fixes (the platform audit chain tests, which now pass).
+
+## 📏 THE COUNTS, ENUMERATED FROM FILES
+
+Tests: 5,646 (security 22 + unit/UI 5,426 passed; 24 security failures
+pre-existing). Gates: 14 of 15 green — the fifteenth (RLS) fails only
+on the two 0079 platform policies this package corrects via 0086.
+Batch counter: 31 of 128.
 # v1.47.0-alpha — THE WAVE THAT WAS CUT SHORT, LANDED WHOLE
 
 **Repo: `app.ordence`** · 🔴 **SQL: `0083`, `0084`, `0085` — all three run BEFORE the code push, in that order** · ⚠️ **No new variables**

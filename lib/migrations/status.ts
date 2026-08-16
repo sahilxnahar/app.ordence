@@ -1,4 +1,5 @@
 import { sql } from "drizzle-orm";
+import "server-only";
 import { withPlatformScope } from "@/db";
 import { requirePlatformAdmin } from "@/server/platform/guard";
 

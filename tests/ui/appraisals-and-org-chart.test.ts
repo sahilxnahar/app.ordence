@@ -388,8 +388,18 @@ describe("🔴 three review kinds, three readerships", () => {
    * harm the release step exists to prevent.
    */
   it("the subject does NOT read the manager review before release", () => {
-    expect(canReadReview("manager", rel({ isSubject: true }), { released: false })).toBe(false);
-    expect(canReadReview("manager", rel({ isSubject: true }), { released: true })).toBe(true);
+    // ⭐ BOTH CALLS pass `submitted: true`: drafts never reach the subject
+    // anyway (the unread branch is the writer's alone), so the release
+    // flag alone is the question this test must answer. A call without
+    // `submitted` collapses both assertions into the draft branch and
+    // hides exactly the regression this test exists for.
+    const submitted = { submitted: true } as const;
+    expect(
+      canReadReview("manager", rel({ isSubject: true }), { released: false, ...submitted }),
+    ).toBe(false);
+    expect(
+      canReadReview("manager", rel({ isSubject: true }), { released: true, ...submitted }),
+    ).toBe(true);
   });
 
   /**
