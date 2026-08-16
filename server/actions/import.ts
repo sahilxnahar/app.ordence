@@ -681,7 +681,6 @@ async function resolveLookups(
             and(
               eq(stockItems.tenantId, ctx.tenant.id),
               eq(stockItems.isActive, true),
-              isNull(stockItems.deletedAt),
               inArray(sql`lower(${stockItems.sku})`, list),
             ),
           )
@@ -700,7 +699,6 @@ async function resolveLookups(
             and(
               eq(warehouses.tenantId, ctx.tenant.id),
               eq(warehouses.isActive, true),
-              isNull(warehouses.deletedAt),
               inArray(sql`lower(${warehouses.code})`, list),
             ),
           )

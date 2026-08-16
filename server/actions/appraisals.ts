@@ -1520,7 +1520,14 @@ export async function myAppraisals(): Promise<ActionResult<MyAppraisalsView>> {
 
         const mineOfThese = reviews.filter((r) => r.subjectId === s.id);
         const shapedReviews: ReviewView[] = mineOfThese.map((r) => {
-          const readable = canReadReview(r.kind, relation, { released, submitted: r.submittedAt !== null });
+          // ⭐ THE RELEASE FLAG ALONE IS NOT THE QUESTION. Drafts never
+          // reach the subject (the unread branch is the writer's alone),
+          // so `submitted` must be explicit here — the visibility matrix
+          // is keyed on both, and the test suite pins it.
+          const readable = canReadReview(r.kind, relation, {
+            released,
+            submitted: r.submittedAt !== null,
+          });
           return {
             kind: r.kind,
             reviewerName: byId.get(r.reviewerEmployeeId)?.fullName ?? "—",
