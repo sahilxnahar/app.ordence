@@ -2,7 +2,15 @@
 -- VERIFY-0089 — READ-ONLY, NEON-SAFE. WHAT THE POLICIES ACTUALLY DO.
 -- ############################################################################
 --
---   psql -d <database> -f VERIFY-0089-neon-safe.sql
+--   Paste the whole file into the Neon SQL editor and press Run, or
+--   run it with:  psql -d <database> -f VERIFY-0089-neon-safe.sql
+--
+-- ⚠️ PURE SQL, NO psql META-COMMANDS. An earlier version of this file
+--    used `\echo` for its headings. `\echo` is a psql client command,
+--    not SQL, and the Neon SQL editor is not psql , it answered
+--    "unsupported command: \echo ''" and the whole file stopped on the
+--    first heading. Headings are ordinary `--` comments now, so the file
+--    runs in the Neon editor, in psql, and through any driver.
 --
 -- Writes nothing. Creates nothing. Every session setting it touches is
 -- transaction-local and gone when the statement ends. Safe against Neon.
@@ -66,16 +74,16 @@
 -- ############################################################################
 
 
-\echo ''
-\echo '================ VERIFY-0089 — login_lockouts ================'
-\echo ''
-\echo '=== 1. THE POLICIES, VERBATIM. BOTH CLAUSES. ==='
-\echo '    Printed in full so a reader can see what section 2 evaluated.'
-\echo '    `qual` is USING: it decides which existing rows SELECT, UPDATE'
-\echo '    and DELETE may touch. `with_check` decides which NEW rows'
-\echo '    INSERT and UPDATE may produce. A policy with cmd = ALL supplies'
-\echo '    BOTH, for every command — which is how `USING (true)` leaked.'
-\echo ''
+--
+-- ================ VERIFY-0089 — login_lockouts ================
+--
+-- === 1. THE POLICIES, VERBATIM. BOTH CLAUSES. ===
+--     Printed in full so a reader can see what section 2 evaluated.
+--     `qual` is USING: it decides which existing rows SELECT, UPDATE
+--     and DELETE may touch. `with_check` decides which NEW rows
+--     INSERT and UPDATE may produce. A policy with cmd = ALL supplies
+--     BOTH, for every command — which is how `USING (true)` leaked.
+--
 
 SELECT
     p.polname                                   AS policy,
@@ -94,13 +102,13 @@ WHERE p.polrelid = to_regclass('public.login_lockouts')
 ORDER BY p.polname;
 
 
-\echo ''
-\echo '=== 2. BEHAVIOUR. THE CHECK THE OLD FILE DID NOT DO. ==='
-\echo '    Every policy''s LIVE predicate is evaluated against a synthetic'
-\echo '    row, under a simulated session, and combined the way Postgres'
-\echo '    combines them. Read the NOTICE lines: each one names the'
-\echo '    session, the row, the command and the answer.'
-\echo ''
+--
+-- === 2. BEHAVIOUR. THE CHECK THE OLD FILE DID NOT DO. ===
+--     Every policy's LIVE predicate is evaluated against a synthetic
+--     row, under a simulated session, and combined the way Postgres
+--     combines them. Read the NOTICE lines: each one names the
+--     session, the row, the command and the answer.
+--
 
 DO $verify$
 DECLARE
@@ -257,13 +265,13 @@ END
 $verify$;
 
 
-\echo ''
-\echo '=== 3. THE LIVE READ, AND WHETHER IT MEANT ANYTHING ==='
-\echo '    Section 2 evaluated predicates. This asks the table itself.'
-\echo '    ⚠️ It is only evidence when the connected role does NOT bypass'
-\echo '    RLS. The verdict column says which case you are in — a pass'
-\echo '    under a bypassing role is reported as NOT PROVEN, not as OK.'
-\echo ''
+--
+-- === 3. THE LIVE READ, AND WHETHER IT MEANT ANYTHING ===
+--     Section 2 evaluated predicates. This asks the table itself.
+--     ⚠️ It is only evidence when the connected role does NOT bypass
+--     RLS. The verdict column says which case you are in — a pass
+--     under a bypassing role is reported as NOT PROVEN, not as OK.
+--
 
 BEGIN;
 SELECT set_config('app.current_tenant_id', '11111111-1111-1111-1111-111111111111', true) AS pinned_tenant;
@@ -285,9 +293,9 @@ SELECT
 COMMIT;
 
 
-\echo ''
-\echo '=== 4. RLS IS ON, AND FORCED EVEN FOR THE OWNER ==='
-\echo ''
+--
+-- === 4. RLS IS ON, AND FORCED EVEN FOR THE OWNER ===
+--
 
 SELECT
     'rls' AS what,
@@ -299,9 +307,9 @@ SELECT
 FROM pg_class WHERE relname = 'login_lockouts';
 
 
-\echo ''
-\echo '=== 5. THE TABLE SHAPE ==='
-\echo ''
+--
+-- === 5. THE TABLE SHAPE ===
+--
 
 SELECT
     'table' AS what,
@@ -320,12 +328,12 @@ FROM (
 ) s;
 
 
-\echo ''
-\echo '=== 6. GRANTS — WHAT ordence_app MAY ATTEMPT ==='
-\echo '    ⚠️ A SECOND GATE, NOT THE SAME ONE. Grants decide what the'
-\echo '    role may attempt; the policies in sections 1-2 decide which'
-\echo '    rows it then reaches. Both must be right.'
-\echo ''
+--
+-- === 6. GRANTS — WHAT ordence_app MAY ATTEMPT ===
+--     ⚠️ A SECOND GATE, NOT THE SAME ONE. Grants decide what the
+--     role may attempt; the policies in sections 1-2 decide which
+--     rows it then reaches. Both must be right.
+--
 
 SELECT
     'grants' AS what,
@@ -348,9 +356,9 @@ SELECT
          ELSE '🔴 GRANTS WRONG — see \dp login_lockouts' END AS verdict;
 
 
-\echo ''
-\echo '=== 7. RESIDUE — NOBODY ELSE HOLDS ANYTHING ==='
-\echo ''
+--
+-- === 7. RESIDUE — NOBODY ELSE HOLDS ANYTHING ===
+--
 
 SELECT
     'residue' AS what,
@@ -366,6 +374,74 @@ FROM (
       AND grantee NOT IN ('ordence_app', 'ordence_test', 'postgres')
 ) r;
 
-\echo ''
-\echo '=============== END VERIFY-0089 ==============================='
-\echo ''
+--
+-- =============== END VERIFY-0089 ===============================
+--
+
+
+-- ############################################################################
+-- 6. THE VERDICT AS A RESULT SET , FOR THE NEON SQL EDITOR
+-- ############################################################################
+--
+-- ⚠️ SECTION 2 ABOVE REPORTS THROUGH `RAISE NOTICE`, WHICH THE NEON SQL
+--    EDITOR DOES NOT DISPLAY. It shows result tables. Run in psql you get
+--    thirteen behavioural lines; run in the Neon editor you get nothing at
+--    all from that section, which reads exactly like a section that found
+--    nothing wrong. That is the same shape of mistake as the file this one
+--    replaced, so the checks below return ROWS.
+--
+-- These are static: they read the policy text out of the catalogue rather
+-- than evaluating it. Section 2 is still the stronger proof, and
+-- DRILL-DO-NOT-RUN-IN-NEON-0089.sql is stronger again because it uses two
+-- real tenants. This section is the part that survives the client.
+
+SELECT
+    '6. USING CLAUSES'                                             AS section,
+    p.polname                                                      AS policy,
+    CASE p.polcmd WHEN 'r' THEN 'SELECT' WHEN 'a' THEN 'INSERT'
+                  WHEN 'w' THEN 'UPDATE' WHEN 'd' THEN 'DELETE'
+                  ELSE 'ALL' END                                   AS applies_to,
+    coalesce(pg_get_expr(p.polqual, p.polrelid), '(none)')         AS using_clause,
+    CASE
+      WHEN p.polpermissive
+       AND pg_get_expr(p.polqual, p.polrelid) IN ('true', 'TRUE')
+        THEN '🔴 LEAK , a permissive USING of true is OR''d with every other policy and erases them. This is the defect 0089 shipped with.'
+      WHEN p.polqual IS NULL AND p.polcmd IN ('r','w','d','*')
+        THEN '🔴 NO USING on a command that reads existing rows.'
+      ELSE 'OK'
+    END                                                            AS verdict
+FROM pg_policy p
+WHERE p.polrelid = 'login_lockouts'::regclass
+ORDER BY p.polname;
+
+SELECT
+    '6. WRITE BOUNDARY'                                            AS section,
+    p.polname                                                      AS policy,
+    coalesce(pg_get_expr(p.polwithcheck, p.polrelid), '(none)')    AS with_check_clause,
+    CASE
+      WHEN p.polcmd = 'r' THEN 'n/a , SELECT has no WITH CHECK'
+      WHEN pg_get_expr(p.polwithcheck, p.polrelid) = 'app_platform_scope()' THEN 'OK'
+      WHEN pg_get_expr(p.polwithcheck, p.polrelid) LIKE '%app_current_tenant_id() IS NULL%'
+        THEN '🔴 TOO WIDE , any connection with no tenant set may write. Use app_platform_scope().'
+      ELSE '⚠️ REVIEW , not the house form for a platform-evidence table.'
+    END                                                            AS verdict
+FROM pg_policy p
+WHERE p.polrelid = 'login_lockouts'::regclass
+ORDER BY p.polname;
+
+SELECT
+    '6. HEADLINE' AS section,
+    CASE
+      WHEN count(*) FILTER (
+             WHERE p.polpermissive AND pg_get_expr(p.polqual, p.polrelid) IN ('true','TRUE')
+           ) > 0
+        THEN '🔴 THIS TABLE LEAKS. A permissive USING(true) is present. Do not deploy. Tell Claude.'
+      WHEN count(*) FILTER (
+             WHERE p.polcmd <> 'r'
+               AND coalesce(pg_get_expr(p.polwithcheck, p.polrelid),'') <> 'app_platform_scope()'
+           ) > 0
+        THEN '⚠️ A write boundary is not app_platform_scope(). Read the rows above.'
+      ELSE '✅ Policy shapes are correct: no permissive USING(true), and every write boundary is app_platform_scope().'
+    END           AS verdict
+FROM pg_policy p
+WHERE p.polrelid = 'login_lockouts'::regclass;
