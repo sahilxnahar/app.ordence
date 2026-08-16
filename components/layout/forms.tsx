@@ -272,3 +272,32 @@ export function useUtmReport() {
     void tags;
   }, []);
 }
+
+
+/**
+ * ⭐⭐ THE CLIENT WRAPPER FOR `useUtmReport`, AND WHY IT LIVES HERE.
+ *
+ * 🔴 THIS COMPONENT WAS DEFINED IN `app/layout.tsx`, WHICH IS A SERVER
+ * COMPONENT, AND IT TOOK THE WHOLE APPLICATION DOWN.
+ *
+ *     Error: Attempted to call useUtmReport() from the server but
+ *     useUtmReport is on the client.
+ *
+ * Defining the wrapper inside `layout.tsx` looks like it makes it a
+ * client component, and it does not: a function declared in a server
+ * module IS server code, wherever the hook it calls happens to live.
+ * The root layout renders on every request, so a throw there is not one
+ * broken page , it is a 500 on every route in the product, customer app
+ * and staff console alike. It was.
+ *
+ * ⚠️ `next build` DOES NOT CATCH IT. The build succeeded and deployed
+ * green; the error is thrown at render time, per request.
+ *
+ * ⭐ THE FIX IS WHERE THE COMPONENT LIVES, NOT WHAT IT DOES. This file
+ * carries `"use client"` at the top, so anything exported from it is a
+ * client component and the layout may render it as a child.
+ */
+export function UtmCapture() {
+  useUtmReport();
+  return null;
+}

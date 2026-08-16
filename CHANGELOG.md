@@ -1,3 +1,24 @@
+# v1.54.0-alpha — THE 500 ON EVERY ROUTE
+
+**Repo: `app.ordence`** · 🔴 **SQL: unchanged (`0086`–`0090`)** · ⚠️ **No new variables**
+
+- 🔴🔴 **THE ENTIRE APPLICATION WAS RETURNING 500, ON EVERY ROUTE, ON BOTH
+  HOSTS.** `app/layout.tsx` is a server component and declared a wrapper
+  that called `useUtmReport()`, a hook from a `"use client"` module.
+  Declaring the wrapper inside the layout looks like it makes it a client
+  component; it does not. The root layout renders on every request, so
+  React threw on every route in the product while `/api/health` stayed
+  200 and the deployment reported healthy. From the Wave 8b UTM item.
+  **The fix is where the component lives, not what it does**: `UtmCapture`
+  moved into the `"use client"` module and the layout renders it.
+- ⭐ **SEVENTEENTH GATE: `check:client-hooks`.** A file without
+  `"use client"` may not import and call a `use*` identifier from a file
+  with it. Proven by reintroducing the exact defect.
+- ⚠️ **`app.ordence.com/platform` now returns 404 BY DESIGN.** Once
+  `PLATFORM_HOST` resolves, the console is refused on the app host and
+  lives at `admin.ordence.com`. That is the documented behaviour, not a
+  regression.
+- ⚠️ **Seventeen gates green. 128 test files, 4,467 passing.**
 # v1.53.0-alpha — THE BUILD FIX, AND THE GATE THAT SHOULD HAVE CAUGHT IT
 
 **Repo: `app.ordence`** · 🔴 **SQL: unchanged from v1.52.0 (`0086`–`0090`, all BEFORE the push)** · ⚠️ **No new variables**

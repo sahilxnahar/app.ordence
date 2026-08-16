@@ -1,6 +1,6 @@
 {
   "name": "ordence",
-  "version": "1.53.0-alpha",
+  "version": "1.54.0-alpha",
   "private": true,
   "scripts": {
     "dev": "next dev",
@@ -45,7 +45,8 @@
     "check:tax-decisions": "node scripts/check-tax-decisions.mjs",
     "check:links": "node scripts/check-links.mjs",
     "check:tenant-isolation": "node scripts/check-tenant-isolation.mjs",
-    "check:route-exports": "node scripts/check-route-exports.mjs"
+    "check:route-exports": "node scripts/check-route-exports.mjs",
+    "check:client-hooks": "node scripts/check-client-hooks.mjs"
   },
   "dependencies": {
     "@clerk/nextjs": "^6.39.6",

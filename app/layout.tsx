@@ -8,7 +8,7 @@ import { getClerkPublishableKey, getClerkPaths } from "@/lib/env";
 import { ThemeScript } from "@/components/layout/theme-provider";
 import { BackToTop, ScrollProgressBar, SkipToContent } from "@/components/layout/accessibility";
 import { CookieBanner } from "@/components/layout/cookie-banner";
-import { useUtmReport } from "@/components/layout/forms";
+import { UtmCapture } from "@/components/layout/forms";
 
 export const metadata: Metadata = {
   title: "Ordence",
@@ -172,7 +172,3 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
  * moment attribution outlives the session it has become tracking, and
  * this app does not do that.
  */
-function UtmCapture() {
-  useUtmReport();
-  return null;
-}
