@@ -13,6 +13,7 @@
  * A view can be pasted into a ticket and reproduced exactly.
  */
 
+import { consoleHref, onConsoleHost } from "@/lib/platform/console-href";
 import { Suspense } from "react";
 import Link from "next/link";
 import { listAllUsers, listAllTenantsForFilter, type UserSortKey } from "@/server/platform/users";
@@ -81,13 +82,18 @@ function hrefWith(
 }
 
 export default async function UsersPage({ searchParams }: { searchParams: SearchParams }) {
+  // ⚠️ The console is served at two base paths. See
+  // `lib/platform/console-href.ts` , a `/platform/...` link on the
+  // console host is not a rewritten path and lands on a 404.
+  const isConsole = await onConsoleHost();
+
   const params = readParams(await searchParams);
 
   return (
     <div className="space-y-6">
       <header className="space-y-1">
         <nav className="text-sm text-muted-foreground">
-          <Link href="/platform" className="hover:underline">Platform</Link>
+          <Link href={consoleHref("/platform", isConsole)} className="hover:underline">Platform</Link>
           <span className="px-2">/</span>
           <span>Users</span>
         </nav>

@@ -29,6 +29,7 @@
  * confirms it does and that they were close.
  */
 
+import { consoleHref, onConsoleHost } from "@/lib/platform/console-href";
 import { Suspense } from "react";
 import Link from "next/link";
 import { notFound } from "next/navigation";
@@ -83,6 +84,14 @@ const NAV = [
   { href: "/platform/staff", label: "Staff access" },
 ] as const;
 
+/**
+ * ⚠️ THE NAV ABOVE IS WRITTEN IN CANONICAL `/platform/...` PATHS, WHICH
+ * ARE THE PATHS THAT EXIST ON DISK. `consoleHref` maps them onto the form
+ * THIS host actually serves. On `admin.` the middleware already rewrites
+ * `/x` to `/platform/x`, so a link to `/platform/x` there is not a
+ * rewritten path, falls through to tenant resolution, and lands on a 404.
+ * That is why every link in this console used to be broken.
+ */
 export default async function PlatformLayout({
   children,
 }: {
@@ -93,6 +102,12 @@ export default async function PlatformLayout({
   // Fail closed, and fail SILENTLY. No message, no hint, no redirect that
   // names the console.
   if (!operator) notFound();
+
+  // ⚠️ READ THE HOST ONCE, HERE. Every link below is written in the
+  // canonical `/platform/...` form and mapped onto whatever this host
+  // actually serves. See `lib/platform/console-href.ts` for the 404 chain
+  // this prevents.
+  const isConsole = await onConsoleHost();
 
   return (
     <div className="min-h-screen bg-background">
@@ -115,7 +130,7 @@ export default async function PlatformLayout({
 
           <nav className="flex items-center gap-4 text-sm">
             {NAV.map((item) => (
-              <Link key={item.href} href={item.href} className="hover:underline">
+              <Link key={item.href} href={consoleHref(item.href, isConsole)} className="hover:underline">
                 {item.label}
               </Link>
             ))}

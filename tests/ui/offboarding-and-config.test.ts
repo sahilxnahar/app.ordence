@@ -519,6 +519,15 @@ describe("everything is reachable", () => {
   });
 
   it("the global chain screen is linked from a page somebody opens", () => {
-    expect(codeOnly(read("app/platform/tenants/page.tsx"))).toContain('href="/platform/config"');
+    // ⚠️ ASSERTS THE LINK, NOT HOW IT IS SPELLED. This pinned the literal
+    // string `href="/platform/config"` and broke when console links became
+    // host-aware. The console is served at two base paths , /platform/x on
+    // app. and /x on admin. , so every link now goes through
+    // `consoleHref()`. The property that matters is that the config screen
+    // is REACHABLE from a page somebody opens, which is what this test is
+    // named after. A test that pins the spelling fails when the spelling
+    // is corrected, which trains people to edit the test.
+    const src = codeOnly(read("app/platform/tenants/page.tsx"));
+    expect(src).toMatch(/href=\{?\s*(?:"\/platform\/config"|consoleHref\(\s*"\/platform\/config")/);
   });
 });

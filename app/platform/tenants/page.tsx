@@ -34,6 +34,7 @@
  * a specific workspace IS audited, and that is where the boundary belongs.
  */
 
+import { consoleHref, onConsoleHost } from "@/lib/platform/console-href";
 import { Suspense } from "react";
 import Link from "next/link";
 import { notFound } from "next/navigation";
@@ -66,6 +67,11 @@ export default async function AttentionPage({
 }: {
   searchParams: SearchParams;
 }) {
+  // ⚠️ The console is served at two base paths. See
+  // `lib/platform/console-href.ts` , a `/platform/...` link on the
+  // console host is not a rewritten path and lands on a 404.
+  const isConsole = await onConsoleHost();
+
   const params = await searchParams;
   const kindParam = typeof params.kind === "string" ? params.kind : "all";
 
@@ -76,7 +82,7 @@ export default async function AttentionPage({
         <p className="mt-1 text-sm text-muted-foreground">
           Workspaces with a reason somebody should look at them today. Everything else is
           in the{" "}
-          <Link href="/platform" className="underline">
+          <Link href={consoleHref("/platform", isConsole)} className="underline">
             directory
           </Link>
           .
@@ -91,7 +97,7 @@ export default async function AttentionPage({
         */}
         <p className="mt-1 text-sm text-muted-foreground">
           Limits, messages and windows resolve through the{" "}
-          <Link href="/platform/config" className="underline">
+          <Link href={consoleHref("/platform/config", isConsole)} className="underline">
             configuration chain
           </Link>
           .
@@ -106,6 +112,9 @@ export default async function AttentionPage({
 }
 
 async function AttentionBody({ kind }: { kind: string }) {
+  // ⚠️ Two base paths for this console. See `lib/platform/console-href.ts`.
+  const isConsole = await onConsoleHost();
+
   const operator = await getPlatformOperator();
   if (!operator) notFound();
 
@@ -183,7 +192,7 @@ async function AttentionBody({ kind }: { kind: string }) {
       {kind !== "all" ? (
         <p className="text-sm">
           Filtered to {TROUBLE_LABELS[kind as TroubleKind] ?? kind} ·{" "}
-          <Link href="/platform/tenants" className="underline">
+          <Link href={consoleHref("/platform/tenants", isConsole)} className="underline">
             show all
           </Link>
         </p>

@@ -8,6 +8,7 @@
  * ⚠️ Every status/role change writes to the CUSTOMER'S audit log.
  */
 
+import { consoleHref, onConsoleHost } from "@/lib/platform/console-href";
 import { Suspense } from "react";
 import Link from "next/link";
 import { notFound } from "next/navigation";
@@ -42,6 +43,11 @@ export default async function UserDetailPage({
 }: {
   params: Promise<{ id: string }>;
 }) {
+  // ⚠️ The console is served at two base paths. See
+  // `lib/platform/console-href.ts` , a `/platform/...` link on the
+  // console host is not a rewritten path and lands on a 404.
+  const isConsole = await onConsoleHost();
+
   const { id } = await params;
   const decodedId = decodeURIComponent(id);
 
@@ -53,6 +59,9 @@ export default async function UserDetailPage({
 }
 
 async function UserDetailBody({ clerkUserId }: { clerkUserId: string }) {
+  // ⚠️ Two base paths for this console. See `lib/platform/console-href.ts`.
+  const isConsole = await onConsoleHost();
+
   const result = await getPlatformUserDetail(clerkUserId);
 
   if (!result.ok) {
@@ -65,9 +74,9 @@ async function UserDetailBody({ clerkUserId }: { clerkUserId: string }) {
     <div className="space-y-6">
       {/* ---- breadcrumb ---- */}
       <nav className="text-sm text-muted-foreground">
-        <Link href="/platform" className="hover:underline">Platform</Link>
+        <Link href={consoleHref("/platform", isConsole)} className="hover:underline">Platform</Link>
         <span className="px-2">/</span>
-        <Link href="/platform/users" className="hover:underline">Users</Link>
+        <Link href={consoleHref("/platform/users", isConsole)} className="hover:underline">Users</Link>
         <span className="px-2">/</span>
         <span>{user.fullName || user.email}</span>
       </nav>

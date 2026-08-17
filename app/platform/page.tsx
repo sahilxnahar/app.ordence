@@ -26,6 +26,7 @@
  * session: consented, time-limited, bannered and audited.
  */
 
+import { consoleHref, onConsoleHost } from "@/lib/platform/console-href";
 import { Suspense } from "react";
 import Link from "next/link";
 import { listTenants, type TenantSortKey } from "@/server/platform/tenants";
@@ -89,6 +90,11 @@ export default async function PlatformHomePage({
 }: {
   searchParams: SearchParams;
 }) {
+  // ⚠️ The console is served at two base paths. See
+  // `lib/platform/console-href.ts` , a `/platform/...` link on the
+  // console host is not a rewritten path and lands on a 404.
+  const isConsole = await onConsoleHost();
+
   const params = readParams(await searchParams);
 
   return (
@@ -111,6 +117,9 @@ export default async function PlatformHomePage({
 }
 
 async function TenantList({ params }: { params: ReturnType<typeof readParams> }) {
+  // ⚠️ Two base paths for this console. See `lib/platform/console-href.ts`.
+  const isConsole = await onConsoleHost();
+
   const operator = await getPlatformOperator();
   if (!operator) return null;
 
@@ -200,7 +209,7 @@ async function TenantList({ params }: { params: ReturnType<typeof readParams> })
 
       {live > 0 ? (
         <p className="text-sm">
-          <Link href="/platform/sessions?live=1" className="underline">
+          <Link href={consoleHref("/platform/sessions?live=1", isConsole)} className="underline">
             {live === 1 ? "One session is" : `${live} sessions are`} open inside a
             customer&rsquo;s workspace — review them
           </Link>

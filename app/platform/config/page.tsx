@@ -26,6 +26,7 @@
  * on a screen.
  */
 
+import { consoleHref, onConsoleHost } from "@/lib/platform/console-href";
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { getPlatformOperator } from "@/server/platform/guard";
@@ -49,6 +50,11 @@ export const metadata = {
 const TIERS: readonly PlanTier[] = ["trial", "basic", "advanced", "ai", "enterprise"];
 
 export default async function PlatformConfigPage() {
+  // ⚠️ The console is served at two base paths. See
+  // `lib/platform/console-href.ts` , a `/platform/...` link on the
+  // console host is not a rewritten path and lands on a 404.
+  const isConsole = await onConsoleHost();
+
   // ⚠️ The page-level check is a courtesy, not the boundary. Every read
   // and write behind the per-workspace screens re-checks its own
   // capability, because a server action is a POST to whatever URL the
@@ -179,7 +185,7 @@ export default async function PlatformConfigPage() {
       </Card>
 
       <p className="text-sm">
-        <Link href="/platform/tenants" className="underline">
+        <Link href={consoleHref("/platform/tenants", isConsole)} className="underline">
           Set an override on a workspace
         </Link>
       </p>

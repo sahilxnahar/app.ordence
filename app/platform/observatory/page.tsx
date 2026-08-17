@@ -23,6 +23,7 @@
  * the product and a blank page is not a loading state.
  */
 
+import { consoleHref, onConsoleHost } from "@/lib/platform/console-href";
 import { Suspense } from "react";
 import Link from "next/link";
 import { getObservatory } from "@/server/platform/observatory";
@@ -105,12 +106,16 @@ function Skeleton() {
   );
 }
 
-export default function ObservatoryPage() {
+export default async function ObservatoryPage() {
+  // ⚠️ The console is served at two base paths. See
+  // `lib/platform/console-href.ts` , a `/platform/...` link on the
+  // console host is not a rewritten path and lands on a 404.
+  const isConsole = await onConsoleHost();
   return (
     <div className="space-y-6 p-6">
       <header className="space-y-1">
         <nav className="text-sm text-muted-foreground">
-          <Link href="/platform" className="hover:underline">
+          <Link href={consoleHref("/platform", isConsole)} className="hover:underline">
             Platform
           </Link>
           <span className="px-2">/</span>

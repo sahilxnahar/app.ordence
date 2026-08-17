@@ -1,3 +1,28 @@
+# v1.55.0-alpha — EVERY LINK IN THE STAFF CONSOLE
+
+**Repo: `app.ordence`** · 🔴 **SQL: unchanged (`0086`–`0090`)** · ⚠️ **No new variables**
+
+- 🔴🔴 **THE CONSOLE LOADED AND EVERY LINK IN IT WENT TO A 404.** Traced
+  live against production, the chain was: click a nav item →
+  `/platform/tenants` → not rewritten on the console host (it already
+  starts with `/platform`) → falls through to tenant resolution → redirect
+  to `/dashboard` → **that** IS rewritten to `/platform/dashboard` → which
+  does not exist → 404.
+  ⚠️ **The console is served at two base paths**: `/platform/x` on
+  `app.ordence.com`, and `/x` on `admin.ordence.com` where middleware
+  rewrites. Every link was written for the first and the operator uses the
+  second.
+  **Fixed with `lib/platform/console-href.ts`**, one helper reading the
+  request's own Host header. All twelve hard-coded links updated; the one
+  in a client component became relative, because a client component cannot
+  read the host and a relative href resolves against whichever base it is on.
+- ⚠️ **A fix that looked tidier was wrong, and testing caught it.** Turning
+  the middleware rewrite into a redirect reads better and would have broken
+  the one path that DID work, since the rewritten form is currently the only
+  one that resolves. The links were wrong, not the routing.
+- ⭐ **EIGHTEENTH GATE: `check:console-links`.** No hard-coded `/platform`
+  href inside `app/platform/**`. Proven by reintroducing one.
+- ⚠️ **Eighteen gates green. 128 test files, 4,467 passing.**
 # v1.54.0-alpha — THE 500 ON EVERY ROUTE
 
 **Repo: `app.ordence`** · 🔴 **SQL: unchanged (`0086`–`0090`)** · ⚠️ **No new variables**

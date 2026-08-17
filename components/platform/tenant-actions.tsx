@@ -322,7 +322,15 @@ export function TenantActions(props: TenantActionsProps) {
             normally and its users are unaffected.{" "}
           </span>
           {queuedNote}{" "}
-          <a className="underline" href="/platform/approvals">
+          {/*
+             ⚠️ RELATIVE, NOT ABSOLUTE, AND THAT IS THE WHOLE FIX HERE.
+             This is a client component and cannot read the request host,
+             so it cannot know whether the console is served at
+             `/platform/approvals` or at `/approvals`. A relative href
+             resolves against whichever base the current page is on, which
+             is correct on both hosts without either of them being named.
+          */}
+          <a className="underline" href="approvals">
             Open the approvals queue
           </a>
           .

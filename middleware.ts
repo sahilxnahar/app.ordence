@@ -710,9 +710,35 @@ async function run(auth: ClerkAuth, req: NextRequest) {
    * else `/platform` is not. Neither half depends on a developer
    * remembering anything.
    *
-   * ⚠️ REWRITE, NOT REDIRECT, for the console's own root. A redirect
-   * would bounce the operator to `app.` and leak the console's existence
-   * in a Location header to anyone who probes the host.
+   * ⚠️ SAME-HOST REDIRECT, NOT REWRITE. THIS WAS A REWRITE AND IT BROKE
+   * EVERY LINK IN THE CONSOLE.
+   *
+   * 🔴 THE SYMPTOM: the console loaded, and then every click on the
+   * navigation went to a 404. The page you land on is server-rendered
+   * and fine; the moment the App Router does a client-side navigation it
+   * fails.
+   *
+   * 🔴 THE CAUSE: a rewrite renders `/platform/tenants` while the URL bar
+   * still says `/tenants`. The server is happy , the ROUTER is not. Next's
+   * App Router builds its route tree from the rendered path and its
+   * history from the URL, and when those two disagree every subsequent
+   * RSC fetch asks for a tree that does not exist at the URL it is asking
+   * about. A rewrite INTO a route segment works for the first document
+   * and breaks navigation, which is the worst possible failure shape:
+   * the product looks like it loaded.
+   *
+   * ⭐ THE FIX IS TO MAKE THE URL TRUE. Redirect to the real path once,
+   * and from then on the URL, the route tree and the sidebar's hrefs all
+   * say `/platform/...`. Nothing has to be kept in sync because nothing
+   * differs.
+   *
+   * ⚠️ AND THE SECURITY ARGUMENT FOR THE REWRITE DOES NOT APPLY. The old
+   * comment here said a redirect "would bounce the operator to `app.` and
+   * leak the console's existence in a Location header". That is true of a
+   * CROSS-HOST redirect and this is not one: it stays on `admin.`, and
+   * anyone receiving it has already reached the console's own hostname.
+   * There is nothing left to disclose. The host boundary below is
+   * untouched , `/platform` is still refused everywhere else.
    */
   const path = req.nextUrl.pathname;
 
