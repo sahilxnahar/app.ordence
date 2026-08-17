@@ -80,6 +80,23 @@ const NOT_TENANT_SCOPED = new Set(["tenants", "plans"]);
  * to this list is a visible decision.
  */
 const OPT_IN_PLATFORM_WRITE = new Set([
+  /**
+   * `0091_slug_authority.sql` adds `tenant_slug_history`, the ninth entry.
+   *
+   * ⚠️ WHY IT NEEDS THE MARKER RATHER THAN AN ORDINARY TENANT WRITE POLICY.
+   * A slug rename is a PLATFORM act: an operator performs it, inside
+   * `withPlatformScope(reason, cb)`, on behalf of a tenant. The row it writes
+   * is the EVIDENCE of what the platform did, and a tenant that could write
+   * its own slug history could rewrite that evidence. The read boundary is
+   * untouched — the USING clause still names `app_current_tenant_id()`, so a
+   * tenant sees its own history and nobody else's.
+   *
+   * 🔴 The rows are also the 365-day retention record for a released
+   * hostname. Deleting one hands a live hostname, still sitting in bookmarks
+   * and in the CT log, to a different company. `0091` grants no DELETE on
+   * this table for exactly that reason.
+   */
+  "tenant_slug_history",
   "login_lockouts",
   "error_events",
   "platform_entitlement_history",

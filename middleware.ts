@@ -185,6 +185,28 @@ const isPublicRoute = createRouteMatcher([
   // ══════════════════════════════════════════════════════════════
   "/api/telemetry",
   // ══════════════════════════════════════════════════════════════
+  // PUBLIC SLUG AVAILABILITY (v1.57.0-alpha)
+  //
+  // Deliberately public, and it has to be: the caller is a person part
+  // way through self-serve signup who has no Clerk session and, by
+  // definition, no organisation yet. A gate here would make the field
+  // that tells them their workspace address is free answer 401 for
+  // every single person who needs it.
+  //
+  // ⚠️ THE ONE PATH, NOT `/api/public(.*)`. A wildcard would make every
+  //    route somebody adds under `/api/public` unauthenticated by
+  //    default, and "it was public because of where I put the file" is
+  //    not a decision anyone made. Each entry earns its own line, the
+  //    same way `/api/cron/canary` does.
+  //
+  // "Public" does not mean unbounded: the route rate-limits per source
+  // network before reading the body (10/minute, 60/hour), caps the
+  // body, answers only `available` plus a public sentence that never
+  // names a conflicting workspace, and can neither write nor reserve
+  // anything. Read the header of app/api/public/slug-available/route.ts.
+  // ══════════════════════════════════════════════════════════════
+  "/api/public/slug-available",
+  // ══════════════════════════════════════════════════════════════
   // THE EXTERNAL CLIENT PORTAL (Phase 9)
   //
   // Deliberately public. A counterparty reviewing a contract has no
@@ -486,6 +508,114 @@ async function edgeLimitGate(
       );
 
   return { refusal, headers };
+}
+
+/* ------------------------------------------------------------------ */
+/* RELEASED TENANT HOSTNAMES — 301, RESOLVED IN THE APP LAYER          */
+/* ------------------------------------------------------------------ */
+
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 A RENAMED WORKSPACE LEAVES ITS OLD HOSTNAME LIVE IN THE WORLD
+ * ══════════════════════════════════════════════════════════════════════
+ * `old.ordence.com` stays in every bookmark, every emailed invoice link,
+ * every WhatsApp message a site engineer forwarded, and permanently in
+ * the public Certificate Transparency log. `tenant_slug_history` retains
+ * the label for 365 days so nobody else can take it, and a request
+ * arriving on it must be answered with a 301 to the same path on the
+ * workspace's current host — a redirect and NOTHING else, because the old
+ * name may since have been re-pointed and serving data under it is a
+ * cross-tenant leak wearing a friendly face.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * ⚠️ THE DELIBERATE PART: THIS FILE DOES NOT DO THE LOOKUP
+ * ══════════════════════════════════════════════════════════════════════
+ * Middleware runs in the Edge Runtime on every single request. It may not
+ * open a database connection, and `pg`, Drizzle and
+ * `@neondatabase/serverless` are all banned from this bundle. Two designs
+ * were available and the choice was made on the cost, not the taste:
+ *
+ *   ① AN EDGE-CACHED LOOKUP — a TTL map in the isolate, refilled by a
+ *      subrequest. REJECTED: it puts an `await fetch` on the critical
+ *      path of every cold isolate, and it forces a fail-open/fail-closed
+ *      decision on the lookup itself. Fail open and a released host
+ *      serves under the old name during any blip; fail closed and one
+ *      slow query takes every tenant hostname offline. Both answers are
+ *      worse than the problem being solved.
+ *
+ *   ② REWRITE TO AN APP-LAYER ROUTE that owns the query — CHOSEN. This
+ *      file stays pure string logic and the database work happens in
+ *      `app/api/internal/host-moved/route.ts`, in the Node runtime,
+ *      behind a one-minute per-label cache.
+ *
+ * ⭐ AND IT IS FREE ON THE HOT PATH, WHICH IS WHY THE PLACEMENT MATTERS.
+ *    The rewrite is issued at exactly the two exits where this middleware
+ *    was ALREADY going to refuse the request — no Clerk session (step 4)
+ *    and a session whose organisation does not match the host (step 7).
+ *    A signed-in person working inside their own workspace never reaches
+ *    either, so they never reach the route and never pay for the query.
+ *    Both of those exits were already a round trip ending in a `Location`
+ *    header; the route either issues a better one or reproduces the
+ *    original exactly.
+ *
+ * ⚠️ A REWRITE IS TERMINAL — THERE IS NO "CHECK, THEN CONTINUE". That is
+ *    a property of the framework and it is the reason the check cannot
+ *    simply wrap every request: whatever a rewrite points at PRODUCES the
+ *    response. So it may only be used where the request was already being
+ *    terminated. The residual gap (public routes, which are forwarded
+ *    before the session is read) is argued in the route's own header —
+ *    nothing in this product resolves a tenant from the hostname, so the
+ *    old name serves marketing HTML and a sign-in page and no customer
+ *    record of any kind.
+ *
+ * ⚠️ NOTHING IN `resolveTenantFromHost` CHANGED, AND THAT IS ON PURPOSE.
+ *    A released slug is shape-valid — it was a real workspace address
+ *    yesterday — so it classifies as `{ kind: "subdomain" }` exactly as it
+ *    always did, and no ordering in that resolver moves. `admin.` still
+ *    returns `{ kind: "platform" }` from the first branch and `app.` still
+ *    returns `{ kind: "root" }` from the bare-root branch; neither is
+ *    `subdomain`, so neither can ever reach the rewrite below.
+ */
+const HOST_MOVED_ROUTE = "/api/internal/host-moved";
+
+/**
+ * Hand this request to the resolver instead of refusing it here.
+ *
+ * ⚠️ THE LABEL IS NOT PASSED. The route derives it from the `Host` header,
+ * which the rewrite preserves. Passing it as a parameter would make the
+ * route a public lookup table of "where did workspace X move to" for any
+ * label somebody cares to type; deriving it from the Host means a caller
+ * can only ask about a hostname they were already able to address.
+ *
+ * `fallback` says which refusal to reproduce when the label has NOT been
+ * released, so a request that was going to get `/sign-in` still gets
+ * `/sign-in` and one that was going to get `/access-denied` still does.
+ */
+function rewriteToHostResolver(
+  req: NextRequest,
+  headers: Headers,
+  fallback: "sign-in" | "access-denied",
+): NextResponse {
+  const url = req.nextUrl.clone();
+  url.search = "";
+  url.pathname = HOST_MOVED_ROUTE;
+  url.searchParams.set("path", req.nextUrl.pathname + req.nextUrl.search);
+  url.searchParams.set("fallback", fallback);
+  /*
+   * 🔴 `{ request: { headers } }` IS NOT OPTIONAL HERE.
+   *
+   * A bare `NextResponse.rewrite(url)` forwards the request's ORIGINAL
+   * headers — including every `x-tenant-*` a client supplied, which step 1
+   * of this middleware deleted precisely so that nothing downstream can be
+   * told which tenant it is serving by the caller. The resolver does not
+   * read them today; handing it the unsanitised set anyway would leave a
+   * spoofable header sitting one edit away from being trusted, on the one
+   * route whose entire job is deciding what a hostname is allowed to be.
+   *
+   * It also carries `x-request-id`, so the resolver's log line correlates
+   * with the request that produced it.
+   */
+  return applySecurityHeaders(NextResponse.rewrite(url, { request: { headers } }));
 }
 
 /** Copy the observability headers onto whatever response we return. */
@@ -808,6 +938,25 @@ async function run(auth: ClerkAuth, req: NextRequest) {
   const { userId, orgId, orgSlug, orgRole, sessionClaims } = await auth();
 
   if (!userId) {
+    /**
+     * ⭐ THE RELEASED-HOSTNAME BRANCH — v1.57.0-alpha.
+     *
+     * ⚠️ ONLY FOR A TENANT SUBDOMAIN, AND ONLY WHERE THIS FILE WAS ALREADY
+     * REFUSING. `admin.` resolves to `platform` and `app.`/`www.`/
+     * `*.workers.dev`/`*.vercel.app` resolve to `root`, so none of them can
+     * be `subdomain` and none of them reaches this line. See the block
+     * above `rewriteToHostResolver` for why the lookup is not done here.
+     *
+     * ⚠️ THE GUARD AGAINST REWRITING THE RESOLVER TO ITSELF is not
+     * theoretical: the resolver route is not on `isPublicRoute`, so a
+     * direct session-less request to it lands on exactly this branch.
+     * Without the check it would be rewritten to itself with its own path
+     * nested in the query, which resolves fine and reads like a bug.
+     */
+    if (locator.kind === "subdomain" && !path.startsWith(HOST_MOVED_ROUTE)) {
+      return rewriteToHostResolver(req, headers, "sign-in");
+    }
+
     // API callers get JSON; browsers get redirected to sign-in.
     if (req.nextUrl.pathname.startsWith("/api/")) {
       return jsonError(401, "unauthenticated", "Sign-in required.", requestId);
@@ -874,6 +1023,26 @@ async function run(auth: ClerkAuth, req: NextRequest) {
   // The host says one tenant; the session says another. Refuse.
   // Without this, any authenticated user could browse any tenant's subdomain.
   if (locator.kind === "subdomain" && orgSlug && locator.slug !== orgSlug) {
+    /**
+     * ⭐ THE SECOND RELEASED-HOSTNAME EXIT — v1.57.0-alpha.
+     *
+     * ⚠️ THIS IS WHERE A RENAMED WORKSPACE'S OWN STAFF LAND, EVERY TIME.
+     * After a rename their session carries the NEW `orgSlug` while their
+     * bookmark still carries the old label, so `locator.slug !== orgSlug`
+     * is true for every one of them — and until now the answer was
+     * `/access-denied`, which tells a paying customer that they may not
+     * enter their own workspace.
+     *
+     * ⚠️ IT IS NOT A WEAKENING OF THE CROSS-TENANT CHECK. The resolver
+     * refuses to redirect for any label a live workspace currently holds,
+     * so a genuine attempt to reach someone else's host still ends in
+     * `/access-denied` — the route reproduces this exact refusal when the
+     * label was not released. Nothing is served under the old name in
+     * either case.
+     */
+    if (!path.startsWith(HOST_MOVED_ROUTE)) {
+      return rewriteToHostResolver(req, headers, "access-denied");
+    }
     return req.nextUrl.pathname.startsWith("/api/")
       ? jsonError(403, "tenant_mismatch", "Session does not belong to this workspace.", requestId)
       : applySecurityHeaders(NextResponse.redirect(new URL("/access-denied", req.url)));

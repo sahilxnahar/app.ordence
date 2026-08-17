@@ -44,7 +44,10 @@ import { z } from "zod";
 import { sql } from "drizzle-orm";
 import { withPlatformScope } from "@/db";
 import { requireCapability, recordPlatformAudit } from "./guard";
+import { claimSlug } from "./claim-slug";
 import type { PlatformResult } from "@/lib/platform/schemas";
+import { checkSlugShape, foldSlug, rejection, type SlugRejection } from "@/lib/slug";
+import { operatorSlugSchema } from "@/lib/slug-schema";
 import {
   INDUSTRY_TEMPLATES,
   INDUSTRY_KEYS,
@@ -63,46 +66,92 @@ import {
 } from "@/lib/entitlements/features";
 
 /* ------------------------------------------------------------------ */
+/* PRIVATE HELPERS                                                     */
+/* ------------------------------------------------------------------ */
+
+/*
+ * 🔴 NOTHING IN THIS SECTION MAY EVER BE EXPORTED. `"use server"` at the top
+ *    of this file publishes EVERY export as a network-reachable endpoint, and
+ *    the tier-2 capability guard sits one hop from each of them. A class or a
+ *    helper exported from here is either a broken build or an unguarded
+ *    surface, depending on Next's mood.
+ */
+
+/**
+ * Carries a typed slug refusal out of the `withPlatformScope` callback.
+ *
+ * ⚠️ IT EXISTS TO UNWIND THE TRANSACTION, not merely to signal. A refusal
+ * from the guard trigger or a unique index leaves the transaction aborted;
+ * returning a value from the callback would COMMIT it, and every subsequent
+ * statement on the handle would have failed with 25P02 anyway. Throwing is
+ * the mechanism, the message is a side effect.
+ */
+class SlugClaimRefused extends Error {
+  readonly rejection: SlugRejection;
+
+  constructor(rejection: SlugRejection) {
+    super(`slug_claim_refused:${rejection.code}`);
+    this.name = "SlugClaimRefused";
+    this.rejection = rejection;
+  }
+}
+
+/**
+ * ⚠️ `tx.execute()` RETURNS TWO DIFFERENT SHAPES depending on which Neon
+ * driver built the client: the HTTP driver hands back a bare array of rows,
+ * the WebSocket/pool driver a pg-style `QueryResult` with `.rows`. Indexing
+ * `[0]` on the second yields `undefined`, which in the dry run below would
+ * read as "nothing is blocked" for EVERY plan — a check that always passes
+ * is worse than no check, because the operator believes it.
+ */
+function firstRow(result: unknown): Record<string, unknown> | null {
+  if (Array.isArray(result)) {
+    return (result[0] as Record<string, unknown> | undefined) ?? null;
+  }
+  const rows = (result as { rows?: unknown } | null)?.rows;
+  if (Array.isArray(rows)) {
+    return (rows[0] as Record<string, unknown> | undefined) ?? null;
+  }
+  return null;
+}
+
+/* ------------------------------------------------------------------ */
 /* SLUG RULES                                                          */
 /* ------------------------------------------------------------------ */
 
 /**
- * A slug becomes `<slug>.app.ordence.com`. It is therefore a DNS label and
- * a tenant identifier at the same time, and the DNS side is the stricter
- * of the two: 63 characters, lowercase alphanumeric and hyphens, no leading
- * or trailing hyphen.
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 THE RESERVED LIST AND THE SLUG REGEX THAT USED TO LIVE HERE ARE GONE.
+ * ══════════════════════════════════════════════════════════════════════
+ * This file carried its own 34-name reserved set and its own regex, and
+ * `lib/tenant.ts` carried a different 33-name set and a different regex.
+ * They disagreed by eight names in each direction and by one character of
+ * minimum length. Provisioning would happily mint `assets`, `ns1`, `ftp`,
+ * `clerk`, `preview`, `vercel` and `logout`; resolution then refused them
+ * and fell back to the root site, so the workspace provisioned
+ * "successfully" and the customer's front door was dead, with nothing
+ * anywhere reporting it.
  *
- * ⚠️ RESERVED WORDS ARE A SECURITY CONTROL, NOT TIDINESS. A tenant that
- * managed to claim the slug `admin` would own `admin.app.ordence.com` — a
- * hostname that looks like ours, serves their content, and carries a valid
- * certificate we issued. Phishing does not get easier than that.
+ * ⚠️ THE FIX IS NOT "KEEP THEM IN SYNC" — discipline is what produced the
+ *    drift. There is now ONE list (`lib/slug.ts`), one schema built from it
+ *    (`lib/slug-schema.ts`), and one enforcer (`0091_slug_authority.sql`),
+ *    with a test asserting the TypeScript mirror equals the `reserved_slugs`
+ *    table. 🔴 Do not reintroduce a local copy of either here.
+ *
+ * `operatorSlugSchema` is the staff-facing wording of exactly the same
+ * rules the public signup form uses — the only difference is the message,
+ * and it must stay that way. If the two ever differ in what they ACCEPT, an
+ * operator has been handed the power to provision a workspace the resolver
+ * will not serve, which is the original incident rebuilt.
+ *
+ * ⚠️ AND IT IS STILL ONLY A MISTAKE GUARD. Reserved, taken, too-similar and
+ *    recently-released are decided by the database at INSERT time, inside
+ *    `claimSlug()`. Nothing here may ever be the only refusal.
  */
-const RESERVED_SLUGS = new Set([
-  "admin", "administrator", "api", "app", "apps", "auth", "billing", "blog",
-  "cdn", "console", "dashboard", "dev", "docs", "help", "internal", "login",
-  "mail", "ordence", "platform", "portal", "root", "secure", "signin",
-  "signup", "smtp", "staff", "staging", "static", "status", "support",
-  "system", "test", "www",
-]);
-
-const slugSchema = z
-  .string()
-  .trim()
-  .toLowerCase()
-  .min(3, "At least 3 characters.")
-  .max(63, "DNS labels stop at 63 characters.")
-  .regex(
-    /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/,
-    "Lowercase letters, numbers and hyphens only, and it cannot start or end with a hyphen.",
-  )
-  .refine((value) => !RESERVED_SLUGS.has(value), {
-    message: "That name is reserved — it would produce a hostname that impersonates Ordence.",
-  });
-
 const provisionSchema = z.object({
   name: z.string().trim().min(2, "Give the workspace a name.").max(120),
   legalName: z.string().trim().max(200).optional(),
-  slug: slugSchema,
+  slug: operatorSlugSchema,
   industry: z
     .string()
     .refine(isIndustryKey, "Unknown industry pack.")
@@ -208,8 +257,29 @@ const ROOT_DOMAIN =
 /**
  * Work out exactly what provisioning would do. **Writes nothing.**
  *
- * Two database reads, both of them existence checks — is the slug taken, is
- * the custom domain taken. Everything else is derived.
+ * ══════════════════════════════════════════════════════════════════════
+ * ⭐ THIS IS ADVISORY, AND IT ASKS THE DATABASE'S OWN QUESTIONS IN THE
+ *    DATABASE'S OWN ORDER.
+ * ══════════════════════════════════════════════════════════════════════
+ * Nothing here decides anything. `claimSlug()` decides, at INSERT time,
+ * because between reading this plan and approving it an operator can take a
+ * phone call and somebody else can take the name.
+ *
+ * ⚠️ BUT A DRY RUN THAT USES DIFFERENT LOGIC FROM THE INSERT IS A DRY RUN
+ *    THAT LIES, and the lie is worse than no dry run at all: the operator
+ *    reads "no blockers", clicks provision, and gets a refusal that the
+ *    screen just told them could not happen. So the five checks below are
+ *    the five the database applies, in the order it applies them:
+ *
+ *      1. shape          `tenants_slug_shape` / `tenants_slug_lowercase`
+ *      2. reserved       `ordence_guard_tenant_slug()` → P0091
+ *      3. retention      the same trigger        → P0092 (exact), P0093 (fold)
+ *      4. exact unique   `tenants_slug_unique`   → 23505
+ *      5. fold unique    `tenants_slug_fold_unique` → 23505
+ *
+ *    The order matters for the MESSAGE, not for the outcome: a reserved name
+ *    that is also taken should be reported as reserved, because that is what
+ *    the operator would be told if they pressed on.
  */
 export async function planProvision(input: unknown): Promise<PlatformResult<ProvisionPlan>> {
   const operator = await requireCapability("tenants:provision");
@@ -225,27 +295,119 @@ export async function planProvision(input: unknown): Promise<PlatformResult<Prov
   const data = parsed.data;
 
   try {
+    const slugFold = foldSlug(data.slug);
+
     const conflicts = await withPlatformScope(
-      "Provisioning dry-run: checking slug and custom-domain uniqueness across all tenants.",
+      "Provisioning dry-run: asking the reserved-slug list, the 365-day slug retention log " +
+        "(exact and confusable-folded) and the two tenant slug unique indexes whether a " +
+        "candidate workspace address is claimable, plus custom-domain uniqueness, across all tenants.",
       async (tx) => {
-        const rows = await tx.execute(sql`
+        /*
+         * ⚠️ THE RETENTION LOOKUPS DELIBERATELY DO NOT EXCLUDE ANY TENANT.
+         * The trigger excludes the row's own tenant (`tenant_id IS DISTINCT
+         * FROM NEW.id`) so that a workspace may re-claim a slug it released
+         * itself. A provision has no tenant yet, so there is nothing to
+         * exclude and the unfiltered query is the identical question.
+         *
+         * ⚠️ `reserved_slugs`, `tenant_slug_history` and `tenants.slug_fold`
+         * all arrive with 0091. On a database where 0091 has not been
+         * applied this query fails LOUDLY rather than quietly reporting
+         * "no blockers" — which is the correct failure for a check whose
+         * whole job is to agree with the enforcer.
+         */
+        const result = await tx.execute(sql`
           SELECT
+            EXISTS (SELECT 1 FROM reserved_slugs WHERE slug = ${data.slug})     AS reserved,
+            EXISTS (
+              SELECT 1 FROM tenant_slug_history
+               WHERE slug = ${data.slug}
+                 AND released_at IS NOT NULL
+                 AND released_at > now() - interval '365 days'
+            )                                                                   AS released_exact,
+            EXISTS (
+              SELECT 1 FROM tenant_slug_history
+               WHERE slug_fold = ${slugFold}
+                 AND released_at IS NOT NULL
+                 AND released_at > now() - interval '365 days'
+            )                                                                   AS released_fold,
             EXISTS (SELECT 1 FROM tenants WHERE slug = ${data.slug})            AS slug_taken,
-            ${data.customDomain ?? null}::text IS NOT NULL
+            EXISTS (SELECT 1 FROM tenants WHERE slug_fold = ${slugFold})        AS fold_taken,
+            (
+              ${data.customDomain ?? null}::text IS NOT NULL
               AND EXISTS (
                 SELECT 1 FROM tenants WHERE custom_domain = ${data.customDomain ?? null}
-              )                                                                  AS domain_taken
+              )
+            )                                                                   AS domain_taken
         `);
-        return (rows as unknown as Array<Record<string, unknown>>)[0] ?? {};
+        return firstRow(result) ?? {};
       },
     );
 
     const blockers: string[] = [];
     const warnings: string[] = [];
 
-    if (conflicts.slug_taken === true) {
-      blockers.push(`The slug "${data.slug}" is already in use by another workspace.`);
+    /*
+     * ⚠️ 1 — SHAPE. `operatorSlugSchema` has already refused anything
+     * malformed, so this is normally unreachable. It is here because "the
+     * schema already checked it" is precisely the assumption that let the
+     * two reserved lists drift: if `checkSlugShape()` and the schema ever
+     * disagree, the operator sees it here rather than discovering it as a
+     * CHECK violation from an INSERT.
+     */
+    const shape = checkSlugShape(data.slug);
+    if (shape && shape.code !== "reserved") {
+      blockers.push(`The slug "${data.slug}" is not a legal workspace address. ${shape.operatorMessage}`);
     }
+
+    /* 2 — RESERVED. The database's list is the authority; the in-process
+     * mirror in lib/slug.ts is checked too, and a disagreement between the
+     * two is itself worth showing, because the test that keeps them equal
+     * has evidently stopped being true. */
+    if (conflicts.reserved === true || shape?.code === "reserved") {
+      blockers.push(
+        `The slug "${data.slug}" is reserved. ${rejection("reserved").operatorMessage}`,
+      );
+      if (conflicts.reserved !== (shape?.code === "reserved")) {
+        warnings.push(
+          "The reserved_slugs table and the RESERVED_SLUGS mirror in lib/slug.ts disagree " +
+            `about "${data.slug}". One of them has drifted; tests/slug-contract.test.ts should be failing.`,
+        );
+      }
+    }
+
+    /* 3 — RETENTION, exact then folded, matching P0092 then P0093. */
+    if (conflicts.released_exact === true) {
+      blockers.push(
+        `The slug "${data.slug}" was released by another workspace within the last 365 days. ` +
+          rejection("recently_released").operatorMessage,
+      );
+    }
+    if (conflicts.released_fold === true) {
+      blockers.push(
+        `The slug "${data.slug}" folds to "${slugFold}", which another workspace released ` +
+          `within the last 365 days. ${rejection("recently_released").operatorMessage}`,
+      );
+    }
+
+    /* 4 — EXACT UNIQUE. */
+    if (conflicts.slug_taken === true) {
+      blockers.push(
+        `The slug "${data.slug}" is already in use by another workspace. ` +
+          rejection("taken").operatorMessage,
+      );
+    }
+
+    /* 5 — FOLD UNIQUE. ⚠️ Reported even when the exact slug is free: this is
+     * the check that refuses `acme-corp` when `acmecorp` exists, and an
+     * operator who does not know it exists will read a bare refusal as a
+     * bug. */
+    if (conflicts.fold_taken === true && conflicts.slug_taken !== true) {
+      blockers.push(
+        `The slug "${data.slug}" folds to "${slugFold}", which an existing workspace already ` +
+          `occupies. ${rejection("too_similar").operatorMessage}`,
+      );
+    }
+
     if (conflicts.domain_taken === true) {
       blockers.push(`${data.customDomain} is already attached to another workspace.`);
     }
@@ -464,77 +626,64 @@ export async function provisionTenant(
       `Provisioning workspace "${data.slug}". ${data.reason}`,
       async (tx) => {
         /*
-         * ⚠️ ONE STATEMENT, AND IT RELIES ON THE UNIQUE INDEX.
+         * ⭐ THE CLAIM. The mechanism that used to be written out inline
+         * here — INSERT ... ON CONFLICT (slug) DO NOTHING RETURNING id,
+         * then check how many rows came back — now lives in
+         * `server/platform/claim-slug.ts`, unchanged in substance, because
+         * self-serve signup is a second caller and a second copy of a race
+         * guard is how one of the two copies stops being fixed.
          *
-         * `ON CONFLICT (slug) DO NOTHING` is what actually prevents a
-         * duplicate, not the existence check in the plan. Two operators
-         * clicking at the same instant both pass the check and both reach
-         * here; the database decides, and the loser gets zero rows back and
-         * a clear message rather than a second workspace on the same
-         * hostname.
-         */
-        /*
-         * ⚠️ `clerk_org_id` IS A PLACEHOLDER, AND THE INSERT DID NOT WORK
-         * WITHOUT ONE.
+         * `claimSlug` also writes the `tenant_slug_history` row in this same
+         * transaction, so a tenant can never exist without the record of
+         * when its hostname went live — which is what makes the 365-day
+         * retention rule enforceable later.
          *
-         * `tenants.clerk_org_id` is NOT NULL with no default and was simply
-         * missing from this statement, so every provision failed on a
-         * null-violation that the catch block reported as "Provisioning
-         * failed. Nothing was created." — accurate, and useless for working
-         * out why.
-         *
-         * The real organisation is created AFTER the transaction commits
+         * ⚠️ `clerk_org_id` IS A PLACEHOLDER AND THE INSERT DOES NOT WORK
+         * WITHOUT ONE. `tenants.clerk_org_id` is NOT NULL with no default.
+         * The real organisation is created AFTER this transaction commits
          * (an external call cannot be rolled back with it), so there is no
          * true value available at this moment. The placeholder is
-         * deterministic from the slug and carries a "pending:" marker, so
-         * an unfinished provision is greppable —
+         * deterministic from the slug and carries a "pending:" marker, so an
+         * unfinished provision is greppable —
          *   SELECT slug FROM tenants WHERE clerk_org_id LIKE 'pending:%'
          * is the list of workspaces whose Clerk organisation still needs
-         * creating. It is also unique, which the column's unique index
-         * requires.
-         *
-         * ⚠️ NO BACKTICKS ANYWHERE INSIDE THE sql`` TEMPLATE BELOW. One
-         * backtick in a comment terminates the template literal and the
-         * file stops parsing — which is how this note ended up out here.
+         * creating. It is also unique, which that column's index requires.
          */
-        const rows = await tx.execute(sql`
-          INSERT INTO tenants (
-            clerk_org_id,
-            slug, name, legal_name, plan_tier, status,
-            seat_limit, storage_limit_mb, trial_ends_at,
-            custom_domain, settings, branding
-          ) VALUES (
-            -- See the note above this statement.
-            ${`pending:${data.slug}`},
-            ${data.slug},
-            ${data.name},
-            ${data.legalName ?? null},
-            ${data.planTier},
-            'active',
-            ${data.seatLimit},
-            ${data.storageLimitMb},
-            ${trialEndsAt},
-            ${data.customDomain ?? null},
-            ${JSON.stringify({ industry: data.industry, provisionedBy: operator.email })}::jsonb,
+        const claim = await claimSlug(tx, {
+          slug: data.slug,
+          actor: operator.email,
+          tenant: {
+            clerkOrgId: `pending:${data.slug}`,
+            name: data.name,
+            legalName: data.legalName ?? null,
+            planTier: data.planTier,
+            seatLimit: data.seatLimit,
+            storageLimitMb: data.storageLimitMb,
+            trialEndsAt,
+            customDomain: data.customDomain ?? null,
+            settings: { industry: data.industry, provisionedBy: operator.email },
             /*
              * ⚠️ Branding is left EMPTY on purpose, not defaulted to the
              * industry's colour. Per-tenant theming derives from a single
-             * accent token the customer sets; writing a guess here would make
-             * every workspace in a vertical look identical on day one and
-             * teach the customer that the theming control does nothing.
+             * accent token the customer sets; writing a guess here would
+             * make every workspace in a vertical look identical on day one
+             * and teach the customer that the theming control does nothing.
              * Absent means "not chosen yet", which is true.
              */
-            ${JSON.stringify({})}::jsonb
-          )
-          ON CONFLICT (slug) DO NOTHING
-          RETURNING id
-        `);
+            branding: {},
+          },
+        });
 
-        const row = (rows as unknown as Array<Record<string, unknown>>)[0];
-        if (!row?.id) {
-          throw new Error("slug_taken_race");
-        }
-        return String(row.id);
+        /*
+         * 🔴 THROWN, NOT RETURNED, AND THAT IS THE POINT. A refusal from
+         * the guard trigger or a unique index has already put this
+         * transaction into the aborted state — every further statement on
+         * this handle would fail with 25P02. Throwing unwinds it cleanly
+         * and guarantees that nothing which depended on the claim survives
+         * a claim that never happened.
+         */
+        if (!claim.ok) throw new SlugClaimRefused(claim.rejection);
+        return claim.tenantId;
       },
     );
 
@@ -585,10 +734,28 @@ export async function provisionTenant(
       },
     };
   } catch (error) {
-    if (error instanceof Error && error.message === "slug_taken_race") {
+    /*
+     * ⭐ THE RACE MESSAGE, NOW SOURCED FROM THE REJECTION RATHER THAN FROM
+     * A SENTINEL STRING. Behaviour is unchanged for the case that used to
+     * be called `slug_taken_race`: the operator is told somebody else got
+     * there first and to pick another. What is new is that the three other
+     * refusals the database can produce — reserved, too similar, recently
+     * released — no longer collapse into "Provisioning failed. Nothing was
+     * created.", which was accurate and useless.
+     *
+     * `operatorMessage` and not `publicMessage`: the reader is staff, so it
+     * may name the constraint and the conflict. The public split exists
+     * because a signup form that says "too similar to acmecorp" is a lookup
+     * tool for which near-miss names are taken.
+     */
+    if (error instanceof SlugClaimRefused) {
+      const raced = error.rejection.code === "taken" || error.rejection.code === "too_similar";
       return {
         ok: false,
-        error: `The slug "${data.slug}" was claimed a moment ago by someone else. Pick another.`,
+        error: raced
+          ? `The slug "${data.slug}" was claimed a moment ago by someone else. Pick another. ` +
+            `(${error.rejection.operatorMessage})`
+          : `The slug "${data.slug}" cannot be claimed. ${error.rejection.operatorMessage} Pick another.`,
       };
     }
     console.error("[provisioning] failed:", error);

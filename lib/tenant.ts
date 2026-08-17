@@ -7,6 +7,15 @@
  * `server/tenant-context.ts`; this layer only decides *which* tenant is being asked for.
  */
 
+/**
+ * ⚠️ THE ONLY IMPORT THIS FILE MAY EVER HAVE, AND IT IS SAFE BECAUSE
+ *    `lib/slug.ts` HAS NONE. `middleware.ts` imports this module and runs in
+ *    the Edge Runtime on every request; anything pulled in here is pulled
+ *    into that bundle. The re-export block further down says why the rules
+ *    moved out of this file at all.
+ */
+import { isValidSlug } from "@/lib/slug";
+
 /** Header names used to carry tenant context from middleware to server components. */
 export const TENANT_HEADERS = {
   tenantId: "x-tenant-id",
@@ -26,13 +35,36 @@ export const TENANT_HEADERS = {
  */
 export const SPOOFABLE_HEADERS: readonly string[] = Object.values(TENANT_HEADERS);
 
-/** Reserved subdomains that can never belong to a tenant. */
-export const RESERVED_SLUGS = new Set([
-  "www", "app", "api", "admin", "auth", "login", "logout", "signin", "signup",
-  "dashboard", "status", "docs", "help", "support", "blog", "cdn", "assets",
-  "static", "mail", "smtp", "ftp", "ns1", "ns2", "vercel", "clerk", "internal",
-  "platform", "system", "root", "test", "staging", "dev", "preview",
-]);
+/**
+ * 🔴 THE SLUG RULES DO NOT LIVE HERE ANY MORE. `lib/slug.ts` is the only
+ *    copy: shape, length and the 71 reserved names, mirrored by the
+ *    `reserved_slugs` table and enforced by 0091.
+ *
+ * ⚠️ WHY IT MOVED. This file held one list ("what RESOLVES") and
+ *    `server/platform/provisioning.ts` held another ("what can be CREATED"),
+ *    and they drifted by eight names in each direction. Provisioning minted
+ *    `assets`, `ns1`, `ns2`, `ftp`, `clerk`, `preview`, `vercel` and
+ *    `logout`; the resolver below then refused them and fell back to
+ *    `{ kind: "root" }`, so the workspace was created with a dead front door
+ *    and nothing reported it. Both halves now ask the same function.
+ *
+ * ⚠️ THIS IS A BEHAVIOUR CHANGE AND IT IS THE FIX, NOT A SIDE EFFECT. The
+ *    old local pattern allowed one- and two-character labels; the shared one
+ *    starts at three, and the reserved set grew from 33 names to 71. Hosts
+ *    that used to resolve as tenants now fall back to root — which is
+ *    correct, because provisioning could never have created them either.
+ *
+ * ⚠️ EDGE BUDGET: `lib/slug.ts` imports nothing at all, deliberately, because
+ *    `middleware.ts` imports this file and runs on every request. Do not
+ *    import zod (or anything else) into that module or into this one — the
+ *    Zod schema lives apart in `lib/slug-schema.ts` for exactly that reason.
+ *
+ * Re-exported rather than merely imported: these two names were part of this
+ * module's public surface before the move, and a rename is not worth breaking
+ * a call site over.
+ */
+export { RESERVED_SLUGS } from "@/lib/slug";
+export { isValidSlug };
 
 export type TenantLocator =
   | { kind: "subdomain"; slug: string }
@@ -52,13 +84,6 @@ export type TenantLocator =
    */
   | { kind: "platform" }
   | { kind: "root" };
-
-/** RFC-1123 label: lowercase alphanumeric + hyphen, no leading/trailing hyphen. */
-const SLUG_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
-
-export function isValidSlug(slug: string): boolean {
-  return SLUG_PATTERN.test(slug) && !RESERVED_SLUGS.has(slug);
-}
 
 /** Strip port and normalise case. Returns "" for junk input. */
 function normaliseHost(rawHost: string | null | undefined): string {

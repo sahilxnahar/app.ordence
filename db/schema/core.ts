@@ -24,6 +24,7 @@ import {
   uniqueIndex,
   primaryKey,
   inet,
+  check,
 } from "drizzle-orm/pg-core";
 import { relations, sql } from "drizzle-orm";
 
@@ -94,8 +95,62 @@ export const tenants = pgTable(
     /** Clerk Organization ID — the external identity anchor. */
     clerkOrgId: varchar("clerk_org_id", { length: 255 }).notNull(),
 
-    /** URL-safe identifier used for `slug.app.ordence.com` routing. */
+    /**
+     * URL-safe identifier used for `slug.app.ordence.com` routing.
+     *
+     * 🔴 THIS IS A PUBLIC DNS LABEL, NOT A DISPLAY FIELD. It becomes a
+     * hostname under our wildcard certificate, and that issuance is
+     * published in the public Certificate Transparency log within
+     * minutes. SQL-FILES/0091 moved the whole of slug authority into the
+     * database for that reason: two CHECK constraints below, a reserved
+     * word TABLE (`reservedSlugs` in `./slugs`), a confusable-folded
+     * unique index, a 365-day retention log (`tenantSlugHistory`), and a
+     * SECURITY DEFINER guard trigger. See `db/schema/slugs.ts`.
+     */
     slug: varchar("slug", { length: 63 }).notNull(),
+
+    /**
+     * ⭐ THE CONFUSABLE FOLD (SQL-FILES/0091 §3).
+     *
+     *   slug_fold = translate(
+     *     replace(replace(replace(slug,'-',''),'rn','m'),'vv','w'),
+     *     '01l', 'oii')
+     *
+     * Hyphens vanish, `0`→`o`, `1`/`l`→`i`, `rn`→`m`, `vv`→`w`. With the
+     * `tenants_slug_fold_unique` index below, `0rdence` and `ordence`
+     * collapse to one namespace and the SECOND claimant is refused by the
+     * database in the same statement that tries to claim it.
+     *
+     * WHY IT IS WORTH THE COST: a hostname one glyph away from a real
+     * customer's, holding a certificate WE issued under OUR domain, is
+     * the cheapest credible phishing setup that exists — the victim
+     * checks the padlock and the padlock is real.
+     *
+     * ⚠️ THE COST IS REAL AND IS DELIBERATE: this refuses `acme-corp`
+     * when `acmecorp` exists, and those may be two unrelated companies.
+     * One support conversation is cheaper than one customer phished under
+     * our certificate. And ⚠️ the PUBLIC refusal message must never name
+     * the conflicting workspace — that turns the signup form into a
+     * lookup tool for which near-miss names are taken, which is
+     * reconnaissance for the exact attack this prevents. That split lives
+     * in `lib/slug.ts`.
+     *
+     * 🔴 NEVER WRITE TO THIS COLUMN. It is `GENERATED ALWAYS AS (...)
+     * STORED` in Postgres; any INSERT or UPDATE naming it is rejected
+     * outright by the engine (`42601`), which would take the whole
+     * tenant write down with it. `.generatedAlwaysAs()` is what keeps it
+     * out of `NewTenant` (`$inferInsert`) so TypeScript refuses first —
+     * do not "fix" a type error by casting around it.
+     *
+     * ⚠️ TYPED NULLABLE BECAUSE THE DDL IS. The expression can never
+     * actually yield NULL (`slug` is NOT NULL), but 0091 adds the column
+     * without a NOT NULL clause, and the Drizzle type mirrors the
+     * database rather than the reasoning about it.
+     */
+    slugFold: text("slug_fold").generatedAlwaysAs(
+      sql`translate(replace(replace(replace(slug, '-', ''), 'rn', 'm'), 'vv', 'w'), '01l', 'oii')`,
+    ),
+
     name: varchar("name", { length: 255 }).notNull(),
     legalName: varchar("legal_name", { length: 255 }),
 
@@ -173,12 +228,49 @@ export const tenants = pgTable(
   },
   (t) => ({
     slugUnique: uniqueIndex("tenants_slug_unique").on(t.slug),
+    /**
+     * ⭐ THE FOLD UNIQUE (SQL-FILES/0091 §3). `tenants_slug_unique` above
+     * compares BYTES, and `normaliseHost()` lowercases the Host header
+     * before matching — so before 0091 a row stored as `Acme` and a row
+     * stored as `acme` BOTH answered to acme.ordence.com and whichever
+     * the query returned first won. This index, plus
+     * `tenants_slug_lowercase` below, is what closes that.
+     *
+     * ⚠️ BOTH INDEXES ARE NEEDED. The fold is lossy: it cannot tell
+     * `acme` from `acme`, so dropping the exact one would not be an
+     * optimisation, it would be a regression to no uniqueness at all on
+     * unfoldable pairs.
+     */
+    slugFoldUnique: uniqueIndex("tenants_slug_fold_unique").on(t.slugFold),
     clerkOrgUnique: uniqueIndex("tenants_clerk_org_unique").on(t.clerkOrgId),
     // Partial unique: two tenants may both have NULL domain, but never the same domain.
     customDomainUnique: uniqueIndex("tenants_custom_domain_unique")
       .on(t.customDomain)
       .where(sql`${t.customDomain} IS NOT NULL`),
     statusIdx: index("tenants_status_idx").on(t.status),
+
+    /* --- SQL-FILES/0091 §1 · the shape of a slug -------------------- */
+    /**
+     * ⚠️ THIS IS THE CONSTRAINT THAT CLOSES A LIVE DUPLICATE, and it
+     * looks cosmetic. `tenants_slug_unique` compares bytes;
+     * `normaliseHost()` lowercases before matching. Until 0091 the only
+     * thing stopping `Acme` and `acme` from both existing — and both
+     * answering acme.ordence.com — was a `.toLowerCase()` in one Zod
+     * schema in one code path, and self-serve signup is a second path.
+     */
+    slugLowercase: check("tenants_slug_lowercase", sql`${t.slug} = lower(${t.slug})`),
+    /**
+     * ⚠️ `{1,61}` IN THE MIDDLE, NOT `{0,61}`. That makes 3 the minimum
+     * and 63 (the DNS label limit) the maximum. `SLUG_PATTERN` in
+     * lib/tenant.ts matched a SINGLE character while provisioning.ts
+     * required 3 — and one-letter labels are precisely the ones worth
+     * squatting. The stricter reading wins, in the one layer neither
+     * TypeScript file can bypass.
+     */
+    slugShape: check(
+      "tenants_slug_shape",
+      sql`${t.slug} ~ '^[a-z0-9](?:[a-z0-9-]{1,61}[a-z0-9])?$'`,
+    ),
   }),
 );
 

@@ -414,15 +414,102 @@ function announceDegraded(reason: LimitReason, detail: string): void {
 /* THE ENTRY POINT                                                     */
 /* ------------------------------------------------------------------ */
 
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * ⚠️ THE KEY NAMESPACE IS PART OF THE ISOLATION, NOT DECORATION.
+ * ══════════════════════════════════════════════════════════════════════
+ * Two surfaces must never share a counter (that is the "one bucket for
+ * the console and the customers" mistake), and a staff key must never be
+ * able to collide with an org key — hence distinct `org:` / `staff:` /
+ * `anon:` prefixes rather than a bare id.
+ *
+ * ⚠️ THE WINDOW SUFFIX IS ONLY ADDED WHEN THE CALLER PASSED AN EXPLICIT
+ *    BUDGET, and the asymmetry is deliberate. Every existing caller uses
+ *    the plan matrix, which is one window per surface, so their keys are
+ *    byte-identical to what they were before this parameter existed —
+ *    adding a suffix there would silently reset every live counter on
+ *    deploy. A caller with an explicit budget may be running several
+ *    windows against one identity, and an Upstash sliding window stores
+ *    its state under the key: two windows on one key do not add up to a
+ *    tighter limit, they produce arithmetic neither of them intended.
+ */
+function limitKey(
+  surface: EdgeSurface,
+  identity: EdgeIdentity,
+  explicitBudget: SurfaceBudget | null,
+): string {
+  const who =
+    identity.kind === "tenant"
+      ? `org:${identity.orgId}`
+      : identity.kind === "staff"
+        ? `staff:${identity.userId}`
+        : `anon:${identity.ip}`;
+
+  return explicitBudget === null
+    ? `${surface}:${who}`
+    : `${surface}:${who}:w${explicitBudget.windowSeconds}`;
+}
+
 export type EdgeIdentity =
   /** A workspace. `orgId` is the Clerk organisation id from the session. */
   | { kind: "tenant"; orgId: string }
   /** A member of platform staff. There is no tenant, so the user is the key. */
-  | { kind: "staff"; userId: string };
+  | { kind: "staff"; userId: string }
+  /**
+   * ══════════════════════════════════════════════════════════════════
+   * ⚠️ AN ANONYMOUS CALLER ON A PUBLIC ENDPOINT. THE WEAKEST KEY HERE,
+   *    ADDED KNOWINGLY — v1.57.0-alpha (public slug availability).
+   * ══════════════════════════════════════════════════════════════════
+   * Everything the 🔴 note at the top of this file says about
+   * client-chosen keys still applies: an IP is not server-trusted the
+   * way a Clerk org id is, a NAT gateway collapses a whole office into
+   * one bucket, and anyone with a /64 of IPv6 or a proxy pool has as
+   * many buckets as they care to pay for.
+   *
+   * It is accepted for ONE class of surface: a route that must answer
+   * before a session exists — `app/api/public/slug-available` is the
+   * first — where the alternative is not a better key but NO key.
+   *
+   * ⚠️ THE CALLER PASSES A NETWORK PREFIX, NOT A BARE ADDRESS, and
+   *    derives it from a hop it trusts rather than from the first entry
+   *    of `x-forwarded-for` (which the client writes). `ipPrefix()` in
+   *    `lib/security/rate-limit.ts` is the sanctioned normaliser; this
+   *    module deliberately does not parse addresses itself, because a
+   *    second implementation of that is a second thing to drift.
+   *
+   * 🔴 NEVER USE THIS FOR AN AUTHENTICATED SURFACE. If a session exists,
+   *    the org id is available, server-trusted and unforgeable, and
+   *    keying on the IP instead would be a downgrade an attacker can
+   *    take at will simply by changing address.
+   */
+  | { kind: "anonymous"; ip: string };
 
 export type CheckEdgeLimitOptions = {
   surface: EdgeSurface;
   identity: EdgeIdentity;
+  /**
+   * ══════════════════════════════════════════════════════════════════
+   * ⚠️ AN EXPLICIT BUDGET, FOR CALLERS THE PLAN MATRIX CANNOT DESCRIBE.
+   * ══════════════════════════════════════════════════════════════════
+   * `PLAN_RATE_BUDGETS` answers "how much may this WORKSPACE consume",
+   * and an anonymous caller has no workspace and therefore no plan. The
+   * fallback tier would hand them an `ai`-tier ceiling (1,800/minute on
+   * `api`), which is not a limit on a public endpoint — it is a number
+   * large enough that nobody ever reaches it.
+   *
+   * 🔴 NOT AN ESCAPE HATCH FOR TENANT TRAFFIC. A workspace's ceiling is
+   *    a product decision that lives in `lib/edge/budgets.ts` where it
+   *    can be argued with and where the settings screen can read it. A
+   *    route that passes its own number for a tenant has moved that
+   *    decision somewhere nobody will look.
+   *
+   * ⚠️ Supplying this ALSO CHANGES THE KEY — see `limitKey()`. A caller
+   *    with an explicit budget is usually running more than one window
+   *    against the same identity (10/minute AND 60/hour), and two
+   *    sliding windows sharing one Redis key corrupt each other's
+   *    accounting.
+   */
+  budget?: SurfaceBudget;
   /**
    * The plan, when the caller already knows it (any Node path that has a
    * `TenantContext`). Skips the hint entirely and is authoritative.
@@ -473,19 +560,9 @@ export async function checkEdgeLimit(
       }
     }
 
-    const budget = budgetFor(tier, surface);
+    const budget = options.budget ?? budgetFor(tier, surface);
 
-    /**
-     * ⚠️ The key namespace is part of the isolation, not decoration. Two
-     * surfaces must never share a counter (that is the "one bucket for
-     * the console and the customers" mistake), and a staff key must never
-     * be able to collide with an org key — hence distinct `org:` / `staff:`
-     * prefixes rather than a bare id.
-     */
-    const key =
-      identity.kind === "tenant"
-        ? `${surface}:org:${identity.orgId}`
-        : `${surface}:staff:${identity.userId}`;
+    const key = limitKey(surface, identity, options.budget ?? null);
 
     /* ---- 2. The shared counter ------------------------------------ */
     const limiter = options.forceMemory ? null : limiterFor(surface, budget);
@@ -753,6 +830,13 @@ export type EdgeLimitPosition = {
  * ⚠️ RETURNS `remaining: null` RATHER THAN A ZERO OR A FULL BUDGET WHEN
  * THERE IS NO COUNTER. "Not measured" and "measured as fine" must never
  * render as the same number on a screen someone makes a decision from.
+ *
+ * ⚠️ IT PEEKS THE PLAN-MATRIX KEY ONLY. A caller that passed an explicit
+ * `budget` to `checkEdgeLimit` writes a window-suffixed key, so peeking
+ * it here would read an empty counter and report a full budget — the
+ * exact "reassuring number for a control that is not running" this
+ * function's own design refuses. There is no dashboard for the anonymous
+ * public surfaces today; when there is, it needs the window it means.
  */
 export async function peekEdgeLimit(
   surface: EdgeSurface,
@@ -761,10 +845,7 @@ export async function peekEdgeLimit(
 ): Promise<EdgeLimitPosition> {
   const tier = surface === "platform" ? null : (planTier ?? null);
   const budget = budgetFor(tier, surface);
-  const key =
-    identity.kind === "tenant"
-      ? `${surface}:org:${identity.orgId}`
-      : `${surface}:staff:${identity.userId}`;
+  const key = limitKey(surface, identity, null);
 
   const limiter = limiterFor(surface, budget);
   if (!limiter) {

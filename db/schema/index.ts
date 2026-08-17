@@ -419,3 +419,28 @@ export * from "./returns";
  * an UPDATE.
  */
 export * from "./budgets";
+
+/**
+ * ⭐⭐⭐ SLUG AUTHORITY — Batch 132 (SQL 0091).
+ *
+ * 🔴 EXPORTED AFTER `./core`, WHICH IT REFERENCES. `tenant_slug_history`
+ * hangs off `tenants`, and the dependency runs one way only —
+ * `core.ts` deliberately does NOT reference back, which is why
+ * `tenantsRelations` gains no `slugHistory` side.
+ *
+ * 🔴 A TENANT SLUG IS A PUBLIC DNS LABEL UNDER OUR WILDCARD CERTIFICATE,
+ * and every issuance is published in the public CT log within minutes.
+ * Before 0091 the database knew one thing about slugs — a byte-comparing
+ * unique index — while two TypeScript files, one deciding what RESOLVES
+ * and one deciding what is CREATED, had drifted apart by eight names in
+ * each direction. `reserved_slugs` is now the single list, and it is a
+ * TABLE rather than a constraint so an operator can tighten it at 2am
+ * without a deploy.
+ *
+ * ⚠️ THE AVAILABILITY CHECK IS ADVISORY. The unique index is the truth
+ * and the insert is the claim. Any code path that asks "is acme free?"
+ * and then TRUSTS the answer is a race whose window is the user's typing
+ * speed; the greyed-out signup button is a mistake guard, never a
+ * boundary.
+ */
+export * from "./slugs";

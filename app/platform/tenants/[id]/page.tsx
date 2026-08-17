@@ -42,8 +42,10 @@ import {
   requestTerminationAction,
   cancelTerminationAction,
   exportOffboardingSnapshotAction,
+  renameTenantSlugAction,
 } from "@/server/platform/actions";
 import { TenantActions } from "@/components/platform/tenant-actions";
+import { RenameSlugCard } from "@/components/platform/rename-slug-card";
 import { FlagEditor } from "@/components/platform/flag-editor";
 import { OffboardingPanel } from "@/components/platform/offboarding-panel";
 import {
@@ -145,6 +147,28 @@ async function TenantDetailBody({ tenantId }: { tenantId: string }) {
           />
         </div>
       </div>
+
+      {/*
+        ⭐ THE ADDRESS — v1.57.0-alpha.
+
+        ⚠️ ON ITS OWN CARD RATHER THAN IN THE ACTION BAR, AND THAT IS A
+        DELIBERATE PIECE OF FRICTION. The bar holds suspend, reactivate
+        and impersonate: reversible things an operator does while a
+        customer is on the phone. A rename changes a public hostname and
+        burns the old one for 365 days, and it should not sit one
+        mis-click away from "reactivate".
+
+        `canRename` is a courtesy, not a control — the capability is
+        re-checked inside `renameTenantSlug()`, one hop from the
+        `"use server"` export, because that export is a public HTTP
+        endpoint reachable from any page.
+      */}
+      <RenameSlugCard
+        tenantId={tenant.id}
+        currentSlug={tenant.slug}
+        canRename={can("tenants:provision")}
+        onRename={renameTenantSlugAction}
+      />
 
       {/*
         The customer's OWN access state, computed by the same

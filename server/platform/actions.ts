@@ -51,6 +51,7 @@ import {
   stopImpersonation as stopImpersonationImpl,
   getActiveImpersonation as getActiveImpersonationImpl,
 } from "./impersonation";
+import { renameTenantSlug as renameTenantSlugImpl } from "./rename-slug";
 import { platformSearch as platformSearchImpl } from "./search";
 import { revokeImpersonationSession as revokeImpersonationSessionImpl } from "./action-log";
 import {
@@ -179,6 +180,48 @@ export async function cancelTerminationAction(input: unknown) {
 
 export async function exportOffboardingSnapshotAction(input: unknown) {
   return exportOffboardingSnapshotImpl(input);
+}
+
+/* ------------------------------------------------------------------ */
+/* THE ADDRESS — RENAME, OPERATOR-ONLY — v1.57.0-alpha                 */
+/* ------------------------------------------------------------------ */
+
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 THIS IS THE ONLY EXPORT THE RENAME ADDS, AND THAT IS THE DESIGN
+ * ══════════════════════════════════════════════════════════════════════
+ * `"use server"` publishes EVERY export in this file as a public HTTP
+ * endpoint with a stable action id — so the number of exports a feature
+ * adds here is the number of endpoints it adds to the product. The
+ * schema, the two refusal classes and the URL builder all live in
+ * `server/platform/rename-slug.ts`, which is `import "server-only"` and
+ * publishes nothing.
+ *
+ * `renameTenantSlug()` calls `requireCapability("tenants:provision")` on
+ * its first line — owner grade only. That check is ONE HOP from this
+ * export, which is the most this file is allowed to be: nothing is
+ * decided here, and a wrapper that did half the checking is a wrapper
+ * somebody eventually calls the inner function around.
+ *
+ * ⚠️ THERE IS NO SELF-SERVE EQUIVALENT AND THERE MUST NOT BE ONE YET. A
+ * rename is a hostname change: it needs the released-host 301 (shipped
+ * with this batch) AND an owner notification (not built) before a
+ * customer can be handed the button. Read the header of
+ * `server/platform/rename-slug.ts` before adding one.
+ *
+ * ⭐ REVALIDATES THE DIRECTORY AND THE DETAIL PAGE. The slug is printed
+ * on both, and a console still showing the old address after a rename is
+ * how an operator reads a stale cache as a failed action and does it
+ * twice — the second one burning a second hostname.
+ */
+export async function renameTenantSlugAction(input: unknown) {
+  const result = await renameTenantSlugImpl(input);
+  if (result.ok) {
+    revalidatePath("/platform");
+    revalidatePath("/platform/tenants");
+    revalidatePath(`/platform/tenants/${result.data.tenantId}`);
+  }
+  return result;
 }
 
 /* ------------------------------------------------------------------ */
