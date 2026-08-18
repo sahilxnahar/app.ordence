@@ -272,8 +272,46 @@ function balanced(text: string, from: number): string {
  *    with `slug`. If someone reorders it, this must fail rather than
  *    quietly start comparing category names.
  */
+/**
+ * ⚠️ THE SEEDS MOVED INSIDE `DO $seed$ ... $seed$;` BLOCKS AND THIS PARSER HAD
+ *    TO FOLLOW THEM. `0091`'s seed INSERTs are wrapped so they can set
+ *    `app.platform_scope` in the same statement, because on a RE-RUN the table
+ *    already has FORCE ROW LEVEL SECURITY and a bare INSERT is refused.
+ *
+ * ⭐ WHEN THAT HAPPENED, THIS FILE FAILED RATHER THAN PASSING VACUOUSLY, which
+ *    is the whole reason the "finds the seeding statements at all" guard
+ *    exists. `statementsOf()` treats a dollar-quoted body as opaque (correctly
+ *    , it is full of semicolons that are not statement boundaries), so the
+ *    top-level scan found ZERO INSERTs. An empty parse compared against an
+ *    empty set would have reported perfect agreement between 71 TypeScript
+ *    names and nothing at all.
+ *
+ * So: scan top-level statements, and ALSO scan inside every dollar-quoted
+ * body. A seed is a seed wherever it is written.
+ */
+function dollarQuotedBodies(source: string): string[] {
+  const out: string[] = [];
+  const open = /\$([A-Za-z_][A-Za-z0-9_]*)?\$/g;
+  let m: RegExpExecArray | null;
+  while ((m = open.exec(source)) !== null) {
+    const tag = m[0];
+    const close = source.indexOf(tag, m.index + tag.length);
+    if (close === -1) break;
+    out.push(source.slice(m.index + tag.length, close));
+    open.lastIndex = close + tag.length;
+  }
+  return out;
+}
+
 function seededReservedSlugs(): { slugs: string[]; statements: number } {
-  const inserts = statementsMatching(/^INSERT\s+INTO\s+public\.reserved_slugs\b/i);
+  const nested = dollarQuotedBodies(SOURCE)
+    .flatMap((body) => statementsOf(body))
+    .filter((st) => /^INSERT\s+INTO\s+public\.reserved_slugs\b/i.test(st));
+
+  const inserts = [
+    ...statementsMatching(/^INSERT\s+INTO\s+public\.reserved_slugs\b/i),
+    ...nested,
+  ];
   const slugs: string[] = [];
 
   for (const statement of inserts) {

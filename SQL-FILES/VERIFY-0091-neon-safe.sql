@@ -13,10 +13,15 @@
 --    "policies OK" over a real cross-tenant leak.
 --
 --    🔴 Every attempt in section 7 runs inside a subtransaction that is
---    ROLLED BACK, and it writes its findings into a TEMP table that
---    disappears when your editor session ends. It creates no tenant, it
---    modifies no row, and it leaves nothing behind. Read section 7's own
---    comment before running it if you want to satisfy yourself of that.
+--    ROLLED BACK. It creates no tenant, it modifies no row, and it leaves
+--    nothing behind except a probe FUNCTION that tab 9 drops. Read section
+--    7's own comment if you want to satisfy yourself of that.
+--
+--    ⚠️ Section 7 used a TEMP table and did not work: a browser console
+--       sends each statement on its own connection, and a temp table is
+--       session-scoped, so it was created on one connection and read from
+--       another. It is a function now, because a function lives in the
+--       catalog rather than the session.
 --
 -- ⚠️ NO `\echo`, NO `RAISE NOTICE`. Both are invisible or unsupported in
 --    the Neon editor. Everything comes back as a result ROW. This file was
@@ -24,6 +29,9 @@
 --    reason.
 --
 -- SEND ME TAB 8. It is one row per thing 0091 promised.
+--
+-- ⚠️ RUN `STATE-OF-0091-neon-safe.sql` FIRST if you have not. 0091 applied
+--    only partially once, and this file assumes its objects exist.
 -- =====================================================================
 
 
@@ -221,194 +229,153 @@ SELECT
 -- TAB 7 · THE GUARD ACTUALLY REFUSES  (attempts, then rolls back)
 -- =====================================================================
 --
--- 🔴 READ THIS BEFORE RUNNING, THEN DECIDE FOR YOURSELF.
+-- 🔴 THIS WAS A TEMP TABLE AND A `DO` BLOCK ACROSS THREE STATEMENTS, AND
+--    THAT DOES NOT WORK IN A BROWSER SQL CONSOLE.
 --
---    Everything below happens inside ONE `DO` block. Each attempt is
---    wrapped in `BEGIN ... EXCEPTION WHEN OTHERS THEN ... END`, which in
---    PL/pgSQL opens an implicit SUBTRANSACTION. When the exception is
---    caught, that subtransaction is rolled back and the attempted INSERT
---    is undone. The final `RAISE EXCEPTION` at the end of the block
---    unwinds anything that somehow did commit inside it.
+--    The console sends each statement on its own connection. A TEMP table
+--    is session-scoped, so it was created on one connection, written on a
+--    second and read from a third, and the third reported
+--    `relation "verify_0091_findings" does not exist`.
 --
---    Findings are written to a TEMP table, which lives only for your
---    editor session and is invisible to the application.
+--    Same root cause as `SET LOCAL` evaporating in 0092 and as 0091's
+--    `BEGIN;` providing no atomicity: **nothing session-scoped or
+--    transaction-scoped survives between statements here.**
 --
---    Net effect on your data: none. No tenant is created, no row is
---    modified, no sequence is consumed that matters.
+-- ⭐ A FUNCTION DOES SURVIVE, because it lives in the catalog rather than
+--    in the session. So the probes are a function, called by the next
+--    statement, and dropped by the last one. Each statement stands alone.
 --
--- ⚠️ WHY BOTHER, GIVEN TABS 1 TO 5 ALREADY READ THE CATALOG.
---    Because `VERIFY-0089` read the catalog, printed "policies OK", and
---    was sitting on top of a real cross-tenant read leak on the same
---    database. A control that exists and a control that refuses are two
---    different claims and only one of them matters.
+-- ⚠️ WHAT IT DOES TO YOUR DATA: nothing. Each attempt runs in a
+--    `BEGIN ... EXCEPTION` block, which in PL/pgSQL is a SUBTRANSACTION,
+--    and catching the exception rolls that subtransaction back. The one
+--    attempt that SUCCEEDS (the control) raises a private SQLSTATE on
+--    purpose so that it is undone too. No tenant is created.
 -- =====================================================================
 
-DROP TABLE IF EXISTS verify_0091_findings;
-CREATE TEMP TABLE verify_0091_findings (
-    ord         int,
-    attempt     text,
-    expected    text,
+CREATE OR REPLACE FUNCTION public.ordence_verify_0091()
+RETURNS TABLE (
+    ord          int,
+    attempt      text,
+    expected     text,
     got_sqlstate text,
-    got_message text,
-    verdict     text
-);
-
-DO $verify$
+    verdict      text,
+    got_message  text
+)
+LANGUAGE plpgsql
+AS $verify$
 DECLARE
-    v_state   text;
-    v_msg     text;
-    v_probe   text;
-    v_target  text;
+    v_state  text;
+    v_msg    text;
+    v_probe  text;
+    v_target text;
 BEGIN
-    -- 🔴 WITHOUT THIS LINE THIS WHOLE SECTION LIES.
-    --    `tenants` carries FORCE ROW LEVEL SECURITY with
-    --    `WITH CHECK (id = app_current_tenant_id() OR app_platform_scope())`
-    --    from 0014. For any role without BYPASSRLS, every INSERT below is
-    --    refused by RLS rather than by the thing being tested, so the CONTROL
-    --    probe reports "the guard is refusing legal names" and rows 2 to 5
-    --    report PASS for the wrong reason. A verify file that passes for the
-    --    wrong reason is worse than no verify file.
-    --
-    --    `set_config(..., true)` is transaction-local, the plpgsql equivalent
-    --    of SET LOCAL, and unwinds with the block.
+    -- 🔴 `tenants` carries FORCE ROW LEVEL SECURITY from 0014. Without this
+    --    every attempt below is refused by RLS rather than by the thing being
+    --    tested, the CONTROL reads "the guard is refusing legal names", and
+    --    rows 2 to 5 report PASS for the wrong reason.
     PERFORM set_config('app.platform_scope', 'on', true);
 
-    -- =================================================================
-    -- ⚠️ THE PATTERN BELOW IS NOT STYLISTIC. READ IT ONCE.
-    --
-    -- A finding must be recorded in the OUTER transaction, never inside
-    -- the subtransaction that performed the attempt. In PL/pgSQL a
-    -- BEGIN ... EXCEPTION block IS a subtransaction: when it unwinds,
-    -- every row it wrote unwinds with it, TEMP TABLES INCLUDED. A temp
-    -- table is session-scoped, not transaction-exempt.
-    --
-    -- 🔴 That is exactly how the first draft of this file reported
-    --    "0 of 0 PASS": the attempts ran, the findings were written, and
-    --    then the rollback that made the file safe also erased the
-    --    evidence that it had worked.
-    --
-    -- So: each attempt captures SQLSTATE and SQLERRM into VARIABLES, and
-    -- the INSERT happens after the handler returns. PL/pgSQL variables
-    -- live in memory and are not transactional, which is what makes this
-    -- work.
-    -- =================================================================
-
-    -- 0 · CONTROL: a fresh, legal slug must be ACCEPTED.
-    --   Without this row every other PASS is meaningless: a guard that
-    --   refuses everything would score five out of five.
+    -- 0 · CONTROL: a legal slug must be ACCEPTED. Without this row, a guard
+    --     that refused everything would score four out of four.
     v_state := NULL; v_msg := NULL;
     BEGIN
         INSERT INTO public.tenants (clerk_org_id, slug, name)
         VALUES ('verify0091:probe', 'zzverify0091probe', 'VERIFY 0091 control');
-        RAISE EXCEPTION USING ERRCODE = 'P0098', MESSAGE = 'verify control rollback';
+        RAISE EXCEPTION USING ERRCODE = 'P0098', MESSAGE = 'control rollback';
     EXCEPTION
-        WHEN SQLSTATE 'P0098' THEN
-            NULL;                       -- accepted, and now undone
-        WHEN OTHERS THEN
-            v_state := SQLSTATE; v_msg := SQLERRM;
+        WHEN SQLSTATE 'P0098' THEN NULL;          -- accepted, and now undone
+        WHEN OTHERS THEN v_state := SQLSTATE; v_msg := SQLERRM;
     END;
-    INSERT INTO verify_0091_findings VALUES
-        (1, 'CONTROL: a fresh, legal slug', 'ACCEPTED', v_state, v_msg,
-         CASE WHEN v_state IS NULL THEN 'PASS'
-              ELSE 'FAIL, the guard is refusing legal names' END);
+    ord := 1; attempt := 'CONTROL: a fresh, legal slug'; expected := 'ACCEPTED';
+    got_sqlstate := coalesce(v_state,'none'); got_message := v_msg;
+    verdict := CASE WHEN v_state IS NULL THEN 'PASS'
+                    ELSE 'FAIL, the guard is refusing legal names' END;
+    RETURN NEXT;
 
-    -- 1 · a reserved name
+    -- 1 · reserved name
     v_state := NULL; v_msg := NULL;
     BEGIN
         INSERT INTO public.tenants (clerk_org_id, slug, name)
         VALUES ('verify0091:r', 'postmaster', 'VERIFY 0091');
-    EXCEPTION WHEN OTHERS THEN
-        v_state := SQLSTATE; v_msg := SQLERRM;
+    EXCEPTION WHEN OTHERS THEN v_state := SQLSTATE; v_msg := SQLERRM;
     END;
-    INSERT INTO verify_0091_findings VALUES
-        (2, 'reserved name "postmaster"', 'P0091', v_state, v_msg,
-         CASE WHEN v_state = 'P0091' THEN 'PASS'
-              WHEN v_state IS NULL    THEN 'FAIL, it was ACCEPTED'
-              ELSE 'FAIL, wrong SQLSTATE' END);
+    ord := 2; attempt := 'reserved name "postmaster"'; expected := 'P0091';
+    got_sqlstate := coalesce(v_state,'none'); got_message := v_msg;
+    verdict := CASE WHEN v_state = 'P0091' THEN 'PASS'
+                    WHEN v_state IS NULL    THEN 'FAIL, it was ACCEPTED'
+                    ELSE 'FAIL, wrong SQLSTATE' END;
+    RETURN NEXT;
 
-    -- 2 · a mixed-case slug
-    --   🔴 This is the one that closes a LIVE duplicate. normaliseHost()
-    --   lowercases the Host header, so `Acme` and `acme` both answer to
-    --   acme.ordence.com and the old unique index compared bytes.
+    -- 2 · mixed case. 🔴 This is the one that closes a LIVE duplicate:
+    --     normaliseHost() lowercases the Host header, so `Acme` and `acme`
+    --     both answer to acme.ordence.com and the old index compared bytes.
     v_state := NULL; v_msg := NULL;
     BEGIN
         INSERT INTO public.tenants (clerk_org_id, slug, name)
         VALUES ('verify0091:u', 'ZZVerify0091', 'VERIFY 0091');
-    EXCEPTION WHEN OTHERS THEN
-        v_state := SQLSTATE; v_msg := SQLERRM;
+    EXCEPTION WHEN OTHERS THEN v_state := SQLSTATE; v_msg := SQLERRM;
     END;
-    INSERT INTO verify_0091_findings VALUES
-        (3, 'mixed-case slug "ZZVerify0091"', '23514 tenants_slug_lowercase', v_state, v_msg,
-         CASE WHEN v_state = '23514' THEN 'PASS'
-              WHEN v_state IS NULL   THEN 'FAIL, it was ACCEPTED'
-              ELSE 'FAIL, wrong SQLSTATE' END);
+    ord := 3; attempt := 'mixed-case slug "ZZVerify0091"';
+    expected := '23514 tenants_slug_lowercase';
+    got_sqlstate := coalesce(v_state,'none'); got_message := v_msg;
+    verdict := CASE WHEN v_state = '23514' THEN 'PASS'
+                    WHEN v_state IS NULL    THEN 'FAIL, it was ACCEPTED'
+                    ELSE 'FAIL, wrong SQLSTATE' END;
+    RETURN NEXT;
 
-    -- 3 · a two-character slug
+    -- 3 · two characters
     v_state := NULL; v_msg := NULL;
     BEGIN
         INSERT INTO public.tenants (clerk_org_id, slug, name)
         VALUES ('verify0091:s', 'zz', 'VERIFY 0091');
-    EXCEPTION WHEN OTHERS THEN
-        v_state := SQLSTATE; v_msg := SQLERRM;
+    EXCEPTION WHEN OTHERS THEN v_state := SQLSTATE; v_msg := SQLERRM;
     END;
-    INSERT INTO verify_0091_findings VALUES
-        (4, 'two-character slug "zz"', '23514 tenants_slug_shape', v_state, v_msg,
-         CASE WHEN v_state = '23514' THEN 'PASS'
-              WHEN v_state IS NULL   THEN 'FAIL, it was ACCEPTED'
-              ELSE 'FAIL, wrong SQLSTATE' END);
+    ord := 4; attempt := 'two-character slug "zz"';
+    expected := '23514 tenants_slug_shape';
+    got_sqlstate := coalesce(v_state,'none'); got_message := v_msg;
+    verdict := CASE WHEN v_state = '23514' THEN 'PASS'
+                    WHEN v_state IS NULL    THEN 'FAIL, it was ACCEPTED'
+                    ELSE 'FAIL, wrong SQLSTATE' END;
+    RETURN NEXT;
 
-    -- 4 · a confusable of a slug that really exists on THIS database
-    --
-    -- ⭐ Built from a LIVE slug rather than a fixture, so it proves the
-    --    fold index against your actual data rather than against a name
-    --    I invented. The substitution is l -> 1, which is the exact pair
-    --    the first draft of 0091 got wrong.
-    v_state := NULL; v_msg := NULL; v_probe := NULL; v_target := NULL;
-
-    SELECT t.slug INTO v_target
-    FROM public.tenants t
-    WHERE t.slug LIKE '%l%'
-    ORDER BY t.created_at
-    LIMIT 1;
+    -- 4 · ⭐ a confusable built from one of YOUR OWN live slugs, so this
+    --     proves the fold index against real data rather than a fixture.
+    --     The substitution is l -> 1, the exact pair the first draft of
+    --     0091 got wrong.
+    v_state := NULL; v_msg := NULL;
+    SELECT t.slug INTO v_target FROM public.tenants t
+     WHERE t.slug LIKE '%l%' ORDER BY t.created_at LIMIT 1;
 
     IF v_target IS NULL THEN
-        INSERT INTO verify_0091_findings VALUES
-            (5, 'confusable of a live slug', '23505 tenants_slug_fold_unique',
-             NULL, NULL, 'SKIPPED, no existing slug contains the letter l');
+        ord := 5; attempt := 'confusable of a live slug';
+        expected := '23505 tenants_slug_fold_unique';
+        got_sqlstate := 'none'; got_message := NULL;
+        verdict := 'SKIPPED, no existing slug contains the letter l';
+        RETURN NEXT;
     ELSE
         v_probe := replace(v_target, 'l', '1');
         BEGIN
             INSERT INTO public.tenants (clerk_org_id, slug, name)
             VALUES ('verify0091:f', v_probe, 'VERIFY 0091');
-        EXCEPTION WHEN OTHERS THEN
-            v_state := SQLSTATE; v_msg := SQLERRM;
+        EXCEPTION WHEN OTHERS THEN v_state := SQLSTATE; v_msg := SQLERRM;
         END;
-        INSERT INTO verify_0091_findings VALUES
-            (5, 'confusable "' || v_probe || '" of live slug "' || v_target || '"',
-             '23505 tenants_slug_fold_unique', v_state, v_msg,
-             CASE WHEN v_state = '23505' THEN 'PASS'
-                  WHEN v_state IS NULL   THEN 'FAIL, ACCEPTED, the fold is not working'
-                  ELSE 'FAIL, wrong SQLSTATE' END);
+        ord := 5;
+        attempt := 'confusable "' || v_probe || '" of live slug "' || v_target || '"';
+        expected := '23505 tenants_slug_fold_unique';
+        got_sqlstate := coalesce(v_state,'none'); got_message := v_msg;
+        verdict := CASE WHEN v_state = '23505' THEN 'PASS'
+                        WHEN v_state IS NULL    THEN 'FAIL, ACCEPTED, the fold is not working'
+                        ELSE 'FAIL, wrong SQLSTATE' END;
+        RETURN NEXT;
     END IF;
-
-    -- ⚠️ NO OUTER `RAISE` HERE, DELIBERATELY.
-    --    Every attempt above was already undone by its own subtransaction.
-    --    An outer RAISE would roll back the FINDINGS as well, which is
-    --    what the first draft did. Nothing uncommitted remains: the only
-    --    rows still in existence are in a TEMP table that vanishes when
-    --    your editor session ends.
 END
 $verify$;
 
 SELECT
-    'TAB 7 · live refusals' AS section,
-    attempt,
-    expected,
-    coalesce(got_sqlstate, 'none') AS got_sqlstate,
-    verdict,
-    got_message
-FROM verify_0091_findings
-ORDER BY ord;
+    '-- TAB 7 · live refusals' AS section,
+    v.ord, v.attempt, v.expected, v.got_sqlstate, v.verdict, v.got_message
+FROM public.ordence_verify_0091() v
+ORDER BY v.ord;
 
 
 -- =====================================================================
@@ -438,8 +405,8 @@ WITH facts AS (
         (SELECT count(*) FROM public.tenants t
           WHERE NOT EXISTS (SELECT 1 FROM public.tenant_slug_history h
                             WHERE h.tenant_id=t.id AND h.slug=t.slug))  AS backfill_gaps,
-        (SELECT count(*) FROM verify_0091_findings WHERE verdict LIKE 'FAIL%') AS live_failures,
-        (SELECT count(*) FROM verify_0091_findings)                     AS live_attempts
+        (SELECT count(*) FROM public.ordence_verify_0091() WHERE verdict LIKE 'FAIL%') AS live_failures,
+        (SELECT count(*) FROM public.ordence_verify_0091())              AS live_attempts
 )
 SELECT * FROM (
     SELECT 1 AS ord, 'shape and case constraints' AS item,
@@ -478,3 +445,14 @@ SELECT * FROM (
                 ELSE 'FAIL, see TAB 7' END FROM facts
 ) v
 ORDER BY ord;
+
+
+-- =====================================================================
+-- TAB 9 · CLEAN UP
+-- ---------------------------------------------------------------------
+-- The probe function is scaffolding, not part of the product. Drop it.
+-- ⚠️ If you re-run this file it is simply recreated, so forgetting to run
+--    this is untidy rather than dangerous.
+-- =====================================================================
+
+DROP FUNCTION IF EXISTS public.ordence_verify_0091();

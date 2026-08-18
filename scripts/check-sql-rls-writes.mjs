@@ -74,12 +74,21 @@ const fail = (m) => { console.error(`::error::${m}`); failures += 1; };
  * and each entry says why.
  */
 const GRANDFATHERED = new Map([
-  [
-    "0091_slug_authority.sql",
-    "already applied. Its section 6 backfill of tenant_slug_history sits after " +
-      "FORCE RLS on the same table. It did not fail because the backfill inserts " +
-      "nothing on a database with no tenants, so the policy was never exercised.",
-  ],
+  /**
+   * 🔴 `0091` WAS ON THIS LIST AND HAS BEEN TAKEN OFF IT, WHICH IS THE POINT
+   *    OF THE LIST BEING EXPLICIT.
+   *
+   * It was grandfathered as "already applied". It was not: it applied
+   * PARTIALLY. `reserved_slugs` landed, `tenant_slug_history` never did, and
+   * the console reported the run as finished because a file wrapped in
+   * BEGIN/COMMIT is not atomic in a browser that sends each statement on its
+   * own connection. Grandfathering it meant this gate stopped looking at the
+   * file that most needed looking at.
+   *
+   * ⚠️ THE LESSON FOR THIS LIST: "already applied" is a claim about the
+   *    database, not about the file, and nobody had checked it. An entry here
+   *    now needs evidence, not an assumption.
+   */
   /**
    * ⚠️ THE FOLLOWING ARE ALL ALREADY APPLIED TO PRODUCTION, AND EVERY ONE OF
    *    THEM APPLIED SUCCESSFULLY. That is evidence, not luck: the role that
@@ -112,6 +121,67 @@ const GRANDFATHERED = new Map([
    */
   ["ALL-IN-ONE-SETUP.sql", "legacy aggregate, not in the run order"],
   ["RUN-THESE-IN-ORDER-13.sql", "legacy aggregate, not in the run order"],
+]);
+
+/**
+ * ⚠️ FALSE-ATOMICITY GRANDFATHER LIST, BY NAME AND ONLY BY NAME.
+ *
+ * Every file here wraps itself in BEGIN/COMMIT and is ALREADY APPLIED.
+ * Editing an applied migration is re-running history under the same name,
+ * which is how a database ends up in a state no file describes. They are
+ * corrected by a later numbered file if they ever need to be.
+ *
+ * 🔴 `0091` IS DELIBERATELY NOT ON THIS LIST. It was grandfathered once as
+ *    "already applied" and it was not: it applied HALF-WAY, which is the
+ *    exact incident this rule exists for. "Already applied" is a claim about
+ *    the database, not about the file, and it needs evidence.
+ */
+const BEGIN_COMMIT_GRANDFATHERED = new Set([
+  "0028_phase39_orders.sql",
+  "0029_phase40_inventory.sql",
+  "0030_phase42_land.sql",
+  "0031_phase44_ra_bills.sql",
+  "0032_engine4_compliance.sql",
+  "0033_engine1_scheduling.sql",
+  "0034_engine2_pricing.sql",
+  "0035_engine5_metering.sql",
+  "0036_engine3_field_ops.sql",
+  "0037_engine6_vault.sql",
+  "0038_construction_labour.sql",
+  "0039_tables_paste_only.sql",
+  "0040_stock_reservation_floor.sql",
+  "0041_contracting_depth.sql",
+  "0043_engine1_engine4_tables.sql",
+  "0059_court_fees_disbursements.sql",
+  "0060_tasks_activities_calendar.sql",
+  "0061_crm_consent_messaging.sql",
+  "0064_integration_frame.sql",
+  "0065_lead_intake.sql",
+  "0066_utility_messaging.sql",
+  "0067_campaigns.sql",
+  "0068_order_rhythm.sql",
+  "0069_connection_probes.sql",
+  "0070_bank_reconciliation.sql",
+  "0071_tenant_agents.sql",
+  "0073_period_lock_and_reorder.sql",
+  "0074_platform_control.sql",
+  "0075_payroll.sql",
+  "0077_monthly_return.sql",
+  "0078_real_estate_completion.sql",
+  "0079_rls_opt_in_and_telemetry.sql",
+  "0081_audit_hash_chain.sql",
+  "0082_leave_and_attendance.sql",
+  "0084_cost_centres_and_budgets.sql",
+  "0085_appraisals_and_org.sql",
+  "0086_policy_platform_platform_tables.sql",
+  "0087_hardening_narrow_grants.sql",
+  "0088_hardening_auth_events.sql",
+  "0089_hardening_login_lockouts.sql",
+  "0090_period_close_message_normalization.sql",
+  "RUN-THESE-IN-ORDER-14.sql",
+  "RUN-THESE-IN-ORDER-15.sql",
+  "RUN-THESE-IN-ORDER-16.sql",
+  "VERIFY-0089-neon-safe.sql",
 ]);
 
 /** Files that never touch a browser console or the app role. */
@@ -164,6 +234,32 @@ for (const file of files) {
    *    connection and one transaction by construction, and there is no gap
    *    for the setting to be lost in.
    */
+  /**
+   * 🔴 `BEGIN;` / `COMMIT;` IN A MIGRATION IS FALSE ATOMICITY HERE.
+   *
+   * A browser SQL console sends each statement on its own connection and does
+   * not hold a transaction across them, so `BEGIN;` at the top of a file buys
+   * nothing and makes the file LOOK safe. `0091` was wrapped that way, a
+   * statement in its section 3 failed, everything before it stayed committed,
+   * everything after it never ran, and the console reported the run as
+   * finished. The partial state was only discovered when a later file tripped
+   * over a table that should have existed.
+   *
+   * ⚠️ The replacement is not a bigger transaction, it is INDEPENDENT
+   *    IDEMPOTENCE per statement: IF NOT EXISTS, OR REPLACE, DROP ... IF
+   *    EXISTS before CREATE, ON CONFLICT DO NOTHING, and an existence check
+   *    before ADD CONSTRAINT. That survives the thing that actually happens.
+   */
+  if (!GRANDFATHERED.has(file) && !BEGIN_COMMIT_GRANDFATHERED.has(file) && /^\s*BEGIN\s*;/im.test(sql) && /^\s*COMMIT\s*;/im.test(sql)) {
+    fail(
+      `${DIR}/${file} — wraps itself in BEGIN/COMMIT. A browser SQL console sends each ` +
+      `statement on its own connection, so this provides NO atomicity and only the ` +
+      `appearance of it: a mid-file failure leaves everything before it committed and ` +
+      `everything after it never run, with the console reporting success. Remove them and ` +
+      `make every statement independently idempotent.`,
+    );
+  }
+
   const setsScopeInStatement = /set_config\s*\(\s*'app\.platform_scope'/i.test(sql);
   const setsScopeAcrossStatements = /SET\s+(LOCAL\s+)?app\.platform_scope/i.test(sql);
   const setsScope = setsScopeInStatement;

@@ -78,7 +78,42 @@
 --
 -- ############################################################################
 
-BEGIN;
+-- ############################################################################
+-- 🔴 THIS FILE HAS NO `BEGIN;` AND NO `COMMIT;`. THAT IS DELIBERATE AND IT IS
+--    A CORRECTION, NOT A STYLE CHOICE.
+-- ############################################################################
+--
+-- The first version opened with `BEGIN;` and closed with `COMMIT;`. In a
+-- terminal that makes the file atomic. **In a browser SQL console it does
+-- nothing**, because the console sends each statement SEPARATELY and does not
+-- hold a transaction across them. Every statement autocommits on its own.
+--
+-- So the file was never one migration. It was thirty independent ones, and
+-- when a statement in section 3 failed, everything before it stayed committed
+-- and everything after it never ran. `reserved_slugs` existed, with its RLS
+-- policy, while `tenant_slug_history` did not exist at all , and the console
+-- reported the run as finished.
+--
+-- ⚠️ THE `BEGIN;` WAS WORSE THAN USELESS. It was not providing atomicity and
+--    it was making the file look as though it did, which is why the partial
+--    state went unnoticed until a later file tripped over the missing table.
+--
+-- ⭐ WHAT REPLACES IT: every statement below is INDEPENDENTLY IDEMPOTENT.
+--    `CREATE TABLE IF NOT EXISTS`, `CREATE INDEX IF NOT EXISTS`,
+--    `DROP POLICY IF EXISTS` before every `CREATE POLICY`, `CREATE OR REPLACE
+--    FUNCTION`, `ON CONFLICT DO NOTHING`, and a `pg_constraint` existence
+--    check before every `ADD CONSTRAINT`. Re-running the file is a no-op, and
+--    re-running it after a partial failure completes it.
+--
+--    That is a stronger property than atomicity for a file that is pasted
+--    into a browser, because it survives the thing that actually happens.
+--
+-- 🔴 RUN `STATE-OF-0091-neon-safe.sql` FIRST. It is one statement, reads only
+--    pg_catalog, and tells you exactly which parts of this file are already
+--    present and whether a re-run will hit a data blocker.
+--
+-- ############################################################################
+
 
 
 -- ============================================================================
@@ -172,83 +207,123 @@ COMMENT ON TABLE public.reserved_slugs IS
     'either impersonates Ordence or influences mail and certificate issuance.';
 
 -- --- the union of the two lists that had drifted apart (41) ----------------
-INSERT INTO public.reserved_slugs (slug, category, reason) VALUES
-    ('account',       'identity',    'account surfaces'),
-    ('accounts',      'identity',    'account surfaces'),
-    ('admin',         'impersonate', 'impersonates the Ordence console'),
-    ('administrator', 'impersonate', 'impersonates the Ordence console'),
-    ('api',           'infra',       'API host'),
-    ('app',           'infra',       'the product host itself'),
-    ('apps',          'infra',       'the product host itself'),
-    ('assets',        'infra',       'static asset host'),
-    ('auth',          'identity',    'authentication surface'),
-    ('billing',       'money',       'money surface, high-value impersonation'),
-    ('blog',          'marketing',   'marketing surface'),
-    ('cdn',           'infra',       'asset delivery host'),
-    ('clerk',         'identity',    'our identity provider, impersonation'),
-    ('console',       'impersonate', 'impersonates the Ordence console'),
-    ('dashboard',     'infra',       'product surface'),
-    ('dev',           'infra',       'environment label'),
-    ('docs',          'marketing',   'documentation surface'),
-    ('ftp',           'infra',       'protocol label'),
-    ('help',          'marketing',   'support surface'),
-    ('internal',      'impersonate', 'implies Ordence staff'),
-    ('login',         'identity',    'authentication surface'),
-    ('logout',        'identity',    'authentication surface'),
-    ('mail',          'mail',        'mail routing label'),
-    ('ns1',           'infra',       'nameserver label'),
-    ('ns2',           'infra',       'nameserver label'),
-    ('ordence',       'impersonate', 'is our own name'),
-    ('platform',      'impersonate', 'impersonates the Ordence console'),
-    ('portal',        'impersonate', 'implies an Ordence-operated surface'),
-    ('preview',       'infra',       'environment label'),
-    ('root',          'impersonate', 'implies privilege'),
-    ('secure',        'impersonate', 'implies an Ordence-operated surface'),
-    ('signin',        'identity',    'authentication surface'),
-    ('signup',        'identity',    'authentication surface'),
-    ('smtp',          'mail',        'mail routing label'),
-    ('staff',         'impersonate', 'implies Ordence staff'),
-    ('staging',       'infra',       'environment label'),
-    ('static',        'infra',       'static asset host'),
-    ('status',        'infra',       'status page, trusted during an incident'),
-    ('support',       'impersonate', 'implies Ordence support, social engineering'),
-    ('system',        'impersonate', 'implies privilege'),
-    ('test',          'infra',       'environment label'),
-    ('vercel',        'infra',       'vendor label'),
-    ('www',           'infra',       'the root site itself')
-ON CONFLICT (slug) DO NOTHING;
+-- 🔴 WRAPPED IN A `DO` BLOCK, AND THE REASON IS A RE-RUN, NOT A FRESH INSTALL.
+--
+--    On a fresh database this INSERT runs BEFORE the ALTER ... FORCE ROW
+--    LEVEL SECURITY further down, so a bare INSERT works and nothing here
+--    looks necessary.
+--
+--    ⚠️ ON A RE-RUN AFTER A PARTIAL APPLY, THE RLS IS ALREADY THERE, and the
+--       bare INSERT is refused with "new row violates row-level security
+--       policy for table reserved_slugs". A file that only applies to a
+--       database that has never seen it is not idempotent, it is single-use,
+--       and the situation that actually needs it is the second run.
+--
+--    `set_config(..., true)` inside the block is transaction-local and cannot
+--    be lost the way a separate `SET LOCAL` statement is in a browser console.
+DO $seed$
+BEGIN
+    PERFORM set_config('app.platform_scope', 'on', true);
+
+    INSERT INTO public.reserved_slugs (slug, category, reason) VALUES
+        ('account',       'identity',    'account surfaces'),
+        ('accounts',      'identity',    'account surfaces'),
+        ('admin',         'impersonate', 'impersonates the Ordence console'),
+        ('administrator', 'impersonate', 'impersonates the Ordence console'),
+        ('api',           'infra',       'API host'),
+        ('app',           'infra',       'the product host itself'),
+        ('apps',          'infra',       'the product host itself'),
+        ('assets',        'infra',       'static asset host'),
+        ('auth',          'identity',    'authentication surface'),
+        ('billing',       'money',       'money surface, high-value impersonation'),
+        ('blog',          'marketing',   'marketing surface'),
+        ('cdn',           'infra',       'asset delivery host'),
+        ('clerk',         'identity',    'our identity provider, impersonation'),
+        ('console',       'impersonate', 'impersonates the Ordence console'),
+        ('dashboard',     'infra',       'product surface'),
+        ('dev',           'infra',       'environment label'),
+        ('docs',          'marketing',   'documentation surface'),
+        ('ftp',           'infra',       'protocol label'),
+        ('help',          'marketing',   'support surface'),
+        ('internal',      'impersonate', 'implies Ordence staff'),
+        ('login',         'identity',    'authentication surface'),
+        ('logout',        'identity',    'authentication surface'),
+        ('mail',          'mail',        'mail routing label'),
+        ('ns1',           'infra',       'nameserver label'),
+        ('ns2',           'infra',       'nameserver label'),
+        ('ordence',       'impersonate', 'is our own name'),
+        ('platform',      'impersonate', 'impersonates the Ordence console'),
+        ('portal',        'impersonate', 'implies an Ordence-operated surface'),
+        ('preview',       'infra',       'environment label'),
+        ('root',          'impersonate', 'implies privilege'),
+        ('secure',        'impersonate', 'implies an Ordence-operated surface'),
+        ('signin',        'identity',    'authentication surface'),
+        ('signup',        'identity',    'authentication surface'),
+        ('smtp',          'mail',        'mail routing label'),
+        ('staff',         'impersonate', 'implies Ordence staff'),
+        ('staging',       'infra',       'environment label'),
+        ('static',        'infra',       'static asset host'),
+        ('status',        'infra',       'status page, trusted during an incident'),
+        ('support',       'impersonate', 'implies Ordence support, social engineering'),
+        ('system',        'impersonate', 'implies privilege'),
+        ('test',          'infra',       'environment label'),
+        ('vercel',        'infra',       'vendor label'),
+        ('www',           'infra',       'the root site itself')
+    ON CONFLICT (slug) DO NOTHING;
+END
+$seed$;
 
 -- --- certificate, mail and identity labels, new in 0091 --------------------
-INSERT INTO public.reserved_slugs (slug, category, reason) VALUES
-    ('abuse',         'certificate', 'CA-accepted domain-control validation address'),
-    ('hostmaster',    'certificate', 'CA-accepted domain-control validation address'),
-    ('postmaster',    'certificate', 'CA-accepted domain-control validation address'),
-    ('webmaster',     'certificate', 'CA-accepted domain-control validation address'),
-    ('_domainkey',    'mail',        'DKIM record label, unreachable today but reserved ahead of any pattern change'),
-    ('autodiscover',  'mail',        'mail client autodiscovery'),
-    ('dmarc',         'mail',        'mail authentication policy label'),
-    ('email',         'mail',        'mail routing label'),
-    ('imap',          'mail',        'mail routing label'),
-    ('mx',            'mail',        'mail exchange label'),
-    ('pop',           'mail',        'mail routing label'),
-    ('spf',           'mail',        'mail authentication policy label'),
-    ('webmail',       'mail',        'mail routing label'),
-    ('ci',            'infra',       'build infrastructure'),
-    ('git',           'infra',       'source infrastructure'),
-    ('vpn',           'infra',       'network infrastructure'),
-    ('idp',           'identity',    'identity provider label'),
-    ('oauth',         'identity',    'authorisation surface'),
-    ('sso',           'identity',    'authentication surface'),
-    ('security',      'impersonate', 'implies an Ordence security surface'),
-    ('verification',  'identity',    'implies an Ordence verification surface'),
-    ('verify',        'identity',    'implies an Ordence verification surface'),
-    ('gst',           'money',       'statutory surface, high-value impersonation in India'),
-    ('invoice',       'money',       'money surface, high-value impersonation'),
-    ('invoices',      'money',       'money surface, high-value impersonation'),
-    ('pay',           'money',       'money surface, high-value impersonation'),
-    ('payment',       'money',       'money surface, high-value impersonation'),
-    ('payments',      'money',       'money surface, high-value impersonation')
-ON CONFLICT (slug) DO NOTHING;
+-- 🔴 WRAPPED IN A `DO` BLOCK, AND THE REASON IS A RE-RUN, NOT A FRESH INSTALL.
+--
+--    On a fresh database this INSERT runs BEFORE the ALTER ... FORCE ROW
+--    LEVEL SECURITY further down, so a bare INSERT works and nothing here
+--    looks necessary.
+--
+--    ⚠️ ON A RE-RUN AFTER A PARTIAL APPLY, THE RLS IS ALREADY THERE, and the
+--       bare INSERT is refused with "new row violates row-level security
+--       policy for table reserved_slugs". A file that only applies to a
+--       database that has never seen it is not idempotent, it is single-use,
+--       and the situation that actually needs it is the second run.
+--
+--    `set_config(..., true)` inside the block is transaction-local and cannot
+--    be lost the way a separate `SET LOCAL` statement is in a browser console.
+DO $seed$
+BEGIN
+    PERFORM set_config('app.platform_scope', 'on', true);
+
+    INSERT INTO public.reserved_slugs (slug, category, reason) VALUES
+        ('abuse',         'certificate', 'CA-accepted domain-control validation address'),
+        ('hostmaster',    'certificate', 'CA-accepted domain-control validation address'),
+        ('postmaster',    'certificate', 'CA-accepted domain-control validation address'),
+        ('webmaster',     'certificate', 'CA-accepted domain-control validation address'),
+        ('_domainkey',    'mail',        'DKIM record label, unreachable today but reserved ahead of any pattern change'),
+        ('autodiscover',  'mail',        'mail client autodiscovery'),
+        ('dmarc',         'mail',        'mail authentication policy label'),
+        ('email',         'mail',        'mail routing label'),
+        ('imap',          'mail',        'mail routing label'),
+        ('mx',            'mail',        'mail exchange label'),
+        ('pop',           'mail',        'mail routing label'),
+        ('spf',           'mail',        'mail authentication policy label'),
+        ('webmail',       'mail',        'mail routing label'),
+        ('ci',            'infra',       'build infrastructure'),
+        ('git',           'infra',       'source infrastructure'),
+        ('vpn',           'infra',       'network infrastructure'),
+        ('idp',           'identity',    'identity provider label'),
+        ('oauth',         'identity',    'authorisation surface'),
+        ('sso',           'identity',    'authentication surface'),
+        ('security',      'impersonate', 'implies an Ordence security surface'),
+        ('verification',  'identity',    'implies an Ordence verification surface'),
+        ('verify',        'identity',    'implies an Ordence verification surface'),
+        ('gst',           'money',       'statutory surface, high-value impersonation in India'),
+        ('invoice',       'money',       'money surface, high-value impersonation'),
+        ('invoices',      'money',       'money surface, high-value impersonation'),
+        ('pay',           'money',       'money surface, high-value impersonation'),
+        ('payment',       'money',       'money surface, high-value impersonation'),
+        ('payments',      'money',       'money surface, high-value impersonation')
+    ON CONFLICT (slug) DO NOTHING;
+END
+$seed$;
 
 -- --- RLS on the list itself ------------------------------------------------
 --
@@ -568,17 +643,53 @@ CREATE TRIGGER ordence_guard_tenant_slug
 -- created_at, which is the truth as far as it is knowable.
 -- ============================================================================
 
-INSERT INTO public.tenant_slug_history (tenant_id, slug, slug_fold, claimed_at)
-SELECT
-    t.id,
-    t.slug,
-    translate(replace(replace(replace(t.slug, '-', ''), 'rn', 'm'), 'vv', 'w'), '01l', 'oii'),
-    t.created_at
-FROM public.tenants t
-WHERE NOT EXISTS (
-    SELECT 1 FROM public.tenant_slug_history h
-    WHERE h.tenant_id = t.id AND h.slug = t.slug
-);
+-- 🔴 THIS IS A `DO` BLOCK AND NOT A BARE INSERT, FOR A REASON THAT COST TWO
+--    ROUNDS TO FIND.
+--
+--    Section 4 above puts FORCE ROW LEVEL SECURITY on `tenant_slug_history`
+--    with `WITH CHECK (app_platform_scope())`. A bare INSERT here is therefore
+--    refused for any role without BYPASSRLS:
+--
+--        ERROR: new row violates row-level security policy for table
+--               "tenant_slug_history"
+--
+--    ⚠️ AND `SET LOCAL app.platform_scope = 'on';` AS ITS OWN STATEMENT DOES
+--       NOT FIX IT. In a browser console that statement reports success and
+--       then evaporates, because the next statement runs on a different
+--       connection. The console shows `SET  executed successfully` immediately
+--       above the RLS refusal.
+--
+--    ⭐ A `DO` block is ONE statement, therefore one connection and one
+--       transaction by construction. `set_config(name, value, true)` is the
+--       PL/pgSQL form of SET LOCAL and unwinds with the block. There is no gap
+--       for the setting to be lost in.
+--
+--    ⚠️ IT ALSO DID NOT SURFACE EARLIER because on a database with no
+--       workspaces the INSERT touches zero rows and never tests the policy.
+--       A latent failure that waits for the first customer is worse than one
+--       that fails today.
+DO $backfill$
+DECLARE
+    v_rows integer;
+BEGIN
+    PERFORM set_config('app.platform_scope', 'on', true);
+
+    INSERT INTO public.tenant_slug_history (tenant_id, slug, slug_fold, claimed_at)
+    SELECT
+        t.id,
+        t.slug,
+        translate(replace(replace(replace(t.slug, '-', ''), 'rn', 'm'), 'vv', 'w'), '01l', 'oii'),
+        t.created_at
+    FROM public.tenants t
+    WHERE NOT EXISTS (
+        SELECT 1 FROM public.tenant_slug_history h
+        WHERE h.tenant_id = t.id AND h.slug = t.slug
+    );
+
+    GET DIAGNOSTICS v_rows = ROW_COUNT;
+    RAISE NOTICE '0091 backfill: % history row(s) written', v_rows;
+END
+$backfill$;
 
 
 -- ============================================================================
@@ -606,4 +717,4 @@ END $$;
 --    be deleted the first time it is inconvenient. Rows leave only by
 --    ON DELETE CASCADE when the tenant itself is removed.
 
-COMMIT;
+-- No COMMIT. See the header: there was no transaction to commit.

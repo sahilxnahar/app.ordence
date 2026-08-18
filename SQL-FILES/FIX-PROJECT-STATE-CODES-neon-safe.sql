@@ -42,21 +42,47 @@
 --     with different policies, which is the whole point of the design.)
 -- =====================================================================
 
-BEGIN;
-SET LOCAL app.tenant_id = '00000000-0000-0000-0000-000000000000';  -- <<< EDIT
+-- 🔴 ONE STATEMENT. NOT `BEGIN; SET LOCAL ...; SELECT ...;`.
+--
+--    A browser SQL console sends each statement on its own connection, so a
+--    `SET LOCAL` issued as its own statement reports success and is GONE by
+--    the time the next statement runs. You get `SET  executed successfully`
+--    directly above an empty result or a permission error, which is the most
+--    misleading pair of outputs in this whole toolchain.
+--
+--    Setting the tenant and reading the rows therefore happen inside ONE
+--    function call. One statement is one connection and one transaction by
+--    construction.
+--
+-- ⚠️ EDIT THE UUID IN BOTH PLACES BELOW. Get tenant ids from:
+--        SELECT id, slug, name FROM tenants ORDER BY created_at;
+--    (`tenants` DOES carry a platform clause, so that query needs
+--     app.platform_scope instead. Different table, different policy, which is
+--     the whole point of the design.)
+
+CREATE OR REPLACE FUNCTION public.ordence_projects_missing_state(p_tenant uuid)
+RETURNS TABLE (project_id uuid, project_name text, current_state_code text)
+LANGUAGE plpgsql AS $fn$
+BEGIN
+    PERFORM set_config('app.tenant_id', p_tenant::text, true);
+    RETURN QUERY
+        SELECT p.id, p.name::text, p.state_code::text
+        FROM projects p
+        WHERE p.state_code IS NULL
+        ORDER BY p.name;
+END
+$fn$;
 
 SELECT
     'projects missing a state code' AS finding,
-    p.id                            AS project_id,
-    p.name                          AS project_name,
-    p.state_code                    AS current_state_code,
+    m.project_id,
+    m.project_name,
+    m.current_state_code,
     'invoices on this project cannot be classified as intra or inter state'
                                     AS consequence
-FROM projects p
-WHERE p.state_code IS NULL
-ORDER BY p.name;
-
-COMMIT;
+FROM public.ordence_projects_missing_state(
+        '00000000-0000-0000-0000-000000000000'   -- <<< EDIT
+     ) m;
 
 
 -- =====================================================================
@@ -82,13 +108,19 @@ COMMIT;
 --    so it will store and then never match a GSTIN prefix.
 -- =====================================================================
 
--- BEGIN;
--- SET LOCAL app.tenant_id = '00000000-0000-0000-0000-000000000000';  -- <<< EDIT
+-- ⚠️ ONE `DO` BLOCK, for the same reason as section 1. Uncomment, edit, run.
 --
--- UPDATE projects SET state_code = '27' WHERE id = '<project-uuid>';  -- <<< EDIT
--- UPDATE projects SET state_code = '29' WHERE id = '<project-uuid>';  -- <<< EDIT
+-- DO $fix$
+-- BEGIN
+--     PERFORM set_config('app.tenant_id',
+--         '00000000-0000-0000-0000-000000000000', true);   -- <<< EDIT
 --
--- -- Re-read before committing. If this returns rows you are not done.
--- SELECT id, name, state_code FROM projects WHERE state_code IS NULL;
+--     UPDATE projects SET state_code = '27' WHERE id = '<project-uuid>';  -- <<< EDIT
+--     UPDATE projects SET state_code = '29' WHERE id = '<project-uuid>';  -- <<< EDIT
+-- END
+-- $fix$;
 --
--- COMMIT;
+-- -- Then re-run SECTION 1. If it still returns rows, you are not done.
+--
+-- -- Tidy up when finished:
+-- -- DROP FUNCTION IF EXISTS public.ordence_projects_missing_state(uuid);
