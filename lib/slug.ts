@@ -142,7 +142,8 @@ const RESERVED_BY_CATEGORY = {
    */
   mail: [
     "_domainkey", "autodiscover", "clk", "clk2", "clkmail", "dmarc", "email",
-    "imap", "mail", "mx", "pop", "smtp", "spf", "webmail",
+    "imap", "mail", "mx", "pop", "resend", "send", "smtp", "spf", "updates",
+    "webmail",
   ],
 
   /** Money and statutory surfaces. High-value impersonation targets in

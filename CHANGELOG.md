@@ -1,3 +1,36 @@
+# v1.64.1-alpha , RESERVE THE RESEND HOSTS
+
+**Repo: `app.ordence`** * 🔴 **SQL: `0103`, run it before or after the push, either order is safe** * ⚠️ **No new environment variables**
+
+- 🔴 **Resend now has DNS under `ordence.com` and the reserved slug list did not
+  know.** `updates.ordence.com` has been the verified sending domain for 16
+  days; adding the root domain creates `send.ordence.com` with an MX and an
+  SPF TXT. Neither label was reserved. `0103` adds `updates`, `send` and
+  `resend`.
+  ⭐ **The mechanism is subtler than 0092's and it generalises the rule.**
+  `send` carries only an MX and a TXT, so the natural assumption is that the
+  Railway wildcard still answers address queries for it. It does not: a DNS
+  wildcard is used only when the queried name does not exist in the zone at
+  all, and one MX record makes the name exist. An A query then returns NODATA
+  rather than falling through to `*`. So a tenant claiming `send` would get a
+  workspace whose hostname resolves to **nothing**.
+  The rule is therefore not "an explicit address record beats a wildcard". It
+  is **"any record at a name removes that name from the wildcard"**.
+- ⚠️ **Second time this has fired.** Clerk in 0092, Resend here. Every time a
+  vendor is given DNS under `ordence.com`, its labels are reserved in the same
+  change. The reserved list is a mirror of the zone file, and a mirror goes
+  stale silently.
+- ⭐ **The SQL alone is enough to close the hole**, because 0091 deliberately
+  made the reserved list a TABLE rather than a constraint. The database is the
+  authority; `lib/slug.ts` is the advisory front-end copy that keeps the
+  public form from naming a conflicting workspace.
+- ⚠️ **A defect in my own verification, found and corrected.** My first check
+  of "does the policy refuse an unscoped write" ran as `postgres`, which is a
+  superuser, and superusers bypass RLS unconditionally. It printed a pass that
+  proved nothing. Redone as a non-superuser role it refuses without platform
+  scope and accepts with it, which is the actual claim. That is the third RLS
+  bypass vector in this project's notes and it caught me anyway.
+
 # v1.64.0-alpha , THE THREE ENGINES THAT WERE NOT THERE
 
 **Repo: `app.ordence`** * 🔴 **SQL: `0100`, `0101`, `0102`, run IN THAT ORDER, BEFORE the code push** * ⚠️ **No new environment variables**
