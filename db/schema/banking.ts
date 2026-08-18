@@ -54,8 +54,43 @@ export const bankAccounts = pgTable(
     accountLast4: varchar("account_last4", { length: 4 }),
     ifsc: varchar("ifsc", { length: 11 }),
 
-    /** ⭐ Everything on or before this date has been explained. */
+    /**
+     * ⭐⭐ EVERYTHING ON OR BEFORE THIS DATE HAS BEEN EXPLAINED, AND AS
+     * OF 0102 THAT IS ENFORCED RATHER THAN ASSERTED.
+     *
+     * 🔴 BEFORE 0102 THIS COLUMN WAS THE EIGHTH INSTANCE OF THIS
+     * CODEBASE'S OLDEST DEFECT: declared, displayed, and read by nothing
+     * that could refuse anything. `unmatch` deleted a confirmed match
+     * under a signed-off date without a word, so a reconciled month
+     * could change underneath a figure somebody had signed.
+     *
+     * ⚠️ IT IS NOW READ BY `confirmMatch`, by `unmatch`, by
+     * `importStatement` and by the `ordence_guard_reconciled_bank_line`
+     * trigger in 0102. Written ONLY by signing off a reconciliation,
+     * and moved backwards only by reopening one with a reason.
+     */
     reconciledTo: date("reconciled_to"),
+
+    /**
+     * 🔴🔴 THE ROUNDING TOLERANCE, AND IT IS ZERO UNLESS SOMEBODY SETS IT.
+     *
+     * ⚠️ A RECONCILIATION THAT BALANCES BECAUSE OF A TOLERANCE IS A
+     * RECONCILIATION THAT DOES NOT BALANCE. This exists because a few
+     * real accounts carry a permanent paise-level difference from a
+     * historic conversion, and the alternative to a configured,
+     * per-account, recorded allowance is somebody posting a fake journal
+     * to make the screen go green.
+     *
+     * ⭐ SO IT IS PER ACCOUNT, IT DEFAULTS TO ZERO, `buildBrs` READS IT
+     * AT THE COMPARISON, AND ANYTHING IT LETS THROUGH IS STORED ON THE
+     * RECONCILIATION AS `differenceAbsorbedMinor` FOREVER. It decides
+     * whether a person may sign, never whether the account reconciled.
+     */
+    reconciliationToleranceMinor: bigint("reconciliation_tolerance_minor", {
+      mode: "bigint",
+    })
+      .default(0n)
+      .notNull(),
 
     isActive: boolean("is_active").default(true).notNull(),
 
@@ -98,12 +133,37 @@ export const bankStatements = pgTable(
     sourceFilename: varchar("source_filename", { length: 400 }),
 
     lineCount: integer("line_count").default(0).notNull(),
+
+    /**
+     * ⭐⭐ THE WHOLE-FILE DUPLICATE GUARD, ADDED IN 0102.
+     *
+     * ⚠️ `bank_statement_lines.fingerprint` catches a LINE that looks
+     * like another line, and it REPORTS rather than refuses because two
+     * identical payments on one day are real. That was the only guard
+     * there was, so re-importing January simply warned and then wrote
+     * every January line a second time.
+     *
+     * 🔴 A WHOLE FILE IMPORTED TWICE IS A DIFFERENT CLAIM AND CAN BE
+     * REFUSED OUTRIGHT. See `lib/banking/statement-digest.ts`.
+     *
+     * ⚠️ NULLABLE, because every statement imported before 0102 has no
+     * digest and backfilling one would be inventing evidence about a
+     * file nobody kept. Postgres treats NULLs as distinct in a unique
+     * index, so the historic rows neither collide nor block.
+     */
+    importDigest: varchar("import_digest", { length: 64 }),
   },
   (t) => ({
     accountIdx: index("bank_statements_account_idx").on(
       t.tenantId,
       t.bankAccountId,
       t.periodFrom,
+    ),
+    /** 🔴 THE SAME FILE CANNOT BE IMPORTED TWICE INTO ONE ACCOUNT. */
+    digestUnique: uniqueIndex("bank_statements_import_digest_unique").on(
+      t.tenantId,
+      t.bankAccountId,
+      t.importDigest,
     ),
   }),
 );
@@ -204,6 +264,173 @@ export const bankLineMatches = pgTable(
   }),
 );
 
+/* ================================================================== */
+/* ⭐⭐⭐ THE RECONCILIATION EVENT — 0102                                */
+/* ================================================================== */
+
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴🔴 MATCHING IS NOT RECONCILING, AND ONLY THE FIRST EXISTED
+ * ══════════════════════════════════════════════════════════════════════
+ * `bank_line_matches` is per-line and revocable. Nothing anywhere said
+ * "this account was reconciled to this balance as at this date, by this
+ * person" — so there was no artefact to hand an auditor, nothing to
+ * reproduce a signed figure from, and nothing to stop a signed month
+ * changing afterwards.
+ *
+ * ⭐ THIS ROW IS THE ARTEFACT. It is written once, at sign-off, with the
+ * five figures frozen onto it. The reconciliation is NOT re-derived when
+ * somebody opens it later: re-deriving it would mean the statement shown
+ * in September for March is whatever March looks like in September, which
+ * is the precise property a signature is supposed to remove.
+ *
+ * ⚠️ AND THE ITEMS ARE FROZEN TOO, in `bank_reconciliation_items`. A BRS
+ * whose total is stored and whose lines are recomputed foots against
+ * nothing.
+ */
+export const bankReconciliations = pgTable(
+  "bank_reconciliations",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    tenantId: uuid("tenant_id")
+      .notNull()
+      .references(() => tenants.id, { onDelete: "cascade" }),
+    bankAccountId: uuid("bank_account_id")
+      .notNull()
+      .references(() => bankAccounts.id, { onDelete: "cascade" }),
+    /**
+     * ⚠️ CASCADE RATHER THAN RESTRICT, AND IT IS A COMPROMISE WORTH
+     * NAMING. RESTRICT is what this relationship deserves — a statement
+     * that has been reconciled should not be deletable — but the chain
+     * from `tenants` is cascade all the way down, so a RESTRICT here
+     * would make deleting a tenant impossible and the first person to
+     * hit that would remove the constraint rather than the row. Nothing
+     * in this tree deletes a statement; the protection that matters is
+     * the trigger in 0102, which refuses the change rather than the row.
+     */
+    statementId: uuid("statement_id")
+      .notNull()
+      .references(() => bankStatements.id, { onDelete: "cascade" }),
+
+    /** 🔴 THE LOCK BOUNDARY. Everything on or before this is sealed. */
+    reconciledTo: date("reconciled_to").notNull(),
+
+    /**
+     * ⭐ WHAT `bank_accounts.reconciled_to` WAS BEFORE THIS SIGN-OFF, so
+     * a reopen restores it exactly instead of guessing. Null where this
+     * was the first reconciliation on the account.
+     */
+    previousReconciledTo: date("previous_reconciled_to"),
+
+    bankBalanceMinor: bigint("bank_balance_minor", { mode: "bigint" }).notNull(),
+    bookBalanceMinor: bigint("book_balance_minor", { mode: "bigint" }).notNull(),
+
+    /** ⭐ Positive magnitudes. The direction lives in CATEGORY_META. */
+    chequesNotPresentedMinor: bigint("cheques_not_presented_minor", { mode: "bigint" })
+      .default(0n)
+      .notNull(),
+    depositsNotCreditedMinor: bigint("deposits_not_credited_minor", { mode: "bigint" })
+      .default(0n)
+      .notNull(),
+    bankChargesMinor: bigint("bank_charges_minor", { mode: "bigint" })
+      .default(0n)
+      .notNull(),
+    directCreditsMinor: bigint("direct_credits_minor", { mode: "bigint" })
+      .default(0n)
+      .notNull(),
+
+    /** 🔴 book − (bank ∓ the four categories). Zero on an exact statement. */
+    differenceMinor: bigint("difference_minor", { mode: "bigint" }).default(0n).notNull(),
+
+    /**
+     * ⚠️ THE TOLERANCE AS IT STOOD AT SIGN-OFF, frozen. Reading today's
+     * value when re-rendering a two-year-old reconciliation would show a
+     * statement that was signed under different rules from the ones
+     * printed on it.
+     */
+    toleranceMinor: bigint("tolerance_minor", { mode: "bigint" }).default(0n).notNull(),
+
+    /**
+     * 🔴🔴 WHAT THE TOLERANCE LET THROUGH, RECORDED SO IT IS NOT
+     * SWALLOWED. Zero on a statement that footed exactly. Non-zero is an
+     * account that did NOT reconcile and was signed anyway, deliberately,
+     * and the amount stays on the row forever.
+     */
+    differenceAbsorbedMinor: bigint("difference_absorbed_minor", { mode: "bigint" })
+      .default(0n)
+      .notNull(),
+
+    /** signed_off · reopened */
+    status: varchar("status", { length: 20 }).default("signed_off").notNull(),
+
+    signedOffAt: timestamp("signed_off_at", { withTimezone: true }).defaultNow().notNull(),
+    signedOffBy: uuid("signed_off_by").references(() => users.id, { onDelete: "set null" }),
+    note: text("note"),
+
+    /** ⚠️ Reopening is an exceptional act and must be justified. */
+    reopenedAt: timestamp("reopened_at", { withTimezone: true }),
+    reopenedBy: uuid("reopened_by").references(() => users.id, { onDelete: "set null" }),
+    reopenReason: text("reopen_reason"),
+  },
+  (t) => ({
+    accountIdx: index("bank_reconciliations_account_idx").on(
+      t.tenantId,
+      t.bankAccountId,
+      t.reconciledTo,
+    ),
+    /**
+     * 🔴 ONE LIVE SIGN-OFF PER ACCOUNT PER DATE. Partial, so that
+     * reopening a March reconciliation and signing a corrected one is
+     * possible — which is the whole reason reopening exists.
+     */
+    liveUnique: uniqueIndex("bank_reconciliations_live_per_date")
+      .on(t.tenantId, t.bankAccountId, t.reconciledTo)
+      .where(sql`status = 'signed_off'`),
+  }),
+);
+
+/**
+ * ⭐⭐ THE LINES OF THE STATEMENT, FROZEN.
+ *
+ * 🔴 `source_id` IS NOT A FOREIGN KEY, deliberately. It points at a bank
+ * statement line for a bank-side item and at a receipt or a payment for a
+ * book-side item, and the whole point of freezing them is that the
+ * evidence survives whatever happens to the document afterwards. A
+ * cascade here would delete the reason a signed figure was what it was.
+ */
+export const bankReconciliationItems = pgTable(
+  "bank_reconciliation_items",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    tenantId: uuid("tenant_id")
+      .notNull()
+      .references(() => tenants.id, { onDelete: "cascade" }),
+    reconciliationId: uuid("reconciliation_id")
+      .notNull()
+      .references(() => bankReconciliations.id, { onDelete: "cascade" }),
+
+    /** One of RECONCILIATION_CATEGORIES. Derived, never chosen. */
+    category: varchar("category", { length: 40 }).notNull(),
+    /** bank · books */
+    side: varchar("side", { length: 10 }).notNull(),
+
+    sourceId: uuid("source_id").notNull(),
+    sourceKind: varchar("source_kind", { length: 30 }),
+
+    occurredOn: date("occurred_on").notNull(),
+    /** 🔴 SIGNED. Positive is money IN, as everywhere else here. */
+    amountMinor: bigint("amount_minor", { mode: "bigint" }).notNull(),
+    description: text("description").notNull(),
+  },
+  (t) => ({
+    reconciliationIdx: index("bank_reconciliation_items_parent_idx").on(
+      t.tenantId,
+      t.reconciliationId,
+      t.category,
+    ),
+  }),
+);
+
 /* ------------------------------------------------------------------ */
 /* RELATIONS                                                           */
 /* ------------------------------------------------------------------ */
@@ -242,10 +469,37 @@ export const bankLineMatchesRelations = relations(bankLineMatches, ({ one }) => 
   }),
 }));
 
+export const bankReconciliationsRelations = relations(
+  bankReconciliations,
+  ({ one, many }) => ({
+    account: one(bankAccounts, {
+      fields: [bankReconciliations.bankAccountId],
+      references: [bankAccounts.id],
+    }),
+    statement: one(bankStatements, {
+      fields: [bankReconciliations.statementId],
+      references: [bankStatements.id],
+    }),
+    items: many(bankReconciliationItems),
+  }),
+);
+
+export const bankReconciliationItemsRelations = relations(
+  bankReconciliationItems,
+  ({ one }) => ({
+    reconciliation: one(bankReconciliations, {
+      fields: [bankReconciliationItems.reconciliationId],
+      references: [bankReconciliations.id],
+    }),
+  }),
+);
+
 export type BankAccount = typeof bankAccounts.$inferSelect;
 export type BankStatement = typeof bankStatements.$inferSelect;
 export type BankStatementLine = typeof bankStatementLines.$inferSelect;
 export type BankLineMatch = typeof bankLineMatches.$inferSelect;
+export type BankReconciliation = typeof bankReconciliations.$inferSelect;
+export type BankReconciliationItem = typeof bankReconciliationItems.$inferSelect;
 
 /** ⚠️ Kept next to the table so the two cannot drift. */
 export const MATCHED_KINDS = Object.freeze([
@@ -254,4 +508,3 @@ export const MATCHED_KINDS = Object.freeze([
   "journal_entry",
 ] as const);
 
-void sql;

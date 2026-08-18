@@ -277,6 +277,24 @@ export default async function AccountingPage({
 
         <TrialBalancePeriodPicker period={period} />
 
+        {/*
+          🔴 BATCH 0101 — THE TOTALS ARE NOT A QUANTITY OF ANYTHING WHEN
+          LEDGERS IN MORE THAN ONE CURRENCY HAVE MOVEMENT IN THE PERIOD.
+
+          ⚠️ IT IS SHOWN ABOVE THE TABLE AND NOT AS A FOOTNOTE. The failure
+          this guards against is not an error — it is a plausible number
+          that somebody reads, believes and files, and a caption under the
+          totals is read after the number has already been believed.
+        */}
+        {trialBalance?.currencyMixed && trialBalance.currencyWarning && (
+          <p
+            role="alert"
+            className="rounded-md border border-destructive/40 bg-destructive/5 p-3 text-sm text-destructive"
+          >
+            {trialBalance.currencyWarning}
+          </p>
+        )}
+
         {!trialBalanceResult.ok ? (
           <p className="text-sm text-destructive">{trialBalanceResult.error}</p>
         ) : trialBalance && trialBalance.rows.length === 0 ? (
@@ -295,6 +313,13 @@ export default async function AccountingPage({
                     <th scope="col" className="px-3 py-2 text-left font-medium">Code</th>
                     <th scope="col" className="px-3 py-2 text-left font-medium">Account</th>
                     <th scope="col" className="px-3 py-2 text-left font-medium">Type</th>
+                    {/* ⭐ 0101. Shown only when there is something to
+                        distinguish — a column of "INR" on every row of an
+                        INR-only workspace is noise that trains people to
+                        stop reading the column. */}
+                    {trialBalance.currencyMixed && (
+                      <th scope="col" className="px-3 py-2 text-left font-medium">Currency</th>
+                    )}
                     <th scope="col" className="px-3 py-2 text-right font-medium">Debit</th>
                     <th scope="col" className="px-3 py-2 text-right font-medium">Credit</th>
                     <th scope="col" className="px-3 py-2 text-right font-medium">Balance</th>
@@ -308,6 +333,9 @@ export default async function AccountingPage({
                       <td className="px-3 py-2 text-xs text-muted-foreground">
                         {row.accountType}
                       </td>
+                      {trialBalance.currencyMixed && (
+                        <td className="px-3 py-2 font-mono text-xs">{row.currency}</td>
+                      )}
                       <td className="px-3 py-2 text-right"><Amount value={row.totalDebit} /></td>
                       <td className="px-3 py-2 text-right"><Amount value={row.totalCredit} /></td>
                       <td className="px-3 py-2 text-right"><Amount value={row.balance} /></td>
@@ -316,7 +344,14 @@ export default async function AccountingPage({
                 </tbody>
                 <tfoot className="border-t-2 border-border bg-muted/30 font-medium">
                   <tr>
-                    <td className="px-3 py-2" colSpan={3}>Totals</td>
+                    <td className="px-3 py-2" colSpan={trialBalance.currencyMixed ? 4 : 3}>
+                      Totals
+                      {trialBalance.currencyMixed && (
+                        <span className="ml-2 text-xs font-normal text-destructive">
+                          ({trialBalance.currencies.join(" + ")} added together)
+                        </span>
+                      )}
+                    </td>
                     <td className="px-3 py-2 text-right tabular-nums">
                       {trialBalance.totalDebits}
                     </td>

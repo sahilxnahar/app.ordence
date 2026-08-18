@@ -119,6 +119,24 @@ const FINANCIAL_MODULES = [
    * withholding. That is where the tax reaches the ledger.
    */
   "vendor-payments",
+  /**
+   * ⭐⭐⭐ ADDED IN v1.53.0-alpha (batch 100), AND ADDING IT IS THE POINT.
+   *
+   * 🔴 DEPRECIATION IS THE ONE ENTRY EVERY BUSINESS WITH A FIXED ASSET
+   *    MAKES, and until this batch nothing in Ordence computed it — the
+   *    only occurrences of the word were in Tally IMPORT validators, i.e.
+   *    the product could read a figure somebody else had produced and
+   *    produce none of its own.
+   *
+   * ⭐ `fixed-assets.ts` posts the Companies Act, Schedule II charge and
+   *    the profit or loss on disposal. It deliberately does NOT post the
+   *    section 32 block allowance: that is a computation for the income
+   *    tax return, not an accounting entry, and `depreciation_runs`
+   *    carries a CHECK constraint refusing it a transaction id. Listing
+   *    the module here is what makes that answer checkable rather than
+   *    assumed.
+   */
+  "fixed-assets",
 ];
 
 /**

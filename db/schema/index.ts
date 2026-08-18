@@ -450,3 +450,38 @@ export * from "./budgets";
  * boundary.
  */
 export * from "./slugs";
+
+/**
+ * ⭐⭐⭐ THE FIXED ASSET REGISTER AND THE DEPRECIATION ENGINE — Batch 100
+ *        (SQL 0100).
+ *
+ * 🔴 EXPORTED AFTER `./assets`, `./accounting` AND `./core`, ALL THREE OF
+ * WHICH IT REFERENCES — the CRM catalogue row for the same physical
+ * thing, the ledger transaction a depreciation run posts, and the tenant.
+ * The dependency runs one way only: `assets.ts` knows nothing about
+ * capitalisation, and must not, because the `assets` table also holds the
+ * flats a developer is SELLING and those are stock in trade.
+ *
+ * ⚠️ THIS IS A SECOND ASSET TABLE ON PURPOSE. See the header of
+ * `fixed-assets.ts` for why `assets` was considered and rejected: a
+ * `numeric(18,2)` "value" column is not a cost, a CRM catalogue entry is
+ * not a block of assets, and Schedule II component accounting needs a
+ * carve-out invariant an edge table cannot hold.
+ */
+export * from "./fixed-assets";
+
+/**
+ * ⭐⭐⭐ MULTI-CURRENCY AND FX — Batch 0101 (SQL 0101).
+ *
+ * 🔴 EXPORTED AFTER `./core` AND `./accounting`, BOTH OF WHICH IT
+ * REFERENCES — the tenant, the user who typed a rate, and the ledger
+ * transaction a revaluation posts.
+ *
+ * ⚠️ TWO OF ITS FIVE TABLES HAVE NO `tenant_id` AND THAT IS THE DESIGN,
+ * NOT AN OMISSION. `currency_units` (how many decimals the dinar has) and
+ * `fx_reference_rates` (what the RBI published) are the same fact for
+ * every workspace. `fx_rates` — what somebody in THIS workspace typed —
+ * is tenant-scoped with the ordinary policy and no escape hatch. The
+ * header of `fx.ts` argues the split.
+ */
+export * from "./fx";

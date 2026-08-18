@@ -83,6 +83,9 @@ import {
 import { rupeesInWords } from "@/lib/invoicing/amount-in-words";
 import { copyLabelsFor, printGaps, type PostalAddress, type PrintFinding } from "@/lib/invoicing/print";
 import { serializeAmount, toBigIntAmount } from "@/lib/billing/money";
+import { functionalCurrencyFromSettings } from "@/lib/fx/currency";
+import { recogniseSalesInvoice } from "@/server/fx/initial-recognition";
+import { sumByCurrency, MixedCurrencyError } from "@/lib/fx/aggregate";
 import type { ActionResult } from "@/lib/validators/crm";
 
 const FEATURE_ORDERS = "sales.orders" as const;
@@ -387,15 +390,38 @@ export async function issueInvoice(
          * lands in the posting backlog at `/accounting/posting` instead,
          * where posting it later is safe because it is idempotent.
          */
-        await postSalesInvoice(tx, {
+        /**
+         * ══════════════════════════════════════════════════════════════
+         * ⭐⭐⭐ ① INITIAL RECOGNITION — AS 11 ¶9 / Ind AS 21 ¶21, 0101.
+         * ══════════════════════════════════════════════════════════════
+         * 🔴 THE LEDGER GETS THE FUNCTIONAL-CURRENCY FIGURE AND NOT THE
+         * FOREIGN ONE. `post-sales.ts` writes `currency: "INR"` on every
+         * transaction and formats every leg as rupees, so before this
+         * line a USD 10,000 invoice posted 10,000 to a rupee receivables
+         * ledger — a hundred-fold understatement that balances and looks
+         * exactly like a fact.
+         *
+         * ⚠️ FOR AN INVOICE ALREADY IN THE BOOKS' OWN CURRENCY — every
+         * invoice in the product today — this returns its input
+         * unchanged, resolves no rate and posts exactly what it posted
+         * before. It also FILLS `functional_currency` and
+         * `functional_total_minor`, so a later reader never has to guess
+         * whether a NULL means "same currency" or "nobody computed it".
+         *
+         * ⚠️ AND IT REFUSES WHEN A FOREIGN-CURRENCY INVOICE HAS NO RATE
+         * FOR ITS OWN DATE. Harder than this file's usual "post later
+         * from the backlog", and correct: an unposted invoice is visible
+         * on a backlog screen, and an invoice posted at a guessed rate is
+         * invisible for ever.
+         */
+        const recognised = await recogniseSalesInvoice(tx, {
           tenantId: ctx.tenant.id,
-          userId: ctx.user.id,
           invoiceId: invoice.id,
           invoiceNumber,
           invoiceDate: String(invoice.invoiceDate),
-          companyId: invoice.companyId,
-          customerName: invoice.customerLegalName,
-          tax: {
+          invoiceCurrency: invoice.currency,
+          functionalCurrency: functionalCurrencyFromSettings(ctx.tenant.settings).code,
+          totals: {
             taxableValueMinor: toBigIntAmount(invoice.taxableValueMinor),
             cgstMinor: toBigIntAmount(invoice.cgstMinor),
             sgstMinor: toBigIntAmount(invoice.sgstMinor),
@@ -404,6 +430,19 @@ export async function issueInvoice(
             roundOffMinor: toBigIntAmount(invoice.roundOffMinor),
             totalMinor: toBigIntAmount(invoice.totalMinor),
           },
+        });
+
+        await postSalesInvoice(tx, {
+          tenantId: ctx.tenant.id,
+          userId: ctx.user.id,
+          invoiceId: invoice.id,
+          invoiceNumber,
+          invoiceDate: String(invoice.invoiceDate),
+          companyId: invoice.companyId,
+          customerName: invoice.customerLegalName,
+          // ⭐ THE READ. Translated at the invoice-date rate, or the
+          // original figures when no translation was needed.
+          tax: recognised.functionalTotals,
         });
 
         await writeAudit(ctx, {
@@ -1038,9 +1077,27 @@ async function loadCreditableState(
     )
     .groupBy(salesCreditNoteLines.invoiceLineId);
 
-  const [totalRow] = await tx
+  /**
+   * ⭐⭐ BATCH 0101 — SUMMED PER CURRENCY, THEN REQUIRED TO BE ONE.
+   *
+   * 🔴 THIS USED TO BE `coalesce(sum(total_minor), 0)` ACROSS EVERY
+   * CURRENCY. The figure it produces is compared against the INVOICE's
+   * total to work out remaining credit headroom, so a credit note in a
+   * different currency from its invoice consumed headroom at one-to-one —
+   * a USD 100 note against a ₹8,000 invoice looked like ₹100 of credit
+   * and left ₹7,900 of headroom that does not exist.
+   *
+   * ⭐ AND THE FIX HERE IS A REFUSAL, NOT A CONVERSION. A credit note
+   * against an invoice is a reversal of THAT DOCUMENT; Rule 53 of the CGST
+   * Rules requires it to carry the original invoice's particulars, and its
+   * currency is one of them. Converting would let a note be raised in
+   * dollars against a rupee invoice and call the arithmetic sound.
+   * `requireSingleCurrency` names the currencies it found.
+   */
+  const creditNoteAmounts = await tx
     .select({
-      total: sql<string>`coalesce(sum(${salesCreditNotes.totalMinor}), 0)::text`,
+      currency: salesCreditNotes.currency,
+      totalMinor: salesCreditNotes.totalMinor,
     })
     .from(salesCreditNotes)
     .where(
@@ -1050,6 +1107,20 @@ async function loadCreditableState(
         consuming,
       ),
     );
+
+  const creditBuckets = sumByCurrency(
+    creditNoteAmounts.map((r) => ({
+      currency: r.currency,
+      amountMinor: toBigIntAmount(r.totalMinor),
+    })),
+  );
+  if (creditBuckets.length > 1) {
+    throw new MixedCurrencyError(
+      "The credit notes already issued against this invoice",
+      creditBuckets.map((b) => b.currency),
+    );
+  }
+  const issuedCreditTotal = creditBuckets[0]?.amountMinor ?? 0n;
 
   const creditedByLine = new Map<string, string>();
   for (const r of creditedRows) {
@@ -1068,7 +1139,7 @@ async function loadCreditableState(
       quantity: String(l.quantity),
       quantityCreditedIssued: creditedByLine.get(l.id) ?? "0.000",
     })),
-    issuedCreditTotalMinor: toBigIntAmount(totalRow?.total ?? "0"),
+    issuedCreditTotalMinor: issuedCreditTotal,
   };
 }
 
@@ -1386,6 +1457,17 @@ export async function issueCreditNote(
           role: ctx.role,
           creditNoteId: data.creditNoteId,
           noteTotalMinor: toBigIntAmount(note.totalMinor),
+          /**
+           * ⭐⭐ BATCH 0101 — BOTH CURRENCIES, AND BOTH ARE REQUIRED.
+           *
+           * 🔴 `note.currency` HAS BEEN ON THIS ROW SINCE PHASE 49 AND
+           * NOTHING HAS EVER READ IT. Before this batch the cap summed
+           * `total_minor` across every currency at one-to-one, so a
+           * workspace issuing in dollars against a rupee limit consumed
+           * about a fortieth of its own cap per note. This is the read.
+           */
+          noteCurrency: note.currency,
+          functionalCurrency: functionalCurrencyFromSettings(ctx.tenant.settings).code,
           factors,
         });
 

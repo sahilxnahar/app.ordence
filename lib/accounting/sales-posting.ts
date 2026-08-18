@@ -61,7 +61,27 @@ export type PostingRole =
   /** Stock found that the books did not have. A credit, reducing cost. */
   | "inventory_variance_gain"
   /** Stock the books had and the shelf did not. Shrinkage. */
-  | "inventory_variance_loss";
+  | "inventory_variance_loss"
+  /**
+   * ⭐⭐ THE TWO BANK-RECONCILIATION ROLES, ADDED IN v1.63.0 (0102).
+   *
+   * ══════════════════════════════════════════════════════════════════
+   * 🔴 THESE ARE THE ENTRIES THE BOOKS DO NOT HAVE AND THE BANK DOES
+   * ══════════════════════════════════════════════════════════════════
+   * A bank charge and a credit of interest appear on the statement and
+   * nowhere else. Before 0102 the reconciliation screen was where they
+   * were DISCOVERED and somewhere else entirely was where they had to be
+   * WRITTEN UP, which meant in practice that they were written up at
+   * year end from a printed statement, or not at all.
+   *
+   * ⚠️ TWO ROLES AND NOT ONE. Netting charges against interest in a
+   * single "bank adjustments" account makes both invisible: "what did
+   * this bank cost us this year" is a question with an answer, and
+   * netting it against interest income is not that answer. It is the
+   * same argument as the two stock-variance roles above.
+   */
+  | "bank_charges"
+  | "bank_interest_income";
 
 export type PostingLeg = {
   role: PostingRole;
@@ -327,7 +347,84 @@ export const POSTING_ROLE_META: Record<
     accountType: "expense",
     help: "Stock the books had and the shelf did not. Kept separate from Stock Found on purpose: netting the two makes a bad month look like a quiet one, and 'how much stock did we lose this year' stops having an answer.",
   },
+  bank_charges: {
+    label: "Bank Charges",
+    tallyGroup: "Indirect Expenses",
+    accountType: "expense",
+    help: "What the bank took: fees, NEFT and RTGS charges, cheque return charges. Found on the statement, so posted from the reconciliation screen. ⚠️ THE GST ON A BANK CHARGE IS NOT SPLIT OUT HERE — the statement line is one gross figure with no GSTIN, no invoice number and no rate on it. Claim the input credit from the bank's own tax invoice; deriving it from this line would put an unsupported claim in GSTR-3B.",
+  },
+  bank_interest_income: {
+    label: "Bank Interest Received",
+    tallyGroup: "Indirect Incomes",
+    accountType: "revenue",
+    help: "Interest the bank credited. Kept apart from Bank Charges on purpose: netting the two hides both, and interest received is taxable income that has to be reported whether or not charges happened to exceed it.",
+  },
 };
+
+/* ================================================================== */
+/* ⭐⭐ THE BANK RECONCILIATION ADJUSTMENT — v1.63.0 (0102)             */
+/* ================================================================== */
+
+/**
+ * ⚠️ NARROW ON PURPOSE. Exactly two things found on a bank statement can
+ * be written up from the statement alone with no further evidence:
+ *
+ *   bank_charge       the bank took money for its own services
+ *   interest_credited the bank gave money for holding ours
+ *
+ * 🔴 EVERYTHING ELSE ON THAT LIST IS A DOCUMENT SOMEWHERE ELSE. A direct
+ * debit is a vendor payment, an unexpected credit is a customer receipt,
+ * and a transfer is a transfer. Offering a free-text "other adjustment"
+ * here would turn the reconciliation screen into a general journal with
+ * no counterparty, no tax treatment and no document behind it — and it
+ * would be used, because it is the fastest way to make the screen go
+ * green. The two kinds below are the ones where the statement genuinely
+ * IS the evidence.
+ */
+export type BankAdjustmentKind = "bank_charge" | "interest_credited";
+
+/**
+ * ⭐ THE BANK LEG IS THE ACCOUNT'S OWN LEDGER, NOT THE GENERIC `bank`
+ * ROLE — resolved by the caller and passed to `postBankAdjustment` as an
+ * override, because a tenant with three bank accounts has one `bank`
+ * role and posting an HDFC charge to the ICICI ledger would leave both
+ * accounts permanently unreconcilable.
+ */
+export function buildBankAdjustmentPosting(args: {
+  kind: BankAdjustmentKind;
+  /** 🔴 POSITIVE MAGNITUDE. The direction comes from `kind`. */
+  amountMinor: bigint;
+  narration: string;
+}): PostingLeg[] {
+  if (args.amountMinor <= 0n) {
+    throw new PostingImbalance(
+      "A bank adjustment of zero or less is not an adjustment. The direction comes from the kind, never from the sign.",
+    );
+  }
+
+  const description = args.narration.replace(/\s+/g, " ").trim().slice(0, 300);
+
+  const legs: PostingLeg[] =
+    args.kind === "bank_charge"
+      ? [
+          // The bank took it: the expense rises and the asset falls.
+          { role: "bank_charges", entryType: "debit", amountMinor: args.amountMinor, description },
+          { role: "bank", entryType: "credit", amountMinor: args.amountMinor, description },
+        ]
+      : [
+          // The bank gave it: the asset rises and income is earned.
+          { role: "bank", entryType: "debit", amountMinor: args.amountMinor, description },
+          {
+            role: "bank_interest_income",
+            entryType: "credit",
+            amountMinor: args.amountMinor,
+            description,
+          },
+        ];
+
+  assertBalances(legs);
+  return legs;
+}
 
 /* ================================================================== */
 /* ⭐ THE PURCHASE SIDE — Phase 59                                      */
@@ -2140,5 +2237,530 @@ export const RETURN_ROLE_META: Record<
     tallyGroup: "Indirect Expenses",
     accountType: "expense",
     help: "An expense, and disallowed for income tax. Separate from interest because they are different lines on the challan.",
+  },
+};
+
+/* ================================================================== */
+/* ⭐⭐⭐ DEPRECIATION AND DISPOSAL — Batch 100, v1.53.0-alpha          */
+/* ================================================================== */
+
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 ONLY THE COMPANIES ACT CHARGE REACHES THE LEDGER
+ * ══════════════════════════════════════════════════════════════════════
+ * Section 32 depreciation is computed on the same assets and produces a
+ * different, usually larger, number. It is an allowance in a tax
+ * computation and it is NOT an accounting entry — posting it would put
+ * the Income-tax Act's figure into a Companies Act balance sheet and
+ * overstate accumulated depreciation by the whole timing difference.
+ *
+ * There is therefore no `postIncomeTaxDepreciation` anywhere in this
+ * codebase, `depreciation_runs` carries a CHECK constraint refusing a
+ * `transaction_id` on an income-tax run, and this comment exists so that
+ * nobody adds one "for completeness".
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * ⚠️ ACCUMULATED DEPRECIATION IS ITS OWN ACCOUNT, NOT A CREDIT TO COST
+ * ══════════════════════════════════════════════════════════════════════
+ * Crediting the asset account directly would work arithmetically and
+ * would destroy the disclosure: Schedule III to the Companies Act 2013
+ * requires gross block, accumulated depreciation and net block to be
+ * shown separately, and once cost has been netted off there is no way to
+ * recover the gross figure. It is the same argument as the two stock
+ * variance accounts and the separate pension payable — netting destroys
+ * the only answer to a question somebody will ask.
+ */
+export type FixedAssetPostingRole =
+  /** The period's charge. Hits the profit and loss account. */
+  | "depreciation_expense"
+  /** ⭐ CONTRA-ASSET. Credited by the charge, cleared on disposal. */
+  | "accumulated_depreciation"
+  /** Gross block. Credited with the asset's COST when it leaves. */
+  | "fixed_asset_cost"
+  /** What the buyer owes for the asset. Cleared when the money arrives. */
+  | "asset_disposal_receivable"
+  /** Consideration above carrying amount. */
+  | "asset_disposal_gain"
+  /** Carrying amount above consideration. */
+  | "asset_disposal_loss";
+
+export type FixedAssetLeg = {
+  role: FixedAssetPostingRole;
+  entryType: "debit" | "credit";
+  amountMinor: bigint;
+  description: string;
+};
+
+export function assertFixedAssetBalances(legs: readonly FixedAssetLeg[]): void {
+  const debit = legs
+    .filter((l) => l.entryType === "debit")
+    .reduce((sum, l) => sum + l.amountMinor, 0n);
+  const credit = legs
+    .filter((l) => l.entryType === "credit")
+    .reduce((sum, l) => sum + l.amountMinor, 0n);
+  if (debit !== credit) {
+    throw new PostingImbalance(
+      `Fixed asset journal does not balance: debits ${debit} vs credits ${credit}.`,
+    );
+  }
+}
+
+/**
+ * ⭐ ONE JOURNAL FOR THE WHOLE RUN, NOT ONE PER ASSET.
+ *
+ * ⚠️ A COMPANY WITH FOUR HUNDRED ASSETS WOULD OTHERWISE PRODUCE FOUR
+ * HUNDRED TRANSACTIONS A MONTH, every one of them balanced, every one of
+ * them correct, and a trial balance nobody can read. The per-asset detail
+ * lives in `depreciation_lines`, which is where somebody actually looks
+ * for it — the same decision as one journal per payroll run rather than
+ * one per payslip.
+ */
+export function buildDepreciationPosting(args: {
+  readonly totalChargeMinor: bigint;
+  readonly periodLabel: string;
+  readonly assetCount: number;
+}): FixedAssetLeg[] {
+  if (args.totalChargeMinor <= 0n) {
+    throw new PostingImbalance(
+      "A depreciation run with no charge has no journal. Nothing has been posted.",
+    );
+  }
+  const legs: FixedAssetLeg[] = [
+    {
+      role: "depreciation_expense",
+      entryType: "debit",
+      amountMinor: args.totalChargeMinor,
+      description: `Depreciation for ${args.periodLabel} — ${args.assetCount} asset${args.assetCount === 1 ? "" : "s"}`,
+    },
+    {
+      role: "accumulated_depreciation",
+      entryType: "credit",
+      amountMinor: args.totalChargeMinor,
+      description: `Depreciation for ${args.periodLabel}`,
+    },
+  ];
+  assertFixedAssetBalances(legs);
+  return legs;
+}
+
+/**
+ * ⭐⭐ DISPOSAL — THE COMPANIES ACT ENTRY, AND ONLY THAT.
+ *
+ * Four or five legs: the accumulated depreciation attaching to the asset
+ * is cleared, the gross cost leaves the block, the consideration becomes
+ * a receivable, and the difference is a gain or a loss.
+ *
+ * 🔴 THE INCOME-TAX SIDE POSTS NOTHING HERE AND MUST NOT. Under s.32 the
+ * same sale reduces the WDV of the BLOCK by the moneys payable and
+ * produces no gain or loss at all unless the block empties (s.50(2)) or
+ * is exhausted (s.50(1)). A book profit of ₹2 lakh on this machine may
+ * carry no tax at all this year. Ordence records both answers and
+ * reconciles neither, because they do not reconcile.
+ *
+ * ⚠️ A RECEIVABLE RATHER THAN BANK. The asset leaving and the money
+ * arriving are two events on two dates; collapsing them claims cash was
+ * received on a day it was not, which is the same error the separate
+ * `salaries_payable` account exists to prevent.
+ */
+export function buildDisposalPosting(args: {
+  readonly assetNo: string;
+  readonly costMinor: bigint;
+  readonly accumulatedMinor: bigint;
+  readonly considerationMinor: bigint;
+  readonly disposedOn: string;
+}): FixedAssetLeg[] {
+  const carrying = args.costMinor - args.accumulatedMinor;
+  const difference = args.considerationMinor - carrying;
+  const legs: FixedAssetLeg[] = [];
+
+  if (args.accumulatedMinor > 0n) {
+    legs.push({
+      role: "accumulated_depreciation",
+      entryType: "debit",
+      amountMinor: args.accumulatedMinor,
+      description: `Accumulated depreciation on ${args.assetNo} cleared on disposal`,
+    });
+  }
+  if (args.considerationMinor > 0n) {
+    legs.push({
+      role: "asset_disposal_receivable",
+      entryType: "debit",
+      amountMinor: args.considerationMinor,
+      description: `Consideration receivable for ${args.assetNo} sold on ${args.disposedOn}`,
+    });
+  }
+  if (difference < 0n) {
+    legs.push({
+      role: "asset_disposal_loss",
+      entryType: "debit",
+      amountMinor: -difference,
+      description: `Loss on disposal of ${args.assetNo}`,
+    });
+  }
+  legs.push({
+    role: "fixed_asset_cost",
+    entryType: "credit",
+    amountMinor: args.costMinor,
+    description: `Cost of ${args.assetNo} removed from the gross block`,
+  });
+  if (difference > 0n) {
+    legs.push({
+      role: "asset_disposal_gain",
+      entryType: "credit",
+      amountMinor: difference,
+      description: `Profit on disposal of ${args.assetNo}`,
+    });
+  }
+
+  assertFixedAssetBalances(legs);
+  return legs;
+}
+
+export function fixedAssetRolesUsed(
+  legs: readonly FixedAssetLeg[],
+): FixedAssetPostingRole[] {
+  return [...new Set(legs.map((l) => l.role))];
+}
+
+export const FIXED_ASSET_ROLE_META: Record<
+  FixedAssetPostingRole,
+  { label: string; tallyGroup: string; accountType: string; help: string }
+> = {
+  depreciation_expense: {
+    label: "Depreciation",
+    tallyGroup: "Indirect Expenses",
+    accountType: "expense",
+    help: "⭐ The Companies Act, Schedule II charge for the period. 🔴 NOT the section 32 allowance — that is a different, usually larger number, it belongs in the tax computation and it never comes near this ledger.",
+  },
+  accumulated_depreciation: {
+    label: "Accumulated Depreciation",
+    tallyGroup: "Fixed Assets",
+    accountType: "asset",
+    help: "🔴 A CONTRA-ASSET, credited by every charge. Schedule III requires gross block, accumulated depreciation and net block to be shown separately — crediting the asset account directly would balance and would destroy the disclosure permanently.",
+  },
+  fixed_asset_cost: {
+    label: "Fixed Assets (gross block)",
+    tallyGroup: "Fixed Assets",
+    accountType: "asset",
+    help: "Cost, at what was paid for it. Credited only when an asset leaves, and by its ORIGINAL COST — never by its written-down value.",
+  },
+  asset_disposal_receivable: {
+    label: "Asset Disposal Receivable",
+    tallyGroup: "Current Assets",
+    accountType: "asset",
+    help: "⚠️ What the buyer owes for the asset, cleared when the money arrives. Posting straight to bank would claim cash was received on the day the asset left, which is usually not the same day.",
+  },
+  asset_disposal_gain: {
+    label: "Profit on Sale of Fixed Assets",
+    tallyGroup: "Indirect Incomes",
+    accountType: "revenue",
+    help: "Consideration above carrying amount. ⚠️ It is NOT a taxable capital gain by itself: under s.50 the proceeds simply reduce the block, and a gain arises only if the block is exhausted or emptied.",
+  },
+  asset_disposal_loss: {
+    label: "Loss on Sale of Fixed Assets",
+    tallyGroup: "Indirect Expenses",
+    accountType: "expense",
+    help: "Carrying amount above consideration. ⚠️ Likewise not an allowable capital loss on its own — the block absorbs it and it comes back as depreciation in later years.",
+  },
+};
+
+/* ================================================================== */
+/* ⭐⭐⭐ EXCHANGE DIFFERENCES — Batch 0101, v1.64.0-alpha              */
+/* ================================================================== */
+
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 AN EXCHANGE DIFFERENCE IS A PROFIT AND LOSS ITEM, IMMEDIATELY
+ * ══════════════════════════════════════════════════════════════════════
+ * AS 11 ¶13 and Ind AS 21 ¶28 both say the same thing: exchange
+ * differences arising on the settlement of monetary items, and on
+ * restating monetary items at rates different from those at which they
+ * were initially recorded, are recognised as INCOME OR EXPENSE IN THE
+ * PERIOD IN WHICH THEY ARISE.
+ *
+ * ⚠️ NOT PARKED ON THE BALANCE SHEET. Paragraph 46A of AS 11 once allowed
+ * long-term monetary items to be capitalised or deferred, and that
+ * transitional option has expired; there is no general "exchange
+ * fluctuation reserve" for trade receivables and payables, and creating
+ * one would keep a real loss out of the P&L indefinitely.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * ⚠️ TWO ROLES AND NOT ONE, FOR THE THIRD TIME IN THIS FILE
+ * ══════════════════════════════════════════════════════════════════════
+ * The same argument as the two stock-variance accounts and the two bank
+ * adjustment accounts. Netting the gain against the loss makes "what did
+ * the currency cost us this year" a question with no answer anywhere in
+ * the system — and unlike stock, this one is asked by the board every
+ * quarter in an exporting business.
+ *
+ * ⭐ AND THE UNREALISED AND REALISED DIFFERENCES SHARE THE TWO ROLES ON
+ * PURPOSE. They are the same line in the P&L; what distinguishes them is
+ * the DOCUMENT that produced them (a revaluation run versus a receipt),
+ * and that is already on the transaction. Four accounts would ask a
+ * tenant to map two more ledgers to make a distinction their statutory
+ * format does not draw.
+ */
+export type FxPostingRole =
+  /**
+   * ⭐ Gain. The rupee weakened against a receivable, or strengthened
+   * against a payable. An indirect income.
+   */
+  | "fx_gain"
+  /** ⭐ Loss. The mirror. An indirect expense. */
+  | "fx_loss"
+  /**
+   * 🔴 THE OTHER SIDE, AND IT IS NOT ONE ACCOUNT.
+   *
+   * A restatement of a RECEIVABLE moves Sundry Debtors; a restatement of
+   * a PAYABLE moves Sundry Creditors; a restatement of a foreign BANK
+   * balance moves that bank account. Posting all three to a single
+   * "FX revaluation" control account would balance and would leave the
+   * debtors ledger disagreeing with the customer statements by exactly
+   * the revaluation — which is discovered at the next reconciliation, six
+   * months later.
+   *
+   * ⚠️ SO THE CONTRA IS RESOLVED PER ITEM by the caller and passed in as a
+   * LEDGER OVERRIDE, the same shape `postBankAdjustment` uses for the
+   * account's own bank ledger. These three roles are the FALLBACK for a
+   * tenant who has not mapped a specific ledger, and they are named so
+   * that the fallback is visible rather than silent.
+   */
+  | "fx_receivable_contra"
+  | "fx_payable_contra"
+  | "fx_bank_contra";
+
+export type FxLeg = {
+  role: FxPostingRole;
+  entryType: "debit" | "credit";
+  /** Minor units of the FUNCTIONAL currency. Always positive. */
+  amountMinor: bigint;
+  description: string;
+  /**
+   * ⭐ THE LEDGER THIS LEG MUST HIT, WHEN THE CALLER KNOWS IT. Overrides
+   * the role map. Used for the contra legs, never for the gain or loss.
+   */
+  ledgerIdOverride?: string | null;
+};
+
+export function assertFxBalances(legs: readonly FxLeg[]): void {
+  let debit = 0n;
+  let credit = 0n;
+  for (const l of legs) {
+    if (l.amountMinor < 0n) {
+      throw new PostingImbalance(
+        `An exchange-difference leg carries a negative amount (${l.role}). Direction belongs in ` +
+          `entryType, never in the sign — an unrealised loss is a DEBIT to fx_loss, not a ` +
+          `negative credit to fx_gain.`,
+      );
+    }
+    if (l.entryType === "debit") debit += l.amountMinor;
+    else credit += l.amountMinor;
+  }
+  if (debit !== credit) {
+    throw new PostingImbalance(
+      `Exchange-difference journal does not balance: debits ${debit}, credits ${credit}, ` +
+        `difference ${debit - credit} minor units.`,
+    );
+  }
+}
+
+/** Which contra role a restated item kind belongs to. */
+export function fxContraRoleForKind(kind: string): FxPostingRole {
+  switch (kind) {
+    case "trade_receivable":
+    case "loan_receivable":
+    case "other_monetary_asset":
+      return "fx_receivable_contra";
+    case "trade_payable":
+    case "loan_payable":
+    case "other_monetary_liability":
+      return "fx_payable_contra";
+    case "foreign_bank_balance":
+    case "foreign_cash":
+      return "fx_bank_contra";
+    default:
+      throw new PostingImbalance(
+        `"${kind}" has no exchange-difference contra account. Nothing has been posted. A ` +
+          `restatement whose other leg is guessed lands in the wrong control account and is ` +
+          `found at the next reconciliation, not before.`,
+      );
+  }
+}
+
+/**
+ * ⭐⭐⭐ THE REVALUATION JOURNAL.
+ *
+ * One line per restated item — the contra — and ONE aggregate line each
+ * for the gain and the loss.
+ *
+ *   Dr  Sundry Debtors            (receivable worth more)
+ *       Cr  Exchange Gain
+ *
+ *   Dr  Exchange Loss
+ *       Cr  Sundry Creditors      (payable worth more)
+ *
+ * 🔴 THE GAIN AND THE LOSS ARE NOT NETTED BEFORE POSTING. A run that
+ * produced ₹80,000 of gains and ₹95,000 of losses posts both, not
+ * ₹15,000 of loss. The P&L line then shows what actually happened, and
+ * the trial balance still foots because the contra legs carry the same
+ * two totals on the other side.
+ *
+ * ⚠️ ZERO-DIFFERENCE ITEMS PRODUCE NO LEG AT ALL. An invoice whose
+ * closing rate happens to equal its carrying rate has no exchange
+ * difference; a ₹0.00 leg would clutter the debtors ledger of every
+ * exporter with one row per invoice per quarter for ever.
+ */
+export function buildFxRevaluationPosting(args: {
+  /** One entry per item the run actually restated. */
+  items: readonly {
+    kind: string;
+    /** Positive is a GAIN in the P&L. Already sign-corrected for the side. */
+    plEffectMinor: bigint;
+    /** The item's own control ledger, when the caller resolved one. */
+    contraLedgerId?: string | null;
+    description: string;
+  }[];
+  asOfDate: string;
+}): FxLeg[] {
+  const legs: FxLeg[] = [];
+  let gainTotal = 0n;
+  let lossTotal = 0n;
+
+  for (const item of args.items) {
+    if (item.plEffectMinor === 0n) continue;
+    const contra = fxContraRoleForKind(item.kind);
+    const magnitude = item.plEffectMinor > 0n ? item.plEffectMinor : -item.plEffectMinor;
+
+    /**
+     * ⚠️ THE CONTRA'S DIRECTION FOLLOWS THE P&L EFFECT AND THE SIDE OF
+     * THE BALANCE SHEET TOGETHER, and both are already folded into
+     * `plEffectMinor` by `exchangeDifferenceForPl()`. A gain on an ASSET
+     * debits the asset; a gain on a LIABILITY (the rupee strengthened, we
+     * owe less) DEBITS the liability too — reducing it. Both cases debit
+     * the contra on a gain, which is why one rule covers all three
+     * control accounts and there is no per-kind sign table to get wrong.
+     */
+    legs.push({
+      role: contra,
+      entryType: item.plEffectMinor > 0n ? "debit" : "credit",
+      amountMinor: magnitude,
+      description: item.description,
+      ledgerIdOverride: item.contraLedgerId ?? null,
+    });
+
+    if (item.plEffectMinor > 0n) gainTotal += magnitude;
+    else lossTotal += magnitude;
+  }
+
+  if (gainTotal > 0n) {
+    legs.push({
+      role: "fx_gain",
+      entryType: "credit",
+      amountMinor: gainTotal,
+      description: `Exchange gain on restatement at ${args.asOfDate}`,
+      ledgerIdOverride: null,
+    });
+  }
+  if (lossTotal > 0n) {
+    legs.push({
+      role: "fx_loss",
+      entryType: "debit",
+      amountMinor: lossTotal,
+      description: `Exchange loss on restatement at ${args.asOfDate}`,
+      ledgerIdOverride: null,
+    });
+  }
+
+  assertFxBalances(legs);
+  return legs;
+}
+
+/**
+ * ⭐ THE REALISED DIFFERENCE ON SETTLEMENT.
+ *
+ * 🔴 THE CONTRA IS THE ITEM'S OWN CONTROL ACCOUNT AND THE AMOUNT IS
+ * MEASURED AGAINST THE CARRYING VALUE, NOT THE INVOICE. See
+ * `lib/fx/restatement.ts#settlementDifference` for why: measuring against
+ * the invoice re-books a difference that a previous year's P&L already
+ * took, overstating this year by exactly last year's restatement.
+ */
+export function buildFxSettlementPosting(args: {
+  kind: string;
+  realisedDifferenceMinor: bigint;
+  contraLedgerId?: string | null;
+  documentReference: string;
+  settlementDate: string;
+}): FxLeg[] {
+  if (args.realisedDifferenceMinor === 0n) return [];
+
+  const isLiability =
+    args.kind === "trade_payable" ||
+    args.kind === "loan_payable" ||
+    args.kind === "other_monetary_liability";
+  // Same fold as the revaluation: a liability worth more is a loss.
+  const plEffect = isLiability ? -args.realisedDifferenceMinor : args.realisedDifferenceMinor;
+  const magnitude = plEffect > 0n ? plEffect : -plEffect;
+  const contra = fxContraRoleForKind(args.kind);
+  const ref = `${args.documentReference} settled ${args.settlementDate}`;
+
+  const legs: FxLeg[] = [
+    {
+      role: contra,
+      entryType: plEffect > 0n ? "debit" : "credit",
+      amountMinor: magnitude,
+      description: `Realised exchange difference — ${ref}`,
+      ledgerIdOverride: args.contraLedgerId ?? null,
+    },
+    {
+      role: plEffect > 0n ? "fx_gain" : "fx_loss",
+      entryType: plEffect > 0n ? "credit" : "debit",
+      amountMinor: magnitude,
+      description: `Realised exchange ${plEffect > 0n ? "gain" : "loss"} — ${ref}`,
+      ledgerIdOverride: null,
+    },
+  ];
+
+  assertFxBalances(legs);
+  return legs;
+}
+
+/** Every role a set of FX legs needs a ledger for, minus the overridden ones. */
+export function fxRolesUsed(legs: readonly FxLeg[]): FxPostingRole[] {
+  return [...new Set(legs.filter((l) => !l.ledgerIdOverride).map((l) => l.role))];
+}
+
+export const FX_ROLE_META: Record<
+  FxPostingRole,
+  { label: string; tallyGroup: string; accountType: string; help: string }
+> = {
+  fx_gain: {
+    label: "Exchange Gain",
+    tallyGroup: "Indirect Incomes",
+    accountType: "revenue",
+    help: "⭐ Gains on restating and settling foreign-currency receivables, payables and bank balances. AS 11 ¶13 takes these to the P&L in the period they arise — there is no reserve to park them in. 🔴 Kept apart from Exchange Loss: netting them makes 'what did the currency cost us this year' unanswerable.",
+  },
+  fx_loss: {
+    label: "Exchange Loss",
+    tallyGroup: "Indirect Expenses",
+    accountType: "expense",
+    help: "⭐ Losses on the same items. ⚠️ Both realised and unrealised land here; what tells them apart is the document, which is on the transaction, not a fourth ledger to map.",
+  },
+  fx_receivable_contra: {
+    label: "Sundry Debtors (FX restatement)",
+    tallyGroup: "Sundry Debtors",
+    accountType: "asset",
+    help: "⚠️ THE FALLBACK ONLY. A restatement normally moves the SAME debtors ledger the invoice sits in, resolved per item. Map this if you want restatements collected separately — and expect your debtors control to differ from the sum of the customer statements by exactly this balance.",
+  },
+  fx_payable_contra: {
+    label: "Sundry Creditors (FX restatement)",
+    tallyGroup: "Sundry Creditors",
+    accountType: "liability",
+    help: "⚠️ The fallback for payables. Same caveat as the debtors contra.",
+  },
+  fx_bank_contra: {
+    label: "Foreign Currency Bank (FX restatement)",
+    tallyGroup: "Bank Accounts",
+    accountType: "asset",
+    help: "⚠️ The fallback for a foreign-currency bank or cash balance. Normally the account's own ledger is used, because a bank reconciliation compares this balance with a statement.",
   },
 };

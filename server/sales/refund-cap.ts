@@ -36,7 +36,7 @@ import "server-only";
  * rather than degrading to "no row found, therefore no cap".
  */
 
-import { and, eq, gte, notInArray, sql } from "drizzle-orm";
+import { and, eq, gte, notInArray } from "drizzle-orm";
 import { auth } from "@clerk/nextjs/server";
 import { approvalLimits } from "@/db/schema/credit";
 import { salesCreditNotes } from "@/db/schema/sales-invoices";
@@ -57,6 +57,10 @@ import {
   type FactorEvidence,
 } from "@/lib/security/session-policy";
 import type { SystemRole } from "@/db/schema/core";
+import { normaliseCurrencyCode } from "@/lib/fx/currency";
+import { sumByCurrency } from "@/lib/fx/aggregate";
+import { convertMinor, CLOSING_RATE_WINDOW } from "@/lib/fx/convert";
+import { resolveQuote } from "@/server/fx/rate-service";
 import type { withTenant } from "@/db";
 
 type Tx = Parameters<Parameters<typeof withTenant>[1]>[0];
@@ -136,12 +140,36 @@ export async function assertCreditNoteWithinCaps(args: {
   /** Their `system_role` — what `approval_limits.role` stores. */
   role: SystemRole;
   creditNoteId: string;
-  /** 🔴 The document total in paise, tax included. Never a float. */
+  /** 🔴 The document total in minor units, tax included. Never a float. */
   noteTotalMinor: bigint;
+  /**
+   * ⭐⭐ BATCH 0101 — THE CURRENCY THE NOTE IS IN, AND IT IS REQUIRED.
+   *
+   * 🔴 WHAT THIS FIXES. The daily total below used to be
+   * `coalesce(sum(total_minor), 0)` over every credit note the person
+   * issued today, WHATEVER CURRENCY EACH WAS IN, compared against a cap
+   * that is denominated in the workspace's own currency. A ₹5,00,000
+   * daily cap and three USD 5,000 credit notes consumed 15,000 of it
+   * instead of roughly ₹12,50,000 — so the cap let out about forty times
+   * what it was set to, silently, and nothing on any screen said so.
+   *
+   * ⚠️ IT IS A REQUIRED ARGUMENT RATHER THAN AN OPTIONAL ONE WITH A
+   * DEFAULT OF "INR". A default here is exactly how the original bug
+   * would come back: every existing caller compiles, and the one new
+   * caller that issues in dollars silently gets the old behaviour.
+   */
+  noteCurrency: string;
+  /**
+   * The workspace's functional currency — what the cap is denominated in.
+   * From `functionalCurrencyFromSettings(tenant.settings)`.
+   */
+  functionalCurrency: string;
   factors: FactorEvidence;
   now?: Date;
 }): Promise<CreditNoteCapVerdict> {
   const now = args.now ?? new Date();
+  const noteCurrency = normaliseCurrencyCode(args.noteCurrency);
+  const functionalCurrency = normaliseCurrencyCode(args.functionalCurrency);
 
   /* ── THE CAPS ─────────────────────────────────────────────────── */
   const rows = await args.tx
@@ -182,8 +210,18 @@ export async function assertCreditNoteWithinCaps(args: {
   // ⚠️ AND ON THE SAME STATUS PREDICATE AS THE NUMBERING SERIES —
   // everything except drafts and cancellations. A draft has taken no
   // money and a cancelled note has given it back.
-  const [today] = await args.tx
-    .select({ totalMinor: sql<string | null>`coalesce(sum(${salesCreditNotes.totalMinor}), 0)` })
+  //
+  // 🔴🔴 AND IT IS NO LONGER `sum(total_minor)` OVER EVERY CURRENCY AT
+  // ONCE. See the note on `noteCurrency` in the signature: that sum
+  // compared dollars with a rupee cap at one-to-one and let out about
+  // forty times what the cap said. The rows come back UNAGGREGATED and
+  // are grouped by currency in `lib/fx/aggregate.ts`, then each non-
+  // functional bucket is converted through a rate resolved for TODAY.
+  const issuedToday = await args.tx
+    .select({
+      currency: salesCreditNotes.currency,
+      totalMinor: salesCreditNotes.totalMinor,
+    })
     .from(salesCreditNotes)
     .where(
       and(
@@ -194,20 +232,105 @@ export async function assertCreditNoteWithinCaps(args: {
       ),
     );
 
-  // ⚠️ AN AGGREGATE THAT COMES BACK WITH NO ROW AT ALL IS NOT ZERO — it
-  // is a query that did not run the way we think it did. Refusing is the
-  // only safe reading; treating it as ₹0 issued today would hand a full
-  // fresh daily cap to whoever provoked it.
-  if (!today) {
+  // ⚠️ AN AGGREGATE THAT COMES BACK AS `undefined` IS NOT ZERO — it is a
+  // query that did not run the way we think it did. Refusing is the only
+  // safe reading; treating it as ₹0 issued today would hand a full fresh
+  // daily cap to whoever provoked it. (An EMPTY ARRAY genuinely is zero:
+  // a person who has issued nothing today has issued nothing.)
+  if (!Array.isArray(issuedToday)) {
     throw new Error(
       "The day's credit-note total could not be read, so this credit note has not been " +
         "issued. Nothing has changed. Please try again.",
     );
   }
 
+  const today = todayInIndia(now);
+  const buckets = sumByCurrency(
+    issuedToday.map((r) => ({
+      currency: normaliseCurrencyCode(r.currency),
+      amountMinor: toBigIntAmount(r.totalMinor),
+    })),
+  );
+
+  /**
+   * 🔴 A BUCKET WITH NO RATE REFUSES THE ISSUE. It does NOT get counted at
+   * one-to-one and it does NOT get skipped.
+   *
+   *   • counting it at 1:1 is the bug being fixed
+   *   • skipping it is worse: the day's total comes back LOWER, so the cap
+   *     lets MORE out, and the failure mode of a control must never be
+   *     "the control relaxes"
+   *
+   * ⚠️ IT IS AN EXCEPTION AND NOT A VERDICT, because it is not a decision
+   * about this person's authority — it is the system saying it cannot
+   * measure the day. The caller's transaction rolls back, nothing is
+   * issued, and the message says which rate to enter.
+   */
+  let issuedTodayMinor = 0n;
+  for (const bucket of buckets) {
+    if (bucket.currency === functionalCurrency) {
+      issuedTodayMinor += bucket.amountMinor;
+      continue;
+    }
+    const quote = await resolveQuote(args.tx, {
+      tenantId: args.tenantId,
+      from: bucket.currency,
+      to: functionalCurrency,
+      on: today,
+      policy: CLOSING_RATE_WINDOW,
+    });
+    if (!quote) {
+      throw new Error(
+        `This credit note has NOT been issued. ${bucket.count} credit note(s) already issued ` +
+          `today are in ${bucket.currency}, and no exchange rate to ${functionalCurrency} is on ` +
+          `file for ${today} — so the day's total against your ${functionalCurrency} limit ` +
+          `cannot be measured. Enter the rate and try again. Nothing has changed.`,
+      );
+    }
+    issuedTodayMinor += convertMinor({
+      amountMinor: bucket.amountMinor,
+      from: bucket.currency,
+      to: functionalCurrency,
+      quote,
+      on: today,
+      policy: CLOSING_RATE_WINDOW,
+    }).amountMinor;
+  }
+
+  /**
+   * ⭐ THE NOTE BEING ISSUED IS MEASURED IN THE SAME CURRENCY AS THE CAP,
+   * for the same reason. A USD 5,000 note tested against a ₹5,00,000
+   * per-note cap as though it were ₹5,000 passes every time.
+   */
+  let noteTotalInFunctionalMinor = args.noteTotalMinor;
+  if (noteCurrency !== functionalCurrency) {
+    const quote = await resolveQuote(args.tx, {
+      tenantId: args.tenantId,
+      from: noteCurrency,
+      to: functionalCurrency,
+      on: today,
+      policy: CLOSING_RATE_WINDOW,
+    });
+    if (!quote) {
+      throw new Error(
+        `This credit note is in ${noteCurrency} and no exchange rate to ${functionalCurrency} ` +
+          `is on file for ${today}, so it cannot be measured against your limit. It has NOT ` +
+          `been issued and nothing has changed. Enter the rate and try again.`,
+      );
+    }
+    noteTotalInFunctionalMinor = convertMinor({
+      amountMinor: args.noteTotalMinor,
+      from: noteCurrency,
+      to: functionalCurrency,
+      quote,
+      on: today,
+      policy: CLOSING_RATE_WINDOW,
+    }).amountMinor;
+  }
+
   const verdict = assessCreditNoteCap({
-    noteTotalMinor: args.noteTotalMinor,
-    issuedTodayMinor: toBigIntAmount(today.totalMinor),
+    noteTotalMinor: noteTotalInFunctionalMinor,
+    issuedTodayMinor,
     perNoteCapMinor: perNote.capMinor,
     perNoteCapIsDefault: perNote.capIsDefault,
     dailyCapMinor: daily.capMinor,

@@ -348,10 +348,55 @@ describe("🔴 the refusal happens server-side, inside the transaction", () => {
 });
 
 describe("🔴 the day comes from the rows", () => {
-  it("sums sales_credit_notes rather than reading a counter", () => {
-    expect(ENFORCE).toMatch(/sum\(/);
+  it("folds sales_credit_notes rather than reading a counter", () => {
+    /**
+     * ⚠️ THE `sum(` ASSERTION WAS DROPPED IN BATCH 0101 AND THE INTENT
+     * KEPT. The intent of this test is "the day is derived from the rows
+     * and never from a stored counter". It used to assert that by looking
+     * for the string `sum(`, which was the SQL aggregate the gate happened
+     * to use — and 0101 removed that aggregate BECAUSE it was
+     * currency-blind: `sum(total_minor)` added dollars to rupees and
+     * compared the result with a rupee cap.
+     *
+     * ⭐ The rows are now read unaggregated and folded per currency in
+     * `lib/fx/aggregate.ts`, which is MORE derived-from-the-rows than
+     * before, not less. Asserting the shape of the arithmetic would have
+     * failed a correct change; asserting that no counter is read does not.
+     */
     expect(ENFORCE).toMatch(/salesCreditNotes/);
+    expect(ENFORCE).toMatch(/sumByCurrency|reduce|for \(const/);
     expect(ENFORCE).not.toMatch(/issuedTodayColumn|creditedTodayMinor|dailyTotalColumn/);
+  });
+
+  /**
+   * ⭐⭐ BATCH 0101 — THE DAY IS MEASURED IN ONE CURRENCY.
+   *
+   * 🔴 THE DEFECT: the daily cap is denominated in the workspace's own
+   * currency and the day's total used to be `sum(total_minor)` over every
+   * credit note whatever currency each was in. Three USD 5,000 notes
+   * consumed 15,000 of a ₹5,00,000 cap instead of about ₹12,50,000 — so
+   * the control let out roughly forty times what it was set to.
+   *
+   * ⚠️ ASSERTED ON THE PROPERTY, NOT ON A COUNT OR A STRING. Both
+   * currencies must reach the conversion, and a bucket with no rate must
+   * REFUSE rather than be skipped — because the failure mode of a spending
+   * control must never be "the control relaxes".
+   */
+  it("converts every non-functional bucket before comparing with the cap", () => {
+    const gate = ENFORCE.slice(ENFORCE.indexOf("export async function assertCreditNoteWithinCaps"));
+    expect(gate).toMatch(/noteCurrency/);
+    expect(gate).toMatch(/functionalCurrency/);
+    expect(gate).toMatch(/convertMinor/);
+    // The note being issued is measured in the cap's currency too.
+    expect(gate).toMatch(/noteTotalInFunctionalMinor/);
+  });
+
+  it("refuses when a bucket has no rate, rather than skipping it", () => {
+    const gate = ENFORCE.slice(ENFORCE.indexOf("export async function assertCreditNoteWithinCaps"));
+    // A `continue` on a missing rate would silently lower the day's total
+    // and therefore raise the effective cap.
+    expect(gate).not.toMatch(/if \(!quote\) continue/);
+    expect(gate).toMatch(/if \(!quote\) \{[\s\S]{0,400}throw new Error/);
   });
 
   it("measures the day on issuedAt, never on the date a person typed", () => {

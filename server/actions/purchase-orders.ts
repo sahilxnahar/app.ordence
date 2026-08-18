@@ -382,10 +382,23 @@ export async function recordGoodsReceipt(
              *
              * ⚠️ Without it `unitCostMinor` on the movement would be
              * null, and a movement with no cost is invisible to every
-             * valuation method. Batch 86 makes `valuationMethod` actually
-             * read, and it would have read a ledger of costless receipts:
-             * quantity right, value zero, inventory asset understated to
-             * nothing on the balance sheet.
+             * valuation method. Batches 85-87 made `valuationMethod`
+             * actually read, and it would have read a ledger of costless
+             * receipts: quantity right, value zero, inventory asset
+             * understated to nothing on the balance sheet.
+             *
+             * ⭐ THE RECEIPT IS THE LAYER. `lib/inventory/valuation.ts`
+             * builds its FIFO layers, its weighted-average pool and its
+             * standard-cost variance out of exactly this number, so a GRN
+             * posted without it now produces a MISSING_RECEIPT_COST
+             * warning and an incomplete valuation rather than a confident
+             * wrong one.
+             *
+             * ⚠️ STILL OUTSTANDING HERE: this path writes the movement
+             * directly rather than through `costMovement`, so a GRN that
+             * is a RETURN to the supplier (a negative line) is valued at
+             * this rate rather than out of the layers it takes back. It
+             * is stated rather than quietly wrong , see the batch report.
              */
             unitPriceMinor: purchaseOrderLines.unitPriceMinor,
           })

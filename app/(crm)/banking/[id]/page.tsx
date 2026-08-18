@@ -11,10 +11,15 @@
 import Link from "next/link";
 import {
   confirmMatch,
+  getReconciliationStatement,
   getStatementWorkspace,
+  postBankLineAdjustment,
+  reopenBankReconciliation,
+  signOffReconciliation,
   unmatch,
 } from "@/server/actions/banking";
 import { MatchList } from "@/components/banking/match-list";
+import { ReconciliationStatementPanel } from "@/components/banking/reconciliation-statement";
 
 export const dynamic = "force-dynamic";
 
@@ -27,6 +32,13 @@ export default async function StatementPage({
 }) {
   const { id } = await params;
   const result = await getStatementWorkspace({ statementId: id });
+  /**
+   * ⭐ FETCHED ALONGSIDE THE MATCH LIST, NOT INSTEAD OF IT. Matching is
+   * the input and the reconciliation is the output, and somebody working
+   * a month needs both on one screen — the whole reason the statement
+   * never got written up before is that it lived nowhere.
+   */
+  const brs = await getReconciliationStatement({ statementId: id });
 
   if (!result.ok) {
     return (
@@ -82,6 +94,44 @@ export default async function StatementPage({
         confirmAction={confirmMatch}
         unmatchAction={unmatch}
       />
+
+      {brs.ok ? (
+        <ReconciliationStatementPanel
+          statementId={id}
+          periodTo={brs.data.periodTo}
+          reconciledTo={brs.data.reconciledTo}
+          printable={brs.data.printable.map((l) => ({
+            label: l.label,
+            amountMinor: l.amountMinor.toString(),
+            effect: l.effect,
+          }))}
+          reconcilesExactly={brs.data.brs.reconcilesExactly}
+          signOffPermitted={brs.data.brs.signOffPermitted}
+          differenceMinor={brs.data.brs.differenceMinor.toString()}
+          differenceAbsorbedMinor={brs.data.brs.differenceAbsorbedMinor.toString()}
+          toleranceMinor={brs.data.brs.toleranceMinor.toString()}
+          notes={[...brs.data.brs.notes]}
+          unpostedLines={brs.data.brs.items
+            .filter((i) => i.side === "bank")
+            .map((i) => ({
+              id: i.sourceId,
+              valueDate: i.occurredOn,
+              amountMinor: i.amountMinor.toString(),
+              narration: i.description,
+            }))}
+          history={brs.data.history.map((h) => ({
+            id: h.id,
+            reconciledTo: h.reconciledTo,
+            status: h.status,
+            differenceAbsorbedMinor: h.differenceAbsorbedMinor,
+          }))}
+          signOffAction={signOffReconciliation}
+          reopenAction={reopenBankReconciliation}
+          postAdjustmentAction={postBankLineAdjustment}
+        />
+      ) : (
+        <p className="text-sm text-destructive">{brs.error}</p>
+      )}
     </main>
   );
 }

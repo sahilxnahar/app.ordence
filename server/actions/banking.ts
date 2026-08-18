@@ -28,19 +28,19 @@
  * higher than the cost of one extra click.
  */
 
-import { and, eq, gte, inArray, lte, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, sql } from "drizzle-orm";
 import { revalidatePath } from "next/cache";
 import { z } from "zod";
 import { withTenant } from "@/db";
 import {
   bankAccounts,
   bankLineMatches,
+  bankReconciliationItems,
+  bankReconciliations,
   bankStatementLines,
   bankStatements,
 } from "@/db/schema/banking";
-import { customerReceipts } from "@/db/schema/sales-invoices";
 import { ledgers } from "@/db/schema/accounting";
-import { vendorPayments } from "@/db/schema/procurement";
 import { requirePermission, writeAudit } from "@/server/audit";
 import { toSalesActionError } from "@/server/sales/guards";
 import {
@@ -53,6 +53,24 @@ import {
   type ReconciliationStatement,
   type StatementLine,
 } from "@/lib/banking/match";
+import {
+  isLockedByReconciliation,
+  printableBrs,
+  reconciliationLockRefusal,
+  type Brs,
+  type BrsPrintLine,
+} from "@/lib/banking/reconciliation";
+import { statementDigest } from "@/lib/banking/statement-digest";
+import {
+  accountLockState,
+  buildReconciliationView,
+  freezeReconciliation,
+  ledgerBalanceAt,
+  lineLockState,
+  loadCandidates,
+  reopenReconciliation,
+} from "@/server/banking/reconciliation-service";
+import { postBankAdjustment } from "@/server/accounting/post-sales";
 import type { ActionResult } from "@/lib/validators/crm";
 
 const MANAGE = "settings:update" as const;
@@ -354,7 +372,12 @@ export async function importStatement(
       ctx.tenant.id,
       async (tx) => {
         const [account] = await tx
-          .select({ id: bankAccounts.id, label: bankAccounts.label })
+          .select({
+            id: bankAccounts.id,
+            label: bankAccounts.label,
+            // 🔴 READ, not merely stored. See the refusal below.
+            reconciledTo: bankAccounts.reconciledTo,
+          })
           .from(bankAccounts)
           .where(
             and(
@@ -365,6 +388,91 @@ export async function importStatement(
           .limit(1);
 
         if (!account) throw new Error("No such bank account.");
+
+        /**
+         * 🔴🔴 THE WHOLE-FILE DUPLICATE GUARD — 0102.
+         *
+         * ══════════════════════════════════════════════════════════════
+         * ⚠️ THE LINE-LEVEL CHECK BELOW ONLY EVER WARNED
+         * ══════════════════════════════════════════════════════════════
+         * It reported lines that looked like ones already stored and then
+         * wrote every one of them anyway, deliberately, because two
+         * identical payments on one day are real. That is the right
+         * strength for a LINE and it is far too weak for a FILE: somebody
+         * re-importing January got a warning they clicked past and a
+         * second copy of the month.
+         *
+         * ⭐ A DIGEST OVER THE WHOLE STATEMENT — account, period, both
+         * balances, and every line fingerprint in order — collides with
+         * exactly one thing: the same file imported again. So this one
+         * REFUSES, and it refuses before anything is written.
+         *
+         * ⚠️ CHECKED HERE AS WELL AS BY THE UNIQUE INDEX. The index is
+         * what makes it true when two people press Import at the same
+         * moment; this is what produces a sentence rather than
+         * "duplicate key value violates unique constraint".
+         */
+        const digest = statementDigest({
+          bankAccountId: data.bankAccountId,
+          periodFrom: data.periodFrom,
+          periodTo: data.periodTo,
+          openingBalanceMinor: BigInt(data.openingBalanceMinor),
+          closingBalanceMinor: BigInt(data.closingBalanceMinor),
+          lines: parsed,
+        });
+
+        const [alreadyImported] = await tx
+          .select({
+            id: bankStatements.id,
+            importedAt: bankStatements.importedAt,
+            sourceFilename: bankStatements.sourceFilename,
+            lineCount: bankStatements.lineCount,
+          })
+          .from(bankStatements)
+          .where(
+            and(
+              eq(bankStatements.tenantId, ctx.tenant.id),
+              eq(bankStatements.bankAccountId, data.bankAccountId),
+              eq(bankStatements.importDigest, digest),
+            ),
+          )
+          .limit(1);
+
+        if (alreadyImported) {
+          throw new BankAccountRefusal(
+            `This exact statement has already been imported: ${alreadyImported.lineCount} lines${
+              alreadyImported.sourceFilename
+                ? ` from ${alreadyImported.sourceFilename}`
+                : ""
+            }, on ${new Date(alreadyImported.importedAt as Date).toISOString().slice(0, 10)}.`,
+            "Nothing has been added. Importing it a second time would double every line in the period and put the account out by exactly the month's turnover, with nothing on screen saying why. If the bank has re-issued a corrected statement, the corrected file will differ and will import.",
+          );
+        }
+
+        /**
+         * 🔴🔴 THE RECONCILIATION LOCK, ON THE IMPORT PATH — 0102.
+         *
+         * ⚠️ A LOCK THAT ONLY GUARDED MATCHING WOULD HAVE A HOLE THE SIZE
+         * OF THE IMPORTER. Adding a statement line dated inside a signed
+         * period adds an unmatched item to a reconciliation that was
+         * signed without it, so the signed figure stops being
+         * reproducible from the data behind it — which is the entire
+         * thing a signature is for.
+         */
+        const lock =
+          account.reconciledTo === null ? null : String(account.reconciledTo);
+        const sealed = parsed.filter((l) =>
+          isLockedByReconciliation(l.valueDate, lock),
+        );
+        if (sealed.length > 0 && lock !== null) {
+          const earliest = sealed
+            .map((l) => l.valueDate)
+            .sort()[0] as string;
+          throw new BankAccountRefusal(
+            `${sealed.length} line${sealed.length === 1 ? " is" : "s are"} dated on or before ${lock}, and this account is reconciled to ${lock} (the earliest is ${earliest}).`,
+            "Nothing has been imported. A line inside a signed period changes a reconciliation somebody has already signed. Reopen that reconciliation with a reason if the signed figure is genuinely wrong, or import a statement that starts after the reconciled date.",
+          );
+        }
 
         // ⭐⭐ THE DUPLICATE CHECK, AGAINST WHAT IS ALREADY STORED.
         //
@@ -407,6 +515,7 @@ export async function importStatement(
             closingBalanceMinor: BigInt(data.closingBalanceMinor),
             sourceFilename: data.sourceFilename ?? null,
             lineCount: parsed.length,
+            importDigest: digest,
             importedBy: ctx.user.id,
           })
           .returning({ id: bankStatements.id });
@@ -465,6 +574,9 @@ export async function importStatement(
     revalidatePath("/banking");
     return { ok: true, data: result };
   } catch (err) {
+    if (err instanceof BankAccountRefusal) {
+      return { ok: false, error: `${err.message} ${err.remedy}` };
+    }
     return toSalesActionError(err, "importStatement");
   }
 }
@@ -674,9 +786,31 @@ export async function confirmMatch(
     const data = confirmSchema.parse(input);
     const ctx = await requirePermission(MANAGE);
 
-    await withTenant(
+    const outcome = await withTenant(
       ctx.tenant.id,
       async (tx) => {
+        /**
+         * 🔴🔴 THE RECONCILIATION LOCK, READ — 0102.
+         *
+         * ⚠️ ADDING A MATCH UNDER A SIGNED DATE IS AS DESTRUCTIVE AS
+         * REMOVING ONE. Both move an item off the outstanding list, both
+         * change the signed statement's arithmetic, and only one of them
+         * looks like a deletion. A lock that guarded `unmatch` alone
+         * would be a lock with a hole in it that reads as control.
+         */
+        const state = await lineLockState(tx, ctx.tenant.id, data.statementLineId);
+        if (!state) throw new Error("No such statement line.");
+        if (state.locked && state.reconciledTo !== null) {
+          throw new BankAccountRefusal(
+            reconciliationLockRefusal(
+              "Matching it now",
+              state.valueDate,
+              state.reconciledTo,
+            ),
+            "",
+          );
+        }
+
         await tx.insert(bankLineMatches).values({
           tenantId: ctx.tenant.id,
           statementLineId: data.statementLineId,
@@ -700,13 +834,18 @@ export async function confirmMatch(
           },
           severity: "notice",
         });
+
+        return { matched: true as const };
       },
       { impersonationId: ctx.impersonationId },
     );
 
     revalidatePath("/banking");
-    return { ok: true, data: { matched: true } };
+    return { ok: true, data: outcome };
   } catch (err) {
+    if (err instanceof BankAccountRefusal) {
+      return { ok: false, error: `${err.message} ${err.remedy}`.trim() };
+    }
     return toSalesActionError(err, "confirmMatch");
   }
 }
@@ -726,9 +865,41 @@ export async function unmatch(
       .parse(input);
     const ctx = await requirePermission(MANAGE);
 
-    await withTenant(
+    const outcome = await withTenant(
       ctx.tenant.id,
       async (tx) => {
+        /**
+         * 🔴🔴🔴 THE READ THAT MAKES `reconciled_to` A CONTROL RATHER THAN
+         * A LABEL — 0102.
+         *
+         * ══════════════════════════════════════════════════════════════
+         * ⚠️ BEFORE THIS, `unmatch` DELETED FREELY, AT ANY DATE
+         * ══════════════════════════════════════════════════════════════
+         * A confirmed match under a signed-off reconciliation could be
+         * removed with one click and no record beyond an audit row nobody
+         * reads. The signed statement's arithmetic then referred to an
+         * outstanding list that no longer existed, and re-rendering it
+         * produced a different document with the same signature on it.
+         *
+         * 🔴 THE COLUMN EXISTED FOR FIVE VERSIONS AND NOTHING CONSULTED
+         * IT. That is this codebase's oldest and most expensive defect
+         * shape — a field declared and enforced by nothing — and a lock
+         * of that kind is worse than no lock, because it looks like
+         * control.
+         */
+        const state = await lineLockState(tx, ctx.tenant.id, statementLineId);
+        if (!state) throw new Error("No such statement line.");
+        if (state.locked && state.reconciledTo !== null) {
+          throw new BankAccountRefusal(
+            reconciliationLockRefusal(
+              "Unmatching it now",
+              state.valueDate,
+              state.reconciledTo,
+            ),
+            "",
+          );
+        }
+
         await tx
           .delete(bankLineMatches)
           .where(
@@ -745,14 +916,743 @@ export async function unmatch(
           newValue: { unmatched: true },
           severity: "notice",
         });
+
+        return { unmatched: true as const };
       },
       { impersonationId: ctx.impersonationId },
     );
 
     revalidatePath("/banking");
-    return { ok: true, data: { unmatched: true } };
+    return { ok: true, data: outcome };
   } catch (err) {
+    if (err instanceof BankAccountRefusal) {
+      return { ok: false, error: `${err.message} ${err.remedy}`.trim() };
+    }
     return toSalesActionError(err, "unmatch");
+  }
+}
+
+/* ================================================================== */
+/* ⭐⭐⭐ THE RECONCILIATION ITSELF — 0102                               */
+/* ================================================================== */
+
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 MATCHING WAS BUILT. RECONCILING WAS NOT.
+ * ══════════════════════════════════════════════════════════════════════
+ * Everything above this line pairs a bank line with a document. That is
+ * the INPUT to a reconciliation. The reconciliation is the statement an
+ * auditor asks for — bank balance, the outstanding items by name, book
+ * balance — and the act of saying "this account is reconciled to this
+ * figure as at this date", which is what makes the months beneath it
+ * stop moving.
+ */
+
+export interface ReconciliationStatementView {
+  readonly statementId: string;
+  readonly bankAccountId: string;
+  readonly accountLabel: string;
+  readonly periodFrom: string;
+  readonly periodTo: string;
+  readonly reconciledTo: string | null;
+  readonly brs: Brs;
+  /** ⭐ Ordered, signed lines. The renderer must not decide the order. */
+  readonly printable: readonly BrsPrintLine[];
+  readonly history: ReadonlyArray<{
+    id: string;
+    reconciledTo: string;
+    status: string;
+    differenceMinor: string;
+    differenceAbsorbedMinor: string;
+    signedOffAt: string;
+  }>;
+}
+
+/**
+ * ⭐⭐ THE LIVE BANK RECONCILIATION STATEMENT FOR ONE IMPORTED STATEMENT.
+ *
+ * ⚠️ MONEY CROSSES THE SERVER/CLIENT BOUNDARY AS A STRING IN `history`
+ * and as `bigint` inside `brs`. That is not an inconsistency: `brs` is
+ * consumed by server components which can hold a bigint, and `history` is
+ * rendered in a list where a `bigint` would fail to serialise. Both are
+ * exact; neither is a Number.
+ */
+export async function getReconciliationStatement(
+  input: unknown,
+): Promise<ActionResult<ReconciliationStatementView>> {
+  try {
+    const { statementId } = z
+      .object({ statementId: z.string().uuid() })
+      .parse(input);
+    const ctx = await requirePermission(MANAGE);
+
+    return await withTenant(
+      ctx.tenant.id,
+      async (tx) => {
+        const view = await buildReconciliationView(tx, ctx.tenant.id, statementId);
+        if (!view) throw new Error("No such statement.");
+
+        const history = await tx
+          .select({
+            id: bankReconciliations.id,
+            reconciledTo: bankReconciliations.reconciledTo,
+            status: bankReconciliations.status,
+            differenceMinor: bankReconciliations.differenceMinor,
+            differenceAbsorbedMinor: bankReconciliations.differenceAbsorbedMinor,
+            signedOffAt: bankReconciliations.signedOffAt,
+          })
+          .from(bankReconciliations)
+          .where(
+            and(
+              eq(bankReconciliations.tenantId, ctx.tenant.id),
+              eq(bankReconciliations.bankAccountId, view.bankAccountId),
+            ),
+          )
+          .orderBy(desc(bankReconciliations.reconciledTo))
+          .limit(24);
+
+        return {
+          ok: true as const,
+          data: {
+            statementId: view.statementId,
+            bankAccountId: view.bankAccountId,
+            accountLabel: view.accountLabel,
+            periodFrom: view.periodFrom,
+            periodTo: view.periodTo,
+            reconciledTo: view.reconciledTo,
+            brs: view.brs,
+            printable: printableBrs(view.brs),
+            history: history.map((h: Record<string, unknown>) => ({
+              id: h.id as string,
+              reconciledTo: String(h.reconciledTo),
+              status: h.status as string,
+              differenceMinor: String(h.differenceMinor),
+              differenceAbsorbedMinor: String(h.differenceAbsorbedMinor),
+              signedOffAt: (h.signedOffAt as Date).toISOString(),
+            })),
+          },
+        };
+      },
+      { impersonationId: ctx.impersonationId },
+    );
+  } catch (err) {
+    return toSalesActionError(err, "getReconciliationStatement");
+  }
+}
+
+const signOffSchema = z.object({
+  statementId: z.string().uuid(),
+  /**
+   * ⚠️ OPTIONAL, AND IT DEFAULTS TO THE STATEMENT'S OWN CLOSING DATE.
+   * Reconciling "to" a date later than the statement covers would seal
+   * transactions the statement says nothing about.
+   */
+  reconciledTo: z
+    .string()
+    .regex(/^\d{4}-\d{2}-\d{2}$/)
+    .optional(),
+  note: z.string().max(2000).optional(),
+});
+
+/**
+ * ⭐⭐⭐ THE ACT OF RECONCILING, WHICH DID NOT EXIST BEFORE 0102.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 WHAT THIS WRITES, AND WHY IT IS TWO THINGS AND NOT ONE
+ * ══════════════════════════════════════════════════════════════════════
+ *   ① THE ARTEFACT — the statement, frozen, with its outstanding items
+ *     stored as rows rather than recomputed. A BRS whose total is stored
+ *     and whose lines are re-derived on every render foots against
+ *     nothing, and the version shown in September for March is whatever
+ *     March happens to look like in September.
+ *
+ *   ② THE LOCK — `bank_accounts.reconciled_to`. Without it the artefact
+ *     is a screenshot: everything under it can still be changed, and the
+ *     signature refers to data that has moved.
+ *
+ * ⭐ BOTH IN ONE TRANSACTION. Either half alone is worse than neither.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 A STATEMENT THAT DOES NOT FOOT CANNOT BE SIGNED
+ * ══════════════════════════════════════════════════════════════════════
+ * ...unless the account carries an explicit, configured tolerance, in
+ * which case the amount it let through is written onto the row and stays
+ * there. A tolerance is permission to sign; it is never evidence that the
+ * account balanced, and `differenceAbsorbedMinor` is what stops the two
+ * being confused a year later.
+ */
+export async function signOffReconciliation(
+  input: unknown,
+): Promise<
+  ActionResult<{
+    reconciliationId: string;
+    reconciledTo: string;
+    itemCount: number;
+    differenceMinor: string;
+    differenceAbsorbedMinor: string;
+    note: string;
+  }>
+> {
+  try {
+    const data = signOffSchema.parse(input);
+    const ctx = await requirePermission(MANAGE);
+
+    const result = await withTenant(
+      ctx.tenant.id,
+      async (tx) => {
+        const view = await buildReconciliationView(tx, ctx.tenant.id, data.statementId);
+        if (!view) throw new Error("No such statement.");
+
+        const reconciledTo = data.reconciledTo ?? view.periodTo;
+
+        if (reconciledTo > view.periodTo) {
+          throw new BankAccountRefusal(
+            `You cannot reconcile to ${reconciledTo} from a statement that ends on ${view.periodTo}.`,
+            "The reconciled date seals everything on or before it, and this statement says nothing about the days after its closing date. Import the later statement first.",
+          );
+        }
+
+        /**
+         * ⚠️ THE LOCK ONLY EVER MOVES FORWARD ON THIS PATH. Signing a
+         * date earlier than the current one would silently unseal the
+         * months in between — a reopen with a reason is the only way
+         * backwards, and it is recorded as one.
+         */
+        if (view.reconciledTo !== null && reconciledTo <= view.reconciledTo) {
+          throw new BankAccountRefusal(
+            `This account is already reconciled to ${view.reconciledTo}, which is on or after ${reconciledTo}.`,
+            "Signing this would move the lock backwards and unseal months that have already been signed. Reopen the later reconciliation with a reason if it is wrong.",
+          );
+        }
+
+        if (!view.brs.signOffPermitted) {
+          throw new BankAccountRefusal(
+            `This account does not reconcile: ${view.brs.differenceMinor} paise remains after every outstanding item on both sides is allowed for.`,
+            "A confirmed match is wrong or something is missing from both lists. It is not a rounding error, and signing it off would put a figure into the record that cannot be reproduced from the data behind it. If this account genuinely carries a permanent small difference, set a tolerance on it deliberately — the amount it absorbs is then recorded on every reconciliation it touches.",
+          );
+        }
+
+        const frozen = await freezeReconciliation(tx, {
+          tenantId: ctx.tenant.id,
+          userId: ctx.user.id,
+          view,
+          reconciledTo,
+          previousReconciledTo: view.reconciledTo,
+          note: data.note ?? null,
+        });
+
+        await writeAudit(ctx, {
+          action: "create",
+          resourceType: "bank_reconciliation",
+          resourceId: frozen.reconciliationId,
+          newValue: {
+            account: view.accountLabel,
+            reconciledTo,
+            bankBalanceMinor: view.brs.bankBalanceMinor.toString(),
+            bookBalanceMinor: view.brs.bookBalanceMinor.toString(),
+            differenceMinor: view.brs.differenceMinor.toString(),
+            differenceAbsorbedMinor: view.brs.differenceAbsorbedMinor.toString(),
+            items: frozen.itemCount,
+          },
+          /**
+           * ⚠️ `notice`, OR `warning` WHERE A TOLERANCE DID THE WORK. An
+           * account signed off with a difference is a different event
+           * from one that footed, and the audit stream should not have
+           * to re-read the amount to tell them apart.
+           */
+          severity:
+            view.brs.differenceAbsorbedMinor === 0n ? "notice" : "warning",
+        });
+
+        return {
+          reconciliationId: frozen.reconciliationId,
+          reconciledTo,
+          itemCount: frozen.itemCount,
+          differenceMinor: view.brs.differenceMinor.toString(),
+          differenceAbsorbedMinor: view.brs.differenceAbsorbedMinor.toString(),
+          note:
+            view.brs.differenceAbsorbedMinor === 0n
+              ? `${view.accountLabel} is reconciled to ${reconciledTo}. ${frozen.itemCount} outstanding item${frozen.itemCount === 1 ? "" : "s"} recorded. Matches dated on or before ${reconciledTo} can no longer be added or removed.`
+              : `${view.accountLabel} is reconciled to ${reconciledTo} with ${view.brs.differenceAbsorbedMinor} paise allowed through by the configured tolerance. That amount is recorded on the reconciliation and on this audit entry. The account did not balance; it was signed anyway, deliberately.`,
+        };
+      },
+      { impersonationId: ctx.impersonationId },
+    );
+
+    revalidatePath("/banking");
+    revalidatePath("/accounting");
+    return { ok: true, data: result };
+  } catch (err) {
+    if (err instanceof BankAccountRefusal) {
+      return { ok: false, error: `${err.message} ${err.remedy}`.trim() };
+    }
+    return toSalesActionError(err, "signOffReconciliation");
+  }
+}
+
+/**
+ * ⭐⭐ THE WAY BACK, AND IT LEAVES A MARK.
+ *
+ * ⚠️ MODELLED ON `reopenFinancialPeriod`, DELIBERATELY. A reconciliation
+ * that cannot be reopened is one that gets worked around — somebody posts
+ * a correcting journal into a later month to make a wrong signed figure
+ * add up, and the correction is then indistinguishable from a real
+ * transaction forever.
+ *
+ * 🔴 SO REOPENING IS ALLOWED, IS RECORDED AS `critical`, NEEDS A WRITTEN
+ * REASON, AND KEEPS THE ORIGINAL ROW. The row is the evidence that a
+ * figure was signed at all; deleting it would make the reopen invisible,
+ * which is the only thing that would make it dangerous.
+ */
+export async function reopenBankReconciliation(
+  input: unknown,
+): Promise<ActionResult<{ restoredTo: string | null; note: string }>> {
+  try {
+    const data = z
+      .object({
+        reconciliationId: z.string().uuid(),
+        reason: z
+          .string()
+          .trim()
+          .min(
+            20,
+            "Say what is wrong with the signed figure, in a sentence somebody reading this in a year can act on.",
+          )
+          .max(2000),
+      })
+      .parse(input);
+    const ctx = await requirePermission(MANAGE);
+
+    const result = await withTenant(
+      ctx.tenant.id,
+      async (tx) => {
+        const outcome = await reopenReconciliation(tx, {
+          tenantId: ctx.tenant.id,
+          userId: ctx.user.id,
+          reconciliationId: data.reconciliationId,
+          reason: data.reason,
+        });
+
+        await writeAudit(ctx, {
+          action: "update",
+          resourceType: "bank_reconciliation",
+          resourceId: data.reconciliationId,
+          newValue: {
+            reopened: true,
+            wasReconciledTo: outcome.reconciledTo,
+            lockRestoredTo: outcome.restoredTo,
+            reason: data.reason,
+          },
+          // 🔴 A signed figure has been unsealed. That is a critical event.
+          severity: "critical",
+        });
+
+        return outcome;
+      },
+      { impersonationId: ctx.impersonationId },
+    );
+
+    revalidatePath("/banking");
+    return {
+      ok: true,
+      data: {
+        restoredTo: result.restoredTo,
+        note:
+          result.restoredTo === null
+            ? `Reopened. This account has no reconciled date any more, so every match on it can be changed again. The reconciliation row is kept, marked reopened, with your reason on it.`
+            : `Reopened. The lock is back at ${result.restoredTo}, where it stood before this reconciliation was signed. The reconciliation row is kept, marked reopened, with your reason on it.`,
+      },
+    };
+  } catch (err) {
+    return toSalesActionError(err, "reopenBankReconciliation");
+  }
+}
+
+/**
+ * ⭐⭐ THE SIGNED ARTEFACT, READ BACK AS IT WAS SIGNED.
+ *
+ * 🔴 NOTHING HERE IS RECOMPUTED. Every figure and every item comes off
+ * the frozen rows. That is the whole point: re-deriving a March
+ * reconciliation in September produces whatever March looks like in
+ * September, and a signature on a document that changes is not a
+ * signature on anything.
+ */
+export async function getSignedReconciliation(
+  input: unknown,
+): Promise<
+  ActionResult<{
+    id: string;
+    reconciledTo: string;
+    status: string;
+    bankBalanceMinor: string;
+    bookBalanceMinor: string;
+    chequesNotPresentedMinor: string;
+    depositsNotCreditedMinor: string;
+    bankChargesMinor: string;
+    directCreditsMinor: string;
+    differenceMinor: string;
+    toleranceMinor: string;
+    differenceAbsorbedMinor: string;
+    signedOffAt: string;
+    note: string | null;
+    reopenReason: string | null;
+    items: ReadonlyArray<{
+      category: string;
+      side: string;
+      occurredOn: string;
+      amountMinor: string;
+      description: string;
+    }>;
+  }>
+> {
+  try {
+    const { reconciliationId } = z
+      .object({ reconciliationId: z.string().uuid() })
+      .parse(input);
+    const ctx = await requirePermission(MANAGE);
+
+    return await withTenant(
+      ctx.tenant.id,
+      async (tx) => {
+        const [row] = await tx
+          .select()
+          .from(bankReconciliations)
+          .where(
+            and(
+              eq(bankReconciliations.tenantId, ctx.tenant.id),
+              eq(bankReconciliations.id, reconciliationId),
+            ),
+          )
+          .limit(1);
+
+        if (!row) throw new Error("No such reconciliation.");
+
+        const items = await tx
+          .select({
+            category: bankReconciliationItems.category,
+            side: bankReconciliationItems.side,
+            occurredOn: bankReconciliationItems.occurredOn,
+            amountMinor: bankReconciliationItems.amountMinor,
+            description: bankReconciliationItems.description,
+          })
+          .from(bankReconciliationItems)
+          .where(
+            and(
+              eq(bankReconciliationItems.tenantId, ctx.tenant.id),
+              eq(bankReconciliationItems.reconciliationId, reconciliationId),
+            ),
+          )
+          .orderBy(
+            asc(bankReconciliationItems.category),
+            asc(bankReconciliationItems.occurredOn),
+          );
+
+        const r = row as Record<string, unknown>;
+
+        return {
+          ok: true as const,
+          data: {
+            id: r.id as string,
+            reconciledTo: String(r.reconciledTo),
+            status: r.status as string,
+            bankBalanceMinor: String(r.bankBalanceMinor),
+            bookBalanceMinor: String(r.bookBalanceMinor),
+            chequesNotPresentedMinor: String(r.chequesNotPresentedMinor),
+            depositsNotCreditedMinor: String(r.depositsNotCreditedMinor),
+            bankChargesMinor: String(r.bankChargesMinor),
+            directCreditsMinor: String(r.directCreditsMinor),
+            differenceMinor: String(r.differenceMinor),
+            toleranceMinor: String(r.toleranceMinor),
+            differenceAbsorbedMinor: String(r.differenceAbsorbedMinor),
+            signedOffAt: (r.signedOffAt as Date).toISOString(),
+            note: (r.note as string | null) ?? null,
+            reopenReason: (r.reopenReason as string | null) ?? null,
+            items: items.map((i: Record<string, unknown>) => ({
+              category: i.category as string,
+              side: i.side as string,
+              occurredOn: String(i.occurredOn),
+              amountMinor: String(i.amountMinor),
+              description: i.description as string,
+            })),
+          },
+        };
+      },
+      { impersonationId: ctx.impersonationId },
+    );
+  } catch (err) {
+    return toSalesActionError(err, "getSignedReconciliation");
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* POSTING WHAT THE RECONCILIATION FOUND                                */
+/* ------------------------------------------------------------------ */
+
+const adjustmentSchema = z.object({
+  statementLineId: z.string().uuid(),
+  /**
+   * ⚠️ THE PERSON ASSERTS THE NATURE; THE SIGN OF THE LINE DECIDES THE
+   * DIRECTION, AND A CONTRADICTION IS REFUSED. Deriving the kind from
+   * the sign alone would let a vendor payment be written up as a bank
+   * charge with one click, and asking for the direction as well as the
+   * nature would let somebody debit an expense for money that arrived.
+   */
+  kind: z.enum(["bank_charge", "interest_credited"]),
+  note: z.string().max(1000).optional(),
+});
+
+/**
+ * ⭐⭐⭐ THE ENTRY THE BOOKS ARE MISSING, POSTED FROM WHERE IT WAS FOUND.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 `lib/banking/match.ts` HAS SAID "SOMEBODY HAS TO WRITE IT UP" SINCE
+ *    v1.18.0, AND NOTHING IN THE BANKING MODULE COULD WRITE ANYTHING UP
+ * ══════════════════════════════════════════════════════════════════════
+ * The operator was shown a list of entries the books did not have and
+ * given no way to add them, so the list was the same length every month.
+ *
+ * ⭐ THIS GOES THROUGH `server/accounting/post-sales.ts`, THE ONE POSTING
+ * PATH — same idempotency key, same closed-period refusal, same role map,
+ * same balanced legs, same audit. A second posting path in the banking
+ * module would be a second place for the period lock to be forgotten,
+ * which is exactly how 0073 came to be written.
+ *
+ * ⚠️ AND THE POSTED JOURNAL IS IMMEDIATELY MATCHED TO THE LINE. A charge
+ * written up and left unmatched still sits on the outstanding list, so
+ * the reconciliation does not improve and the operator posts it again.
+ */
+export async function postBankLineAdjustment(
+  input: unknown,
+): Promise<ActionResult<{ transactionId: string | null; note: string }>> {
+  try {
+    const data = adjustmentSchema.parse(input);
+    const ctx = await requirePermission(MANAGE);
+
+    const result = await withTenant(
+      ctx.tenant.id,
+      async (tx) => {
+        const state = await lineLockState(tx, ctx.tenant.id, data.statementLineId);
+        if (!state) throw new Error("No such statement line.");
+
+        // 🔴 THE SAME LOCK, READ ON THIS PATH TOO. Posting a journal
+        // dated inside a signed period changes the book balance the
+        // signed statement was drawn against.
+        if (state.locked && state.reconciledTo !== null) {
+          throw new BankAccountRefusal(
+            reconciliationLockRefusal(
+              "Posting it now",
+              state.valueDate,
+              state.reconciledTo,
+            ),
+            "",
+          );
+        }
+
+        const expected =
+          state.amountMinor < 0n ? "bank_charge" : "interest_credited";
+        if (data.kind !== expected) {
+          throw new BankAccountRefusal(
+            `This line ${state.amountMinor < 0n ? "took money out of" : "put money into"} the account, so it cannot be ${data.kind === "bank_charge" ? "a bank charge" : "interest credited"}.`,
+            "If it is neither a bank charge nor interest, it is a document that belongs somewhere else — a vendor payment, a customer receipt, a transfer — and it should be recorded there and matched here, not written up as an adjustment with no counterparty.",
+          );
+        }
+
+        const [existingMatch] = await tx
+          .select({ id: bankLineMatches.id })
+          .from(bankLineMatches)
+          .where(
+            and(
+              eq(bankLineMatches.tenantId, ctx.tenant.id),
+              eq(bankLineMatches.statementLineId, data.statementLineId),
+            ),
+          )
+          .limit(1);
+
+        if (existingMatch) {
+          throw new BankAccountRefusal(
+            "This line is already matched to something.",
+            "Unmatch it first if the existing match is wrong. Posting a second explanation for one movement of money would explain it twice.",
+          );
+        }
+
+        const magnitude =
+          state.amountMinor < 0n ? -state.amountMinor : state.amountMinor;
+
+        const outcome = await postBankAdjustment(tx, {
+          tenantId: ctx.tenant.id,
+          userId: ctx.user.id,
+          statementLineId: data.statementLineId,
+          kind: data.kind,
+          amountMinor: magnitude,
+          // ⚠️ THE BANK'S VALUE DATE, NEVER TODAY. See post-sales.ts.
+          valueDate: state.valueDate,
+          narration: state.narration,
+          bankLedgerId: state.ledgerId,
+        });
+
+        if (!outcome.posted) {
+          /**
+           * ⚠️ EVERY NON-POSTING OUTCOME GETS ITS OWN SENTENCE. A single
+           * "could not post" would make an unmapped ledger, a closed
+           * month and an already-posted line look like the same fault,
+           * and they have three different remedies.
+           */
+          const explanation =
+            outcome.reason === "unmapped_roles"
+              ? `Your chart of accounts has no ledger mapped for: ${outcome.missing.join(", ")}. Map them on the posting accounts screen — guessing which of your accounts is "bank charges" would post a real expense to an account nobody chose.`
+              : outcome.reason === "period_closed"
+                ? `${outcome.period} is closed, and this charge is dated ${state.valueDate}, which falls inside it. Reopen that period deliberately if the charge genuinely belongs there. Do not date it into an open month: it would then be missing from the month it happened in, which is the month whose reconciliation found it.`
+                : outcome.reason === "already_posted"
+                  ? "This line has already been posted once. Nothing has been written a second time."
+                  : "There was nothing to post for this line.";
+
+          throw new BankAccountRefusal("Nothing has been posted.", explanation);
+        }
+
+        /**
+         * ⭐ THE MATCH IS WRITTEN HERE AND NOT THROUGH `confirmMatch`,
+         * because it must share this transaction: a journal posted
+         * without its match leaves the charge on the outstanding list
+         * and invites a second posting, and the pair have to commit or
+         * fail together.
+         */
+        await tx.insert(bankLineMatches).values({
+          tenantId: ctx.tenant.id,
+          statementLineId: data.statementLineId,
+          matchedKind: "journal_entry",
+          matchedId: outcome.transactionId,
+          // ⚠️ NO SCORE. Nothing was proposed; this line was explained.
+          proposedScore: null,
+          wasAmbiguous: false,
+          confirmedBy: ctx.user.id,
+          note: data.note ?? null,
+        });
+
+        await writeAudit(ctx, {
+          action: "create",
+          resourceType: "bank_line_adjustment",
+          resourceId: data.statementLineId,
+          newValue: {
+            kind: data.kind,
+            amountMinor: magnitude.toString(),
+            valueDate: state.valueDate,
+            transactionId: outcome.transactionId,
+          },
+          severity: "notice",
+        });
+
+        return {
+          transactionId: outcome.transactionId,
+          note: `Posted and matched. The ${data.kind === "bank_charge" ? "charge" : "interest"} is dated ${state.valueDate}, the day the bank has it, and it is now off the outstanding list.`,
+        };
+      },
+      { impersonationId: ctx.impersonationId },
+    );
+
+    revalidatePath("/banking");
+    revalidatePath("/accounting");
+    return { ok: true, data: result };
+  } catch (err) {
+    if (err instanceof BankAccountRefusal) {
+      return { ok: false, error: `${err.message} ${err.remedy}`.trim() };
+    }
+    return toSalesActionError(err, "postBankLineAdjustment");
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* THE TOLERANCE, SET DELIBERATELY OR NOT AT ALL                        */
+/* ------------------------------------------------------------------ */
+
+/**
+ * ⚠️ THIS EXISTS SO THAT A TOLERANCE IS NEVER A DEFAULT, A CONSTANT OR A
+ * SILENT ROUNDING. It is zero on every account until somebody sets it,
+ * per account, with a reason that lands in the audit log — and the amount
+ * it lets through is written onto every reconciliation it touches.
+ *
+ * 🔴 CAPPED AT ₹100. A tolerance large enough to hide a real transaction
+ * is not a tolerance, it is a way of signing off an account that does not
+ * reconcile. The cap is a hundred rupees because the differences this is
+ * for are paise from a historic conversion, and a bank charge is more
+ * than a hundred rupees.
+ */
+export async function setReconciliationTolerance(
+  input: unknown,
+): Promise<ActionResult<{ toleranceMinor: string; note: string }>> {
+  try {
+    const data = z
+      .object({
+        bankAccountId: z.string().uuid(),
+        toleranceMinor: z
+          .string()
+          .regex(/^\d+$/, "Paise, as a whole number. Zero means no tolerance."),
+        reason: z
+          .string()
+          .trim()
+          .min(
+            20,
+            "Say why this account carries a permanent difference. A tolerance with no stated cause is a way to sign off an account that does not reconcile.",
+          )
+          .max(2000),
+      })
+      .parse(input);
+    const ctx = await requirePermission(MANAGE);
+
+    const tolerance = BigInt(data.toleranceMinor);
+    if (tolerance > 10_000n) {
+      return {
+        ok: false,
+        error:
+          "A reconciliation tolerance above ₹100 is not a tolerance. A difference that large is a transaction — a charge, a receipt, a wrong match — and absorbing it would hide the thing the reconciliation exists to find.",
+      };
+    }
+
+    const result = await withTenant(
+      ctx.tenant.id,
+      async (tx) => {
+        const before = await accountLockState(tx, ctx.tenant.id, data.bankAccountId);
+        if (!before) throw new Error("No such bank account.");
+
+        await tx
+          .update(bankAccounts)
+          .set({
+            reconciliationToleranceMinor: tolerance,
+            updatedAt: new Date(),
+          })
+          .where(
+            and(
+              eq(bankAccounts.tenantId, ctx.tenant.id),
+              eq(bankAccounts.id, data.bankAccountId),
+            ),
+          );
+
+        await writeAudit(ctx, {
+          action: "update",
+          resourceType: "bank_account",
+          resourceId: data.bankAccountId,
+          oldValue: { toleranceMinor: before.toleranceMinor.toString() },
+          newValue: { toleranceMinor: tolerance.toString(), reason: data.reason },
+          severity: tolerance === 0n ? "notice" : "warning",
+        });
+
+        return { label: before.label };
+      },
+      { impersonationId: ctx.impersonationId },
+    );
+
+    revalidatePath("/banking");
+    return {
+      ok: true,
+      data: {
+        toleranceMinor: tolerance.toString(),
+        note:
+          tolerance === 0n
+            ? `${result.label} now has no tolerance. A reconciliation on it has to foot exactly before it can be signed.`
+            : `${result.label} will accept a difference of up to ${tolerance} paise at sign-off. Anything it absorbs is recorded on the reconciliation as a difference, because it is one.`,
+      },
+    };
+  } catch (err) {
+    return toSalesActionError(err, "setReconciliationTolerance");
   }
 }
 
@@ -768,6 +1668,8 @@ export async function getBankAccounts(): Promise<
       bankName: string;
       accountLast4: string | null;
       reconciledTo: string | null;
+      /** ⭐ Surfaced so an account carrying a tolerance says so on screen. */
+      reconciliationToleranceMinor: string;
     }>;
     statements: ReadonlyArray<{
       id: string;
@@ -791,6 +1693,7 @@ export async function getBankAccounts(): Promise<
             bankName: bankAccounts.bankName,
             accountLast4: bankAccounts.accountLast4,
             reconciledTo: bankAccounts.reconciledTo,
+            reconciliationToleranceMinor: bankAccounts.reconciliationToleranceMinor,
           })
           .from(bankAccounts)
           .where(
@@ -823,6 +1726,7 @@ export async function getBankAccounts(): Promise<
               bankName: a.bankName as string,
               accountLast4: (a.accountLast4 as string | null) ?? null,
               reconciledTo: a.reconciledTo === null ? null : String(a.reconciledTo),
+              reconciliationToleranceMinor: String(a.reconciliationToleranceMinor ?? 0),
             })),
             statements: statements.map((s: Record<string, unknown>) => ({
               id: s.id as string,
@@ -849,126 +1753,13 @@ export async function getBankAccounts(): Promise<
 type Tx = any;
 
 /**
- * ⚠️ CANDIDATES ARE DRAWN FROM A WINDOW AROUND THE STATEMENT PERIOD, not
- * from all history. A cheque written in December clears in January, so a
- * period-exact query misses precisely the items that make reconciliation
- * necessary in the first place.
+ * ⭐ `loadCandidates`, `ledgerBalanceAt` AND `shiftDays` MOVED TO
+ * `server/banking/reconciliation-service.ts` IN 0102, UNCHANGED.
+ *
+ * ⚠️ THE STATEMENT WORKSPACE AND THE RECONCILIATION STATEMENT HAVE TO
+ * DRAW THE SAME OUTSTANDING ITEMS FROM THE SAME 45-DAY WINDOW. Two
+ * copies of that constant is two answers to "what is outstanding", and
+ * the one on the signed artefact would be the one nobody noticed had
+ * drifted.
  */
-const CANDIDATE_WINDOW_DAYS = 45;
 
-async function loadCandidates(
-  tx: Tx,
-  tenantId: string,
-  periodFrom: string,
-  periodTo: string,
-): Promise<readonly LedgerCandidate[]> {
-  const from = shiftDays(periodFrom, -CANDIDATE_WINDOW_DAYS);
-  const to = shiftDays(periodTo, CANDIDATE_WINDOW_DAYS);
-
-  const receipts = await tx
-    .select({
-      id: customerReceipts.id,
-      occurredOn: customerReceipts.receivedOn,
-      amountMinor: customerReceipts.amountMinor,
-      reference: customerReceipts.bankRef,
-      instrument: customerReceipts.instrumentRef,
-      documentNo: customerReceipts.receiptNumber,
-    })
-    .from(customerReceipts)
-    .where(
-      and(
-        eq(customerReceipts.tenantId, tenantId),
-        gte(customerReceipts.receivedOn, from),
-        lte(customerReceipts.receivedOn, to),
-      ),
-    );
-
-  const payments = await tx
-    .select({
-      id: vendorPayments.id,
-      occurredOn: vendorPayments.paymentDate,
-      amountMinor: vendorPayments.netMinor,
-      reference: vendorPayments.bankReference,
-      documentNo: vendorPayments.paymentNumber,
-    })
-    .from(vendorPayments)
-    .where(
-      and(
-        eq(vendorPayments.tenantId, tenantId),
-        gte(vendorPayments.paymentDate, from),
-        lte(vendorPayments.paymentDate, to),
-      ),
-    );
-
-  const out: LedgerCandidate[] = [];
-
-  for (const r of receipts as Record<string, unknown>[]) {
-    out.push({
-      id: r.id as string,
-      kind: "customer_receipt",
-      occurredOn: String(r.occurredOn),
-      // ⭐ POSITIVE. Money in.
-      amountMinor: BigInt(r.amountMinor as string | bigint),
-      reference:
-        (r.reference as string | null) ?? (r.instrument as string | null) ?? null,
-      counterpartyName: null,
-      documentNo: (r.documentNo as string | null) ?? null,
-    });
-  }
-
-  for (const p of payments as Record<string, unknown>[]) {
-    out.push({
-      id: p.id as string,
-      kind: "vendor_payment",
-      occurredOn: String(p.occurredOn),
-      /**
-       * 🔴 NEGATED. Money out.
-       *
-       * ⚠️ THIS SINGLE MINUS SIGN IS THE EASIEST THING IN THE MODULE TO
-       * GET WRONG, and getting it wrong makes every payment fail to
-       * match while every one of them looks like it should.
-       */
-      amountMinor: -BigInt(p.amountMinor as string | bigint),
-      reference: (p.reference as string | null) ?? null,
-      counterpartyName: null,
-      documentNo: (p.documentNo as string | null) ?? null,
-    });
-  }
-
-  return out;
-}
-
-/**
- * ⚠️ THE LEDGER BALANCE ON A DATE, from the journal lines themselves
- * rather than from a cached figure. A reconciliation checked against a
- * stale cache reconciles against the wrong number and says so
- * confidently.
- */
-async function ledgerBalanceAt(
-  tx: Tx,
-  tenantId: string,
-  ledgerId: string,
-  onDate: string,
-): Promise<bigint> {
-  const rows = await tx.execute(sql`
-    SELECT COALESCE(SUM(
-             CASE WHEN je.entry_type = 'debit'
-                  THEN je.amount_minor ELSE -je.amount_minor END
-           ), 0)::bigint AS balance
-      FROM journal_entries je
-      JOIN transactions t ON t.id = je.transaction_id
-     WHERE je.tenant_id = ${tenantId}::uuid
-       AND je.ledger_id = ${ledgerId}::uuid
-       AND t.transaction_date <= ${onDate}::date
-       AND t.status = 'posted'
-  `);
-  const first =
-    (Array.isArray(rows) ? rows[0] : (rows as { rows?: unknown[] }).rows?.[0]) ?? {};
-  return BigInt((first as { balance?: string | number }).balance ?? 0);
-}
-
-function shiftDays(iso: string, days: number): string {
-  const [y, m, d] = iso.split("-").map(Number);
-  const t = Date.UTC(y ?? 1970, (m ?? 1) - 1, d ?? 1) + days * 86_400_000;
-  return new Date(t).toISOString().slice(0, 10);
-}

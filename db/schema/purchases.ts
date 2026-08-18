@@ -683,6 +683,67 @@ export const purchaseInvoices = pgTable(
       .notNull(),
     totalMinor: bigint("total_minor", { mode: "bigint" }).default(sql`0`).notNull(),
 
+    /* --- ⭐⭐⭐ FOREIGN CURRENCY — Batch 0101 (SQL 0101) ------------- */
+
+    /**
+     * ⭐ THE FUNCTIONAL-CURRENCY EQUIVALENT, AND IT IS WHAT POSTS.
+     *
+     * ══════════════════════════════════════════════════════════════════
+     * 🔴 PRESENTATION CURRENCY vs FUNCTIONAL CURRENCY
+     * ══════════════════════════════════════════════════════════════════
+     * `currency` above is what the CUSTOMER is billed in — the number on
+     * the document, the number they pay. `functional_currency` is what the
+     * BOOKS are kept in: `tenants.settings.currency`, read by
+     * `functionalCurrencyFromSettings()` in `lib/fx/currency.ts`.
+     *
+     * ⚠️ THE LEDGER GETS THE FUNCTIONAL FIGURE AND NOTHING ELSE. AS 11 ¶9
+     * records a foreign-currency transaction by applying the exchange rate
+     * at the date of the transaction to the foreign amount. Posting the
+     * foreign amount to an INR ledger would put dollars in a rupee trial
+     * balance, which foots and is meaningless.
+     *
+     * ⚠️ NULLABLE, AND NULL IS CORRECT FOR EVERY EXISTING ROW. An invoice
+     * already in the functional currency needs no translation and no rate,
+     * so `functional_total_minor IS NULL` means "the same as total_minor"
+     * — it does NOT mean "not yet computed". The CHECK in SQL 0101 makes
+     * the two agree: a row whose `currency` differs from
+     * `functional_currency` must carry a rate and a functional total.
+     */
+    functionalCurrency: varchar("functional_currency", { length: 3 }),
+    functionalTotalMinor: bigint("functional_total_minor", { mode: "bigint" }),
+
+    /**
+     * The rate applied at INITIAL RECOGNITION, frozen. `numeric(30,12)`,
+     * quoted as `currency` → `functional_currency`.
+     *
+     * 🔴 IT IS NEVER RECOMPUTED. An invoice dated 14 December is measured
+     * at 14 December's rate for as long as it exists; re-deriving it later
+     * from the rate table would silently restate a filed period the first
+     * time somebody corrected a rate.
+     */
+    fxRate: numeric("fx_rate", { precision: 30, scale: 12 }),
+    fxRateDate: date("fx_rate_date", { mode: "string" }),
+    /** 'rbi_reference' | 'provider' | 'manual' | 'derived_inverse'. */
+    fxRateSource: varchar("fx_rate_source", { length: 20 }),
+
+    /**
+     * ⭐⭐ WHAT THE OUTSTANDING BALANCE IS CURRENTLY CARRIED AT, in the
+     * functional currency. Moved by every reporting-date restatement.
+     *
+     * 🔴 THIS IS THE COLUMN THAT MAKES SETTLEMENT CORRECT. AS 11 ¶13
+     * measures the realised difference against the rate the item was LAST
+     * CARRIED AT, not against the original invoice. An invoice raised at
+     * 82, restated at 31 March to 83 and settled in May at 85 produces a
+     * gain of 1 in year one and 2 in year two. Measuring settlement
+     * against 82 books all 3 in year two and double-counts the 1 that
+     * year one's P&L already took.
+     *
+     * ⚠️ NULL until the first restatement, and `functional_total_minor` is
+     * the answer while it is null.
+     */
+    fxCarriedFunctionalMinor: bigint("fx_carried_functional_minor", { mode: "bigint" }),
+    fxLastRevaluedOn: date("fx_last_revalued_on", { mode: "string" }),
+
     /* --- ⭐ Reverse charge ---------------------------------------- */
 
     /**

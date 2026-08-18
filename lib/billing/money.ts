@@ -24,12 +24,41 @@
 /* PARSING & FORMATTING                                                */
 /* ------------------------------------------------------------------ */
 
-/** Currencies whose minor unit is not 1/100 of the major unit. */
-const ZERO_DECIMAL_CURRENCIES = new Set(["JPY", "KRW", "VND", "CLP", "ISK"]);
-
-export function minorUnitExponent(currency: string): number {
-  return ZERO_DECIMAL_CURRENCIES.has(currency.toUpperCase()) ? 0 : 2;
-}
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴🔴 BATCH 0101 — THIS FUNCTION WAS WRONG AND NOW DELEGATES
+ * ══════════════════════════════════════════════════════════════════════
+ * It used to read, in full:
+ *
+ *     const ZERO_DECIMAL_CURRENCIES = new Set(["JPY","KRW","VND","CLP","ISK"]);
+ *     return ZERO_DECIMAL_CURRENCIES.has(currency.toUpperCase()) ? 0 : 2;
+ *
+ * Right for the five it named. WRONG BY A FACTOR OF TEN for the Gulf:
+ * KWD, BHD, OMR, JOD, TND, LYD and IQD have THREE decimal places — one
+ * dinar is a thousand fils. `formatMoneyPlain(1234n, "KWD")` returned
+ * "12.34" for a value that is 1.234 dinars, and `parseMoney("1.234","KWD")`
+ * threw on a perfectly ordinary amount. Wrong again for CLF and UYW,
+ * which have four.
+ *
+ * ⚠️ AND IT DEFAULTED SILENTLY. An unrecognised code became two decimals
+ * with nothing said — the exact "declared and enforced by nothing"
+ * pattern, in the one place where being wrong is invisible because the
+ * number still looks like money.
+ *
+ * ⭐ THE TABLE NOW LIVES IN `lib/fx/currency.ts`, is complete for the
+ * active ISO-4217 codes, and REFUSES a code it does not know. This
+ * wrapper is kept because ~60 call sites import it from here; it adds
+ * nothing but the name.
+ *
+ * ⚠️ THE BEHAVIOUR CHANGE THAT MATTERS: an unknown code now THROWS
+ * `UnknownCurrencyError` instead of quietly returning 2. That is
+ * deliberate. Every currency Ordence stores comes from a `varchar(3)`
+ * column defaulting to 'INR', a Zod schema that upper-cases, or this
+ * catalogue, so a throw means genuinely bad data — and formatting bad
+ * data as though it were rupees is how it stays in the database.
+ */
+export { minorUnitExponent } from "@/lib/fx/currency";
+import { minorUnitExponent } from "@/lib/fx/currency";
 
 /**
  * Decimal string → minor units.

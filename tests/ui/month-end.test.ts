@@ -472,15 +472,43 @@ describe("nothing edits the bank's own evidence", () => {
     expect(action).not.toMatch(/\.delete\(bankStatementLines\)/);
   });
 
+  /**
+   * ⚠️ THIS TEST USED TO ASSERT `inserts.toHaveLength(1)` AND THAT WAS THE
+   * WRONG ASSERTION — v1.63.0 (0102).
+   *
+   * The invariant is "no row in `bank_line_matches` that a person did not
+   * cause", and a count of insert sites is a proxy for it that stops being
+   * true the moment a second legitimate person-initiated writer exists.
+   * 0102 added one: `postBankLineAdjustment` writes the match for a journal
+   * it has just posted, on a line the operator picked, in the same
+   * transaction — because a charge written up and left unmatched stays on
+   * the outstanding list and invites a second posting.
+   *
+   * ⭐ SO THE PROPERTY IS ASSERTED DIRECTLY: every insert names the person
+   * responsible, and no bulk or score-triggered path exists. That is
+   * stronger than the count was, and it does not fail a correct change.
+   */
   it("has no auto-confirm at any score", () => {
     const action = read("server/actions/banking.ts");
-    const inserts = action.match(/\.insert\(bankLineMatches\)/g) ?? [];
-    // ⚠️ Exactly one, and it is inside `confirmMatch`, which a person calls.
-    expect(inserts).toHaveLength(1);
+    const inserts = [...action.matchAll(/\.insert\(bankLineMatches\)/g)];
+    expect(inserts.length).toBeGreaterThan(0);
+
+    for (const m of inserts) {
+      // 🔴 EVERY MATCH RECORDS WHO DECIDED IT. A row written without a
+      // person on it is an auto-confirm however it got there.
+      expect(action.slice(m.index!, m.index! + 800)).toContain(
+        "confirmedBy: ctx.user.id",
+      );
+    }
+
     const confirmFn = action.slice(
       action.indexOf("export async function confirmMatch"),
       action.indexOf("export async function unmatch"),
     );
     expect(confirmFn).toContain(".insert(bankLineMatches)");
+
+    // ⚠️ And nothing anywhere matches in bulk or off a score threshold.
+    expect(action).not.toMatch(/autoConfirm|confirmAll|matchEverything/);
+    expect(action).not.toMatch(/score\s*>=?\s*\d+\s*\)\s*\{?\s*await tx\.insert/);
   });
 });

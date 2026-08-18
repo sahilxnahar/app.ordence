@@ -48,6 +48,14 @@ import {
 import { requirePermission, writeAudit } from "@/server/audit";
 import { guardSalesWrite, salesFail, toSalesActionError } from "@/server/sales/guards";
 import { serializeAmount } from "@/lib/billing/money";
+import {
+  QTY_SCALE,
+  formatQuantity as formatQuantityForClient,
+  mulDiv,
+  parseQuantity,
+  type ValuationWarningCode,
+} from "@/lib/inventory/valuation";
+import { costMovement, valuationFor } from "@/server/inventory/valuation-service";
 import type { ActionResult } from "@/lib/validators/crm";
 
 const FEATURE = "inventory.stock" as const;
@@ -296,9 +304,36 @@ const movementSchema = z.object({
   approvedBy: z.string().uuid().optional().nullable(),
 });
 
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * ⭐⭐⭐ WHERE `valuationMethod` FINALLY MEANS SOMETHING — Batch 86
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 UNTIL THIS, THE COLUMN WAS READ BY NOTHING. A customer picked FIFO,
+ * the form saved it, the settings page confirmed it, and every issue was
+ * valued at whatever unit cost happened to be typed on it — which is not
+ * FIFO, not weighted average, and not a basis anybody chose.
+ *
+ * ⭐ AN OUTWARD MOVEMENT IS NOW COSTED BY THE ENGINE, from the item's
+ * declared method and the whole movement history, BEFORE the row is
+ * written. The ledger is append-only, so the value cannot be patched in
+ * afterwards — it has to be decided first and inserted with the row.
+ *
+ * ⚠️ AN INWARD MOVEMENT IS COSTED FROM ITS DOCUMENT, not from the
+ * engine. The price of steel on the day the lorry arrived is a fact that
+ * arrives with the invoice. The engine's job on the way in is only to
+ * record it as a layer, which is why the value is stored rather than
+ * recomputed later.
+ */
 export async function postMovement(
   input: unknown,
-): Promise<ActionResult<{ id: string }>> {
+): Promise<
+  ActionResult<{
+    id: string;
+    valueMinor: string;
+    method: string | null;
+    warnings: { code: string; message: string }[];
+  }>
+> {
   try {
     const data = movementSchema.parse(input);
     const ctx = await guardSalesWrite({
@@ -311,17 +346,60 @@ export async function postMovement(
         data.reason === "adjustment" ? "adjust:stock" : undefined,
     });
 
-    const id = await withTenant(
+    /**
+     * ⚠️ THE ID IS MINTED HERE RATHER THAN BY THE DATABASE, because the
+     * engine has to be asked "what would THIS movement cost" before the
+     * row exists, and the answer has to be attributable to the row that
+     * results. A hypothetical with no identity cannot be matched back.
+     */
+    const movementId = crypto.randomUUID();
+    const signedQty = parseQuantity(data.quantity);
+
+    const posted = await withTenant(
       ctx.tenant.id,
       async (tx) => {
+        const costed =
+          signedQty < 0n
+            ? await costMovement(
+                tx,
+                {
+                  tenantId: ctx.tenant.id,
+                  stockItemId: data.stockItemId,
+                  warehouseId: data.warehouseId,
+                },
+                {
+                  id: movementId,
+                  movedAt: new Date(),
+                  quantity: signedQty,
+                  unitCostMinor: data.unitCostMinor ?? null,
+                  batchNo: data.batchNo ?? null,
+                  reason: data.reason,
+                },
+              )
+            : null;
+
+        /**
+         * ⭐ THE RECEIPT'S VALUE, DIVIDED ONCE AND LATE. `unitCost ×
+         * quantity` is paise × thousandths, so it is divided by 1000
+         * exactly once here; the sub-paise the division cannot hold is
+         * dropped knowingly rather than by rounding the rate first, which
+         * is the mistake that stops a stock ledger footing.
+         */
+        const inwardValue =
+          signedQty > 0n && data.unitCostMinor !== null && data.unitCostMinor !== undefined
+            ? mulDiv(BigInt(data.unitCostMinor), signedQty, QTY_SCALE).quotient
+            : 0n;
+
         const [row] = await tx
           .insert(stockMovements)
           .values({
+            id: movementId,
             tenantId: ctx.tenant.id,
             stockItemId: data.stockItemId,
             warehouseId: data.warehouseId,
             quantity: data.quantity,
             reason: data.reason as never,
+            valueMinor: costed ? costed.valueMinor : inwardValue,
             unitCostMinor: data.unitCostMinor ?? null,
             batchNo: data.batchNo ?? null,
             serialNo: data.serialNo ?? null,
@@ -334,9 +412,14 @@ export async function postMovement(
             createdBy: ctx.user.id,
             impersonationId: ctx.impersonationId,
           })
-          .returning({ id: stockMovements.id });
+          .returning({ id: stockMovements.id, valueMinor: stockMovements.valueMinor });
+        /**
+         * 🔴 AN EMPTY `returning()` IS A WRITE THAT DID NOT HAPPEN — most
+         * often RLS refusing a tenant that is not ours. Treating it as
+         * success would report a movement nobody can find.
+         */
         if (!row) throw new Error("The movement could not be posted.");
-        return row.id;
+        return { id: row.id, valueMinor: row.valueMinor, costed };
       },
       { impersonationId: ctx.impersonationId },
     );
@@ -344,14 +427,38 @@ export async function postMovement(
     await writeAudit(ctx, {
       action: "create",
       resourceType: "stock_movement",
-      resourceId: id,
-      newValue: { quantity: data.quantity, reason: data.reason },
+      resourceId: posted.id,
+      newValue: {
+        quantity: data.quantity,
+        reason: data.reason,
+        /**
+         * ⭐ THE METHOD AND THE RESULTING VALUE GO ON THE AUDIT RECORD.
+         * "What did this cost and on what basis" is the question asked
+         * three years later, and the answer must not depend on the item's
+         * method still being what it was that day.
+         */
+        valuationMethod: posted.costed?.method ?? null,
+        valueMinor: String(posted.valueMinor),
+      },
       reason: data.adjustmentNote ?? undefined,
       severity: data.reason === "adjustment" ? "warning" : "info",
     });
 
     revalidatePath("/inventory");
-    return { ok: true, data: { id } };
+    return {
+      ok: true,
+      data: {
+        id: posted.id,
+        valueMinor: String(posted.valueMinor),
+        method: posted.costed?.method ?? null,
+        /**
+         * ⚠️ WARNINGS ARE RETURNED, NOT SWALLOWED. Stock issued before
+         * its purchase invoice arrived is costed provisionally, and the
+         * person who posted it is the only one who can chase the invoice.
+         */
+        warnings: posted.costed?.warnings ?? [],
+      },
+    };
   } catch (err) {
     return toSalesActionError(err, "postMovement");
   }
@@ -846,5 +953,114 @@ export async function reconcileStockLedger(): Promise<
     return { ok: true, data: { checked: list.length, discrepancies } };
   } catch (err) {
     return toSalesActionError(err, "reconcileStockLedger");
+  }
+}
+
+/* ================================================================== */
+/* ⭐⭐ THE VALUATION WORKING — Batch 87                                */
+/* ================================================================== */
+
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 AN AUDITOR IS ENTITLED TO THE LAYERS, NOT JUST THE TOTAL
+ * ══════════════════════════════════════════════════════════════════════
+ * "Closing stock is ₹14,32,610" is not evidence of anything. The working
+ * — which receipt each remaining unit came from, at what cost, and which
+ * layers each issue consumed — is what makes the figure testable, and it
+ * is the first thing asked for when the method is FIFO.
+ *
+ * ⚠️ IT IS RECOMPUTED FROM THE LEDGER RATHER THAN READ FROM A STORE.
+ * A stored working can be edited; a replay of an append-only ledger
+ * cannot. Running this twice on the same movements must give the same
+ * answer, and that property is the whole reason it is derived.
+ *
+ * ⭐ `complete: false` MEANS DO NOT FILE THIS NUMBER. Something the
+ * engine needed was missing — usually a receipt entered before the
+ * engine existed, carrying no cost — and it refused to invent it. The
+ * warnings name the movements.
+ */
+export async function getStockValuation(input: unknown): Promise<
+  ActionResult<{
+    sku: string;
+    method: string;
+    complete: boolean;
+    closingQuantity: string;
+    closingValueMinor: string;
+    receiptsValueMinor: string;
+    issuesValueMinor: string;
+    subPaiseDiscardedMinor: string;
+    purchasePriceVarianceMinor: string;
+    negativeStockTrueUpMinor: string;
+    landedCostToCogsMinor: string;
+    landedCostToStockMinor: string;
+    layers: {
+      layerId: string;
+      receivedAt: string;
+      batchNo: string | null;
+      qtyRemaining: string;
+      valueRemainingMinor: string;
+      provisional: boolean;
+      landedCostMinor: string;
+    }[];
+    warnings: { code: ValuationWarningCode; movementId: string | null; message: string }[];
+  }>
+> {
+  try {
+    const data = z
+      .object({
+        stockItemId: z.string().uuid(),
+        warehouseId: z.string().uuid(),
+      })
+      .parse(input);
+
+    const ctx = await requirePermission("inventory.stock.read");
+
+    const { sku, run } = await withTenant(ctx.tenant.id, (tx) =>
+      valuationFor(tx, {
+        tenantId: ctx.tenant.id,
+        stockItemId: data.stockItemId,
+        warehouseId: data.warehouseId,
+      }),
+    );
+
+    /**
+     * ⚠️ EVERY FIGURE CROSSES THE BOUNDARY AS A STRING. `bigint` does not
+     * survive `JSON.stringify`, and a paise total that silently becomes a
+     * float on the way to a browser is the same class of defect this
+     * whole engine exists to prevent.
+     */
+    return {
+      ok: true,
+      data: {
+        sku,
+        method: run.method,
+        complete: run.complete,
+        closingQuantity: formatQuantityForClient(run.closingQuantity),
+        closingValueMinor: String(run.closingValueMinor),
+        receiptsValueMinor: String(run.receiptsValueMinor),
+        issuesValueMinor: String(run.issuesValueMinor),
+        subPaiseDiscardedMinor: String(run.subPaiseDiscardedMinor),
+        purchasePriceVarianceMinor: String(run.purchasePriceVarianceMinor),
+        negativeStockTrueUpMinor: String(run.negativeStockTrueUpMinor),
+        landedCostToCogsMinor: String(run.landedCostToCogsMinor),
+        landedCostToStockMinor: String(run.landedCostToStockMinor),
+        layers: run.layers.map((l) => ({
+          layerId: l.layerId,
+          receivedAt: l.receivedAt,
+          batchNo: l.batchNo,
+          qtyRemaining: formatQuantityForClient(l.qtyRemaining),
+          valueRemainingMinor: String(l.valueRemaining),
+          provisional: l.provisional,
+          landedCostMinor: String(l.landedCostMinor),
+        })),
+        warnings: run.warnings.map((w) => ({
+          code: w.code,
+          movementId: w.movementId,
+          message: w.message,
+        })),
+      },
+    };
+  } catch (err) {
+    return toSalesActionError(err, "getStockValuation");
   }
 }

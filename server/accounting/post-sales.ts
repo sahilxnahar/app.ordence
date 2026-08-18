@@ -60,6 +60,8 @@ import {
   buildInvoicePosting,
   buildCreditNotePosting,
   buildReceiptPosting,
+  buildBankAdjustmentPosting,
+  type BankAdjustmentKind,
   rolesUsed,
   type PostingLeg,
   type PostingRole,
@@ -74,7 +76,16 @@ import {
   type ReturnLeg,
   type ReturnPostingFacts,
   type ReturnPostingRole,
+  buildDepreciationPosting,
+  buildDisposalPosting,
+  fixedAssetRolesUsed,
+  type FixedAssetLeg,
+  type FixedAssetPostingRole,
+  fxRolesUsed,
+  type FxLeg,
+  type FxPostingRole,
 } from "@/lib/accounting/sales-posting";
+import { formatMinorPlain } from "@/lib/fx/currency";
 
 type Tx = Parameters<Parameters<typeof withTenant>[1]>[0];
 
@@ -138,7 +149,51 @@ export type SalesKeyKind =
     | "brokerage"
     | "partner_payment"
   /** ⭐ v1.28.0-alpha — a finalised meter billing period. */
-  | "meter_period";
+  | "meter_period"
+  /**
+   * ⭐ v1.64.0-alpha (0102) — a bank charge or a credit of interest
+   * discovered on a bank statement and written up from there.
+   *
+   * ⚠️ KEYED ON THE STATEMENT LINE, NOT ON THE RECONCILIATION. The line
+   * is the thing that can only be posted once; a reconciliation covers
+   * many lines and could be signed, reopened and re-signed, and a key
+   * per reconciliation would let the same charge post twice.
+   */
+  | "bank_adjustment"
+  /**
+   * ⭐ v1.53.0-alpha (0100) — the Companies Act, Schedule II depreciation
+   * run.
+   *
+   * ⚠️ ONE KEY PER RUN, NOT PER ASSET. The journal is one balanced entry
+   * for the whole period's charge; four hundred assets producing four
+   * hundred transactions a month would make the trial balance unreadable
+   * and would say nothing `depreciation_lines` does not already hold.
+   *
+   * 🔴 AND THERE IS DELIBERATELY NO INCOME-TAX EQUIVALENT. The section 32
+   * allowance is a computation for the return, not an accounting entry.
+   */
+  | "depreciation"
+  /** ⭐ v1.53.0-alpha (0100) — a fixed asset leaving the gross block. */
+  | "asset_disposal"
+  /**
+   * ⭐⭐ v1.64.0-alpha (0101) — the reporting-date restatement of foreign
+   * currency monetary items, AS 11 ¶11 / Ind AS 21 ¶23.
+   *
+   * ⚠️ ONE KEY PER RUN AND KEYED ON THE RUN, NOT ON THE DATE. A 31 March
+   * revaluation that is voided and redone is a SECOND run with a second
+   * uuid, and it must be able to post; keying on the reporting date would
+   * make the correction look already-posted and silently do nothing.
+   */
+  | "fx_revaluation"
+  /**
+   * ⭐⭐ v1.64.0-alpha (0101) — the realised exchange difference when a
+   * foreign-currency invoice is settled, AS 11 ¶13 / Ind AS 21 ¶28.
+   *
+   * ⚠️ KEYED ON THE SETTLEMENT, NOT THE INVOICE. An invoice paid in three
+   * instalments produces three realised differences at three rates, and
+   * one key per invoice would post the first and swallow the other two.
+   */
+  | "fx_settlement";
 
 export function salesTransactionKey(kind: SalesKeyKind, documentId: string): string {
   const tag = SALES_KEY_TAGS[kind];
@@ -192,6 +247,13 @@ const SALES_KEY_TAGS: Record<SalesKeyKind, string> = {
   brokerage: "BRK",
   partner_payment: "PPY",
   meter_period: "MTR",
+  bank_adjustment: "BADJ",
+  depreciation: "DEP",
+  asset_disposal: "ADS",
+  /** ⭐ 0101. "FXR" — the unrealised restatement at a reporting date. */
+  fx_revaluation: "FXR",
+  /** ⭐ 0101. "FXS" — the realised difference when the money actually moved. */
+  fx_settlement: "FXS",
 };
 
 /**
@@ -303,6 +365,24 @@ async function writePosting(
     referenceId: string;
     counterpartyId: string | null;
     counterpartyName: string | null;
+    /**
+     * ⭐⭐ A ROLE PINNED TO ONE LEDGER FOR THIS POSTING ONLY — added in
+     * v1.63.0 for the bank reconciliation, and used by nothing else.
+     *
+     * 🔴 `sales_posting_accounts` IS ONE MAP PER TENANT, so the `bank`
+     * role names a single ledger. A tenant with three bank accounts
+     * reconciles three ledgers, and posting an HDFC charge through the
+     * tenant-wide `bank` role would credit whichever account happens to
+     * be mapped — leaving the account the charge came from short and
+     * permanently unreconcilable, and the other one long.
+     *
+     * ⚠️ AN OVERRIDDEN ROLE IS NOT "MISSING". It is checked against the
+     * override map first, so a tenant who has never mapped `bank` can
+     * still post a bank charge against an account whose own ledger is
+     * known — which is the common case, because `createBankAccount`
+     * creates that ledger and the mapping screen is elsewhere.
+     */
+    ledgerOverrides?: Partial<Record<PostingRole, string>>;
   },
 ): Promise<PostOutcome> {
   const [existing] = await tx
@@ -337,7 +417,11 @@ async function writePosting(
   }
 
   const roleMap = await loadRoleMap(tx, args.tenantId);
-  const missing = rolesUsed(args.legs).filter((r) => !roleMap.has(r));
+  const overrides = args.ledgerOverrides ?? {};
+  const ledgerFor = (role: PostingRole): string | undefined =>
+    overrides[role] ?? roleMap.get(role);
+
+  const missing = rolesUsed(args.legs).filter((r) => ledgerFor(r) === undefined);
   if (missing.length > 0) return { posted: false, reason: "unmapped_roles", missing };
 
   /**
@@ -373,7 +457,7 @@ async function writePosting(
     args.legs.map((l) => ({
       tenantId: args.tenantId,
       transactionId: txn.id,
-      ledgerId: roleMap.get(l.role) as string,
+      ledgerId: ledgerFor(l.role) as string,
       entryType: l.entryType,
       /**
        * ⚠️ `numeric(18,2)` FROM `bigint` PAISE BY STRING, never by
@@ -1583,6 +1667,81 @@ export async function postStockCount(
 }
 
 /* ================================================================== */
+/* ⭐⭐ THE BANK RECONCILIATION ADJUSTMENT — v1.64.0-alpha (0102)       */
+/* ================================================================== */
+
+/**
+ * ⭐⭐⭐ THE CHARGE IS DISCOVERED ON THE RECONCILIATION SCREEN, SO IT IS
+ *    POSTED FROM THE RECONCILIATION SCREEN.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 WHAT HAPPENED BEFORE THIS EXISTED
+ * ══════════════════════════════════════════════════════════════════════
+ * `lib/banking/match.ts` has said since v1.18.0 that "bank charges,
+ * interest and direct debits usually live in this list" and that
+ * "somebody has to write it up". Nothing in the banking module could
+ * write anything up. The operator was shown a list of entries the books
+ * were missing and given no way to add them, so the list stayed the same
+ * length every month and the account never reconciled.
+ *
+ * ⚠️ THE DATE IS THE BANK'S VALUE DATE, NEVER TODAY. A charge taken on
+ * 31 March belongs in March. Posting it on the day it was noticed moves
+ * it into April, understates March's costs, and — because the March
+ * reconciliation is what discovered it — leaves March permanently out by
+ * the charge. That is also why the period lock in `writePosting` can
+ * refuse this: a charge found in a month already closed is a real
+ * problem with a real remedy, not something to date around.
+ *
+ * ⭐ AND IT GOES THROUGH `writePosting` LIKE EVERYTHING ELSE. Same
+ * idempotency key check, same closed-period refusal, same role map, same
+ * balanced legs. A second posting path for the banking module would be a
+ * second place for the period lock to be forgotten.
+ */
+export async function postBankAdjustment(
+  tx: Tx,
+  args: {
+    tenantId: string;
+    userId: string;
+    /** 🔴 The idempotency subject: one posting per statement line, ever. */
+    statementLineId: string;
+    kind: BankAdjustmentKind;
+    /** Positive magnitude in paise. */
+    amountMinor: bigint;
+    /** ⚠️ The BANK's value date. See above. */
+    valueDate: string;
+    narration: string;
+    /**
+     * ⭐ THE BANK ACCOUNT'S OWN LEDGER, resolved by the caller from
+     * `bank_accounts.ledger_id`. See `ledgerOverrides` on `writePosting`.
+     */
+    bankLedgerId: string;
+  },
+): Promise<PostOutcome> {
+  const legs = buildBankAdjustmentPosting({
+    kind: args.kind,
+    amountMinor: args.amountMinor,
+    narration: args.narration,
+  });
+
+  return writePosting(tx, {
+    tenantId: args.tenantId,
+    userId: args.userId,
+    legs,
+    key: salesTransactionKey("bank_adjustment", args.statementLineId),
+    description:
+      args.kind === "bank_charge"
+        ? `Bank charge: ${args.narration.slice(0, 160)}`
+        : `Interest credited: ${args.narration.slice(0, 160)}`,
+    transactionDate: args.valueDate,
+    referenceType: "adjustment",
+    referenceId: args.statementLineId,
+    counterpartyId: null,
+    counterpartyName: null,
+    ledgerOverrides: { bank: args.bankLedgerId },
+  });
+}
+
+/* ================================================================== */
 /* ⭐⭐⭐ PAYROLL — Batch 15, v1.23.0-alpha                             */
 /* ================================================================== */
 
@@ -1710,6 +1869,8 @@ export async function postPayrollRun(
 }
 
 export type { PayrollPostingFacts, PayrollPostingRole };
+/** ⭐ Re-exported so the banking action can name the kind without reaching into lib. */
+export type { BankAdjustmentKind };
 
 /* ================================================================== */
 /* ⭐⭐⭐ THE MONTHLY RETURN SET-OFF — Batch 16, v1.24.0-alpha          */
@@ -1844,4 +2005,439 @@ async function closedPeriodFor(
   const first =
     (Array.isArray(rows) ? rows[0] : (rows as { rows?: unknown[] }).rows?.[0]) ?? null;
   return first ? String((first as { name?: string }).name ?? "that period") : null;
+}
+
+/* ================================================================== */
+/* ⭐⭐⭐ DEPRECIATION AND DISPOSAL — Batch 100, v1.53.0-alpha (0100)   */
+/* ================================================================== */
+
+/**
+ * ⚠️ THE SAME MAP TABLE AGAIN. `sales_posting_accounts` is keyed by an
+ * opaque `role` varchar precisely so a new family of roles is rows rather
+ * than a second table with a second RLS policy to keep in step.
+ */
+async function loadFixedAssetRoleMap(
+  tx: Tx,
+  tenantId: string,
+): Promise<Map<FixedAssetPostingRole, string>> {
+  const rows = await tx
+    .select({ role: salesPostingAccounts.role, ledgerId: salesPostingAccounts.ledgerId })
+    .from(salesPostingAccounts)
+    .where(eq(salesPostingAccounts.tenantId, tenantId));
+  return new Map(rows.map((r) => [r.role as FixedAssetPostingRole, r.ledgerId]));
+}
+
+/**
+ * The shared tail of both fixed-asset postings: idempotency by key, the
+ * period lock, the role map, then one balanced transaction.
+ *
+ * ⚠️ IT IS A LOCAL COPY OF `writePosting`'s BODY RATHER THAN A CALL TO
+ * IT, for the same reason `postPayrollRun` has one: `writePosting` is
+ * typed to `PostingLeg`/`PostingRole`, and widening that union to every
+ * role family in the product would remove the compiler's ability to tell
+ * a payroll leg from a sales leg — which is the only thing stopping a
+ * brokerage entry being posted to an ESI account.
+ */
+async function writeFixedAssetPosting(
+  tx: Tx,
+  args: {
+    tenantId: string;
+    userId: string;
+    legs: readonly FixedAssetLeg[];
+    key: string;
+    description: string;
+    transactionDate: string;
+    referenceId: string;
+  },
+): Promise<PostOutcome> {
+  const [existing] = await tx
+    .select({ id: transactions.id })
+    .from(transactions)
+    .where(
+      and(
+        eq(transactions.tenantId, args.tenantId),
+        eq(transactions.transactionNumber, args.key),
+      ),
+    )
+    .limit(1);
+  if (existing) return { posted: false, reason: "already_posted" };
+
+  /**
+   * 🔴 THE PERIOD LOCK. Depreciation for a closed month must not be
+   * recomputable, and this is the last of three places that says so: the
+   * service refuses to compute into a closed period, `depreciation_runs`
+   * has a unique index per basis and period, and this refuses the
+   * posting. 0073's trigger is what makes it true for the import and the
+   * support fix that have not been written yet.
+   */
+  const lockedIn = await closedPeriodFor(tx, args.tenantId, args.transactionDate);
+  if (lockedIn) return { posted: false, reason: "period_closed", period: lockedIn };
+
+  const roleMap = await loadFixedAssetRoleMap(tx, args.tenantId);
+  const missing = fixedAssetRolesUsed(args.legs).filter((r) => !roleMap.has(r));
+  if (missing.length > 0) {
+    // 🔴 THE WHOLE POSTING IS REFUSED, NEVER A PARTIAL ONE. A disposal
+    // journal missing its accumulated depreciation leg does not balance,
+    // and a half-posted disposal looks done.
+    return {
+      posted: false,
+      reason: "unmapped_roles",
+      missing: missing as unknown as PostingRole[],
+    };
+  }
+
+  const debitTotal = args.legs
+    .filter((l) => l.entryType === "debit")
+    .reduce((sum, l) => sum + l.amountMinor, 0n);
+
+  const [txn] = await tx
+    .insert(transactions)
+    .values({
+      tenantId: args.tenantId,
+      transactionNumber: args.key,
+      description: args.description,
+      transactionDate: args.transactionDate,
+      status: "posted",
+      // ⚠️ `adjustment`, reusing the existing enum. Depreciation is not a
+      // sale, a purchase or a receipt, and `classifyVoucherType()` already
+      // maps an adjustment with no debtor leg to a Tally JOURNAL — which
+      // is exactly what this is.
+      referenceType: "adjustment",
+      referenceId: args.referenceId,
+      currency: "INR",
+      totalAmount: formatMoneyPlain(debitTotal, "INR"),
+      createdBy: args.userId,
+      postedAt: new Date(),
+    })
+    .returning({ id: transactions.id });
+
+  if (!txn) throw new Error("The fixed asset journal could not be created.");
+
+  await tx.insert(journalEntries).values(
+    args.legs.map((l) => ({
+      tenantId: args.tenantId,
+      transactionId: txn.id,
+      ledgerId: roleMap.get(l.role) as string,
+      entryType: l.entryType,
+      amount: formatMoneyPlain(l.amountMinor, "INR"),
+      description: l.description,
+      referenceType: "adjustment" as const,
+      referenceId: args.referenceId,
+      // ⚠️ NO COUNTERPARTY ON A DEPRECIATION RUN. Depreciation is an
+      // internal allocation; there is nobody on the other side of it.
+      counterpartyType: null,
+      counterpartyId: null,
+      counterpartyName: null,
+    })),
+  );
+
+  return { posted: true, transactionId: txn.id };
+}
+
+/**
+ * ⭐⭐⭐ THE PERIOD'S DEPRECIATION REACHES THE LEDGER.
+ *
+ * ⚠️ DATED THE LAST DAY OF THE PERIOD, NEVER TODAY. March depreciation
+ * computed on 12 April belongs in March, which is both correct and the
+ * thing that makes the period lock mean something.
+ *
+ * 🔴 THIS FUNCTION REFUSES AN INCOME-TAX RUN AND THAT IS THE POINT OF
+ * THE `basis` ARGUMENT. The caller has one in hand; making it pass the
+ * basis in means the refusal happens here, at the ledger boundary, rather
+ * than relying on every caller to have remembered.
+ */
+export async function postDepreciationRun(
+  tx: Tx,
+  args: {
+    tenantId: string;
+    userId: string;
+    runId: string;
+    basis: string;
+    /** ⚠️ The last day of the period. Not the day the run was computed. */
+    periodEnd: string;
+    periodLabel: string;
+    totalChargeMinor: bigint;
+    assetCount: number;
+  },
+): Promise<PostOutcome> {
+  if (args.basis !== "companies_act") {
+    throw new Error(
+      "Only the Companies Act, Schedule II charge is posted to the ledger. The section 32 " +
+        "allowance is a computation for the income-tax return — posting it would put the " +
+        "Income-tax Act's figure into a Companies Act balance sheet and overstate accumulated " +
+        "depreciation by the whole timing difference.",
+    );
+  }
+  if (args.totalChargeMinor <= 0n) {
+    // ⚠️ A run that charged nothing is a SUCCESSFUL run with nothing to
+    // post — a month in which every asset was already at its residual
+    // value. Reporting it as already posted would be untrue.
+    return { posted: false, reason: "nothing_to_post" };
+  }
+
+  return writeFixedAssetPosting(tx, {
+    tenantId: args.tenantId,
+    userId: args.userId,
+    legs: buildDepreciationPosting({
+      totalChargeMinor: args.totalChargeMinor,
+      periodLabel: args.periodLabel,
+      assetCount: args.assetCount,
+    }),
+    key: salesTransactionKey("depreciation", args.runId),
+    description: `Depreciation — ${args.periodLabel}`,
+    transactionDate: args.periodEnd,
+    referenceId: args.runId,
+  });
+}
+
+/**
+ * ⭐⭐ A FIXED ASSET LEAVES THE GROSS BLOCK.
+ *
+ * ⚠️ DEPRECIATION UP TO THE DATE OF DISPOSAL MUST ALREADY HAVE BEEN
+ * POSTED — `disposeFixedAsset` in `server/actions/fixed-assets.ts` checks
+ * that and refuses otherwise. Posting a disposal against a stale
+ * accumulated figure moves the missing months of depreciation into the
+ * profit or loss on sale, which is a different line of the P&L and a
+ * different disclosure.
+ */
+export async function postAssetDisposal(
+  tx: Tx,
+  args: {
+    tenantId: string;
+    userId: string;
+    assetId: string;
+    assetNo: string;
+    disposedOn: string;
+    costMinor: bigint;
+    accumulatedMinor: bigint;
+    considerationMinor: bigint;
+  },
+): Promise<PostOutcome> {
+  return writeFixedAssetPosting(tx, {
+    tenantId: args.tenantId,
+    userId: args.userId,
+    legs: buildDisposalPosting({
+      assetNo: args.assetNo,
+      costMinor: args.costMinor,
+      accumulatedMinor: args.accumulatedMinor,
+      considerationMinor: args.considerationMinor,
+      disposedOn: args.disposedOn,
+    }),
+    key: salesTransactionKey("asset_disposal", args.assetId),
+    description: `Disposal of fixed asset ${args.assetNo}`,
+    transactionDate: args.disposedOn,
+    referenceId: args.assetId,
+  });
+}
+
+/* ================================================================== */
+/* ⭐⭐⭐ EXCHANGE DIFFERENCES REACH THE LEDGER — Batch 0101            */
+/* ================================================================== */
+
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 THIS IS THE FUNCTION THAT MAKES THE `currency` COLUMNS REAL
+ * ══════════════════════════════════════════════════════════════════════
+ * Every other writer in this file hardcodes `currency: "INR"` on the
+ * transaction and formats every leg with `formatMoneyPlain(x, "INR")`.
+ * That was harmless while nothing could produce a non-INR figure and it
+ * is not harmless now: a revaluation of a dollar receivable produces a
+ * number in the tenant's FUNCTIONAL currency, whatever that is, and
+ * stamping "INR" on it would label a figure with a currency it is not in.
+ *
+ * ⭐ SO THIS WRITER TAKES THE FUNCTIONAL CURRENCY AND USES IT IN BOTH
+ * PLACES — the transaction's `currency` column and the per-leg
+ * `formatMinorPlain`, which reads the exponent PER CURRENCY. A functional
+ * currency of JPY produces "1234", not "12.34", and the ledger foots.
+ *
+ * ⚠️ STATED GAP, AND IT IS THE HONEST HALF OF THE SAME SENTENCE. The
+ * OTHER writers in this file are still INR-only. Converting each of them
+ * is a much larger change — every sales, purchase, payroll and property
+ * posting path, plus the `numeric(18,2)` scale on `journal_entries.amount`
+ * which cannot represent a three-decimal dinar at all. See the batch
+ * report; it is listed, not hidden.
+ */
+
+async function loadFxRoleMap(
+  tx: Tx,
+  tenantId: string,
+): Promise<Map<FxPostingRole, string>> {
+  const rows = await tx
+    .select({ role: salesPostingAccounts.role, ledgerId: salesPostingAccounts.ledgerId })
+    .from(salesPostingAccounts)
+    .where(eq(salesPostingAccounts.tenantId, tenantId));
+  return new Map(rows.map((r) => [r.role as FxPostingRole, r.ledgerId]));
+}
+
+/**
+ * The shared tail for both exchange-difference postings.
+ *
+ * ⚠️ A LOCAL COPY OF `writePosting`'s BODY, for the reason
+ * `writeFixedAssetPosting` gives: widening `PostingLeg` to cover every
+ * role family would remove the compiler's ability to tell an FX leg from
+ * a payroll one.
+ *
+ * ⭐ AND IT HONOURS `ledgerIdOverride`. The contra side of a restatement
+ * is the item's OWN control ledger — the debtors account the invoice sits
+ * in, the bank account the balance sits in — resolved by the caller. The
+ * role map is the fallback, and a leg with an override needs no role
+ * mapped at all, which is why `fxRolesUsed` filters them out.
+ */
+async function writeFxPosting(
+  tx: Tx,
+  args: {
+    tenantId: string;
+    userId: string;
+    legs: readonly FxLeg[];
+    key: string;
+    description: string;
+    transactionDate: string;
+    referenceId: string;
+    /** 🔴 The books' own currency. Never assumed to be INR. */
+    functionalCurrency: string;
+  },
+): Promise<PostOutcome> {
+  if (args.legs.length === 0) return { posted: false, reason: "nothing_to_post" };
+
+  const [existing] = await tx
+    .select({ id: transactions.id })
+    .from(transactions)
+    .where(
+      and(
+        eq(transactions.tenantId, args.tenantId),
+        eq(transactions.transactionNumber, args.key),
+      ),
+    )
+    .limit(1);
+  if (existing) return { posted: false, reason: "already_posted" };
+
+  /**
+   * 🔴 THE PERIOD LOCK. A revaluation is dated the reporting date, which
+   * is precisely the date a close is about to lock. Restating a closed
+   * March in July would move a figure the customer has already filed
+   * against.
+   */
+  const lockedIn = await closedPeriodFor(tx, args.tenantId, args.transactionDate);
+  if (lockedIn) return { posted: false, reason: "period_closed", period: lockedIn };
+
+  const roleMap = await loadFxRoleMap(tx, args.tenantId);
+  const missing = fxRolesUsed(args.legs).filter((r) => !roleMap.has(r));
+  if (missing.length > 0) {
+    // 🔴 THE WHOLE JOURNAL IS REFUSED. Posting the gains and skipping the
+    // losses because only one ledger was mapped would not balance, and a
+    // half-posted revaluation looks finished.
+    return {
+      posted: false,
+      reason: "unmapped_roles",
+      missing: missing as unknown as PostingRole[],
+    };
+  }
+
+  const debitTotal = args.legs
+    .filter((l) => l.entryType === "debit")
+    .reduce((sum, l) => sum + l.amountMinor, 0n);
+
+  const [txn] = await tx
+    .insert(transactions)
+    .values({
+      tenantId: args.tenantId,
+      transactionNumber: args.key,
+      description: args.description,
+      transactionDate: args.transactionDate,
+      status: "posted",
+      referenceType: "adjustment",
+      referenceId: args.referenceId,
+      // ⭐ THE READ THAT MATTERS. Not "INR".
+      currency: args.functionalCurrency,
+      totalAmount: formatMinorPlain(debitTotal, args.functionalCurrency),
+      createdBy: args.userId,
+      postedAt: new Date(),
+    })
+    .returning({ id: transactions.id });
+
+  if (!txn) throw new Error("The exchange-difference journal could not be created.");
+
+  await tx.insert(journalEntries).values(
+    args.legs.map((l) => ({
+      tenantId: args.tenantId,
+      transactionId: txn.id,
+      ledgerId: (l.ledgerIdOverride ?? roleMap.get(l.role)) as string,
+      entryType: l.entryType,
+      // ⭐ AND AGAIN HERE. The exponent comes from the currency.
+      amount: formatMinorPlain(l.amountMinor, args.functionalCurrency),
+      description: l.description,
+      referenceType: "adjustment" as const,
+      referenceId: args.referenceId,
+      // ⚠️ NO COUNTERPARTY. A restatement is a measurement, not a dealing
+      // with anybody; the counterparty is on the invoice being restated.
+      counterpartyType: null,
+      counterpartyId: null,
+      counterpartyName: null,
+    })),
+  );
+
+  return { posted: true, transactionId: txn.id };
+}
+
+/**
+ * ⭐⭐⭐ THE REPORTING-DATE RESTATEMENT REACHES THE LEDGER.
+ *
+ * ⚠️ DATED THE REPORTING DATE, NEVER TODAY. A 31 March restatement
+ * computed on 20 May belongs in March — that is the whole point of a
+ * closing rate — and dating it today would put the exchange difference in
+ * the wrong financial year, which is the one date error that changes a
+ * tax computation.
+ */
+export async function postFxRevaluation(
+  tx: Tx,
+  args: {
+    tenantId: string;
+    userId: string;
+    revaluationId: string;
+    asOfDate: string;
+    functionalCurrency: string;
+    legs: readonly FxLeg[];
+  },
+): Promise<PostOutcome> {
+  return writeFxPosting(tx, {
+    tenantId: args.tenantId,
+    userId: args.userId,
+    legs: args.legs,
+    key: salesTransactionKey("fx_revaluation", args.revaluationId),
+    description: `Exchange differences on restatement at ${args.asOfDate}`,
+    transactionDate: args.asOfDate,
+    referenceId: args.revaluationId,
+    functionalCurrency: args.functionalCurrency,
+  });
+}
+
+/**
+ * ⭐ THE REALISED DIFFERENCE ON A SETTLEMENT REACHES THE LEDGER.
+ *
+ * ⚠️ DATED THE SETTLEMENT DATE. The gain crystallised when the money
+ * moved, not when somebody got round to entering it.
+ */
+export async function postFxSettlement(
+  tx: Tx,
+  args: {
+    tenantId: string;
+    userId: string;
+    /** The receipt or payment whose settlement produced the difference. */
+    settlementId: string;
+    settlementDate: string;
+    documentReference: string;
+    functionalCurrency: string;
+    legs: readonly FxLeg[];
+  },
+): Promise<PostOutcome> {
+  return writeFxPosting(tx, {
+    tenantId: args.tenantId,
+    userId: args.userId,
+    legs: args.legs,
+    key: salesTransactionKey("fx_settlement", args.settlementId),
+    description: `Realised exchange difference — ${args.documentReference}`,
+    transactionDate: args.settlementDate,
+    referenceId: args.settlementId,
+    functionalCurrency: args.functionalCurrency,
+  });
 }

@@ -332,6 +332,7 @@ export async function closeReadiness(
     blockers.push(...(await bookingCancellationBlockers(tx, tenantId, period)));
     blockers.push(...(await brokerageBlockers(tx, tenantId, period)));
     blockers.push(...(await payrollBlockers(tx, tenantId, period)));
+    blockers.push(...(await depreciationBlockers(tx, tenantId, period)));
     blockers.push(...(await advisories(tx, tenantId, period)));
 
     return blockers;
@@ -461,6 +462,123 @@ async function payrollBlockers(
       oldest: row.oldest,
     },
   ];
+}
+
+/* ------------------------------------------------------------------ */
+/* ⭐⭐ DEPRECIATION — Batch 100, v1.53.0-alpha                          */
+/* ------------------------------------------------------------------ */
+
+/**
+ * ⭐ TWO QUESTIONS, AND THEY HAVE DIFFERENT SEVERITIES ON PURPOSE.
+ *
+ * ① A DEPRECIATION RUN COMPUTED FOR THIS PERIOD AND NEVER POSTED IS
+ *    BLOCKING. Somebody produced the figure, looked at it and stopped.
+ *    Sealing the month makes it unpostable where it belongs, which is the
+ *    exact stranding this whole screen exists to prevent.
+ *
+ * ② A PERIOD WITH ASSETS IN USE AND NO RUN AT ALL IS ADVISORY, AND THIS
+ *    IS A DELIBERATE JUDGEMENT RATHER THAN A SOFTER VERSION OF THE SAME
+ *    THING. Plenty of Indian companies charge depreciation once a year at
+ *    31 March and close eleven months without it, which is a presentation
+ *    choice rather than an error. Blocking every one of those closes
+ *    would turn this check into a click — and, as `close-checklist.ts`
+ *    says at the top, an override that becomes routine is worse than no
+ *    check, because it converts a refusal into a habit and leaves a
+ *    record saying somebody considered it.
+ *
+ * ⚠️ THE ADVISORY IS SUPPRESSED WHERE THE REGISTER IS EMPTY. A workspace
+ * that has capitalised nothing is not missing a depreciation charge, and
+ * a permanent advisory nobody can clear teaches people to ignore the
+ * list.
+ */
+async function depreciationBlockers(
+  tx: Tx,
+  tenantId: string,
+  period: Period,
+): Promise<CloseBlocker[]> {
+  const out: CloseBlocker[] = [];
+
+  const unposted = await tx.execute(sql`
+    SELECT count(*)::int                 AS count,
+           MIN(period_end)::text         AS oldest,
+           COALESCE(SUM(total_charge_minor), 0)::text AS total
+      FROM depreciation_runs
+     WHERE tenant_id = ${tenantId}::uuid
+       AND basis = 'companies_act'
+       AND status = 'computed'
+       AND period_end >= ${period.startDate}::date
+       AND period_end <= ${period.endDate}::date
+  `);
+  const unpostedRows = (Array.isArray(unposted)
+    ? unposted
+    : ((unposted as { rows?: unknown[] }).rows ?? [])) as Array<{
+    count?: number;
+    oldest?: string | null;
+    total?: string | null;
+  }>;
+  const u = unpostedRows[0];
+
+  if (u && Number(u.count ?? 0) > 0) {
+    out.push({
+      key: "depreciation_unposted",
+      source: "depreciation run",
+      severity: "blocking",
+      count: Number(u.count),
+      headline: `Depreciation for this period has been computed and not posted`,
+      consequence:
+        "The charge exists as a working and not as an entry, so this period's profit is overstated " +
+        "by the whole of it and the fixed asset register no longer agrees with the balance sheet. " +
+        "Sealing the month makes the run unpostable where it belongs — the period lock will refuse it.",
+      where: "/fixed-assets",
+      amountMinor: u.total ? BigInt(u.total) : null,
+      oldest: u.oldest ? String(u.oldest).slice(0, 10) : null,
+    });
+    return out;
+  }
+
+  /**
+   * ⚠️ "IN USE DURING THE PERIOD" IS THE TEST, not "exists". An asset
+   * bought after the period end is not missing a charge.
+   */
+  const none = await tx.execute(sql`
+    SELECT count(*)::int AS count
+      FROM fixed_assets
+     WHERE tenant_id = ${tenantId}::uuid
+       AND put_to_use_on <= ${period.endDate}::date
+       AND (disposed_on IS NULL OR disposed_on >= ${period.startDate}::date)
+       AND NOT EXISTS (
+         SELECT 1 FROM depreciation_runs r
+          WHERE r.tenant_id = fixed_assets.tenant_id
+            AND r.basis = 'companies_act'
+            AND r.status = 'posted'
+            AND r.period_start <= ${period.endDate}::date
+            AND r.period_end   >= ${period.startDate}::date
+       )
+  `);
+  const noneRows = (Array.isArray(none)
+    ? none
+    : ((none as { rows?: unknown[] }).rows ?? [])) as Array<{ count?: number }>;
+  const n = Number(noneRows[0]?.count ?? 0);
+
+  if (n > 0) {
+    out.push({
+      key: "depreciation_not_run",
+      source: "fixed asset",
+      severity: "advisory",
+      count: n,
+      headline: `${n} fixed asset${n === 1 ? "" : "s"} ${n === 1 ? "was" : "were"} in use in this period and no depreciation has been posted for it`,
+      consequence:
+        "Not necessarily wrong — depreciation may be charged annually at 31 March rather than monthly. " +
+        "But if this period is meant to carry a charge, the profit reported for it is overstated by the " +
+        "whole of it, and Schedule II of the Companies Act 2013 requires the charge for the period the " +
+        "assets were used in.",
+      where: "/fixed-assets",
+      amountMinor: null,
+      oldest: null,
+    });
+  }
+
+  return out;
 }
 
 /* ------------------------------------------------------------------ */

@@ -573,6 +573,21 @@ export type TrialBalanceRow = {
   name: string;
   type: string;
   accountType: string;
+  /**
+   * ⭐⭐ BATCH 0101 — THE LEDGER'S OWN CURRENCY, ON EVERY ROW.
+   *
+   * 🔴 IT WAS NOT HERE BEFORE, AND THAT WAS THE BUG. `ledgers.currency`
+   * has existed since Phase 12 and `ledgerBalances` did not select it, so
+   * a trial balance ADDED a USD bank ledger's movement to an INR sales
+   * ledger's movement, footed perfectly, and printed a total that is a
+   * quantity of nothing. Nothing complained, because a sum of a numeric
+   * column always succeeds.
+   *
+   * ⚠️ NOTHING CHANGES FOR AN INR-ONLY WORKSPACE, which is every workspace
+   * today: `ledgers.currency` defaults to 'INR', so `currencies` below has
+   * one member and `currencyMixed` is false.
+   */
+  currency: string;
   totalDebit: string;
   totalCredit: string;
   /** Debit-positive. Inverted for presentation exactly once, in the UI. */
@@ -652,6 +667,9 @@ async function ledgerBalances(
         name: ledgers.name,
         type: ledgers.type,
         accountType: ledgers.accountType,
+        // ⭐ 0101. Selected so the aggregate can be told whether it spans
+        // currencies. See the comment on `TrialBalanceRow.currency`.
+        currency: ledgers.currency,
         totalDebit: sql<string>`COALESCE(SUM(CASE WHEN ${transactions.id} IS NOT NULL AND ${journalEntries.entryType} = 'debit'  THEN ${journalEntries.amount} ELSE 0 END), 0)::text`,
         totalCredit: sql<string>`COALESCE(SUM(CASE WHEN ${transactions.id} IS NOT NULL AND ${journalEntries.entryType} = 'credit' THEN ${journalEntries.amount} ELSE 0 END), 0)::text`,
       })
@@ -665,7 +683,14 @@ async function ledgerBalances(
       )
       .leftJoin(transactions, inPeriod)
       .where(and(eq(ledgers.tenantId, tenantId), isNull(ledgers.deletedAt)))
-      .groupBy(ledgers.id, ledgers.code, ledgers.name, ledgers.type, ledgers.accountType)
+      .groupBy(
+        ledgers.id,
+        ledgers.code,
+        ledgers.name,
+        ledgers.type,
+        ledgers.accountType,
+        ledgers.currency,
+      )
       .orderBy(ledgers.code)
   );
 
@@ -696,6 +721,63 @@ function toRows(list: readonly LedgerBalance[]): TrialBalanceRow[] {
 }
 
 const PL_TYPES = new Set(["revenue", "expense"]);
+
+/**
+ * ⭐⭐⭐ BATCH 0101 — IS THIS STATEMENT A QUANTITY OF ANYTHING?
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 A TRIAL BALANCE THAT SPANS CURRENCIES FOOTS AND MEANS NOTHING
+ * ══════════════════════════════════════════════════════════════════════
+ * `postTransaction` already refuses to mix currencies WITHIN one journal
+ * — that check has been the only currency logic in the product. It says
+ * nothing about mixing them ACROSS journals, which is what a statement
+ * does: a USD journal and an INR journal are each internally balanced, and
+ * summing both produces a total that balances to the paisa and is a
+ * quantity of nothing.
+ *
+ * ⚠️ THE CORRECT ANSWER UNDER AS 11 IS THAT THE BOOKS ARE KEPT IN THE
+ * FUNCTIONAL CURRENCY and a foreign-currency ledger holds the FUNCTIONAL
+ * amounts, with the foreign amount as memo. So a ledger whose `currency`
+ * differs from the functional currency is a configuration that Ordence
+ * cannot yet honour end to end — see the batch report — and the statement
+ * SAYS SO rather than quietly adding it up.
+ *
+ * ⭐ `isBalanced` KEEPS ITS ARITHMETIC MEANING. Overloading it would break
+ * the period-close dialog, which reads it to decide whether the books
+ * foot. The mixing is reported separately, so a reader gets both facts.
+ */
+function statementCurrencyBasis(list: readonly LedgerBalance[]): {
+  currencies: string[];
+  currencyMixed: boolean;
+  currencyWarning: string | null;
+} {
+  /**
+   * ⚠️ ONLY LEDGERS WITH MOVEMENT COUNT. A dormant USD account with no
+   * entries in the period contributes nothing to the totals, and warning
+   * about it would train people to ignore the warning.
+   */
+  const withMovement = list.filter((r) => r.debitMinor !== 0n || r.creditMinor !== 0n);
+  const currencies = [...new Set(withMovement.map((r) => r.currency))].sort();
+
+  if (currencies.length <= 1) {
+    return { currencies, currencyMixed: false, currencyWarning: null };
+  }
+  const offenders = withMovement
+    .filter((r) => r.currency !== currencies[0])
+    .map((r) => `${r.code} (${r.currency})`)
+    .slice(0, 5);
+  return {
+    currencies,
+    currencyMixed: true,
+    currencyWarning:
+      `⚠️ These totals add ${currencies.join(" and ")} together, so they are not a quantity of ` +
+      `any one currency. Ledgers in more than one currency have movement in this period ` +
+      `(${offenders.join(", ")}${withMovement.length > 5 ? ", …" : ""}). Under AS 11 the books ` +
+      `are kept in the functional currency and a foreign-currency account holds its functional ` +
+      `equivalent; until these ledgers are restated, read the figures per ledger and not as a ` +
+      `total.`,
+  };
+}
 
 /**
  * Revenue less expenses over whatever set of rows is handed in, in the
@@ -738,6 +820,15 @@ export async function getTrialBalance(input?: StatementPeriodInput): Promise<
     totalCredits: string;
     isBalanced: boolean;
     difference: string;
+    /**
+     * ⭐ 0101. Every currency with movement in the period. One member on
+     * every workspace today; more than one means `totalDebits` and
+     * `totalCredits` below are not a quantity of anything.
+     */
+    currencies: string[];
+    currencyMixed: boolean;
+    /** 🔴 The sentence a screen MUST print when `currencyMixed` is true. */
+    currencyWarning: string | null;
   }>
 > {
   try {
@@ -763,6 +854,8 @@ export async function getTrialBalance(input?: StatementPeriodInput): Promise<
         ? totalDebitMinor - totalCreditMinor
         : totalCreditMinor - totalDebitMinor;
 
+    const basis = statementCurrencyBasis(balances);
+
     return {
       ok: true,
       data: {
@@ -772,6 +865,7 @@ export async function getTrialBalance(input?: StatementPeriodInput): Promise<
         totalCredits: fromMinorUnits(totalCreditMinor),
         isBalanced: difference === 0n,
         difference: fromMinorUnits(difference),
+        ...basis,
       },
     };
   } catch (err) {
@@ -794,6 +888,11 @@ export async function getProfitAndLoss(input?: StatementPeriodInput): Promise<
     rows: TrialBalanceRow[];
     /** Revenue less expenses for the period. Positive is a profit. */
     netResult: string;
+    /** ⭐ 0101 — see `getTrialBalance`. `netResult` is only a quantity of
+     *  something when `currencyMixed` is false. */
+    currencies: string[];
+    currencyMixed: boolean;
+    currencyWarning: string | null;
   }>
 > {
   try {
@@ -812,6 +911,9 @@ export async function getProfitAndLoss(input?: StatementPeriodInput): Promise<
         period,
         rows: toRows(pl),
         netResult: fromMinorUnits(netResultMinor(pl)),
+        // ⚠️ MEASURED ON THE P&L ROWS ONLY. A dollar bank account does not
+        // make the profit figure meaningless; a dollar SALES ledger does.
+        ...statementCurrencyBasis(pl),
       },
     };
   } catch (err) {
@@ -854,6 +956,10 @@ export async function getBalanceSheet(input?: StatementPeriodInput): Promise<
     rows: TrialBalanceRow[];
     /** Revenue less expenses from inception to `asAt`. Positive is a profit. */
     retainedResultToDate: string;
+    /** ⭐ 0101 — see `getTrialBalance`. */
+    currencies: string[];
+    currencyMixed: boolean;
+    currencyWarning: string | null;
   }>
 > {
   try {
@@ -875,6 +981,10 @@ export async function getBalanceSheet(input?: StatementPeriodInput): Promise<
         asAt: period.asAt,
         rows: toRows(balances.filter((r) => !PL_TYPES.has(r.accountType))),
         retainedResultToDate: fromMinorUnits(netResultMinor(balances)),
+        // ⚠️ MEASURED OVER EVERY LEDGER, not only the balance-sheet ones:
+        // `retainedResultToDate` is folded from the P&L accounts, so a
+        // foreign-currency revenue ledger makes THIS statement wrong too.
+        ...statementCurrencyBasis(balances),
       },
     };
   } catch (err) {

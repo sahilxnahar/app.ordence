@@ -1,3 +1,75 @@
+# v1.64.0-alpha , THE THREE ENGINES THAT WERE NOT THERE
+
+**Repo: `app.ordence`** * 🔴 **SQL: `0100`, `0101`, `0102`, run IN THAT ORDER, BEFORE the code push** * ⚠️ **No new environment variables**
+
+Mega-wave 4 closed three gaps that had the same shape as the seven before
+them: a column that is stored and read by nothing.
+
+- 🔴🔴 **FIXED ASSETS AND DEPRECIATION (`0100`) , the product could not
+  produce a depreciation schedule at all.** `grep -ril depreciation`
+  returned only Tally *import* validators: the system could read a figure
+  somebody else had computed and could compute none of its own. New:
+  `lib/fixed-assets/depreciation.ts` (pure, bigint paise, no `Date`),
+  Companies Act Schedule II SLM and WDV with day-proration, residual,
+  component accounting and shift uplift; **and, separately**, Income Tax
+  s.32 block-of-assets with the half-rate rule under 180 days. The two
+  computations diverge permanently and that divergence is the deferred-tax
+  input. Depreciation posts through the existing `writePosting` path, not
+  a second one, and inherits its closed-period refusal.
+  ⭐ **Rounding is stated and tested**: every division floors, the residue
+  stays in the balance, and the terminal period is charged the exact
+  remainder, so a whole life sums to cost minus residual to the paisa.
+  ⚠️ Two fields failed the read-at-a-computation test during the build.
+  `block_class` was wired to the Appendix I rate whitelist. `cost_centre`
+  was **deleted**, because it implied an allocation the single journal does
+  not do.
+
+- 🔴🔴 **MULTI-CURRENCY (`0101`) , and this one found a live control that
+  was letting through 40 times its setting.** There were 16 `currency`
+  columns in the schema and zero rate infrastructure, so `sum(amount_minor)`
+  over a mixed set produced a number that was silently wrong.
+  **The worst instance: `server/sales/refund-cap.ts` summed credit notes
+  across currencies at 1:1 against a rupee cap.** Three USD 5,000 notes
+  consumed 15,000 of a Rs 5,00,000 cap instead of about Rs 12,50,000.
+  Now grouped per currency and converted; a bucket with no rate **refuses
+  the issue**, because skipping it would relax the control.
+  Six more currency-blind aggregations fixed (trial balance, credit-note
+  headroom, GST summary, ageing labels, the reports formatter, and
+  `lib/billing/money.ts`, which was wrong by 10x for KWD and 100x for CLF).
+  ⚠️ **Minor units are not universally two decimals.** JPY has zero, KWD
+  and BHD and OMR have three. The exponent is now carried per currency and
+  an unknown code throws instead of defaulting.
+  ⭐ Two rate tables, not one nullable column: published reference rates
+  carry no `tenant_id`, manual rates are `tenant_id NOT NULL`. Isolation is
+  structural rather than conditional on a predicate a future view could
+  route around.
+
+- 🔴 **BANK RECONCILIATION (`0102`) , and `bank_accounts.reconciled_to`
+  turns out to have been the eighth instance of the pattern.** The column
+  has existed since `0070`, is printed on screen, and the only write to it
+  anywhere in the tree set it to `null`. Nothing read it, and `unmatch`
+  deleted freely. There is now a reconciliation event that freezes its
+  items, a **database trigger** that refuses any insert, update or delete
+  of a match on or before the reconciled date, and a statement-level import
+  digest so re-importing the same file adds nothing.
+  ⚠️ **A pre-existing defect found while doing it:** `0087` granted
+  `bank_line_matches` only `SELECT, INSERT` to `ordence_app`, with a
+  comment claiming a guard trigger fired on UPDATE and DELETE regardless.
+  **There was no such trigger.** On any deployment where `ordence_app`
+  exists, `unmatch()` has never been able to run. `0102` creates the
+  trigger `0087` assumed and grants the `DELETE`.
+  ⭐ Auto-match scoring already existed and was **not** rebuilt. The
+  suggestion stays advisory; a person confirms.
+
+- ⚠️ **A defect in the delivered `0101`, found by the drill and not by
+  reading.** The verdict SELECT at the end of the file contained a
+  dollar-quoted literal whose delimiters had been mangled, so the very last
+  statement was a syntax error. Under a browser console every earlier
+  statement would have applied and the one row telling you it worked would
+  have failed. Fixed before packaging. **This is the third time this
+  project has been saved by running a file the way it is actually used
+  rather than the way it reads.**
+
 # v1.55.0-alpha — EVERY LINK IN THE STAFF CONSOLE
 
 **Repo: `app.ordence`** · 🔴 **SQL: unchanged (`0086`–`0090`)** · ⚠️ **No new variables**

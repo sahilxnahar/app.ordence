@@ -18,6 +18,82 @@ import {
   getInventoryValuation,
   getProjectProfitability,
 } from "@/server/actions/reports";
+import { formatMinorPlain, minorUnitExponent } from "@/lib/fx/currency";
+
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * ⭐⭐⭐ BATCH 0101 — THE LABELLED TOTAL, AS IT ARRIVES FROM THE SERVER
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 THIS FILE HELD THE OTHER HALF OF THE BUG. `server/actions/reports.ts`
+ * returned unlabelled numbers and `formatPaise` below turned them into
+ * rupees:
+ *
+ *     const rupees = n / 100;  ... return `₹${rupees.toFixed(0)}`;
+ *
+ * Two faults in one line. The hardcoded ₹ is wrong for any workspace whose
+ * books are not in rupees, and the `/100` is wrong for JPY (no decimals at
+ * all) and wrong by a factor of ten for KWD, BHD, OMR and the other
+ * three-decimal currencies. "Right in the code and wrong in the display"
+ * is exactly the shape this batch was told to check for, and it was here.
+ */
+type LabelledTotal = {
+  currency: string;
+  amountMinor: string;
+  formatted: string;
+  currencyAssumed: boolean;
+};
+
+/**
+ * ⭐ THE CURRENCY AND THE EXPONENT BOTH COME FROM THE SERVER'S LABEL.
+ *
+ * ⚠️ THE LAKH/CRORE ABBREVIATION IS APPLIED ONLY TO INR, because "₹1.2 Cr"
+ * is the Indian numbering system and "$1.2 Cr" is not a thing anybody
+ * reads. Everything else falls through to the exact figure.
+ *
+ * ⚠️ AND `Number` APPEARS ONLY IN THE ABBREVIATION BRANCH, where the value
+ * is already being turned into an approximation on purpose. The exact
+ * figure is formatted from the `bigint` by `formatMinorPlain`.
+ */
+function formatTotal(total: LabelledTotal | null | undefined): string {
+  if (!total) return "—";
+  const currency = total.currency;
+  let minor: bigint;
+  try {
+    minor = BigInt(total.amountMinor);
+  } catch {
+    return total.formatted;
+  }
+  let exponent: number;
+  try {
+    exponent = minorUnitExponent(currency);
+  } catch {
+    // An unknown code never becomes "assume two decimals" — it is shown
+    // exactly as the server labelled it, which at least is not a lie.
+    return total.formatted;
+  }
+
+  if (currency === "INR") {
+    const scale = 10 ** exponent;
+    const major = Number(minor) / scale;
+    const abs = Math.abs(major);
+    if (abs >= 10_000_000) return `₹${(major / 10_000_000).toFixed(2)} Cr`;
+    if (abs >= 100_000) return `₹${(major / 100_000).toFixed(2)} L`;
+    if (abs >= 1_000) return `₹${(major / 1_000).toFixed(1)}K`;
+  }
+  return `${currency} ${formatMinorPlain(minor, currency)}`;
+}
+
+/** The sentence a screen must show when the label is an assumption. */
+function AssumedCurrencyNote({ currency, show }: { currency: string; show: boolean }) {
+  if (!show) return null;
+  return (
+    <p className="rounded-md border border-amber-300 bg-amber-50 p-2 text-xs text-amber-800">
+      ⚠️ Figures are shown in {currency} because the tables behind this report hold no currency
+      of their own. A foreign-currency document cannot be recorded in them, so this label is a
+      property of the schema rather than a measurement.
+    </p>
+  );
+}
 
 const REPORTS = [
   { id: "gst", label: "GST Summary", description: "Output tax, input tax credit, pending filings", icon: "🧾" },
@@ -59,15 +135,6 @@ export default function ReportsClient() {
     });
   }
 
-  function formatPaise(s: string): string {
-    const n = Number(s);
-    if (isNaN(n)) return s;
-    const rupees = n / 100;
-    if (rupees >= 10000000) return `₹${(rupees / 10000000).toFixed(2)} Cr`;
-    if (rupees >= 100000) return `₹${(rupees / 100000).toFixed(2)} L`;
-    if (rupees >= 1000) return `₹${(rupees / 1000).toFixed(1)}K`;
-    return `₹${rupees.toFixed(0)}`;
-  }
 
   return (
     <div className="space-y-6">
@@ -130,13 +197,13 @@ export default function ReportsClient() {
           )}
 
           {/* GST Summary */}
-          {!pending && !error && data && activeReport === "gst" && <GstReportView data={data} formatPaise={formatPaise} />}
+          {!pending && !error && data && activeReport === "gst" && <GstReportView data={data} />}
 
           {/* Receivables Aging */}
-          {!pending && !error && data && activeReport === "receivables" && <ReceivablesReportView data={data} formatPaise={formatPaise} />}
+          {!pending && !error && data && activeReport === "receivables" && <ReceivablesReportView data={data} />}
 
           {/* TDS Summary */}
-          {!pending && !error && data && activeReport === "tds" && <TdsReportView data={data} formatPaise={formatPaise} />}
+          {!pending && !error && data && activeReport === "tds" && <TdsReportView data={data} />}
 
           {/* Compliance Status */}
           {!pending && !error && data && activeReport === "compliance" && <ComplianceReportView data={data} />}
@@ -145,7 +212,7 @@ export default function ReportsClient() {
           {!pending && !error && data && activeReport === "inventory" && <InventoryReportView data={data} />}
 
           {/* Project Profitability */}
-          {!pending && !error && data && activeReport === "profitability" && <ProfitabilityReportView data={data} formatPaise={formatPaise} />}
+          {!pending && !error && data && activeReport === "profitability" && <ProfitabilityReportView data={data} />}
         </div>
       )}
     </div>
@@ -156,34 +223,89 @@ export default function ReportsClient() {
 /* REPORT VIEWS                                                        */
 /* ------------------------------------------------------------------ */
 
-function GstReportView({ data, formatPaise }: { data: Record<string, unknown>; formatPaise: (s: string) => string }) {
+function GstReportView({ data }: { data: Record<string, unknown> }) {
   const d = data as {
-    outputTax: { count: number; totalTax: string; totalValue: string };
-    inputTax: { count: number; totalItc: string };
+    outputTaxByCurrency: Array<{
+      currency: string;
+      count: number;
+      totalTax: LabelledTotal;
+      totalValue: LabelledTotal;
+    }>;
+    outputTaxCurrencies: string[];
+    inputTax: { count: number; totalItc: LabelledTotal };
     pendingFilings: number;
     nextFilingDue: string | null;
   };
+
+  /**
+   * 🔴 THE NET LIABILITY IS ONLY A NUMBER WHEN THERE IS ONE CURRENCY.
+   *
+   * It used to be `Number(outputTax) - Number(inputItc)` over an output
+   * figure that had every currency added together. When the outputs span
+   * currencies there is no subtraction to do: the credit ledger is in
+   * rupees and the output tax is not, so the two are not comparable
+   * without a rate, and inventing one on a compliance screen would be the
+   * worst possible place to guess.
+   */
+  // ⚠️ `noUncheckedIndexedAccess` — index access is `T | undefined`, and
+  // the `?? null` is what makes the narrowing below sound.
+  const singleOutput =
+    d.outputTaxByCurrency.length === 1 ? (d.outputTaxByCurrency[0] ?? null) : null;
+  const netComparable =
+    singleOutput !== null && singleOutput.totalTax.currency === d.inputTax.totalItc.currency;
+  const net: LabelledTotal | null = netComparable && singleOutput
+    ? {
+        currency: singleOutput.totalTax.currency,
+        amountMinor: (
+          BigInt(singleOutput.totalTax.amountMinor) - BigInt(d.inputTax.totalItc.amountMinor)
+        ).toString(),
+        formatted: "",
+        currencyAssumed: singleOutput.totalTax.currencyAssumed,
+      }
+    : null;
 
   return (
     <div className="space-y-4">
       <div className="grid grid-cols-2 gap-4">
         <div className="rounded-md border border-border p-4">
-          <p className="text-xs text-muted-foreground">Output tax (issued invoices)</p>
-          <p className="mt-1 text-2xl font-bold">{formatPaise(d.outputTax.totalTax)}</p>
-          <p className="mt-0.5 text-xs text-muted-foreground">{d.outputTax.count} invoices · taxable value {formatPaise(d.outputTax.totalValue)}</p>
+          <p className="text-xs text-muted-foreground">Output tax (open invoices)</p>
+          {d.outputTaxByCurrency.length === 0 ? (
+            <p className="mt-1 text-2xl font-bold">—</p>
+          ) : (
+            d.outputTaxByCurrency.map((row) => (
+              <div key={row.currency} className="mt-1">
+                <p className="text-2xl font-bold">{formatTotal(row.totalTax)}</p>
+                <p className="mt-0.5 text-xs text-muted-foreground">
+                  {row.count} invoices · taxable value {formatTotal(row.totalValue)}
+                </p>
+              </div>
+            ))
+          )}
         </div>
         <div className="rounded-md border border-border p-4">
           <p className="text-xs text-muted-foreground">Input tax credit claimed</p>
-          <p className="mt-1 text-2xl font-bold">{formatPaise(d.inputTax.totalItc)}</p>
+          <p className="mt-1 text-2xl font-bold">{formatTotal(d.inputTax.totalItc)}</p>
           <p className="mt-0.5 text-xs text-muted-foreground">{d.inputTax.count} entries</p>
         </div>
       </div>
       <div className="rounded-md border border-border p-4">
         <p className="text-xs text-muted-foreground">Net GST liability</p>
-        <p className="mt-1 text-2xl font-bold">
-          {formatPaise(String(Number(d.outputTax.totalTax) - Number(d.inputTax.totalItc)))}
-        </p>
+        {net ? (
+          <p className="mt-1 text-2xl font-bold">{formatTotal(net)}</p>
+        ) : (
+          <p className="mt-1 text-sm text-amber-700">
+            ⚠️ Not shown. The output tax above spans{" "}
+            {d.outputTaxCurrencies.join(", ") || "no"} currenc
+            {d.outputTaxCurrencies.length === 1 ? "y" : "ies"} and the input credit is in{" "}
+            {d.inputTax.totalItc.currency}, so there is no single figure to subtract without an
+            exchange rate. Read the two sides separately.
+          </p>
+        )}
       </div>
+      <AssumedCurrencyNote
+        currency={d.inputTax.totalItc.currency}
+        show={d.inputTax.totalItc.currencyAssumed}
+      />
       {d.pendingFilings > 0 && (
         <div className="rounded-md border border-amber-300 bg-amber-50 p-3 text-sm text-amber-700">
           ⏰ {d.pendingFilings} GST filing(s) pending{d.nextFilingDue ? ` · next due ${d.nextFilingDue}` : ""}
@@ -193,20 +315,24 @@ function GstReportView({ data, formatPaise }: { data: Record<string, unknown>; f
   );
 }
 
-function ReceivablesReportView({ data, formatPaise }: { data: Record<string, unknown>; formatPaise: (s: string) => string }) {
+function ReceivablesReportView({ data }: { data: Record<string, unknown> }) {
   const d = data as {
-    buckets: Array<{ bucket: string; count: number; total: string }>;
-    receipts30Days: { count: number; total: string };
+    currency: string;
+    currencyAssumed: boolean;
+    currencyNote: string;
+    buckets: Array<{ bucket: string; count: number; total: LabelledTotal }>;
+    receipts30Days: { count: number; total: LabelledTotal };
   };
 
   return (
     <div className="space-y-4">
+      <AssumedCurrencyNote currency={d.currency} show={d.currencyAssumed} />
       <table className="w-full text-sm">
         <thead>
           <tr className="border-b border-border text-left text-xs text-muted-foreground">
             <th className="pb-2">Age bucket</th>
             <th className="pb-2 text-right">Count</th>
-            <th className="pb-2 text-right">Outstanding</th>
+            <th className="pb-2 text-right">Outstanding ({d.currency})</th>
           </tr>
         </thead>
         <tbody>
@@ -214,7 +340,7 @@ function ReceivablesReportView({ data, formatPaise }: { data: Record<string, unk
             <tr key={b.bucket} className="border-b border-border/50">
               <td className="py-2.5 font-medium">{b.bucket} days</td>
               <td className="py-2.5 text-right tabular-nums">{b.count}</td>
-              <td className="py-2.5 text-right tabular-nums font-medium">{formatPaise(b.total)}</td>
+              <td className="py-2.5 text-right tabular-nums font-medium">{formatTotal(b.total)}</td>
             </tr>
           ))}
           {d.buckets.length === 0 && (
@@ -224,31 +350,34 @@ function ReceivablesReportView({ data, formatPaise }: { data: Record<string, unk
       </table>
       <div className="rounded-md border border-border p-4">
         <p className="text-xs text-muted-foreground">Collections (last 30 days)</p>
-        <p className="mt-1 text-xl font-bold">{formatPaise(d.receipts30Days.total)}</p>
+        <p className="mt-1 text-xl font-bold">{formatTotal(d.receipts30Days.total)}</p>
         <p className="mt-0.5 text-xs text-muted-foreground">{d.receipts30Days.count} receipts</p>
       </div>
     </div>
   );
 }
 
-function TdsReportView({ data, formatPaise }: { data: Record<string, unknown>; formatPaise: (s: string) => string }) {
+function TdsReportView({ data }: { data: Record<string, unknown> }) {
   const d = data as {
-    quarterly: { count: number; totalTds: string };
-    pendingChallans: { count: number; totalTds: string };
-    bySection: Array<{ section: string; count: number; totalTds: string }>;
+    currency: string;
+    currencyAssumed: boolean;
+    quarterly: { count: number; totalTds: LabelledTotal };
+    pendingChallans: { count: number; totalTds: LabelledTotal };
+    bySection: Array<{ section: string; count: number; totalTds: LabelledTotal }>;
   };
 
   return (
     <div className="space-y-4">
+      <AssumedCurrencyNote currency={d.currency} show={d.currencyAssumed} />
       <div className="grid grid-cols-2 gap-4">
         <div className="rounded-md border border-border p-4">
           <p className="text-xs text-muted-foreground">TDS deducted (last 3 months)</p>
-          <p className="mt-1 text-2xl font-bold">{formatPaise(d.quarterly.totalTds)}</p>
+          <p className="mt-1 text-2xl font-bold">{formatTotal(d.quarterly.totalTds)}</p>
           <p className="mt-0.5 text-xs text-muted-foreground">{d.quarterly.count} deductions</p>
         </div>
         <div className="rounded-md border border-border p-4">
           <p className="text-xs text-muted-foreground">Pending challans</p>
-          <p className="mt-1 text-2xl font-bold">{formatPaise(d.pendingChallans.totalTds)}</p>
+          <p className="mt-1 text-2xl font-bold">{formatTotal(d.pendingChallans.totalTds)}</p>
           <p className="mt-0.5 text-xs text-muted-foreground">{d.pendingChallans.count} challans</p>
         </div>
       </div>
@@ -266,7 +395,7 @@ function TdsReportView({ data, formatPaise }: { data: Record<string, unknown>; f
               <tr key={s.section} className="border-b border-border/50">
                 <td className="py-2.5 font-mono">{s.section}</td>
                 <td className="py-2.5 text-right tabular-nums">{s.count}</td>
-                <td className="py-2.5 text-right tabular-nums font-medium">{formatPaise(s.totalTds)}</td>
+                <td className="py-2.5 text-right tabular-nums font-medium">{formatTotal(s.totalTds)}</td>
               </tr>
             ))}
           </tbody>
@@ -379,16 +508,20 @@ function InventoryReportView({ data }: { data: Record<string, unknown> }) {
   );
 }
 
-function ProfitabilityReportView({ data, formatPaise }: { data: Record<string, unknown>; formatPaise: (s: string) => string }) {
+function ProfitabilityReportView({ data }: { data: Record<string, unknown> }) {
   const d = data as {
+    currency: string;
+    currencyAssumed: boolean;
     projects: Array<{
       id: string; name: string; status: string;
-      contractValue: string; certifiedValue: string; purchaseValue: string; margin: string;
+      contractValue: LabelledTotal; certifiedValue: LabelledTotal;
+      purchaseValue: LabelledTotal; margin: LabelledTotal;
     }>;
   };
 
   return (
     <div className="space-y-4">
+      <AssumedCurrencyNote currency={d.currency} show={d.currencyAssumed} />
       {d.projects.length === 0 ? (
         <p className="rounded-md border border-dashed border-border p-4 text-center text-sm text-muted-foreground">
           No active projects.
@@ -406,17 +539,25 @@ function ProfitabilityReportView({ data, formatPaise }: { data: Record<string, u
           </thead>
           <tbody>
             {d.projects.map((p) => {
-              const cv = Number(p.contractValue);
-              const pv = Number(p.purchaseValue);
-              const margin = cv > 0 ? ((cv - pv) / cv) * 100 : 0;
+              /**
+               * ⚠️ A PERCENTAGE IS ONLY DEFINED WHEN BOTH SIDES ARE IN THE
+               * SAME CURRENCY, and it is nil when the contract value is
+               * nil. `Number(labelled)` on the object would have produced
+               * NaN silently, which is why the minor-unit strings are what
+               * is read here.
+               */
+              const comparable = p.contractValue.currency === p.purchaseValue.currency;
+              const cv = Number(p.contractValue.amountMinor);
+              const pv = Number(p.purchaseValue.amountMinor);
+              const margin = comparable && cv > 0 ? ((cv - pv) / cv) * 100 : 0;
               return (
                 <tr key={p.id} className="border-b border-border/50">
                   <td className="py-2.5 font-medium">{p.name}</td>
-                  <td className="py-2.5 text-right tabular-nums">{formatPaise(p.contractValue)}</td>
-                  <td className="py-2.5 text-right tabular-nums">{formatPaise(p.certifiedValue)}</td>
-                  <td className="py-2.5 text-right tabular-nums">{formatPaise(p.purchaseValue)}</td>
+                  <td className="py-2.5 text-right tabular-nums">{formatTotal(p.contractValue)}</td>
+                  <td className="py-2.5 text-right tabular-nums">{formatTotal(p.certifiedValue)}</td>
+                  <td className="py-2.5 text-right tabular-nums">{formatTotal(p.purchaseValue)}</td>
                   <td className={`py-2.5 text-right tabular-nums font-medium ${margin >= 20 ? "text-green-600" : margin >= 10 ? "text-amber-600" : "text-red-600"}`}>
-                    {margin.toFixed(1)}%
+                    {comparable ? `${margin.toFixed(1)}%` : "—"}
                   </td>
                 </tr>
               );

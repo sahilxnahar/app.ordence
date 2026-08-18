@@ -260,6 +260,35 @@ export const PERMISSION_CATALOG = {
   "payroll.approve": "Sign off a computed payroll run, freezing its payslips",
   "payroll.post": "Post an approved payroll run to the ledger",
 
+  /* ── ⭐⭐⭐ FIXED ASSETS AND DEPRECIATION — v1.53.0-alpha, batch 100
+   *
+   * ══════════════════════════════════════════════════════════════════
+   * 🔴 THREE KEYS, AND THE SPLIT IS BETWEEN DECIDING AND RECORDING
+   * ══════════════════════════════════════════════════════════════════
+   * `fixed_assets.manage` sets the useful life, the residual value and
+   * the method — the three inputs that decide how much profit the
+   * company reports for the next fifteen years. `fixed_assets.post` puts
+   * the charge in the books and takes an asset off them.
+   *
+   * ⚠️ THEY ARE SEPARATE BECAUSE EXTENDING A USEFUL LIFE IS THE EASIEST
+   * WAY TO IMPROVE A PROFIT FIGURE IN ANY ACCOUNTING SYSTEM. Moving
+   * plant from fifteen years to twenty-five reduces this year's
+   * depreciation by nearly half, needs no journal entry, and looks like
+   * a data-entry change. If the same key also posted the run, one person
+   * could make and book that decision without anybody else seeing it.
+   *
+   * ⚠️ AND NEITHER OF THEM IS `assets:*`. Those keys belong to the CRM
+   * catalogue — the flats a developer is SELLING, which are stock in
+   * trade. A sales administrator who can edit a unit's floor plan has no
+   * business changing the depreciation basis of the company's plant.
+   */
+  "fixed_assets.read":
+    "View the fixed asset register, depreciation schedules and the tax block computation",
+  "fixed_assets.manage":
+    "Capitalise an asset and set its useful life, residual value, method and shift usage",
+  "fixed_assets.post":
+    "Post a depreciation run to the ledger, and record the disposal of an asset",
+
   /* ── ⭐⭐ LEAVE AND STAFF ATTENDANCE — v1.46.0, batch 59 ─────────
    *
    * ══════════════════════════════════════════════════════════════════
@@ -573,6 +602,27 @@ export const PERMISSION_CATALOG = {
   "reports:trial_balance": "Run the trial balance",
   "reports:export": "Export financial reports",
 
+  // ── Foreign exchange (Batch 0101) ────────────────────────────────
+  //
+  // ⚠️ THREE KEYS, SPLIT BY BLAST RADIUS AND NOT BY SCREEN.
+  //
+  //   `fx:read` — see the rates on file and the revaluation history.
+  //     Wide, because anybody reading a foreign-currency invoice needs to
+  //     know what rate it was measured at.
+  //   ⭐ `fx:manage_rates` — TYPE A RATE. A rate is a number that lands
+  //     directly in the profit and loss account: AS 11 ¶13 sends every
+  //     exchange difference there, so one paisa on a ₹10 crore exposure
+  //     moves reported profit by ₹1 lakh. It is on the dangerous list for
+  //     the same reason `gst:manage_rates` is — the mistake is invisible
+  //     on every screen until a statement is signed.
+  //   ⭐ `fx:revalue` — RUN THE RESTATEMENT. It posts a journal, moves
+  //     the carrying amount of every open foreign-currency invoice and
+  //     changes the period's profit. Closer to `transactions:post` than
+  //     to a report, and held by whoever signs the accounts.
+  "fx:read": "View exchange rates and revaluation history",
+  "fx:manage_rates": "Enter and correct exchange rates",
+  "fx:revalue": "Run the reporting-date restatement of foreign currency items",
+
   // ── GST (Phase 32) ───────────────────────────────────────────────
   //
   // ⚠️ FOUR KEYS, AND THE SPLIT IS BY BLAST RADIUS RATHER THAN BY SCREEN.
@@ -851,6 +901,10 @@ export const DANGEROUS_PERMISSIONS: readonly PermissionKey[] = [
   "transactions:reverse",
   "periods:close",
   "periods:reopen",
+  // Batch 0101. A rate is an input to the P&L and a revaluation is a
+  // posting; both are invisible on every screen until a statement is run.
+  "fx:manage_rates",
+  "fx:revalue",
   "users:remove",
   "roles:manage",
   "billing:manage",
@@ -1103,6 +1157,11 @@ export const ROLE_TEMPLATES: Readonly<Record<SystemRole, RoleTemplate>> = {
       "transactions:read", "transactions:post", "transactions:reverse",
       "periods:read",
       "reports:trial_balance", "reports:export",
+      // ⭐ THE ROLE THAT OWNS FX. The accountant is the person who applies
+      // AS 11 — they choose the closing rate and they sign the exchange
+      // difference. They cannot CLOSE the period, so a revaluation they
+      // run is still reviewable by whoever attests to the month.
+      "fx:read", "fx:manage_rates", "fx:revalue",
       "billing:read", "billing:manage",
       "contacts:read", "companies:read", "deals:read", "assets:read",
       "contracts:read",
@@ -1133,6 +1192,24 @@ export const ROLE_TEMPLATES: Readonly<Record<SystemRole, RoleTemplate>> = {
        * and the person who posts the total should not be one key.
        */
       "payroll.read", "payroll.post",
+      /**
+       * ⭐⭐ THE FIXED ASSET REGISTER IS THE ACCOUNTANT'S OWN BOOK.
+       * Capitalising a purchase, setting a useful life against Schedule
+       * II, charging the depreciation and computing the section 32 block
+       * are all one person's job in a company of this size, and that
+       * person is the one who signs the accounts these figures go into.
+       *
+       * ⚠️ ALL THREE KEYS, AND THAT IS DELIBERATE HERE WHERE PAYROLL
+       * SPLITS. The payroll separation exists because the person who
+       * sets a salary should not approve the wage bill — two decisions
+       * about other people's money. Depreciation is one decision about
+       * the company's own assets, made under a schedule that constrains
+       * it, and it is checked by an auditor rather than by a second
+       * clerk. Splitting it here would mean nobody could run a month end
+       * without two people in the room, which is how a control gets
+       * routed around rather than obeyed.
+       */
+      "fixed_assets.read", "fixed_assets.manage", "fixed_assets.post",
       // ⭐ PHASE 48 — THE ROLE THAT SETS CREDIT LIMITS. The accountant
       // knows who pays and who does not; nobody else in a company this
       // size has that in front of them daily.
@@ -1449,6 +1526,9 @@ export const ROLE_TEMPLATES: Readonly<Record<SystemRole, RoleTemplate>> = {
       "leads:read", "projects:read", "units:read", "bookings:read",
       "payment_plans:read", "partners:read",
       "gst:read",
+      // ⚠️ Reads the rates, types none. A read-only role that could enter a
+      // rate could move the profit and loss account, which is not a read.
+      "fx:read",
       // ⚠️ Phase 33 reads only, and note what is NOT here for `member`
       // above: a sales executive has no `purchases:read` at all. What we
       // pay our contractors is not something a rep needs and is exactly
