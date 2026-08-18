@@ -54,6 +54,7 @@ import {
 import { requireCapability, recordPlatformAudit, type PlatformOperator } from "./guard";
 import { getConfigChain } from "./configuration";
 import type { PlanTier } from "@/db/schema/core";
+import { readSlugOrigin, type SlugOrigin } from "@/lib/slug-resolution";
 
 /* ------------------------------------------------------------------ */
 /* SHAPES                                                              */
@@ -92,6 +93,18 @@ export type TenantSummary = {
 export type TenantDetail = TenantSummary & {
   legalName: string | null;
   customDomain: string | null;
+  /**
+   * ⭐ SET ONLY WHEN THIS WORKSPACE'S ADDRESS IS NOT THE ONE ITS CLERK
+   *    ORGANISATION ASKED FOR.
+   *
+   * The Clerk webhook grants a different address rather than failing the
+   * signup when 0091 refuses the requested one — reserved, taken,
+   * confusable, or inside the 365-day retention window. Support is then
+   * asked "why is our address not our company name?", and without this
+   * the answer is an audit row from eight months ago that nobody can
+   * find. Null on the overwhelming majority of workspaces.
+   */
+  slugOrigin: SlugOrigin | null;
   failedPaymentCount: number;
   currentPeriodEnd: string | null;
   graceEndsAt: string | null;
@@ -698,6 +711,7 @@ export async function getTenantDetail(
         name: tenant.name,
         legalName: tenant.legalName,
         customDomain: tenant.customDomain,
+        slugOrigin: readSlugOrigin(tenant.settings),
         status: tenant.status,
         planTier: tenant.planTier,
         subscriptionStatus: subscription?.status ?? null,

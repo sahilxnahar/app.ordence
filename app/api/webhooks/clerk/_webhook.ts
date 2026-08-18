@@ -49,6 +49,22 @@ import { canTakeSeats } from "@/lib/billing/seats";
 import type { SystemRole } from "@/db/schema";
 import { recordSecurityEvent } from "@/server/security/record";
 import { recordFailure } from "@/lib/security/lockout";
+/**
+ * ⭐ THE SLUG AUTHORITY, FINALLY READ BY THE PATH THAT CREATES WORKSPACES.
+ *
+ * `lib/slug.ts` has exported `suggestSlugs()`, `checkSlugShape()` and
+ * `rejectionFromPgError()` since v1.56.0 and the signup form was the only
+ * thing that ever called them. This file — the SOLE path that creates a
+ * `tenants` row for a real signup — derived one slug, inserted it, and
+ * returned 500 for every refusal 0091 is capable of producing.
+ */
+import {
+  claimSlugWithFallback,
+  tryRenameSlugForClerkOrg,
+  type SlugRefusal,
+} from "@/server/platform/resolve-slug";
+import type { SlugOrigin } from "@/lib/slug-resolution";
+import type { SlugRejectionCode } from "@/lib/slug";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -412,77 +428,308 @@ const DEFAULT_SETTINGS = {
  *                people and never edit them.
  */
 async function handleOrganizationUpsert(org: ClerkOrganization): Promise<void> {
-  return withPlatformScope(
+  const entry = await withPlatformScope(
     `Clerk webhook: provision or update the workspace mirroring organization ${org.id}`,
     (tx) => organizationUpsert(tx, org),
   );
+
+  /*
+   * ══════════════════════════════════════════════════════════════════
+   * 🔴 THE AUDIT ROW IS WRITTEN AFTER THE TRANSACTION HAS COMMITTED
+   * ══════════════════════════════════════════════════════════════════
+   * It used to be written from INSIDE the `withPlatformScope` callback,
+   * and on the CREATE path that meant it could never land.
+   * `writeAudit()` opens its own `withTenant()` transaction — a second
+   * connection — and `audit_logs.tenant_id` carries a foreign key to
+   * `tenants.id`. From that second connection the brand-new tenant row
+   * is still uncommitted and therefore invisible, so the insert failed
+   * its foreign key and `writeAudit()`'s own catch swallowed it. Every
+   * workspace creation was silently unaudited.
+   *
+   * ⭐ IT IS ALSO WHAT `claimSlug()`'s CONTRACT REQUIRES. A refused claim
+   *    leaves the caller's handle aborted; an audit insert attempted on
+   *    it would fail with 25P02 and take the real error with it.
+   *    `provisioning.ts` and `rename-slug.ts` both say so in the same
+   *    words. This path now agrees with them.
+   */
+  if (entry) await writeAudit(entry);
 }
 
+/** What the transaction decided, carried out so it can be audited. */
+type TenantAuditEntry = Parameters<typeof writeAudit>[0];
+
+/**
+ * ⚠️ RETURNS THE AUDIT ENTRY RATHER THAN WRITING IT. See above.
+ */
 async function organizationUpsert(
   tx: ScopedTx,
   org: ClerkOrganization,
-): Promise<void> {
-  const slug = normaliseSlug(org.slug ?? org.name ?? org.id);
+): Promise<TenantAuditEntry | null> {
+  /*
+   * ⭐ "REQUESTED", NOT "SLUG". The name Clerk asks for is an ASK. What
+   * the workspace ends up on is whatever the database was willing to
+   * grant, and the two are different often enough that conflating them
+   * in a variable name is how they got conflated in the code.
+   */
+  const requested = normaliseSlug(org.slug ?? org.name ?? org.id);
 
   const existing = await tx.query.tenants.findFirst({
     where: eq(tenants.clerkOrgId, org.id),
   });
 
   if (existing) {
-    await tx
-      .update(tenants)
-      .set({
-        name: org.name,
-        slug,
-        branding: { ...DEFAULT_BRANDING, ...existing.branding, logoUrl: org.image_url },
-        updatedAt: new Date(),
-        // Re-activate if this org was previously soft-deleted in Clerk.
-        ...(existing.deletedAt ? { deletedAt: null, status: "active" as const } : {}),
-      })
-      .where(eq(tenants.id, existing.id));
-
-    await writeAudit({
-      tenantId: existing.id,
-      action: "update",
-      resourceType: "tenant",
-      resourceId: existing.id,
-      newValue: { name: org.name, slug },
-      reason: "Clerk organization.updated",
-    });
-    return;
+    return organizationRename(tx, org, existing, requested);
   }
 
+  return organizationProvision(tx, org, requested);
+}
+
+/* ------------------------------------------------------------------ */
+/* THE WORKSPACE DOES NOT EXIST YET                                    */
+/* ------------------------------------------------------------------ */
+
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 THE BUG THIS REPLACES, IN ONE SENTENCE
+ * ══════════════════════════════════════════════════════════════════════
+ * This used to be a single INSERT whose only conflict handling was
+ * `onConflictDoNothing({ target: tenants.clerkOrgId })` — which absorbs a
+ * duplicate ORGANISATION and nothing else. 0091 installs a BEFORE INSERT
+ * trigger that refuses reserved names and two unique indexes that refuse
+ * collisions, so a company called Support, or Ordence, or anything that
+ * normalised onto a name another tenant already held, raised, aborted the
+ * transaction, threw out of `withPlatformScope`, and returned 500. The
+ * customer saw "your workspace is not ready yet" forever, and every retry
+ * did the same thing, because the input never changed.
+ *
+ * ⭐ A REFUSED NAME NOW MEANS A DIFFERENT ADDRESS. It never means no
+ *    workspace. `claimSlugWithFallback()` walks the deterministic
+ *    candidate list from `suggestSlugs()` — which already existed, and
+ *    which nothing on this path read.
+ */
+async function organizationProvision(
+  tx: ScopedTx,
+  org: ClerkOrganization,
+  requested: string,
+): Promise<TenantAuditEntry | null> {
   const trialEndsAt = new Date();
   trialEndsAt.setDate(trialEndsAt.getDate() + FREE_TIER_DEFAULTS.trialDays);
 
-  const [created] = await tx
-    .insert(tenants)
-    .values({
+  const claim = await claimSlugWithFallback(tx, {
+    desired: requested,
+    /*
+     * 🔴 THE CLERK ORGANISATION ID, BECAUSE IT DOES NOT MOVE. Svix
+     *    delivers at least once; the last-resort candidate has to be the
+     *    same string on the second delivery as on the first or a
+     *    redelivery mints a second workspace.
+     */
+    stableId: org.id,
+    actor: `clerk-webhook:${org.id}`,
+    tenant: {
       clerkOrgId: org.id,
       name: org.name,
-      slug,
-      branding: { ...DEFAULT_BRANDING, logoUrl: org.image_url },
-      settings: { ...DEFAULT_SETTINGS },
+      legalName: null,
       planTier: FREE_TIER_DEFAULTS.planTier,
-      status: "active",
       seatLimit: FREE_TIER_DEFAULTS.seatLimit,
       storageLimitMb: FREE_TIER_DEFAULTS.storageLimitMb,
-      trialEndsAt,
-    })
-    // Concurrent deliveries of the same event must not create duplicates.
-    .onConflictDoNothing({ target: tenants.clerkOrgId })
-    .returning();
+      /** `claimSlug` writes it straight into the statement; ISO or null. */
+      trialEndsAt: trialEndsAt.toISOString(),
+      customDomain: null,
+      settings: { ...DEFAULT_SETTINGS },
+      branding: { ...DEFAULT_BRANDING, logoUrl: org.image_url },
+    },
+  });
 
-  if (created) {
-    await writeAudit({
-      tenantId: created.id,
-      action: "create",
-      resourceType: "tenant",
-      resourceId: created.id,
-      newValue: { name: org.name, slug, planTier: created.planTier },
-      reason: "Clerk organization.created",
-    });
+  if (!claim.ok) {
+    /*
+     * 🔴 THROWN, NOT SWALLOWED. Every candidate derived from this company
+     *    name was refused. That is not an answer, it is a fault — and the
+     *    500 it produces is what makes Svix retry and what puts the
+     *    refusals in the log where somebody can read them.
+     */
+    throw new Error(
+      `[clerk-webhook] no address could be claimed for organization ${org.id}. ` +
+        `Requested "${claim.requested}". Refused: ` +
+        claim.refusals.map((r) => `${r.slug} (${r.code}, ${r.source})`).join("; "),
+    );
   }
+
+  const diverted = claim.granted !== claim.requested;
+
+  if (diverted) {
+    /*
+     * ⭐ WRITTEN SO SUPPORT CAN ANSWER "WHY IS MY ADDRESS NOT MY COMPANY
+     *    NAME" WITHOUT GUESSING. It is a second statement rather than part
+     *    of the insert because the granted name is not known until the
+     *    claim succeeds, and the claim is one statement on purpose.
+     *
+     * ⚠️ MERGED INTO `settings`, NEVER REPLACING IT — the column's own
+     *    comment in `db/schema/core.ts` demands it. Here the row is
+     *    brand-new and its settings are exactly `DEFAULT_SETTINGS`, so
+     *    the merge is spelled out rather than assumed.
+     */
+    await tx
+      .update(tenants)
+      .set({
+        settings: {
+          ...DEFAULT_SETTINGS,
+          clerkSlug: {
+            requested: claim.requested,
+            granted: claim.granted,
+            reason: reasonForRequested(claim.requested, claim.refusals),
+          },
+        },
+      })
+      .where(eq(tenants.id, claim.tenantId));
+  }
+
+  return {
+    tenantId: claim.tenantId,
+    action: "create",
+    resourceType: "tenant",
+    resourceId: claim.tenantId,
+    newValue: {
+      name: org.name,
+      /* ⭐ BOTH, ALWAYS. "granted" alone cannot answer the question. */
+      requestedSlug: claim.requested,
+      slug: claim.granted,
+      planTier: FREE_TIER_DEFAULTS.planTier,
+      ...(diverted ? { slugRefusals: refusalsForAudit(claim.refusals) } : {}),
+    },
+    reason: diverted
+      ? `Clerk organization.created — the address "${claim.requested}" was not available ` +
+        `(${reasonForRequested(claim.requested, claim.refusals)}); "${claim.granted}" was granted instead.`
+      : "Clerk organization.created",
+  };
+}
+
+/* ------------------------------------------------------------------ */
+/* THE WORKSPACE ALREADY EXISTS                                        */
+/* ------------------------------------------------------------------ */
+
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 THIS PATH HAD THE SAME DEFECT AND MUST NOT HAVE THE SAME FIX
+ * ══════════════════════════════════════════════════════════════════════
+ * It set `slug` from the Clerk organisation unconditionally, so a rename
+ * in the Clerk dashboard onto a reserved or taken word threw here exactly
+ * as it did on the create path. But an existing workspace is LIVE: its
+ * hostname is in bookmarks, in emailed invoice links, and in a
+ * certificate published in the public CT log.
+ *
+ * ⭐ SO THERE IS NO FALLBACK HERE. If the requested address is refused,
+ *    the workspace KEEPS THE ONE IT HAS, the name and branding still
+ *    update, and the refusal is recorded. Automatically diverting a live
+ *    workspace to `acme-india` would move a public hostname nobody chose
+ *    to move AND burn the old name for 365 days under 0091's retention —
+ *    which is strictly worse than declining the rename.
+ */
+async function organizationRename(
+  tx: ScopedTx,
+  org: ClerkOrganization,
+  existing: TenantRow,
+  requested: string,
+): Promise<TenantAuditEntry> {
+  const rename = await tryRenameSlugForClerkOrg(tx, {
+    tenantId: existing.id,
+    currentSlug: existing.slug,
+    desired: requested,
+    actor: `clerk-webhook:${org.id}`,
+  });
+
+  /*
+   * ⚠️ THE MARKER IS CLEARED WHEN THE ADDRESS FINALLY MATCHES. A stale
+   *    "we could not give you your own name" note on a workspace that has
+   *    since been given it is a support answer that is now wrong.
+   */
+  const origin = rename.ok
+    ? null
+    : {
+        requested,
+        granted: rename.slug,
+        reason: rename.refusal.code,
+      };
+
+  await tx
+    .update(tenants)
+    .set({
+      name: org.name,
+      branding: { ...DEFAULT_BRANDING, ...existing.branding, logoUrl: org.image_url },
+      settings: settingsWithSlugOrigin(existing.settings, origin),
+      updatedAt: new Date(),
+      // Re-activate if this org was previously soft-deleted in Clerk.
+      ...(existing.deletedAt ? { deletedAt: null, status: "active" as const } : {}),
+    })
+    .where(eq(tenants.id, existing.id));
+
+  return {
+    tenantId: existing.id,
+    action: "update",
+    resourceType: "tenant",
+    resourceId: existing.id,
+    oldValue: { slug: existing.slug },
+    newValue: {
+      name: org.name,
+      requestedSlug: requested,
+      slug: rename.slug,
+      ...(rename.ok ? {} : { slugRefusals: refusalsForAudit([rename.refusal]) }),
+    },
+    reason: rename.ok
+      ? "Clerk organization.updated"
+      : `Clerk organization.updated — the address "${requested}" was refused ` +
+        `(${rename.refusal.code}); "${existing.slug}" is unchanged and the workspace keeps working.`,
+  };
+}
+
+/* ------------------------------------------------------------------ */
+/* SLUG BOOKKEEPING                                                    */
+/* ------------------------------------------------------------------ */
+
+type TenantRow = typeof tenants.$inferSelect;
+type TenantSettings = TenantRow["settings"];
+
+/**
+ * Merge the marker in, or take it out, without disturbing the rest of the
+ * column.
+ *
+ * ⚠️ SEVERAL FORMS WRITE TO `tenants.settings`. A replace silently erases
+ *    the billing profile, the timezone and the industry template.
+ */
+function settingsWithSlugOrigin(
+  settings: TenantSettings,
+  origin: SlugOrigin | null,
+): TenantSettings {
+  const { clerkSlug: _previous, ...rest } = settings ?? {};
+  return origin ? { ...rest, clerkSlug: origin } : rest;
+}
+
+/**
+ * Why the address the customer asked for was not the one they got.
+ *
+ * ⚠️ THE REFUSAL FOR THE REQUESTED NAME SPECIFICALLY, not the last one in
+ *    the list. "acme-india was taken" is a true sentence and the wrong
+ *    answer to "why am I not on acme".
+ */
+function reasonForRequested(
+  requested: string,
+  refusals: ReadonlyArray<SlugRefusal>,
+): SlugRejectionCode {
+  const direct = refusals.find((r) => r.slug === requested);
+  /* An empty company name produces no refusal at all — it produced no
+     candidate to refuse. `empty` is the honest code for that. */
+  return direct?.code ?? refusals[0]?.code ?? "empty";
+}
+
+/** Refusals, flattened for the audit blob. Operator wording only. */
+function refusalsForAudit(
+  refusals: ReadonlyArray<SlugRefusal>,
+): Array<Record<string, string>> {
+  return refusals.map((r) => ({
+    slug: r.slug,
+    code: r.code,
+    source: r.source,
+    detail: r.operatorMessage,
+  }));
 }
 
 /** Soft-delete the tenant. Data is retained for the recovery window. */
@@ -896,15 +1143,34 @@ function mapClerkRole(clerkRole: string): SystemRole {
 }
 
 /** Force a Clerk slug into our RFC-1123 subdomain rules. */
+/**
+ * The address a Clerk organisation is ASKING for.
+ *
+ * 🔴 IT NO LONGER INVENTS A NAME, AND THE REMOVED LINE WAS A REAL DEFECT.
+ *    It used to end `|| ` + "`org-${Date.now().toString(36)}`" + `, which is
+ *    a DIFFERENT VALUE ON EVERY CALL. Svix delivers at least once, so two
+ *    deliveries of one `organization.created` for a company whose name
+ *    normalised to nothing would have produced two different slugs — and,
+ *    given a gap between them, two workspaces for one organisation.
+ *
+ * ⭐ AN EMPTY RESULT IS NOW HONEST AND IS HANDLED DOWNSTREAM.
+ *    `planSlugCandidates()` derives the last-resort address from the Clerk
+ *    organisation id, which is stable across deliveries by construction.
+ *
+ * ⚠️ THIS IS NOT A VALIDATOR. Shape and reserved words are `lib/slug.ts`'s
+ *    job and the refusal that counts is 0091's. All this does is turn a
+ *    company name into the closest legal-looking label so that the first
+ *    candidate is usually the one the customer expects.
+ */
 function normaliseSlug(input: string): string {
-  const cleaned = input
+  return input
     .toLowerCase()
     .trim()
     .replace(/[^a-z0-9-]/g, "-")
     .replace(/-+/g, "-")
     .replace(/^-|-$/g, "")
-    .slice(0, 63);
-  return cleaned || `org-${Date.now().toString(36)}`;
+    .slice(0, 63)
+    .replace(/-+$/g, "");
 }
 
 /** Best-effort audit write. Never allowed to fail the webhook. */

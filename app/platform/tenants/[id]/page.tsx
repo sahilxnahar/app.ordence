@@ -78,6 +78,7 @@ import { TenantActions } from "@/components/platform/tenant-actions";
 import { RenameSlugCard } from "@/components/platform/rename-slug-card";
 import { FlagEditor } from "@/components/platform/flag-editor";
 import { consoleHref, onConsoleHost } from "@/lib/platform/console-href";
+import { rejection } from "@/lib/slug";
 import { OffboardingPanel } from "@/components/platform/offboarding-panel";
 import { PlanSeatsCard } from "@/components/platform/plan-seats-card";
 import { TenantTabs, type TenantTabDef } from "@/components/platform/tenant-tabs";
@@ -754,6 +755,42 @@ function AccessTab({
           <SecurityTab tenantId={tenant.id} />
         </Suspense>
       </section>
+
+      {/*
+        ⭐ "WHY IS OUR ADDRESS NOT OUR COMPANY NAME?"
+
+        Shown ONLY when this workspace is not on the address its Clerk
+        organisation asked for — which happens when 0091 refused the
+        requested one and the webhook granted a different one rather than
+        failing the signup. That is the right trade (a different address
+        beats no workspace), but it is invisible to everyone afterwards,
+        and support is the one who gets asked about it.
+
+        ⚠️ It sits immediately above the rename card on purpose: the
+        operator reading this is usually one click from deciding whether
+        to move the workspace onto a better name, and the reason it is
+        not already on one is the first thing they need.
+      */}
+      {tenant.slugOrigin && (
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-sm">
+              This address is not the one Clerk asked for
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-1 text-sm">
+            <p>
+              The Clerk organisation asked for{" "}
+              <code className="rounded bg-muted px-1">{tenant.slugOrigin.requested}</code>{" "}
+              and was granted{" "}
+              <code className="rounded bg-muted px-1">{tenant.slugOrigin.granted}</code>.
+            </p>
+            <p className="text-xs text-muted-foreground">
+              {rejection(tenant.slugOrigin.reason).operatorMessage}
+            </p>
+          </CardContent>
+        </Card>
+      )}
 
       {/*
         ⚠️ THE ADDRESS. On its own card and below the reading material,

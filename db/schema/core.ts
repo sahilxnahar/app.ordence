@@ -205,6 +205,26 @@ export const tenants = pgTable(
           country?: string;
           billingEmail?: string;
         };
+        /**
+         * ⭐ WHY THIS WORKSPACE'S ADDRESS IS NOT ITS COMPANY NAME.
+         *
+         * Written by the Clerk webhook when 0091 refused the address the
+         * Clerk organisation asked for — reserved, taken, confusable, or
+         * inside the 365-day retention window — and a different one was
+         * granted instead. Cleared the moment the requested address
+         * finally becomes the granted one.
+         *
+         * ⚠️ IT IS A RECORD, NOT A DECISION. Nothing reads it to choose a
+         *    slug; `tenants.slug` is the address. This exists so support
+         *    can answer the question without reading an audit row from
+         *    eight months ago. Shape mirrored by `SlugOrigin` in
+         *    `lib/slug-resolution.ts`, which is what reads it back.
+         */
+        clerkSlug?: {
+          requested: string;
+          granted: string;
+          reason: string;
+        };
       }>()
       .default(sql`'{}'::jsonb`)
       .notNull(),

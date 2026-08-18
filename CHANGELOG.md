@@ -1,3 +1,67 @@
+# v1.65.0-alpha , A RESERVED NAME MEANS A DIFFERENT ADDRESS, NEVER NO WORKSPACE
+
+**Repo: `app.ordence`** * ⭐ **SQL: NONE. Push and it works.** * ⚠️ **No new environment variables**
+
+Found in production. The founder created a Clerk organisation whose slug was
+`ordence`, `lib/slug.ts` reserves that name, and the workspace was never
+created. The screen said "your workspace is not ready yet" and nothing in the
+system was going to change that.
+
+- 🔴🔴 **THE SOLE PATH THAT CREATES A WORKSPACE HAD NO FALLBACK.**
+  `_webhook.ts:425` took the Clerk organisation slug verbatim. `0091`'s guard
+  trigger refused it, the transaction aborted, the handler returned 500, and no
+  `tenants` row was ever written. The same failure was waiting for **any**
+  customer whose organisation name normalises to a reserved word , Support,
+  Admin, Billing, API, Portal, Secure, Status, Docs, Test, Dev, Mail, Pay,
+  Invoice, GST and about sixty more , **and for any plain duplicate**. Two
+  customers called Acme, and the second one gets nothing.
+  The only conflict handling was `onConflictDoNothing` on the **organisation
+  id**, which absorbs a redelivery and no name collision at all.
+- ⭐ **The fix wires what already existed.** `suggestSlugs`,
+  `rejectionFromPgError` and `checkSlugShape` have been in `lib/slug.ts` since
+  0091 and were read by nothing on this path. **That is the tenth instance of
+  this codebase's recurring defect**, and this one was the most expensive: it
+  sat on the one code path a paying customer cannot route around.
+- ⭐ **Deterministic by construction.** Svix delivers at least once, so two
+  deliveries must converge on the same address. No clock, no randomness. The
+  last-resort candidate derives from the Clerk organisation id, which is
+  stable. For `ordence` the ladder is `ordence-india`, `ordence-group`,
+  `ordence-projects`, ... then an id-derived name that cannot collide.
+- 🔴 **Only slug refusals are caught.** A foreign key error, a NOT NULL
+  violation or a dropped connection still propagates and still 500s, because
+  Svix retrying those is correct. A catch-all here would have turned this fix
+  into silent data loss, which is worse than the bug it replaces. There is a
+  test that a non-slug error still reaches the 500.
+- ⚠️ **A rename is NOT auto-fallen-back.** Changing an existing workspace's
+  slug changes a live hostname and burns 0091's 365-day retention on the old
+  one. If a Clerk rename resolves to a refused name, the slug is left alone,
+  the display name still updates, and the refusal is recorded. Automating that
+  rename would have been worse than not renaming.
+
+### Two further defects found while fixing it
+
+- 🔴 **Workspace creation was silently unaudited.** `writeAudit` opens its own
+  `withTenant` transaction, and `audit_logs.tenant_id` has a foreign key to
+  `tenants.id`. Called from inside the still-open provisioning transaction, the
+  brand new tenant row is invisible on that second connection, so the insert
+  failed its FK and `writeAudit`'s own catch swallowed it. **Every workspace
+  ever created is missing its creation audit entry.** The write now happens
+  after commit.
+- 🔴 **A Clerk rename retained nothing.** The old update branch set
+  `tenants.slug` with no `tenant_slug_history` bookkeeping, so the previous
+  hostname was never released into the 365-day window , it was immediately
+  free for another company while still live in bookmarks, in email and in the
+  certificate transparency log. That is the exact hazard 0091's retention
+  exists to prevent, bypassed by the one path that renames automatically.
+
+### Still open, and it is a decision rather than a defect
+
+⚠️ The webhook will still rename a live workspace automatically whenever the
+new name **is** available. `rename-slug.ts` argues that a rename should be an
+operator act with a stated reason, because there is no 301 redirect and no
+owner notification yet. So an editor changing a field in the Clerk dashboard
+can silently move a customer's public address. Worth deciding deliberately.
+
 # v1.64.1-alpha , RESERVE THE RESEND HOSTS
 
 **Repo: `app.ordence`** * 🔴 **SQL: `0103`, run it before or after the push, either order is safe** * ⚠️ **No new environment variables**
