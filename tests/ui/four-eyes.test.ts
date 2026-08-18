@@ -34,6 +34,7 @@ import {
   mayReject,
   APPROVAL_POLICIES,
   POLICY_BY_KIND,
+  REQUEST_PATHS,
   SELF_APPROVAL_WAIT_MINUTES,
 } from "@/lib/platform/approvals";
 import { STEP_UP_CAPABILITIES } from "@/lib/platform/roles";
@@ -395,11 +396,43 @@ describe("platform staff administration", () => {
    * ⚠️ SELF-REVOCATION STAYS OPEN while somebody else can still get in.
    * Being unable to kill your own compromised access at 3am is worse.
    */
+  /**
+   * ⚠️ REWRITTEN. THIS PINNED A SHAPE, AND BATCH 130's REFACTOR BROKE IT
+   *    WHILE THE PROPERTY IT CARES ABOUT STAYED TRUE.
+   *
+   * The owner floor moved out of `revokePlatformStaff` into the exported
+   * `usableOwnersExcluding()`, so the whole batch could be evaluated at
+   * once instead of one id at a time. Every term survived; only the
+   * address changed. The old assertion read a slice of ONE function and
+   * looked for `ne(platformStaff.id, staffId)`, a literal that is now
+   * `notInArray(...)` in a helper twenty lines away.
+   *
+   * 🔴 THIS IS THE SIXTH TEST IN THIS PROJECT TO FAIL A CORRECT CHANGE BY
+   *    PINNING AN INCIDENTAL FORM, and the first where TWO tests pinned
+   *    the SAME literal, so one being fixed still left the other red.
+   *    A test that fails on correct work gets deleted, and then nothing
+   *    catches the thing it existed for.
+   *
+   * The property is: the floor is computed from the allowlist, over
+   * ACTIVE OWNER rows, EXCLUDING the ids being revoked, without stopping
+   * at the first row, and it refuses in one stated sentence.
+   */
   it("refuses to revoke the last usable owner", () => {
     const src = read("server/platform/staff.ts");
+
+    // The refusal exists and is stated once, wherever it lives.
     expect(src).toContain("This is the last usable owner");
-    expect(src).toContain('eq(platformStaff.grade, "owner")');
-    expect(src).toContain("ne(platformStaff.id, staffId)");
+
+    // It counts OWNER grade only, and only rows that could actually sign in.
+    expect(src).toMatch(/eq\(\s*platformStaff\.grade\s*,\s*"owner"\s*\)/);
+    expect(src).toMatch(/eq\(\s*platformStaff\.status\s*,\s*"active"\s*\)/);
+
+    // It excludes the grant(s) being revoked. `ne(...)` for one id and
+    // `notInArray(...)` for a batch are the same property; assert either.
+    expect(
+      /ne\(\s*platformStaff\.id/.test(src) || /notInArray\(\s*platformStaff\.id/.test(src),
+      "the owner floor must exclude the grants being revoked, by ne() or notInArray()",
+    ).toBe(true);
     expect(src).toContain("isNull(platformStaff.revokedAt)");
   });
 
@@ -461,38 +494,54 @@ describe("what needs a fresh second factor", () => {
 describe("the approvals screen and the code agree", () => {
   /**
    * 🔴 A DECORATIVE CONTROL IS WORSE THAN NO CONTROL, because it stops
-   * you looking for the real one. Four of six policies still have no
-   * request path and no executor: `impersonate.break_glass`,
-   * `staff.elevate`, `tenant.plan_change`.
+   * you looking for the real one.
    *
-   * ⚠️ THIS TEST DOES NOT PRETEND THEY ARE FIXED. It pins the number
-   * that IS wired, so the debt is a failing number rather than a
-   * paragraph nobody re-reads. Raise it as each one is connected.
+   * ══════════════════════════════════════════════════════════════════
+   * ⭐⭐ THE DEBT IS A FAILING SET, NOT A PARAGRAPH NOBODY RE-READS
+   * ══════════════════════════════════════════════════════════════════
+   * This pin has now moved twice, both times because a policy was
+   * genuinely connected: `tenant.terminate` in Batch 46, and
+   * `entitlement.override_paid`, `staff.elevate` and `tenant.plan_change`
+   * in Batch 43. It names SETS rather than a count for exactly that
+   * reason — a count going 2 → 5 says nothing about WHICH landed.
    *
-   * ⭐ RAISED ONCE, HERE: `tenant.terminate` now has both a request path
-   * (`requestTermination`) and an executor, so it moved out of the
-   * unwired list. That is this pin working as designed, and the reason
-   * it names sets rather than counts, a count would have gone 1 → 2 with
-   * no evidence of WHICH one landed.
+   * ⚠️ WHAT REMAINS UNWIRED IS ONE POLICY AND IT IS NOT A BACKLOG ITEM.
+   * `impersonate.break_glass` cannot go through this queue as the queue
+   * is built: an executor runs inside the APPROVER's request and
+   * `startImpersonation` binds the session to its caller, so approving
+   * one would open the customer's workspace for the wrong person and
+   * name the wrong person in the customer's email. Read
+   * `BLOCKED_BECAUSE` before trying to shrink this set to zero.
    */
   it("wires exactly the policies this version claims to wire", () => {
-    const src = read("server/platform/control-actions.ts");
-    const queued = [...src.matchAll(/kind:\s*"([a-z._]+)"/g)].map((m) => m[1]);
-    const executors = [...src.matchAll(/registerApprovalExecutor\(\s*"([a-z._]+)"/g)].map(
-      (m) => m[1],
+    const registry = read("server/platform/approval-executors.ts");
+    const executors = [
+      ...registry.matchAll(/registerApprovalExecutor\(\s*"([a-z._]+)"/g),
+    ].map((m) => m[1]);
+
+    expect(new Set(executors)).toEqual(
+      new Set([
+        "tenant.suspend",
+        "tenant.terminate",
+        "entitlement.override_paid",
+        "staff.elevate",
+        "tenant.plan_change",
+      ]),
     );
 
-    expect(new Set(queued)).toEqual(new Set(["tenant.suspend", "tenant.terminate"]));
-    expect(new Set(executors)).toEqual(
-      new Set(["tenant.suspend", "entitlement.override_paid", "tenant.terminate"]),
-    );
+    /*
+     * ⭐ AN EXECUTOR ALONE IS NOT ENFORCEMENT. `REQUEST_PATHS` is the
+     * other half and it is pinned in both directions by
+     * `approval-policies.test.ts`; here the two are simply required to
+     * agree, so a registration added without a request path — the state
+     * `entitlement.override_paid` sat in for five versions — fails.
+     */
+    expect(new Set(Object.keys(REQUEST_PATHS))).toEqual(new Set(executors));
 
     const unwired = APPROVAL_POLICIES.map((p) => p.kind).filter(
       (k) => !executors.includes(k),
     );
-    expect(unwired.sort()).toEqual(
-      ["impersonate.break_glass", "staff.elevate", "tenant.plan_change"].sort(),
-    );
+    expect(unwired).toEqual(["impersonate.break_glass"]);
   });
 
   it("every policy still names an approver grade and a reason", () => {

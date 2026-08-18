@@ -102,7 +102,17 @@ describe("the orphaned engine now has a caller", () => {
 
   /** The console navigation already carried the link. It now leads somewhere. */
   it("is linked from the console nav", () => {
-    expect(codeOnly(LAYOUT)).toContain('"/platform/staff"');
+    /*
+     * ⚠️ THE NAV MOVED OUT OF THE LAYOUT AND THE ASSERTION FOLLOWED IT.
+     * `CONSOLE_NAV` now lives in `lib/platform/console-paths.ts` so the
+     * command palette — a `"use client"` component — can share the one
+     * mapping; `console-href.ts` reads `headers()` and cannot be imported
+     * from a client file. The property is unchanged: the console offers a
+     * way to this screen, and the layout renders whatever registry holds
+     * it.
+     */
+    expect(read("lib/platform/console-paths.ts")).toContain('"/platform/staff"');
+    expect(codeOnly(LAYOUT)).toContain("CONSOLE_NAV");
   });
 
   /**
@@ -135,7 +145,16 @@ describe("the last owner", () => {
    */
   it("is protected by the engine, by counting what remains", () => {
     expect(ENGINE_CODE).toContain('eq(platformStaff.grade, "owner")');
-    expect(ENGINE_CODE).toContain("ne(platformStaff.id, staffId)");
+    /**
+     * ⚠️ WAS `ne(platformStaff.id, staffId)` — one id. Batch 130 moved the
+     * floor into `usableOwnersExcluding()` and made the exclusion a LIST,
+     * because a bulk revoke checking one id at a time lets two owners go
+     * in one batch: each sees the other as the survivor. The property
+     * asserted is "the owners being revoked are excluded from the count",
+     * which is what the rule has always meant.
+     */
+    expect(ENGINE_CODE).toContain("notInArray(platformStaff.id");
+    expect(ENGINE_CODE).toContain("usableOwnersExcluding");
     expect(ENGINE_CODE).toContain("remaining.length === 0");
     expect(ENGINE).toContain("This is the last usable owner");
   });

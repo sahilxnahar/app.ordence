@@ -14,13 +14,21 @@ import "server-only";
  * `lib/platform/impersonation-policy.ts` with the full argument. This file
  * enforces it.
  *
- * Five properties, each with the failure it prevents:
+ * Seven properties, each with the failure it prevents. Properties 6 and 7
+ * were added in Batch 28, and properties 1 and 4 changed there.
  *
  *   1. TIME-LIMITED, AND THE CLOCK IS THE AUTHORITY.
- *      Liveness is `now() < expires_at AND ended_at IS NULL`, evaluated
- *      on EVERY use. Nothing depends on a background job, because a
- *      sweeper that stops running must not silently extend everyone's
- *      access.
+ *      Liveness is `now() < LEAST(expires_at, started_at + 30 minutes)
+ *      AND ended_at IS NULL`, evaluated on EVERY use. Nothing depends on
+ *      a background job, because a sweeper that stops running must not
+ *      silently extend everyone's access — and nothing depends on a
+ *      value the client sent, because a paused tab and a hand-crafted
+ *      POST are the same thing to a server that does not consult them.
+ *
+ *      ⚠️ THE CAP IS APPLIED TO THE STORED ROW, not only to new sessions.
+ *      `expires_at` is frozen by the tamper trigger, so a session started
+ *      when the limit was sixty minutes cannot be rewritten; it is
+ *      re-decided from `started_at`, which is frozen too.
  *
  *   2. ATTRIBUTABLE TO THE REAL HUMAN, AND FLAGGED AS IMPERSONATED.
  *      Every audit row written during a session carries the operator's
@@ -35,14 +43,34 @@ import "server-only";
  *      dismissed. The failure it prevents is not subtle — it is an
  *      engineer with two tabs open typing into the wrong one.
  *
- *   4. CONSENTED, WITH A NARROWER ESCAPE HATCH.
- *      Consent buys read-write. Break-glass, for when the customer cannot
- *      be reached, buys READ-ONLY and nothing else.
+ *   4. READ-ONLY BY DEFAULT; CONSENT BUYS THE OPTION, NOT THE ACCESS.
+ *      ⭐ Every session — consented or not — starts read-only. The
+ *      `scope` column records what the customer PERMITTED and is a
+ *      ceiling; taking write access is a separate act that names what is
+ *      about to change and is written to the action register. The
+ *      register row IS the grant, so there is no way to hold write
+ *      access without a record of having taken it.
+ *
+ *      Break-glass, for when the customer cannot be reached, has a
+ *      read-only ceiling and can never be lifted at all.
  *
  *   5. BOUND TO THE SESSION THAT STARTED IT.
  *      The originating IP and user-agent are recorded and re-checked. A
  *      lifted cookie replayed from elsewhere TERMINATES the session
  *      rather than merely logging a note about it.
+ *
+ *   6. ⭐ VISIBLE TO THE CUSTOMER WHILE IT IS HAPPENING, NOT AFTERWARDS.
+ *      Every user of the workspace sees an undismissable banner naming
+ *      the operator, their reason, what they can change and how long is
+ *      left — polled, so it appears within seconds of the session
+ *      starting and disappears within seconds of it ending. The email to
+ *      the owners still goes out; it is a second channel, not the only
+ *      one. See `server/platform/tenant-support-access.ts`.
+ *
+ *   7. ⭐ EVERY ENDING IS RECORDED, INCLUDING THE ONE WITH NOBODY IN THE
+ *      ROOM. `endSession()` writes which of the ways it ended into the
+ *      customer's own audit log — expiry, the operator leaving, the
+ *      workspace ejecting us, or a platform owner terminating it.
  */
 
 import { and, eq, isNull, desc, sql, gt, or } from "drizzle-orm";
@@ -50,6 +78,7 @@ import { headers } from "next/headers";
 import { withPlatformScope, withTenant } from "@/db";
 import { tenants, users } from "@/db/schema";
 import {
+  platformActionLog,
   platformImpersonationSessions,
   platformStaff,
   tenantSupportConsents,
@@ -59,16 +88,25 @@ import {
 import { breakGlassReasonProblem } from "@/lib/platform/break-glass";
 import { breakGlassDebtBlock } from "./break-glass";
 import {
+  cappedExpiry,
+  effectiveScope,
   expiryFor,
   isSessionLive,
   minutesRemaining,
   resolveScope,
+  scopeLiftProblem,
   evaluateOperation,
   bannerText,
+  END_REASON_LABELS,
+  HARD_CAP_MINUTES,
   MODE_LABELS,
   MAX_CONCURRENT_SESSIONS_PER_OPERATOR,
+  SCOPE_LIFT_RESOURCE,
+  type ImpersonationEndReasonKey,
 } from "@/lib/platform/impersonation-policy";
+import { assertMaintenanceAllows } from "./maintenance";
 import {
+  liftImpersonationScopeSchema,
   startImpersonationSchema,
   stopImpersonationSchema,
   type PlatformResult,
@@ -80,8 +118,60 @@ import {
   requireCapability,
   requirePlatformAdmin,
   recordPlatformAudit,
+  type PlatformAuditActor,
   type PlatformOperator,
 } from "./guard";
+
+/* ------------------------------------------------------------------ */
+/* ⭐⭐⭐ THE SCOPE LIFT LIVES IN THE ACTION REGISTER                   */
+/* ------------------------------------------------------------------ */
+
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 WHY THE REGISTER IS THE AUTHORITY AND NOT A COLUMN
+ * ══════════════════════════════════════════════════════════════════════
+ * The obvious design is `UPDATE platform_impersonation_sessions SET scope
+ * = 'read_write'`. The database refuses it: `scope` is in the frozen list
+ * of `prevent_impersonation_tamper()`, alongside who, which workspace,
+ * under what authority and until when.
+ *
+ * ⭐ AND THAT REFUSAL IS RIGHT, so this design agrees with it instead of
+ * asking for an exception. Three properties fall out of it:
+ *
+ *   1. THE GRANT AND THE RECORD OF THE GRANT ARE THE SAME OBJECT. There
+ *      is no way to hold write access without a register row saying who
+ *      took it and why, because the register row IS the access. A
+ *      mutable column plus a best-effort audit write can disagree; this
+ *      cannot.
+ *
+ *   2. IT FAILS CLOSED. `recordPlatformAudit()` never throws — a failed
+ *      write returns silently. If the register write is lost, the lift
+ *      simply did not happen and the session stays read-only. The lift
+ *      is re-read and confirmed before the operator is told it worked.
+ *
+ *   3. IT CANNOT BE UN-RECORDED. `platform_action_log` is append-only and
+ *      DELETE is revoked from the application role, so an operator cannot
+ *      erase the fact that they took write access — which is exactly the
+ *      row somebody under investigation would most like to remove.
+ *
+ * ⚠️ THE COST IS ONE INDEXED READ per impersonated request, folded into
+ * the round trip `getActiveImpersonation()` already makes. Ordinary
+ * customer traffic never reaches it.
+ *
+ * The `resource_type` itself lives in `lib/platform/impersonation-policy.ts`
+ * as `SCOPE_LIFT_RESOURCE`, because three modules need the same string.
+ */
+
+/**
+ * ⚠️ THE HARD CAP, EXPRESSED IN SQL, so a query can filter on it without
+ * dragging every open row into JavaScript first.
+ *
+ * `least()` — never `greatest()`. This can only shorten a session. See
+ * `cappedExpiry()` in the policy module for the argument.
+ */
+function cappedExpirySql() {
+  return sql`least(${platformImpersonationSessions.expiresAt}, ${platformImpersonationSessions.startedAt} + make_interval(mins => ${HARD_CAP_MINUTES}))`;
+}
 
 /* ------------------------------------------------------------------ */
 /* THE ACTIVE SESSION                                                  */
@@ -93,8 +183,27 @@ export type ActiveImpersonation = {
   tenantSlug: string;
   tenantName: string;
   mode: ImpersonationMode;
+  /**
+   * 🔴 THE EFFECTIVE SCOPE — what this session may do RIGHT NOW.
+   *
+   * ⚠️ NOT the `scope` column. It is `read_only` for every session that
+   * has not been deliberately lifted, whatever the customer's consent
+   * permitted. The name is kept because everything downstream — the
+   * tenant context, the role ceiling, `assertImpersonationAllows()` —
+   * already reads this field, and those are precisely the places that
+   * must see the effective answer rather than the permitted one.
+   */
   scope: ImpersonationScope;
+  /** The frozen column: the MOST this session could ever be lifted to. */
+  grantedScope: ImpersonationScope;
+  /** When write access was taken, or null. Read from the action register. */
+  scopeLiftedAt: Date | null;
+  /** The sentence the operator gave when taking write access. */
+  scopeLiftReason: string | null;
+  /** The reason the session was started. Shown in both banners. */
+  justification: string;
   startedAt: Date;
+  /** ⚠️ THE CAPPED expiry — the earlier of the stored one and start + 30m. */
   expiresAt: Date;
   minutesLeft: number;
   banner: string;
@@ -122,8 +231,8 @@ export async function getActiveImpersonation(
 
   const row = await withPlatformScope(
     "Platform console: resolve the operator's live impersonation session for the banner",
-    async (db) =>
-      db
+    async (tx) => {
+      const [found] = await tx
         .select({
           session: platformImpersonationSessions,
           tenantName: tenants.name,
@@ -134,17 +243,62 @@ export async function getActiveImpersonation(
           and(
             eq(platformImpersonationSessions.actorClerkId, op.clerkUserId),
             isNull(platformImpersonationSessions.endedAt),
+            // ⚠️ A CHEAP INDEX-FRIENDLY PREFILTER, NOT THE ANSWER. The
+            // authoritative liveness test is `isSessionLive()` below,
+            // which applies the thirty-minute cap. This predicate only
+            // avoids dragging every historical row into memory.
             gt(platformImpersonationSessions.expiresAt, now),
           ),
         )
         .orderBy(desc(platformImpersonationSessions.startedAt))
-        .limit(1)
-        .then((rows) => rows[0] ?? null),
+        .limit(1);
+
+      if (!found) return null;
+
+      /* ---- ⭐ THE SCOPE LIFT, FROM THE REGISTER ------------------- */
+      //
+      // Read in the SAME transaction as the session, so the banner and
+      // the write gate can never be told two different stories about one
+      // request. `limit(1)` on the newest: a lift is a one-way act and a
+      // second one is refused, but reading the newest is the honest
+      // answer either way.
+      const [lift] = await tx
+        .select({
+          createdAt: platformActionLog.createdAt,
+          justification: platformActionLog.justification,
+        })
+        .from(platformActionLog)
+        .where(
+          and(
+            eq(platformActionLog.resourceType, SCOPE_LIFT_RESOURCE),
+            eq(platformActionLog.resourceId, found.session.id),
+          ),
+        )
+        .orderBy(desc(platformActionLog.createdAt))
+        .limit(1);
+
+      return { ...found, lift: lift ?? null };
+    },
   );
 
   if (!row) return null;
 
   const session = row.session;
+
+  /* ---- ⭐ THE THIRTY-MINUTE HARD CAP, RE-DECIDED HERE ------------- */
+  //
+  // 🔴 EVERY SERVER REQUEST RE-COMPUTES THIS FROM `started_at`, a column
+  // the database refuses to let anybody change. Nothing here reads a
+  // deadline, a countdown or a "minutes left" value that arrived from a
+  // browser — a paused tab, a clock skewed by an hour and a hand-crafted
+  // POST are all the same thing to this check, which is that they are
+  // not consulted.
+  //
+  // ⚠️ THE ROW IS LEFT OPEN. Closing it needs a write, and a read path
+  // that writes turns every page load into a transaction. `ended_at`
+  // stays NULL until the sweep tidies it, and NOTHING anywhere treats a
+  // NULL `ended_at` as evidence of life.
+  if (!isSessionLive(session, now)) return null;
 
   /* ---- Session binding ------------------------------------------ */
   //
@@ -177,10 +331,14 @@ export async function getActiveImpersonation(
     return null;
   }
 
-  const minutesLeft = minutesRemaining(
-    { expiresAt: session.expiresAt, endedAt: session.endedAt },
-    now,
-  );
+  const minutesLeft = minutesRemaining(session, now);
+
+  // ⭐ THE ONE LINE THAT MAKES READ-ONLY THE DEFAULT. Everything that
+  // decides whether a write may proceed reads the value this produces.
+  const scope = effectiveScope({
+    ceiling: session.scope,
+    lifted: row.lift !== null,
+  });
 
   return {
     sessionId: session.id,
@@ -188,18 +346,185 @@ export async function getActiveImpersonation(
     tenantSlug: session.tenantSlug,
     tenantName: row.tenantName,
     mode: session.mode,
-    scope: session.scope,
+    scope,
+    grantedScope: session.scope,
+    scopeLiftedAt: row.lift?.createdAt ?? null,
+    scopeLiftReason: row.lift?.justification ?? null,
+    justification: session.justification,
     startedAt: session.startedAt,
-    expiresAt: session.expiresAt,
+    expiresAt: cappedExpiry(session),
     minutesLeft,
     banner: bannerText({
       tenantName: row.tenantName,
       mode: session.mode,
-      scope: session.scope,
+      scope,
       minutesLeft,
     }),
     actorEmail: session.actorEmail,
   };
+}
+
+/* ------------------------------------------------------------------ */
+/* ⭐⭐⭐ TAKING WRITE ACCESS — A SEPARATE, DELIBERATE ACT              */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Lift a live session from read-only to read-write.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * ⚠️ THIS IS NOT A TOGGLE AND IT IS NOT REVERSIBLE
+ * ══════════════════════════════════════════════════════════════════════
+ * There is no "drop back to read-only" counterpart, and the omission is
+ * deliberate: un-lifting would let an operator write, then hide the fact
+ * that they could, leaving a register that says "read-write" for a window
+ * nobody can bound. If they no longer need write access, the session ends
+ * — which takes one click and costs at most the remainder of half an hour.
+ *
+ * FOUR REFUSALS, IN THIS ORDER, AND EACH ONE IS DIFFERENT:
+ *
+ *   1. THE PURE POLICY (`scopeLiftProblem`) — break-glass can never be
+ *      lifted, a read-only consent can never be exceeded, a lifted
+ *      session cannot be lifted twice, and "fix" is not a reason.
+ *   2. THE CONSENT, RE-READ NOW — a consent revoked five minutes ago must
+ *      not authorise anything, and the only way to be certain of that is
+ *      to read it at the moment of the act rather than trust the copy
+ *      taken when the session started.
+ *   3. THE REGISTER ACCEPTED IT — the lift is not granted until it is
+ *      READABLE. See `SCOPE_LIFT_RESOURCE`.
+ *   4. The customer is told, in their own audit log, in the same breath.
+ */
+export async function liftImpersonationScope(
+  input: unknown,
+): Promise<PlatformResult<{ scope: ImpersonationScope }>> {
+  const parsed = liftImpersonationScopeSchema.safeParse(input);
+  if (!parsed.success) {
+    return {
+      ok: false,
+      error: "Check the form.",
+      fieldErrors: parsed.error.flatten().fieldErrors as Record<string, string[]>,
+    };
+  }
+  const { sessionId, reason } = parsed.data;
+
+  // ⚠️ THE SAME CAPABILITY THAT STARTED THE SESSION, deliberately. The
+  // authority to be inside a consented workspace and the authority to
+  // use the write access the customer already granted are the same
+  // authority; a second capability would imply the customer's grant
+  // needs our grade's permission as well, which inverts who is deciding.
+  const operator = await requireCapability("impersonate:consented");
+
+  const active = await getActiveImpersonation(operator);
+  if (!active || active.sessionId !== sessionId) {
+    // Same sentence for "not yours", "already closed" and "never
+    // existed": the difference between them is a map of which session
+    // ids are real.
+    return { ok: false, error: "No live session of yours to change." };
+  }
+
+  const problem = scopeLiftProblem({
+    mode: active.mode,
+    ceiling: active.grantedScope,
+    alreadyLifted: active.scopeLiftedAt !== null,
+    reason,
+  });
+  if (problem) return { ok: false, error: problem, fieldErrors: { reason: [problem] } };
+
+  /* ---- 2. THE CONSENT, AS IT IS RIGHT NOW ------------------------ */
+  const now = new Date();
+  const consentStillGood = await withPlatformScope(
+    `Platform console: re-read tenant support consent before taking write access in session ${sessionId}`,
+    async (tx) => {
+      const [consent] = await tx
+        .select({ scope: tenantSupportConsents.scope })
+        .from(tenantSupportConsents)
+        .where(
+          and(
+            eq(tenantSupportConsents.tenantId, active.tenantId),
+            isNull(tenantSupportConsents.revokedAt),
+            gt(tenantSupportConsents.expiresAt, now),
+          ),
+        )
+        .orderBy(desc(tenantSupportConsents.grantedAt))
+        .limit(1);
+      return consent?.scope === "read_write";
+    },
+  );
+
+  if (!consentStillGood) {
+    return {
+      ok: false,
+      error:
+        "This workspace's support access no longer permits changes — it was revoked, " +
+        "narrowed or has expired since this session started. The session stays read-only.",
+    };
+  }
+
+  /* ---- 3. THE REGISTER IS THE GRANT ------------------------------ */
+  await recordPlatformAudit({
+    operator,
+    // ⚠️ NULL ON PURPOSE. This row goes to `platform_action_log`, which
+    // is the register the write gate reads on every request. The
+    // customer's copy is the next call.
+    tenantId: null,
+    action: "impersonate",
+    resourceType: SCOPE_LIFT_RESOURCE,
+    resourceId: sessionId,
+    severity: "warning",
+    reason,
+    metadata: {
+      tenantId: active.tenantId,
+      tenantSlug: active.tenantSlug,
+      mode: active.mode,
+      grantedScope: active.grantedScope,
+    },
+  });
+
+  // ⭐ READ BACK BEFORE SAYING YES. `recordPlatformAudit()` never throws,
+  // so "it returned" is not evidence that anything was written — and a
+  // console that reports write access an operator does not have is worse
+  // than one that refuses.
+  const confirmed = await withPlatformScope(
+    `Platform console: confirm the scope lift for session ${sessionId} reached the register`,
+    async (tx) => {
+      const [row] = await tx
+        .select({ id: platformActionLog.id })
+        .from(platformActionLog)
+        .where(
+          and(
+            eq(platformActionLog.resourceType, SCOPE_LIFT_RESOURCE),
+            eq(platformActionLog.resourceId, sessionId),
+          ),
+        )
+        .limit(1);
+      return row != null;
+    },
+  );
+
+  if (!confirmed) {
+    return {
+      ok: false,
+      error:
+        "The action register did not accept the record of this change, so write " +
+        "access was not granted. The session is still read-only. Report this.",
+    };
+  }
+
+  /* ---- 4. THE CUSTOMER'S OWN LOG --------------------------------- */
+  await recordPlatformAudit({
+    operator,
+    tenantId: active.tenantId,
+    action: "impersonate",
+    resourceType: SCOPE_LIFT_RESOURCE,
+    resourceId: sessionId,
+    impersonationId: sessionId,
+    severity: "warning",
+    reason,
+    oldValue: { scope: "read_only" },
+    newValue: { scope: "read_write" },
+    metadata: { modeLabel: MODE_LABELS[active.mode] },
+  });
+
+  return { ok: true, data: { scope: "read_write" } };
 }
 
 /* ------------------------------------------------------------------ */
@@ -507,6 +832,7 @@ export async function stopImpersonation(input: unknown): Promise<PlatformResult<
 
   const session = await endSession(parsed.data.sessionId, "operator_ended", {
     onlyActorClerkId: operator.clerkUserId,
+    endedBy: operator,
   });
 
   if (!session) {
@@ -516,20 +842,17 @@ export async function stopImpersonation(input: unknown): Promise<PlatformResult<
     return { ok: false, error: "No session to end." };
   }
 
-  await recordPlatformAudit({
-    operator,
-    tenantId: session.tenantId,
-    action: "impersonate",
-    resourceType: "impersonation_session",
-    resourceId: session.id,
-    impersonationId: session.id,
-    severity: "notice",
-    reason: "Impersonation session ended by the operator.",
-    newValue: { endedAt: new Date().toISOString(), endedReason: "operator_ended" },
-  });
-
   return { ok: true, data: undefined };
 }
+
+/** The row `endSession()` needs in order to write the register entry. */
+type ClosedSession = {
+  id: string;
+  tenantId: string;
+  tenantSlug: string;
+  actorClerkId: string;
+  actorEmail: string;
+};
 
 /**
  * Close a session.
@@ -540,20 +863,43 @@ export async function stopImpersonation(input: unknown): Promise<PlatformResult<
  * column, refuses re-closing an already-closed row, and refuses DELETE
  * outright. This function is the application-side half of the same rule —
  * it exists to give a good error, not to be the thing that is true.
+ *
+ * ⭐ IT IS ALSO THE ONE PLACE THAT WRITES "THIS SESSION ENDED, AND HERE
+ * IS WHICH OF THE FOUR WAYS IT WAS" — Batch 28.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * ⚠️ THE RECORDING USED TO LIVE IN THE CALLERS, AND ONE OF THEM HAD NONE
+ * ══════════════════════════════════════════════════════════════════════
+ * `stopImpersonation()` wrote an audit row afterwards. The expiry sweep
+ * did not — so the ONE ending that happens with nobody in the room was
+ * the one ending nobody could see in the register. That is backwards:
+ * an operator who ends their own session is announcing it; a session that
+ * ran out is the case a reviewer has to reconstruct.
+ *
+ * Putting the write here means every path gets it, including the one
+ * somebody adds next year, and nobody has to remember.
  */
 async function endSession(
   sessionId: string,
-  reason:
-    | "operator_ended"
-    | "expired"
-    | "revoked_by_tenant"
-    | "revoked_by_platform"
-    | "session_binding_failed",
-  options: { onlyActorClerkId?: string } = {},
-): Promise<{ id: string; tenantId: string } | null> {
-  return withPlatformScope(
+  reason: ImpersonationEndReasonKey,
+  options: {
+    onlyActorClerkId?: string;
+    /**
+     * ⚠️ SCOPES THE UPDATE TO ONE WORKSPACE. Used by the tenant-owner
+     * path, where the caller has proved they administer THIS workspace
+     * and nothing else. Without it, an owner holding a session id from
+     * anywhere could close a session in somebody else's workspace.
+     */
+    onlyTenantId?: string;
+    /** Who did it. Omitted for the clock, which is attributed as system. */
+    endedBy?: PlatformAuditActor;
+    /** Free text folded into the register entry — e.g. the owner's reason. */
+    note?: string;
+  } = {},
+): Promise<ClosedSession | null> {
+  const closed = await withPlatformScope(
     `Platform console: close impersonation session ${sessionId} (${reason})`,
-    async (db) => {
+    async (tx) => {
       const conditions = [
         eq(platformImpersonationSessions.id, sessionId),
         isNull(platformImpersonationSessions.endedAt),
@@ -563,47 +909,220 @@ async function endSession(
           eq(platformImpersonationSessions.actorClerkId, options.onlyActorClerkId),
         );
       }
+      if (options.onlyTenantId) {
+        conditions.push(eq(platformImpersonationSessions.tenantId, options.onlyTenantId));
+      }
 
-      const rows = await db
+      const rows = await tx
         .update(platformImpersonationSessions)
         .set({ endedAt: new Date(), endedReason: reason })
         .where(and(...conditions))
         .returning({
           id: platformImpersonationSessions.id,
           tenantId: platformImpersonationSessions.tenantId,
+          tenantSlug: platformImpersonationSessions.tenantSlug,
+          actorClerkId: platformImpersonationSessions.actorClerkId,
+          actorEmail: platformImpersonationSessions.actorEmail,
         });
 
       return rows[0] ?? null;
     },
   );
+
+  if (!closed) return null;
+  await recordSessionEnd(closed, reason, options.endedBy, options.note);
+  return closed;
 }
 
 /**
- * Tidy sessions whose `expires_at` has passed.
+ * ⭐ WHICH OF THE WAYS IT ENDED, IN THE CUSTOMER'S OWN AUDIT LOG.
+ *
+ * ⚠️ TENANT-ATTRIBUTED, so the workspace whose data was read can see that
+ * the access stopped and how — not only that it started. "Somebody was in
+ * your workspace" with no matching "and they left" is the shape of record
+ * that makes a customer assume the worst, correctly.
+ *
+ * ⚠️ THE EXPIRY CASE HAS NO HUMAN, and is attributed to `system` with the
+ * operator's own address in the row. Attributing it TO the operator would
+ * claim they took an action they did not take; attributing it to nobody
+ * at all would lose which session it concerns.
+ */
+async function recordSessionEnd(
+  session: ClosedSession,
+  reason: ImpersonationEndReasonKey,
+  endedBy?: PlatformAuditActor,
+  note?: string,
+): Promise<void> {
+  const actor: PlatformAuditActor = endedBy ?? {
+    clerkUserId: session.actorClerkId,
+    email: session.actorEmail,
+    grade: "system",
+    ipAddress: null,
+    userAgent: null,
+    requestId: null,
+  };
+
+  await recordPlatformAudit({
+    operator: actor,
+    tenantId: session.tenantId,
+    action: "impersonate",
+    resourceType: "impersonation_session",
+    resourceId: session.id,
+    impersonationId: session.id,
+    // A session terminated because it was used from another address is
+    // an incident; the other three are ordinary endings.
+    severity: reason === "session_binding_failed" ? "critical" : "notice",
+    reason: note
+      ? `${END_REASON_LABELS[reason]}. ${note}`
+      : `${END_REASON_LABELS[reason]}.`,
+    newValue: { endedAt: new Date().toISOString(), endedReason: reason },
+    metadata: {
+      endedReason: reason,
+      // ⭐ THE WORD, not only the enum value. A register read by a person
+      // six months from now should not require the reader to know that
+      // `revoked_by_tenant` means the customer did it themselves.
+      endedReasonLabel: END_REASON_LABELS[reason],
+      sessionOperator: session.actorEmail,
+      endedByOperator: endedBy?.email ?? null,
+    },
+  });
+}
+
+/**
+ * Tidy sessions whose clock has run out.
  *
  * ⚠️ THIS DOES NOT EXPIRE ANYTHING. Those sessions are ALREADY over —
  * `isSessionLive()` has been returning false since the moment the clock
- * passed `expires_at`. All this does is write down why, so the console
- * shows "expired" rather than an open row that is not open. If it never
- * runs, nothing is less safe; the history is just untidy.
+ * passed the capped expiry. All this does is write down why, so the
+ * console shows "expired" rather than an open row that is not open. If it
+ * never runs, nothing is less safe; the history is just untidy.
+ *
+ * ⚠️ THE PREDICATE USES THE CAPPED EXPIRY, so a row written before the
+ * thirty-minute cap existed — with its own sixty-minute `expires_at` —
+ * is tidied at minute thirty, which is when it actually stopped working.
+ * A sweep that disagreed with the liveness test would leave rows the
+ * console calls open and the gate calls closed.
  */
 export async function sweepExpiredImpersonations(): Promise<number> {
   const now = new Date();
   const closed = await withPlatformScope(
     "Platform maintenance: mark expired impersonation sessions as ended",
-    async (db) =>
-      db
+    async (tx) =>
+      tx
         .update(platformImpersonationSessions)
         .set({ endedAt: now, endedReason: "expired" })
         .where(
           and(
             isNull(platformImpersonationSessions.endedAt),
-            sql`${platformImpersonationSessions.expiresAt} <= ${now}`,
+            sql`${cappedExpirySql()} <= ${now}`,
           ),
         )
-        .returning({ id: platformImpersonationSessions.id }),
+        .returning({
+          id: platformImpersonationSessions.id,
+          tenantId: platformImpersonationSessions.tenantId,
+          tenantSlug: platformImpersonationSessions.tenantSlug,
+          actorClerkId: platformImpersonationSessions.actorClerkId,
+          actorEmail: platformImpersonationSessions.actorEmail,
+        }),
   );
+
+  // ⚠️ Sequential, and deliberately not `Promise.all`. Each of these
+  // writes a hash-chained audit row into one tenant's log, and the chain
+  // head is read-then-written — concurrent writers to the same tenant
+  // collide and degrade to unchained rows. A sweep is not on anybody's
+  // critical path; correctness of the chain is worth the seconds.
+  for (const session of closed) {
+    await recordSessionEnd(session, "expired");
+  }
+
   return closed.length;
+}
+
+/**
+ * ⭐ END A SESSION BECAUSE THE WORKSPACE ASKED — Batch 28.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 SHOULD THE CUSTOMER BE ABLE TO KICK OUR ENGINEER OUT MID-INCIDENT?
+ * ══════════════════════════════════════════════════════════════════════
+ * The honest answer is that this control is right for trust and wrong for
+ * the one situation it will most often be used in, and both halves are
+ * true at once. The reasoning is written here rather than left implicit,
+ * because whoever reads this next deserves the argument and not just the
+ * verdict.
+ *
+ * THE CASE AGAINST: the realistic sequence is that something is broken,
+ * the customer has escalated, an engineer is inside diagnosing it, and
+ * somebody at the customer sees an alarming red bar and presses the
+ * button. Access ends mid-transaction. The engineer has to ask for it
+ * back, on a call, while the outage continues. We have handed the
+ * customer a control whose most likely use makes their own incident
+ * longer, and we did it while they were stressed.
+ *
+ * THE CASE FOR, WHICH WINS:
+ *
+ *   1. ⭐ CONSENT THAT CANNOT BE WITHDRAWN IS NOT CONSENT. The entire
+ *      model in `impersonation-policy.ts` rests on the customer having
+ *      said yes. A yes that cannot be turned back into a no is a
+ *      formality we collect once and then rely on forever. Every other
+ *      control here — the expiry, the deny-list, the read-only default —
+ *      is downstream of the customer's agreement actually meaning
+ *      something.
+ *
+ *   2. ⚠️ THE ALTERNATIVE IS NOT "THE ENGINEER STAYS IN". It is "the
+ *      customer telephones somebody and waits". During the exact
+ *      incident this is supposed to protect, that is worse for them and
+ *      no better for us, and it converts a two-second action into a
+ *      support ticket about a support ticket.
+ *
+ *   3. THE COST IS BOUNDED AND SMALL. A session is at most thirty
+ *      minutes. Losing one costs the engineer the time to ask for
+ *      another — awkward, not dangerous. Compare that to what the
+ *      absence of this button costs: a customer who discovers that the
+ *      "revoke access" wording in their settings did not, in the moment
+ *      they wanted it, revoke access.
+ *
+ *   4. IT IS RECORDED AS THEIRS. `revoked_by_tenant` is a distinct
+ *      ending, in their own audit log, with their reason attached. If a
+ *      customer routinely ejects engineers mid-incident, that is a
+ *      conversation to have with them — and it is a conversation this
+ *      record makes possible rather than one it prevents.
+ *
+ * ⚠️ WHAT THIS IS NOT: a way to hide anything. The session row is
+ * evidence and is untouched apart from the one-way close, the actions
+ * already taken remain in the log, and ending access does not un-read
+ * what was read.
+ *
+ * ⚠️ AND IT DOES NOT REVOKE THE CONSENT ITSELF. Ending this session is a
+ * smaller act than withdrawing standing consent, and conflating them
+ * would mean a customer who wanted the engineer to step out for five
+ * minutes has to re-grant access from scratch. Withdrawing consent is a
+ * separate control in their settings, which is where a durable decision
+ * belongs.
+ */
+export async function endSessionForTenantOwner(args: {
+  sessionId: string;
+  /** Proved by the caller's own tenant context. Never taken from input. */
+  tenantId: string;
+  /** Who at the customer did it, for the register. */
+  actorEmail: string;
+  reason: string;
+}): Promise<ClosedSession | null> {
+  return endSession(args.sessionId, "revoked_by_tenant", {
+    onlyTenantId: args.tenantId,
+    endedBy: {
+      // ⚠️ NULL CLERK ID ON PURPOSE. The person who did this is a
+      // CUSTOMER'S user, not platform staff, and writing their Clerk id
+      // into a column whose whole meaning is "which of our staff" would
+      // make a customer look like an operator in every later query.
+      clerkUserId: null,
+      email: args.actorEmail,
+      grade: "system",
+      ipAddress: null,
+      userAgent: null,
+      requestId: null,
+    },
+    note: `Ended by ${args.actorEmail} at the workspace: ${args.reason}`,
+  });
 }
 
 /* ------------------------------------------------------------------ */
@@ -669,6 +1188,30 @@ export async function assertImpersonationAllows(
   operation: string,
   facts?: ImpersonationFacts,
 ): Promise<void> {
+  /*
+   * ══════════════════════════════════════════════════════════════════
+   * 🔴 MAINTENANCE MODE IS CHECKED HERE, FIRST, AND ON EVERY PATH.
+   * ══════════════════════════════════════════════════════════════════
+   * Batch 131 needed a place where writes are actually refused. This is
+   * that place already: every tenant-side mutation in the codebase calls
+   * this function, and the alternative — a second gate of its own — is a
+   * second opinion about what counts as a write. Two opinions on that
+   * question disagree eventually, and the way they disagree is that one
+   * of them lets a save through during a window we told the customer was
+   * frozen.
+   *
+   * ⚠️ BEFORE the `!facts.impersonationId` early return, deliberately.
+   * Maintenance mode applies to ORDINARY USERS — it is the case that
+   * matters — and an early return written for the impersonation question
+   * would have skipped it for everybody who is not being impersonated,
+   * which is everybody.
+   *
+   * ⚠️ It reads reads-vs-writes with the SAME `isWriteOperation` this
+   * file's own policy uses, so an operation is never a write for one gate
+   * and a read for the other.
+   */
+  await assertMaintenanceAllows(operation, facts?.tenant.id ?? null);
+
   /* --- The cheap path: the caller already knows ------------------- */
   if (facts) {
     // Not impersonating. `evaluateOperation(op, null)` would return

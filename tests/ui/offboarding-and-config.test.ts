@@ -76,7 +76,17 @@ describe("the 24-hour window", () => {
    * test fails and they have to come and read the argument first.
    */
   it("the approval executor schedules and never deletes", () => {
-    const code = codeOnly(CONTROL);
+    /*
+     * ⚠️ READ FROM `approval-executors.ts`, NOT FROM `control-actions.ts`.
+     * Batch 43 moved every registration into one module that imports
+     * nothing which could import it back — three of the five policies are
+     * now raised by the WRITING functions, which are reachable from
+     * server actions that never touch `control-actions.ts`, and a
+     * registration living there meant those writes could be held and
+     * then fail to queue. The assertion below is the same assertion; only
+     * the file it reads moved.
+     */
+    const code = codeOnly(read("server/platform/approval-executors.ts"));
     expect(code).toContain('registerApprovalExecutor("tenant.terminate"');
     expect(code).toContain("scheduleTenantTermination(payload)");
 
@@ -506,7 +516,16 @@ describe("everything is reachable", () => {
     expect(code).toContain("requestTerminationAction");
     expect(code).toContain("cancelTerminationAction");
     expect(code).toContain("exportOffboardingSnapshotAction");
-    expect(code).toContain('value="offboarding"');
+    /*
+     * ⚠️ WAS `toContain('value="offboarding"')` — A PINNED TAB ID, AND
+     * THE WRONG ASSERTION. It broke in Batch 125 when the detail page
+     * became Tenant 360 and the panel moved onto the Access tab beside
+     * the other irreversible act (the rename), which is an improvement
+     * the test had no business refusing. The property that actually
+     * matters is that the panel is mounted inside the tabbed surface —
+     * reachable by an operator — not which of the eight tabs holds it.
+     */
+    expect(code).toContain("TenantTabs");
   });
 
   it("the chain panel is mounted on the configure page", () => {

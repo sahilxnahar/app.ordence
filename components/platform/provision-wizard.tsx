@@ -28,6 +28,7 @@ import { Badge } from "@/components/ui/badge";
 import { toast } from "sonner";
 import type { ProvisionPlan, ProvisionOutcome } from "@/server/platform/provisioning";
 import { CONFIGURABLE_PLAN_TIERS } from "@/lib/platform/configuration";
+import { suggestSlugs } from "@/lib/slug";
 
 type IndustryOption = { key: string; label: string; description: string };
 
@@ -47,6 +48,19 @@ export function ProvisionWizard({
   const [pending, startTransition] = useTransition();
   const [plan, setPlan] = useState<ProvisionPlan | null>(null);
   const [outcome, setOutcome] = useState<ProvisionOutcome | null>(null);
+  /**
+   * ⭐ THE SERVER'S REFUSAL, KEPT ON THE SCREEN.
+   *
+   * 🔴 THE DISABLED BUTTON IS A MISTAKE GUARD, NOT A BOUNDARY.
+   * `provisionTenant()` re-plans inside its own transaction and
+   * `claimSlug()` inserts with `ON CONFLICT (slug) DO NOTHING`, so a slug
+   * that was free when the dry run ran can be gone by the time apply
+   * arrives — the race the plan cannot close. That refusal used to be a
+   * toast, which vanishes in four seconds and takes the reason with it.
+   * It is state now, rendered with the alternatives, because the operator
+   * reading it has a customer on the phone waiting for an address.
+   */
+  const [refusal, setRefusal] = useState<string | null>(null);
   const [fieldErrors, setFieldErrors] = useState<Record<string, string[]>>({});
   const [form, setForm] = useState({
     name: "",
@@ -84,6 +98,7 @@ export function ProvisionWizard({
     // different values from the ones in the form is the exact failure this
     // whole two-step design exists to prevent.
     setPlan(null);
+    setRefusal(null);
     setFieldErrors({});
   }
 
@@ -104,17 +119,48 @@ export function ProvisionWizard({
     startTransition(async () => {
       const result = await provisionAction(payload());
       if (!result.ok) {
+        /*
+         * ⚠️ THE MESSAGE IS THE SERVER'S, WORD FOR WORD, AND IT IS NOT
+         * COLLAPSED INTO "provisioning failed". `provisionTenant()`
+         * distinguishes four database refusals — taken, too similar,
+         * reserved, recently released — and each one tells the operator a
+         * different thing to do next. Keeping it verbatim is what makes
+         * the panel below useful instead of decorative.
+         */
+        setRefusal(result.error);
         toast.error(result.error);
-        // Re-plan so the operator sees why, rather than a bare toast.
+        // Re-plan so the operator sees the CURRENT state of the world,
+        // not the one that was true before somebody else claimed the name.
         const fresh = await planAction(payload());
         if (fresh.ok) setPlan(fresh.data);
         return;
       }
       setOutcome(result.data);
       setPlan(null);
+      setRefusal(null);
       toast.success(`Workspace ${result.data.slug} created.`);
     });
   }
+
+  /**
+   * ⚠️ CANDIDATES, NOT OFFERS. `suggestSlugs()` only checks SHAPE — it
+   * cannot know what is taken, reserved or inside the 365-day retention
+   * window. So pressing one does NOT provision anything: it loads the name
+   * into the form and clears the plan, and the operator has to preview it,
+   * which is the query that asks the database. Presenting these as
+   * "available" would teach the operator that this screen's answers are
+   * unreliable on the one screen where they most need to believe it.
+   */
+  const alternatives = suggestSlugs(form.slug, 4);
+
+  /*
+   * ⭐ THE TWO HALVES OF THE DIFF. `mutating && !external` is what this
+   * transaction writes and can roll back; `external` is what survives it
+   * as a job for a person. Splitting the numbered list by that flag is
+   * the whole point of the flag existing on `ProvisionStep`.
+   */
+  const writesInTransaction = plan ? plan.steps.filter((s) => s.mutating && !s.external) : [];
+  const leftPending = plan ? plan.steps.filter((s) => s.external) : [];
 
   /* ── Done ────────────────────────────────────────────────────────── */
   if (outcome) {
@@ -324,6 +370,51 @@ export function ProvisionWizard({
           <CardTitle>2 · Read the plan</CardTitle>
         </CardHeader>
         <CardContent className="space-y-4">
+          {/*
+            🔴 THE REFUSAL, RENDERED — NOT A TOAST.
+            The dry run said this could proceed and the database said no.
+            That is not a bug and not a generic failure: between the two
+            somebody else claimed the name, or the retention window moved.
+            The operator needs the reason and a next name, on screen, for
+            as long as it takes them to type it.
+          */}
+          {refusal && (
+            <div className="rounded-md border-2 border-red-400 bg-red-50 p-3 dark:border-red-700 dark:bg-red-950/40">
+              <p className="text-sm font-semibold text-red-700 dark:text-red-300">
+                Refused — nothing was created
+              </p>
+              <p className="mt-1 text-sm">{refusal}</p>
+              <p className="mt-2 text-xs text-muted-foreground">
+                The whole provision ran inside one transaction and it was rolled
+                back. There is no half-made workspace to clean up, and the owner
+                email was not sent.
+              </p>
+              {alternatives.length > 0 && (
+                <div className="mt-3 space-y-1">
+                  <p className="text-xs font-medium">
+                    Names of the right shape — press one to load it, then preview
+                    it. Shape only: whether it is free is a question for the
+                    database, and preview is what asks.
+                  </p>
+                  <div className="flex flex-wrap gap-2">
+                    {alternatives.map((candidate) => (
+                      <Button
+                        key={candidate}
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        className="font-mono"
+                        onClick={() => set("slug", candidate)}
+                      >
+                        {candidate}
+                      </Button>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
           {!plan ? (
             <p className="text-sm text-muted-foreground">
               Nothing has been created. Fill in the form and press preview — this
@@ -332,16 +423,58 @@ export function ProvisionWizard({
             </p>
           ) : (
             <>
+              {/*
+                ⚠️ ADVISORY, AND IT SAYS SO. Time passes between reading
+                this and approving it. `claimSlug()` inserts with ON
+                CONFLICT DO NOTHING inside the transaction and is the only
+                thing that actually decides — everything below is what
+                WOULD happen if nothing changes in the meantime.
+              */}
+              <p className="rounded-md border border-dashed p-3 text-xs text-muted-foreground">
+                <span className="font-medium text-foreground">
+                  Dry run · nothing has been written.
+                </span>{" "}
+                This is advice, not a reservation. The address is claimed at the
+                moment you press create, not now, so somebody else can take it
+                between these two clicks. If they do, the create is refused and
+                nothing is created.
+              </p>
+
               {plan.blockers.length > 0 && (
                 <div className="rounded-md border border-red-300 bg-red-50 p-3 dark:border-red-800 dark:bg-red-950/40">
                   <p className="text-sm font-medium text-red-700 dark:text-red-300">
-                    Cannot proceed
+                    Blocked — create is switched off
                   </p>
-                  <ul className="mt-1 list-disc space-y-1 pl-5 text-sm">
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    Each of these is a refusal the database would issue. Clear
+                    them in the form on the left and preview again.
+                  </p>
+                  <ul className="mt-2 list-disc space-y-1 pl-5 text-sm">
                     {plan.blockers.map((b) => (
+                      // ⚠️ The blocker string already carries the operator
+                      // message from `lib/slug.ts` — what to do about it is
+                      // part of the sentence, not a separate lookup here,
+                      // so the wording cannot drift away from the refusal.
                       <li key={b}>{b}</li>
                     ))}
                   </ul>
+                  {alternatives.length > 0 && (
+                    <div className="mt-3 flex flex-wrap items-center gap-2">
+                      <span className="text-xs font-medium">Try instead:</span>
+                      {alternatives.map((candidate) => (
+                        <Button
+                          key={candidate}
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          className="font-mono"
+                          onClick={() => set("slug", candidate)}
+                        >
+                          {candidate}
+                        </Button>
+                      ))}
+                    </div>
+                  )}
                 </div>
               )}
 
@@ -354,26 +487,102 @@ export function ProvisionWizard({
                 </p>
               ))}
 
-              <ol className="space-y-2">
-                {plan.steps.map((step) => (
-                  <li key={step.order} className="flex gap-3 text-sm">
-                    <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-muted text-xs tabular-nums">
-                      {step.order}
-                    </span>
-                    <span>
-                      <span className="font-medium">{step.title}</span>
-                      {step.external && (
-                        <Badge variant="outline" className="ml-2 text-[10px]">
-                          outside the transaction
-                        </Badge>
-                      )}
-                      <span className="block text-xs text-muted-foreground">
-                        {step.detail}
+              {/*
+                ⭐⭐ THE DIFF. The plan already computed all of this and
+                nothing showed it as a CHANGE — a numbered list of five
+                verbs does not tell an operator what is different
+                afterwards. Two columns do: what is true now, what is true
+                after. Every line on the right is a line the transaction
+                writes; the external steps are below, separately, because
+                they are NOT true when the button stops spinning.
+              */}
+              <div className="grid gap-3 rounded-md border p-3 sm:grid-cols-2">
+                <div className="space-y-2">
+                  <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                    Now
+                  </p>
+                  <ul className="space-y-1.5 text-sm">
+                    <li>
+                      <span className="font-mono text-xs break-all">
+                        {plan.workspaceUrl}
                       </span>
-                    </span>
-                  </li>
-                ))}
-              </ol>
+                      <span className="block text-xs text-muted-foreground">
+                        No workspace holds this address.
+                      </span>
+                    </li>
+                    <li className="text-muted-foreground">
+                      No roles, no industry pack, no billing identity.
+                    </li>
+                    {plan.dns.length > 0 && (
+                      <li className="text-muted-foreground">
+                        The custom domain points nowhere we control.
+                      </li>
+                    )}
+                  </ul>
+                </div>
+
+                <div className="space-y-2 sm:border-l sm:pl-3">
+                  <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                    After you press create
+                  </p>
+                  <ul className="space-y-1.5 text-sm">
+                    <li>
+                      <Badge variant="secondary" className="mr-1.5 text-[10px]">
+                        created
+                      </Badge>
+                      <span className="font-mono text-xs break-all">
+                        {plan.workspaceUrl}
+                      </span>
+                      <span className="block text-xs text-muted-foreground">
+                        Live immediately — the wildcard record already resolves.
+                      </span>
+                    </li>
+                    {writesInTransaction.map((step) => (
+                      <li key={step.order}>
+                        {/*
+                          ⚠️ THE WORD "created", NOT A GREEN DOT. One in
+                          twelve Indian men is colour-blind; a colour that
+                          carries meaning on its own carries none for them.
+                        */}
+                        <Badge variant="secondary" className="mr-1.5 text-[10px]">
+                          created
+                        </Badge>
+                        <span className="font-medium">{step.title}</span>
+                        <span className="block text-xs text-muted-foreground">
+                          {step.detail}
+                        </span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              </div>
+
+              {/*
+                ⚠️ NOT PART OF THE TRANSACTION, SO NOT PART OF "AFTER".
+                These are listed as work that remains, because a provision
+                that half-happened must be visible or it becomes an orphan
+                nobody knows to finish.
+              */}
+              {leftPending.length > 0 && (
+                <div className="space-y-1">
+                  <p className="text-sm font-medium">
+                    Still yours to do afterwards — outside the transaction
+                  </p>
+                  <ul className="space-y-1.5 text-sm">
+                    {leftPending.map((step) => (
+                      <li key={step.order}>
+                        <Badge variant="outline" className="mr-1.5 text-[10px]">
+                          pending
+                        </Badge>
+                        <span className="font-medium">{step.title}</span>
+                        <span className="block text-xs text-muted-foreground">
+                          {step.detail}
+                        </span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
 
               {/*
                 ⭐ WHAT THE CUSTOMER ACTUALLY SEES ON DAY ONE.
@@ -385,14 +594,22 @@ export function ProvisionWizard({
               */}
               <div className="space-y-1">
                 <p className="text-sm font-medium">
-                  Their menu on day one — {plan.industryLabel} on {plan.planTierLabel}
+                  Granted on day one — {plan.industryLabel} on {plan.planTierLabel}{" "}
+                  <span className="font-normal text-muted-foreground">
+                    ({plan.dayOneMenu.length} of{" "}
+                    {plan.dayOneMenu.length + plan.hiddenByPlan.length} screens in
+                    the pack)
+                  </span>
                 </p>
                 <p className="text-xs text-muted-foreground">
                   {plan.dayOneMenu.join(" · ")}
                 </p>
                 {plan.hiddenByPlan.length > 0 && (
                   <p className="text-xs text-amber-700 dark:text-amber-400">
-                    In the pack but not in the plan, so it will not appear:{" "}
+                    {/* ⚠️ "Not granted" in words. This is the difference
+                        between what sales described and what the customer
+                        will see, and it is cheapest to correct now. */}
+                    Not granted by {plan.planTierLabel}, so these will not appear:{" "}
                     {plan.hiddenByPlan.join(", ")}.
                   </p>
                 )}
@@ -401,7 +618,17 @@ export function ProvisionWizard({
               {plan.dns.length > 0 && (
                 <div className="space-y-2">
                   <p className="text-sm font-medium">
-                    DNS records to give the customer
+                    DNS records the customer must add before the domain works
+                  </p>
+                  <p className="text-xs text-muted-foreground">
+                    {/* ⚠️ We do not add these. Nothing in this transaction
+                        touches Cloudflare, so the domain stays recorded and
+                        unverified until these two resolve. The verification
+                        token is derived from the slug, so previewing again
+                        gives the same value — hand it over twice safely. */}
+                    Creating the workspace does not create these. Until they
+                    resolve the custom domain is recorded and unverified, and the
+                    workspace address above is the live one.
                   </p>
                   <div className="overflow-x-auto rounded-md border">
                     <table className="w-full text-xs">
@@ -426,13 +653,29 @@ export function ProvisionWizard({
                 </div>
               )}
 
-              <Button
-                onClick={runProvision}
-                disabled={pending || plan.blockers.length > 0}
-                className="w-full"
-              >
-                {pending ? "Creating…" : `Create ${plan.slug}`}
-              </Button>
+              <div className="space-y-1.5">
+                <Button
+                  onClick={runProvision}
+                  disabled={pending || plan.blockers.length > 0}
+                  className="w-full"
+                >
+                  {pending ? "Creating…" : `Create ${plan.slug}`}
+                </Button>
+                {/*
+                  ⚠️ A DISABLED BUTTON THAT DOES NOT SAY WHY IS A BUG
+                  REPORT. The state is carried by the sentence, not by the
+                  greyed-out fill, for the colour-blindness reason above.
+                */}
+                <p className="text-xs text-muted-foreground">
+                  {plan.blockers.length > 0
+                    ? `Create is off: ${plan.blockers.length} blocker${
+                        plan.blockers.length === 1 ? "" : "s"
+                      } above must be cleared first. It is a guard against a
+                       mistake, not the boundary — the database refuses these
+                       again at insert time whatever this screen shows.`
+                    : "No blockers as of this preview. The address is claimed when you press create, not now."}
+                </p>
+              </div>
             </>
           )}
         </CardContent>

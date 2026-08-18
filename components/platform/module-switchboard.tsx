@@ -52,9 +52,18 @@ import {
   type ModuleRow,
 } from "@/lib/platform/configuration";
 import type { EntitlementDiff } from "@/lib/platform/entitlement-diff";
+import { HeldForApproval } from "@/components/platform/held-for-approval";
 
+/**
+ * ⚠️ `data.queued` IS THE DIFFERENCE BETWEEN "DONE" AND "ASKED". An
+ * `entitlement:` write against a PAYING workspace is held by
+ * `entitlement.override_paid` and nothing changes — see
+ * `setModuleEntitlement`, which holds it inside its own transaction.
+ * Optional here so a test double need not supply it; never optional to
+ * CHECK it.
+ */
 type SetResult =
-  | { ok: true }
+  | { ok: true; data?: { queued?: boolean; note?: string } }
   | { ok: false; error: string; needsStepUp?: boolean };
 
 type PreviewResult = { ok: true; data: EntitlementDiff } | { ok: false; error: string };
@@ -85,6 +94,7 @@ export function ModuleSwitchboard({
   onSet,
   onStepUp,
   onPreview,
+  isConsoleHost = false,
 }: {
   tenantId: string;
   matrix: ModuleMatrix;
@@ -122,9 +132,12 @@ export function ModuleSwitchboard({
     featureKey: string;
     direction: "enable" | "disable";
   }) => Promise<PreviewResult>;
+  /** ⚠️ The console answers on two base paths. See `console-paths.ts`. */
+  isConsoleHost?: boolean;
 }) {
   const router = useRouter();
   const [editing, setEditing] = useState<string | null>(null);
+  const [heldNote, setHeldNote] = useState<string | null>(null);
   const [reason, setReason] = useState("");
   const [expiresAt, setExpiresAt] = useState("");
   const [preview, setPreview] = useState<EntitlementDiff | null>(null);
@@ -181,6 +194,17 @@ export function ModuleSwitchboard({
 
       if (result.ok) {
         close();
+        /*
+         * 🔴 A QUEUED CHANGE IS NOT A SUCCESS. The switchboard below
+         * still shows the old state, and a green toast turns that into
+         * "the screen is stale" rather than "it has not happened".
+         */
+        if (result.data?.queued) {
+          setHeldNote(result.data.note ?? "This change is waiting for approval.");
+          router.refresh();
+          return;
+        }
+        setHeldNote(null);
         toast.success(
           mode === "clear"
             ? `${row.label} follows the plan again.`
@@ -200,6 +224,20 @@ export function ModuleSwitchboard({
 
   return (
     <div className="space-y-6">
+      {/*
+        ⭐ ABOVE THE BOARD. The panel the change was made in has closed,
+        so a notice inside it would close with it — and the row below
+        still shows the old state, which is exactly what makes a fading
+        toast dangerous here.
+      */}
+      {heldNote ? (
+        <HeldForApproval
+          note={heldNote}
+          isConsoleHost={isConsoleHost}
+          testId="module-held-for-approval"
+        />
+      ) : null}
+
       <Card>
         <CardContent className="flex flex-wrap items-center gap-4 pt-4 text-sm">
           <span>

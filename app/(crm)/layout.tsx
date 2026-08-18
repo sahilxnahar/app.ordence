@@ -25,6 +25,7 @@
  * is the source of truth.
  */
 
+import { Suspense } from "react";
 import { redirect } from "next/navigation";
 import { auth } from "@clerk/nextjs/server";
 import { OrganizationSwitcher, UserButton } from "@clerk/nextjs";
@@ -43,6 +44,17 @@ import { CommandBar } from "@/components/layout/command-bar";
 import { ThemeToggle } from "@/components/layout/theme-toggle";
 import { MobileSidebar, MobileMenuTrigger, SearchTriggerBridge } from "@/components/layout/mobile-sidebar";
 import { SearchTrigger } from "@/components/layout/search-trigger";
+import { SupportAccessBanner } from "@/components/platform/support-access-banner";
+import { MaintenanceBanner } from "@/components/platform/maintenance-banner";
+import { effectiveMaintenance } from "@/server/platform/maintenance";
+import { remainingMs } from "@/lib/platform/maintenance-policy";
+import { activeSupportAccessForTenant } from "@/server/platform/tenant-support-access";
+import {
+  endSupportSessionAction,
+  leaveSupportSessionAction,
+} from "@/server/actions/support-access";
+import { ADMIN_ROLES } from "@/server/tenant-context";
+import type { SystemRole } from "@/db/schema";
 export const dynamic = "force-dynamic";
 
 export default async function CrmLayout({
@@ -146,60 +158,200 @@ export default async function CrmLayout({
       <CommandBar />
       <SearchTriggerBridge />
 
-      <div className="flex h-screen overflow-hidden">
-        <Sidebar
-          sections={sections}
-          industryLabel={template.label}
-          tenantName={tenant.name}
-        />
-        <MobileSidebar
-          sections={sections}
-          industryLabel={template.label}
-          tenantName={tenant.name}
-        />
+      <div className="flex h-screen flex-col overflow-hidden">
+        {/*
+          ⭐⭐⭐ THE CUSTOMER'S OWN SUPPORT-ACCESS NOTICE — Batch 28.
 
-        <div className="flex min-w-0 flex-1 flex-col">
-          <header className="flex h-14 shrink-0 items-center justify-between border-b border-border px-5">
-            <div className="flex items-center gap-3">
-              <MobileMenuTrigger />
-              <OrganizationSwitcher
-                hidePersonal
-                afterSelectOrganizationUrl="/dashboard"
-              />
+          ══════════════════════════════════════════════════════════════
+          🔴 IT IS IN THE LAYOUT, ABOVE EVERYTHING, ON EVERY SCREEN
+          ══════════════════════════════════════════════════════════════
+          Not on a settings page somebody would have to go and look at.
+          The failure this prevents is a customer learning, weeks later
+          and from an email they had filtered, that one of our staff was
+          inside their workspace reading their payroll. The banner has to
+          be where they already are.
+
+          ⚠️ IT SUSPENDS SEPARATELY. Resolving the session is a database
+          round trip, and blocking the entire CRM shell on it would slow
+          every page in the product for a query that returns no rows on
+          the overwhelming majority of requests.
+
+          ⚠️ AND ITS FAILURE IS NOT THE APP'S FAILURE. `SupportAccessSlot`
+          swallows a read error and renders nothing rather than taking the
+          workspace down. That is the right trade — but it is also why the
+          banner is a NOTICE and not a boundary. What actually constrains
+          an operator is re-decided server-side on every request, in
+          `getActiveImpersonation()` and `assertImpersonationAllows()`.
+        */}
+        <Suspense fallback={null}>
+          <SupportAccessSlot
+            tenantId={tenant.id}
+            role={role}
+            impersonationId={ctx.impersonationId}
+          />
+        </Suspense>
+
+        {/*
+          🔴 ABOVE THE FOLD AND ABOVE THE SIDEBAR, not tucked into a page.
+          A person who lands directly on an edit form must meet this notice
+          before they meet the form, or they will type into it.
+        */}
+        <Suspense fallback={null}>
+          <MaintenanceNotice tenantId={tenant.id} />
+        </Suspense>
+
+        <div className="flex min-h-0 flex-1 overflow-hidden">
+          <Sidebar
+            sections={sections}
+            industryLabel={template.label}
+            tenantName={tenant.name}
+          />
+          <MobileSidebar
+            sections={sections}
+            industryLabel={template.label}
+            tenantName={tenant.name}
+          />
+
+          <div className="flex min-w-0 flex-1 flex-col">
+            <header className="flex h-14 shrink-0 items-center justify-between border-b border-border px-5">
+              <div className="flex items-center gap-3">
+                <MobileMenuTrigger />
+                <OrganizationSwitcher
+                  hidePersonal
+                  afterSelectOrganizationUrl="/dashboard"
+                />
+              </div>
+              <div className="flex items-center gap-3">
+                <NotificationBell />
+                <span className="hidden text-sm text-muted-foreground sm:inline">
+                  {user.firstName ?? user.email}
+                </span>
+                {/*
+                  Dark mode toggle — Wave 8b (v1.50.0-alpha). The palette
+                  choice is a user preference saved on the device; it is
+                  shown here next to the identity controls because the top
+                  bar is the one place every authenticated screen shares.
+                */}
+                <ThemeToggle />
+                <UserButton />
+              </div>
+            </header>
+            {/*
+              Site search to the top — Wave 8b. The global command bar
+              (⌘K) opens from this control; see components/layout/
+              search-trigger.tsx for why it is a button and not a second
+              search implementation.
+            */}
+            <div className="flex shrink-0 items-center border-b border-border px-5 py-2">
+              <SearchTrigger />
             </div>
-            <div className="flex items-center gap-3">
-              <NotificationBell />
-              <span className="hidden text-sm text-muted-foreground sm:inline">
-                {user.firstName ?? user.email}
-              </span>
-              {/*
-                Dark mode toggle — Wave 8b (v1.50.0-alpha). The palette
-                choice is a user preference saved on the device; it is
-                shown here next to the identity controls because the top
-                bar is the one place every authenticated screen shares.
-              */}
-              <ThemeToggle />
-              <UserButton />
-            </div>
-          </header>
-          {/*
-            Site search to the top — Wave 8b. The global command bar
-            (⌘K) opens from this control; see components/layout/
-            search-trigger.tsx for why it is a button and not a second
-            search implementation.
-          */}
-          <div className="flex shrink-0 items-center border-b border-border px-5 py-2">
-            <SearchTrigger />
+
+            {/*
+              #main-content is the skip-link target: components/layout/
+              accessibility.tsx renders the skip anchor, and the anchor's
+              href must resolve to exactly this id.
+            */}
+            <main id="main-content" className="flex-1 overflow-y-auto">{children}</main>
           </div>
-
-          {/*
-            #main-content is the skip-link target: components/layout/
-            accessibility.tsx renders the skip anchor, and the anchor's
-            href must resolve to exactly this id.
-          */}
-          <main id="main-content" className="flex-1 overflow-y-auto">{children}</main>
         </div>
       </div>
     </IndustryProvider>
+  );
+}
+
+/**
+ * ⭐ WHO IS LOOKING DECIDES WHICH BUTTON THEY GET — and all three of them
+ * are correct answers to different questions.
+ *
+ *   OPERATOR — our own staff, inside this workspace right now. Their
+ *              button LEAVES, and is filed as `operator_ended`. It is
+ *              here because the console layout is not rendered on CRM
+ *              routes, so without it the only way out is to navigate back
+ *              to `admin.` and find a control.
+ *   OWNER    — an owner or admin of the workspace. Their button ENDS OUR
+ *              ACCESS, and is filed as `revoked_by_tenant`. The argument
+ *              for giving them this at all, including the case against
+ *              it, is at `endSessionForTenantOwner()`.
+ *   MEMBER   — everybody else. The notice, with no button, and a sentence
+ *              telling them who at their own company can act on it.
+ *
+ * ⚠️ THE ROLE CHECK HERE IS POLITENESS, NOT AUTHORISATION. Both actions
+ * re-decide server-side; `endSupportSession()` calls
+ * `requireRole(ADMIN_ROLES)` and refuses an impersonated caller outright.
+ */
+async function SupportAccessSlot({
+  tenantId,
+  role,
+  impersonationId,
+}: {
+  tenantId: string;
+  role: SystemRole;
+  impersonationId: string | null;
+}) {
+  // ⚠️ A FAILED READ MUST NOT TAKE THE WORKSPACE DOWN. The banner is a
+  // notice; the enforcement is elsewhere and is unaffected by this
+  // returning null.
+  const notice = await activeSupportAccessForTenant(tenantId).catch(() => null);
+  if (!notice) return null;
+
+  const viewer =
+    impersonationId === notice.sessionId
+      ? ("operator" as const)
+      : (ADMIN_ROLES as readonly SystemRole[]).includes(role)
+        ? ("owner" as const)
+        : ("member" as const);
+
+  return (
+    <SupportAccessBanner
+      sessionId={notice.sessionId}
+      operatorEmail={notice.operatorEmail}
+      authority={notice.authority}
+      mode={notice.mode}
+      scope={notice.scope}
+      reason={notice.reason}
+      writeAccessReason={notice.writeAccessReason}
+      expiresAt={notice.expiresAt}
+      minutesLeft={notice.minutesLeft}
+      viewer={viewer}
+      onEnd={
+        viewer === "operator"
+          ? leaveSupportSessionAction
+          : viewer === "owner"
+            ? endSupportSessionAction
+            : undefined
+      }
+    />
+  );
+}
+
+
+/**
+ * ⭐ THE CUSTOMER-FACING HALF OF MAINTENANCE MODE.
+ *
+ * 🔴 IT IS A NOTICE, NOT THE CONTROL. The writes are refused in
+ * `server/platform/maintenance.ts`, one hop inside the same gate every
+ * mutation already calls. If this component were deleted the product
+ * would still be read-only — it would just be read-only without telling
+ * anybody, which is the failure this exists to prevent.
+ *
+ * ⚠️ THE REMAINING TIME IS COMPUTED HERE, ON THE SERVER, FROM THE STORED
+ * END TIMESTAMP, ON EVERY RENDER. The client re-derives it from the same
+ * absolute timestamp; neither side ever decrements a held number, so a
+ * tab left open overnight cannot extend or shorten the window it shows.
+ */
+async function MaintenanceNotice({ tenantId }: { tenantId: string }) {
+  // ⚠️ A FAILED READ MUST NOT TAKE THE WORKSPACE DOWN, same argument as
+  // the support banner above.
+  const state = await effectiveMaintenance(tenantId).catch(() => null);
+  const active = state?.active ?? null;
+  if (!active) return null;
+
+  return (
+    <MaintenanceBanner
+      scope={active.scope}
+      endsAt={active.endsAt}
+      message={active.message}
+      remainingMsAtRender={remainingMs(active.endsAt)}
+    />
   );
 }

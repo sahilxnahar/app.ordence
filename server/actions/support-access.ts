@@ -48,6 +48,8 @@ import {
   getSupportConsentState,
   type ConsentView,
 } from "@/server/platform/consent";
+import { endSupportSession as endSupportSessionImpl } from "@/server/platform/tenant-support-access";
+import { stopImpersonation as stopImpersonationImpl } from "@/server/platform/impersonation";
 import type { PlatformResult } from "@/lib/platform/schemas";
 
 /**
@@ -103,4 +105,64 @@ export async function revokeSupportAccess(
 
 export async function listSupportAccess(): Promise<PlatformResult<ConsentView[]>> {
   return getSupportConsentState();
+}
+
+/* ------------------------------------------------------------------ */
+/* ⭐⭐ ENDING A LIVE SESSION — Batch 28                                */
+/* ------------------------------------------------------------------ */
+
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * ⚠️ ENDING A SESSION IS NOT REVOKING CONSENT, AND CONFLATING THEM WOULD
+ *    BE A REAL MISTAKE
+ * ══════════════════════════════════════════════════════════════════════
+ * The two exports above manage the CONSENT — a durable, ninety-day
+ * standing permission, or a sixty-minute incident approval. The two
+ * below end ONE LIVE SESSION and leave the permission untouched.
+ *
+ * They are separate because the situations are separate. "Please step
+ * out of my workspace for ten minutes while I take this call" and "I
+ * withdraw support's access to my company's data" are different
+ * sentences with different consequences, and a customer who wanted the
+ * first should not have to re-grant a ninety-day permission afterwards.
+ *
+ * ⭐ TWO EXPORTS AND NOT ONE, because they are performed by different
+ * people under different authority and are recorded as different things:
+ *
+ *   `endSupportSessionAction`   the CUSTOMER ends our access.
+ *                               `requireRole(ADMIN_ROLES)` in their own
+ *                               workspace → filed as `revoked_by_tenant`.
+ *   `leaveSupportSessionAction` OUR OPERATOR chooses to leave.
+ *                               `requirePlatformAdmin()` plus a match on
+ *                               the session's own actor → filed as
+ *                               `operator_ended`.
+ *
+ * One endpoint with an `if` would have made the register's answer to
+ * "who ended this" depend on a branch nobody reads.
+ */
+export async function endSupportSessionAction(input: unknown) {
+  const result = await endSupportSessionImpl(input);
+  if (result.ok) {
+    // ⚠️ `"layout"`, not the default `"page"`. The banner is rendered by
+    // the CRM layout, so revalidating only the current page would leave
+    // it on screen describing access that has stopped.
+    revalidatePath("/", "layout");
+  }
+  return result;
+}
+
+/**
+ * The operator leaves, from inside the customer's workspace.
+ *
+ * ⭐ THIS IS WHY IT LIVES HERE AND NOT ONLY IN THE CONSOLE. An operator
+ * inside a workspace is looking at the CRM, and the console layout — with
+ * its own banner and its own end button — is not rendered on those routes
+ * at all. Before this, the only way out was to navigate back to
+ * `admin.ordence.com` and find a control, and the moment somebody most
+ * needs to leave is the moment they should not have to navigate anywhere.
+ */
+export async function leaveSupportSessionAction(input: unknown) {
+  const result = await stopImpersonationImpl(input);
+  if (result.ok) revalidatePath("/", "layout");
+  return result;
 }

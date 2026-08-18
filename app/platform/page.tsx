@@ -37,6 +37,14 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { HEALTH_LABELS } from "@/lib/platform/health";
 import { formatMoney } from "@/lib/billing/money";
+/*
+ * ⚠️ IMPORTED FROM `control-actions`, WHICH IS ALSO WHAT REGISTERS THE
+ * APPROVAL EXECUTORS. `getApprovalQueue` guards itself with
+ * `requireCapability("tenants:read")`; this page's own operator check is
+ * a courtesy on top of that, not the boundary.
+ */
+import { getApprovalQueue } from "@/server/platform/control-actions";
+import { POLICY_BY_KIND } from "@/lib/platform/approvals";
 
 export const dynamic = "force-dynamic";
 
@@ -107,6 +115,26 @@ export default async function PlatformHomePage({
         </p>
       </div>
 
+      {/*
+        ══════════════════════════════════════════════════════════════
+        ⭐⭐⭐ THE DECISION STACK — WHAT IS WAITING ON A SECOND PERSON
+        ══════════════════════════════════════════════════════════════
+        Until Batch 43 this panel would have been a permanently empty
+        box: one policy of six reached the queue, and it was raised from
+        a dialog most days never open. Suspension, termination, paid
+        entitlement overrides, plan changes and grade elevations all
+        reach it now, so "nothing is waiting" has become a fact worth
+        reading rather than the only possible state.
+
+        ⚠️ SEPARATELY SUSPENDED FROM THE TABLE. The directory's rollups
+        are the slow query on this page; a queue of at most a hundred
+        rows must not wait behind them, because it is the thing somebody
+        opens this page for during an incident.
+      */}
+      <Suspense fallback={<PanelSkeleton />}>
+        <DecisionStack />
+      </Suspense>
+
       <FilterBar params={params} />
 
       <Suspense key={JSON.stringify(params)} fallback={<TableSkeleton />}>
@@ -114,6 +142,99 @@ export default async function PlatformHomePage({
       </Suspense>
     </div>
   );
+}
+
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴🔴 THE SAME SOURCE AS THE ENFORCEMENT, NOT A PARALLEL QUERY
+ * ══════════════════════════════════════════════════════════════════════
+ * This reads `getApprovalQueue()` — which is `listPending()`, which is
+ * the function the approvals screen renders and the one that expires
+ * stale rows on read. It is deliberately NOT a `SELECT count(*) FROM
+ * platform_approval_queue WHERE status = 'pending'`.
+ *
+ * ⚠️ A COUNT WRITTEN HERE WOULD DISAGREE WITH THE QUEUE, and the way it
+ * would disagree is specific rather than theoretical: `listPending`
+ * flips expired rows to `expired` before it lists them, so a badge
+ * counting `status = 'pending'` would keep advertising requests that
+ * cannot be approved. An operator who clicks through to find nothing
+ * there learns that this number is decorative — which is the same
+ * failure as a decorative control, one level up.
+ *
+ * ⭐ AND IT SHOWS THE ROWS, NOT ONLY THE NUMBER. "Three waiting" is a
+ * badge; "Suspend a workspace — Acme (acme)" is a decision.
+ */
+async function DecisionStack() {
+  const isConsole = await onConsoleHost();
+  const result = await getApprovalQueue();
+
+  // ⚠️ SILENT ON FAILURE, AND ONLY HERE. This is a secondary panel on the
+  // directory page; the approvals screen itself renders the error. A red
+  // card at the top of the workspace list on every load would train the
+  // operator to scroll past the top of this page.
+  if (!result.ok) return null;
+
+  const waiting = result.data.rows.filter((r) => String(r.status) === "pending");
+
+  return (
+    <Card>
+      <CardHeader className="flex flex-row flex-wrap items-center justify-between gap-2">
+        <CardTitle>
+          {/*
+            ⚠️ THE STATE IS A WORD, NOT A COLOUR. Roughly one in twelve
+            Indian men is colour-blind, and a count in a coloured pill is
+            the same pill whatever it means.
+          */}
+          {waiting.length === 0
+            ? "Nothing is waiting for approval"
+            : `${waiting.length} waiting for approval`}
+        </CardTitle>
+        <Link href={consoleHref("/platform/approvals", isConsole)} className="text-sm underline">
+          Open the approvals queue
+        </Link>
+      </CardHeader>
+      <CardContent className="space-y-2 text-sm">
+        {waiting.length === 0 ? (
+          <p className="text-muted-foreground">
+            That is the normal state. Only the actions marked Enforced on the
+            approvals screen are held here; everything else still runs
+            immediately, on purpose.
+          </p>
+        ) : (
+          <ul className="space-y-1">
+            {waiting.slice(0, 5).map((row) => (
+              <li key={String(row.id)} className="flex flex-wrap items-center gap-2">
+                <span className="font-medium">
+                  {POLICY_BY_KIND[String(row.actionKind)]?.label ?? String(row.actionKind)}
+                </span>
+                <span className="text-muted-foreground">{String(row.targetLabel)}</span>
+                {/*
+                  ⭐ THE ONE FACT THAT DECIDES WHETHER THE READER CAN DO
+                  ANYTHING ABOUT IT, and it is the SAME number
+                  `decideApproval` will recompute when the button is
+                  pressed. See `listPending`.
+                */}
+                <Badge variant="outline">
+                  {Number(row.otherEligibleApprovers ?? 0) === 0
+                    ? "no second approver available"
+                    : "needs a second approver"}
+                </Badge>
+              </li>
+            ))}
+            {waiting.length > 5 ? (
+              <li className="text-muted-foreground">
+                and {waiting.length - 5} more on the approvals screen
+              </li>
+            ) : null}
+          </ul>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+function PanelSkeleton() {
+  return <div className="h-24 animate-pulse rounded-md bg-muted" aria-busy="true" />;
 }
 
 async function TenantList({ params }: { params: ReturnType<typeof readParams> }) {

@@ -58,6 +58,18 @@ export type ImpersonationBannerProps = {
   minutesLeft: number;
   /** ISO timestamp. The countdown recomputes from this, not from a tick. */
   expiresAt: string;
+  /**
+   * ⭐ THE REASON THE OPERATOR GAVE — Batch 28. Optional, because this
+   * component is also rendered from tests and from surfaces that do not
+   * hold it, and a banner that refuses to render without it would be a
+   * banner that sometimes is not there.
+   *
+   * ⚠️ IT IS TEXT, NOT A CONTROL. The button count in this bar is a
+   * property somebody asserts: exactly one, and it ends the session.
+   * Anything added here that a person can click has to justify itself
+   * against that.
+   */
+  reason?: string;
   onEnd?: () => void;
   ending?: boolean;
 };
@@ -69,6 +81,7 @@ export function ImpersonationBanner({
   mode,
   minutesLeft,
   expiresAt,
+  reason,
   onEnd,
   ending = false,
 }: ImpersonationBannerProps) {
@@ -154,6 +167,17 @@ export function ImpersonationBanner({
         <p className="w-full text-xs font-normal">
           No consent was recorded for this workspace. It is read-only, the owners have
           been emailed, and every action is attributed to you.
+        </p>
+      ) : null}
+
+      {reason ? (
+        // ⚠️ THE REASON IS SHOWN TO THE OPERATOR TOO, not only to the
+        // customer. Somebody who has been in a workspace for twenty
+        // minutes has stopped remembering what they came in to do, and
+        // "what did I say I was here for" is the question that stops a
+        // session drifting into a general look around.
+        <p className="w-full text-xs font-normal" data-testid="impersonation-reason">
+          <span className="font-semibold">You said:</span> {reason}
         </p>
       ) : null}
     </div>

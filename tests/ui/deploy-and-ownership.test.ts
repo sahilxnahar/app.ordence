@@ -26,6 +26,7 @@
  */
 
 import { describe, expect, it } from "vitest";
+import { ENV_CATEGORIES } from "@/lib/platform/env-catalog";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { bootVerdict, BOOT_REQUIRED, BOOT_ADVISORY } from "@/lib/env-boot";
@@ -183,11 +184,23 @@ describe("the diagnostic endpoint", () => {
     expect(diag).toContain("NO EMAIL ADDRESSES, NO IDS, NO ALLOWLIST CONTENTS");
   });
 
-  /** The vault keys were in no artifact anywhere, including this one. */
+  /**
+   * The vault keys were in no artifact anywhere, including this one.
+   *
+   * ⚠️ ASSERTED AGAINST THE CATALOGUE RATHER THAN THE ROUTE'S TEXT —
+   * Batch 127. The category table moved to `lib/platform/env-catalog.ts`
+   * so the secret rotation board could IMPORT it instead of keeping a
+   * second hand-typed copy (the drift that produced migration 0091). The
+   * route reports the same array; the claim worth holding is that the
+   * two vault names are in the list it reports, which is now a value a
+   * test can read directly instead of a string it has to find in source.
+   */
   it("knows the vault exists", () => {
-    expect(diag).toContain('name: "Vault"');
-    expect(diag).toContain("VAULT_ENCRYPTION_KEY");
-    expect(diag).toContain("VAULT_BLIND_INDEX_PEPPER");
+    expect(diag).toContain("ENV_CATEGORIES");
+    const vault = ENV_CATEGORIES.find((c) => c.name === "Vault");
+    expect(vault).toBeDefined();
+    expect(vault?.optional).toContain("VAULT_ENCRYPTION_KEY");
+    expect(vault?.optional).toContain("VAULT_BLIND_INDEX_PEPPER");
   });
 });
 

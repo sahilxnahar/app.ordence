@@ -58,12 +58,17 @@ export type SessionRowView = {
   tenantName: string | null;
   actorEmail: string;
   mode: string;
+  /** The ceiling the customer's consent permitted. */
   scope: string;
+  /** Whether write access was actually taken during the session. */
+  writeAccessTaken: boolean;
   justification: string;
   startedAt: string;
   expiresAt: string;
   endedAt: string | null;
   endedReason: string | null;
+  /** The ending in WORDS. Never inferred from a colour. */
+  endedReasonLabel: string;
   live: boolean;
   minutesLeft: number;
   consentId: string | null;
@@ -154,8 +159,22 @@ export function SessionRegister({
                       ? "Standing consent"
                       : "Incident consent"}
                 </Badge>
+                {/*
+                  ⭐ TWO FACTS, NOT ONE. "Consent allowed changes" and
+                  "changes were actually possible" are different, and a
+                  register that showed only the first would report every
+                  consented session as if we had been editing the
+                  customer's data. Both are words; neither is a colour.
+                */}
                 <div className="mt-1 text-xs">
-                  {s.scope === "read_only" ? "Read only" : "Read and write"}
+                  {s.scope === "read_only"
+                    ? "Consent: read only"
+                    : "Consent: changes permitted"}
+                </div>
+                <div className="text-xs font-medium">
+                  {s.writeAccessTaken
+                    ? "Write access TAKEN"
+                    : "Read only — write access never taken"}
                 </div>
                 <p className="mt-1 max-w-xs text-xs text-muted-foreground">
                   {s.justification}
@@ -167,9 +186,12 @@ export function SessionRegister({
                 <div className="text-muted-foreground">
                   {s.live
                     ? `ends in ${s.minutesLeft} min`
-                    : s.endedAt
-                      ? `ended ${s.endedAt.slice(11, 16)} (${s.endedReason ?? "closed"})`
-                      : `expired ${s.expiresAt.slice(11, 16)}`}
+                    : /* ⭐ THE WORDS COME FROM THE SERVER, which already
+                         resolved "not live and no recorded end" to
+                         "expired". Re-deriving it here would be a second
+                         opinion about the one thing this table exists to
+                         report. */
+                      `${s.endedReasonLabel}${s.endedAt ? ` at ${s.endedAt.slice(11, 16)}` : ""}`}
                 </div>
               </TableCell>
 

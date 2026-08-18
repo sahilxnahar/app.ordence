@@ -1,6 +1,6 @@
 /**
- * Ordence — Platform Console · Workspace Detail
- * Version: v0.29.0-alpha (Phase 29)
+ * Ordence — Platform Console · ⭐⭐⭐ TENANT 360
+ * Version: v1.52.0-alpha (Batch 125)
  *
  * ⚠️ REACHING THIS PAGE IS AN AUDITED EVENT — TWICE. `getTenantDetail()`
  * writes a row into the CUSTOMER'S own audit log saying the workspace was
@@ -10,8 +10,37 @@
  * payment history and their sign-in failures" are not the same sentence,
  * and a customer reviewing the trail is entitled to both.
  *
+ * 🔴 AND EXACTLY TWO, NO MATTER HOW MANY PANELS ASK. Six panels now read
+ * insights independently, and six audit rows saying the same thing at the
+ * same second would turn the customer's trail into noise — which is how a
+ * trail stops being read. Both readers are wrapped in React `cache()`
+ * below, which dedupes them for the life of ONE request. See the note on
+ * `insightsOnce`.
+ *
  * That is also why the directory listing writes nothing: if every glance
  * at a dashboard wrote a row, the rows that matter would be buried.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * ⭐ EIGHT TABS, ONE PER QUESTION SOMEBODY ARRIVES WITH
+ * ══════════════════════════════════════════════════════════════════════
+ *   Overview        what is this workspace, in nine facts
+ *   Plan and seats  what they bought, and the one thing editable here
+ *   Health          why we think they are fine, or not
+ *   Incidents       🔴 NOT WIRED — and it says so, see below
+ *   Entitlements    which switches are flipped for them
+ *   Billing         what they were charged and whether they paid
+ *   Activity        what we did to them
+ *   Access          who can get in, who has been in, and the two
+ *                   irreversible acts (rename, termination)
+ *
+ * The tab lives in `?tab=` so a link in a ticket lands on the tab the
+ * writer meant — see the header of `components/platform/tenant-tabs.tsx`.
+ *
+ * ⚠️ EACH PANEL HAS ITS OWN `<Suspense>`, and that is not decoration.
+ * The three reads behind this page — the workspace row, the insights
+ * bundle, the flag list — hit different tables with different failure
+ * modes. Awaiting all three before painting anything means the slowest
+ * one sets the speed of a screen somebody opened during an incident.
  *
  * ══════════════════════════════════════════════════════════════════════
  * WHAT THIS PAGE SHOWS, AND THE ONE THING IT NEVER WILL
@@ -26,10 +55,10 @@
  * expiring, bannered, and attributable to them by name.
  */
 
-import { Suspense } from "react";
+import { Suspense, cache } from "react";
 import Link from "next/link";
 import { notFound } from "next/navigation";
-import { getTenantDetail } from "@/server/platform/tenants";
+import { getTenantDetail, type TenantDetail } from "@/server/platform/tenants";
 import { getTenantInsights } from "@/server/platform/insights";
 import { listTenantFlags } from "@/server/platform/flags";
 import { hasLiveConsent } from "@/server/platform/consent";
@@ -44,28 +73,54 @@ import {
   exportOffboardingSnapshotAction,
   renameTenantSlugAction,
 } from "@/server/platform/actions";
+import { setPlanAndLimitsAction } from "@/server/platform/config-actions";
 import { TenantActions } from "@/components/platform/tenant-actions";
 import { RenameSlugCard } from "@/components/platform/rename-slug-card";
 import { FlagEditor } from "@/components/platform/flag-editor";
+import { consoleHref, onConsoleHost } from "@/lib/platform/console-href";
 import { OffboardingPanel } from "@/components/platform/offboarding-panel";
+import { PlanSeatsCard } from "@/components/platform/plan-seats-card";
+import { TenantTabs, type TenantTabDef } from "@/components/platform/tenant-tabs";
+import { TenantActivityTable } from "@/components/platform/tenant-activity-table";
 import {
   UsagePanel,
   InvoicePanel,
   SecurityPanel,
   PeoplePanel,
   ConsentPanel,
-  ActivityPanel,
+  IncidentsNotWiredPanel,
   SessionHistoryLink,
 } from "@/components/platform/tenant-panels";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
-import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { HEALTH_LABELS, healthBadgeVariant, formatStorage } from "@/lib/platform/health";
 import { MODE_LABELS, SCOPE_LABELS } from "@/lib/platform/impersonation-policy";
 import { formatMoney } from "@/lib/billing/money";
 import type { ImpersonationMode, ImpersonationScope } from "@/db/schema/platform";
 
 export const dynamic = "force-dynamic";
+
+/* ------------------------------------------------------------------ */
+/* THE TWO AUDITED READS, DEDUPED FOR THE LIFE OF ONE REQUEST          */
+/* ------------------------------------------------------------------ */
+
+/**
+ * ⭐⭐ `cache()` IS DOING TWO JOBS AT ONCE HERE, AND BOTH MATTER.
+ *
+ *   1. It keeps the audit trail honest. Six panels awaiting the insights
+ *      bundle would otherwise write six identical rows into the
+ *      customer's log for one page view.
+ *   2. It keeps the panels independent ANYWAY. Every caller awaits the
+ *      SAME promise, so each `<Suspense>` boundary resolves the moment
+ *      that one read lands — and a panel backed by a different read (the
+ *      flag list) is not held up by it at all.
+ *
+ * ⚠️ THE CACHE IS PER-REQUEST, NOT A CACHE OF DATA. React discards it
+ * when the render finishes; nothing here can serve one operator a
+ * workspace row fetched during another operator's request.
+ */
+const insightsOnce = cache((tenantId: string) => getTenantInsights(tenantId));
+const detailOnce = cache((tenantId: string) => getTenantDetail(tenantId));
 
 export default async function TenantDetailPage({
   params,
@@ -81,21 +136,43 @@ export default async function TenantDetailPage({
   );
 }
 
+/** The eight tabs, in the order an operator reads them. */
+const TABS: readonly TenantTabDef[] = [
+  { value: "overview", label: "Overview" },
+  { value: "plan", label: "Plan and seats" },
+  { value: "health", label: "Health" },
+  { value: "incidents", label: "Incidents" },
+  { value: "entitlements", label: "Entitlements" },
+  { value: "billing", label: "Billing" },
+  { value: "activity", label: "Activity" },
+  { value: "access", label: "Access" },
+] as const;
+
+/** One skeleton, so a loading panel is recognisably a loading panel. */
+function PanelSkeleton({ label }: { label: string }) {
+  return (
+    <div className="rounded-md border border-border p-6" role="status" aria-live="polite">
+      {/* The WORD, not just a shimmer: a grey box is indistinguishable
+          from an empty tab for anybody who cannot see the animation. */}
+      <p className="text-sm text-muted-foreground">Loading {label}…</p>
+      <div aria-hidden className="mt-3 h-24 animate-pulse rounded-md bg-muted" />
+    </div>
+  );
+}
+
 async function TenantDetailBody({ tenantId }: { tenantId: string }) {
+  // ⚠️ Two base paths for this console. An entitlement write held by
+  // `entitlement.override_paid` links to the approvals queue, and
+  // `/platform/...` on the console host is a 404 rather than a rewrite.
+  const isConsole = await onConsoleHost();
   const operator = await getPlatformOperator();
   if (!operator) notFound();
 
-  const result = await getTenantDetail(tenantId);
+  const result = await detailOnce(tenantId);
   if (!result.ok) notFound();
 
   const tenant = result.data;
-  const [flagsResult, consent, insightsResult] = await Promise.all([
-    listTenantFlags(tenantId),
-    hasLiveConsent(tenantId),
-    getTenantInsights(tenantId),
-  ]);
-
-  const insights = insightsResult.ok ? insightsResult.data : null;
+  const consent = await hasLiveConsent(tenantId);
   const can = (c: string) => operator.capabilities.includes(c as never);
 
   return (
@@ -122,53 +199,29 @@ async function TenantDetailBody({ tenantId }: { tenantId: string }) {
           customer sees tomorrow.
         */}
         <Link
-          href={`/platform/tenants/${tenant.id}/configure`}
+          href={consoleHref(`/platform/tenants/${tenant.id}/configure`, isConsole)}
           className="text-sm underline"
         >
           Configure modules, plan and industry
         </Link>
 
         <div className="ml-auto">
-          <TenantActions
-            tenantId={tenant.id}
-            tenantSlug={tenant.slug}
-            tenantName={tenant.name}
-            status={tenant.status}
-            hasConsent={consent}
-            canSuspend={can("tenants:suspend")}
-            canImpersonate={can("impersonate:consented")}
-            canBreakGlass={can("impersonate:breakglass")}
-            onSuspend={suspendTenantAction}
-            onReactivate={reactivateTenantAction}
-            onImpersonate={startImpersonationAction}
-            subjectUsers={(insights?.users ?? [])
-              .filter((u) => u.status === "active" && !u.isPlatformStaff)
-              .map((u) => ({ id: u.id, email: u.email, role: u.role }))}
-          />
+          {/*
+            ⚠️ THE ACTION BAR NEEDS THE USER LIST, WHICH IS AN INSIGHTS
+            READ — so it gets its own boundary too rather than holding
+            the workspace name and the health badge hostage behind it.
+          */}
+          <Suspense fallback={<PanelSkeleton label="the action bar" />}>
+            <ActionBar
+              tenant={tenant}
+              hasConsent={consent}
+              canSuspend={can("tenants:suspend")}
+              canImpersonate={can("impersonate:consented")}
+              canBreakGlass={can("impersonate:breakglass")}
+            />
+          </Suspense>
         </div>
       </div>
-
-      {/*
-        ⭐ THE ADDRESS — v1.57.0-alpha.
-
-        ⚠️ ON ITS OWN CARD RATHER THAN IN THE ACTION BAR, AND THAT IS A
-        DELIBERATE PIECE OF FRICTION. The bar holds suspend, reactivate
-        and impersonate: reversible things an operator does while a
-        customer is on the phone. A rename changes a public hostname and
-        burns the old one for 365 days, and it should not sit one
-        mis-click away from "reactivate".
-
-        `canRename` is a courtesy, not a control — the capability is
-        re-checked inside `renameTenantSlug()`, one hop from the
-        `"use server"` export, because that export is a public HTTP
-        endpoint reachable from any page.
-      */}
-      <RenameSlugCard
-        tenantId={tenant.id}
-        currentSlug={tenant.slug}
-        canRename={can("tenants:provision")}
-        onRename={renameTenantSlugAction}
-      />
 
       {/*
         The customer's OWN access state, computed by the same
@@ -226,65 +279,229 @@ async function TenantDetailBody({ tenantId }: { tenantId: string }) {
         </CardContent>
       </Card>
 
-      {insights && insights.degraded.length > 0 ? (
-        <p
-          role="alert"
-          className="rounded-md border border-destructive/40 bg-destructive/5 p-3 text-sm"
-        >
-          Some panels could not be read ({insights.degraded.join(", ")}). Empty is not the
-          same as nothing happened — treat those tabs as unknown, not as clear.
-        </p>
-      ) : null}
+      <Suspense fallback={null}>
+        <DegradedNotice tenantId={tenantId} />
+      </Suspense>
 
-      <Tabs defaultValue="overview">
-        <TabsList>
-          <TabsTrigger value="overview">Overview</TabsTrigger>
-          <TabsTrigger value="usage">Usage</TabsTrigger>
-          <TabsTrigger value="billing">Billing</TabsTrigger>
-          <TabsTrigger value="people">People</TabsTrigger>
-          <TabsTrigger value="security">Security</TabsTrigger>
-          <TabsTrigger value="flags">Feature flags</TabsTrigger>
-          <TabsTrigger value="access">Support access</TabsTrigger>
-          <TabsTrigger value="activity">Platform activity</TabsTrigger>
-          {/*
-            ⭐ ITS OWN TAB, LAST. Offboarding is the one thing on this
-            page that ends a customer relationship, and putting it beside
-            "Suspend" in the action bar would put the irreversible thing
-            one pixel from the reversible one.
-          */}
-          <TabsTrigger value="offboarding">Offboarding</TabsTrigger>
-        </TabsList>
+      <TenantTabs
+        tabs={TABS}
+        panels={{
+          overview: <OverviewPanel tenant={tenant} />,
 
-        <TabsContent value="overview">
-          <dl className="grid gap-4 rounded-md border border-border p-4 text-sm sm:grid-cols-3">
-            <Fact label="Plan" value={tenant.planTier} />
-            <Fact label="Subscription" value={tenant.subscriptionStatus ?? "none"} />
-            <Fact
-              label="Committed MRR"
-              value={formatMoney(BigInt(tenant.mrrMinor), tenant.currency)}
-            />
-            <Fact label="Seats" value={`${tenant.seatsInUse} of ${tenant.seatLimit}`} />
-            <Fact
-              label="Storage"
-              value={`${formatStorage(tenant.storageUsedMb)} of ${formatStorage(
-                tenant.storageLimitMb,
-              )}`}
-            />
-            <Fact label="Failed payments" value={String(tenant.failedPaymentCount)} />
-            <Fact label="Created" value={tenant.createdAt.slice(0, 10)} />
-            <Fact
-              label="Renews"
-              value={tenant.currentPeriodEnd?.slice(0, 10) ?? "—"}
-            />
-            <Fact
-              label="Last activity"
-              value={tenant.lastActivityAt?.slice(0, 10) ?? "never"}
-            />
-          </dl>
+          plan: (
+            <div className="space-y-6">
+              <PlanSeatsCard
+                tenantId={tenant.id}
+                tenantName={tenant.name}
+                planTier={tenant.planTier}
+                seatLimit={tenant.seatLimit}
+                seatsInUse={tenant.seatsInUse}
+                storageLimitMb={tenant.storageLimitMb}
+                storageUsedMb={tenant.storageUsedMb}
+                mrrMinor={tenant.mrrMinor}
+                perSeatMinor={tenant.subscription?.perSeatAmountMinor ?? null}
+                currency={tenant.currency}
+                /*
+                  ⚠️ A COURTESY, NOT A CONTROL. `setPlanAndLimits()`
+                  re-checks `tenants:configure` and re-runs the
+                  over-commit test against usage read inside its own
+                  transaction — because a `"use server"` export is a
+                  public HTTP endpoint reachable from any page.
+                */
+                canEdit={can("tenants:configure")}
+                onSave={setPlanAndLimitsAction}
+              />
+              <section aria-labelledby="seat-holders-heading">
+                <h2 id="seat-holders-heading" className="text-sm font-medium">
+                  Who is holding those seats
+                </h2>
+                <Suspense fallback={<PanelSkeleton label="the people in this workspace" />}>
+                  <PeopleTab tenantId={tenantId} />
+                </Suspense>
+              </section>
+            </div>
+          ),
 
-          <ul className="mt-4 space-y-1 text-sm">
+          health: (
+            <Suspense fallback={<PanelSkeleton label="health and usage" />}>
+              <HealthTab tenantId={tenantId} tenant={tenant} />
+            </Suspense>
+          ),
+
+          incidents: (
+            <IncidentsNotWiredPanel
+              tenantName={tenant.name}
+              incidentsHref={consoleHref("/platform/incidents", isConsole)}
+            />
+          ),
+
+          entitlements: (
+            <Suspense fallback={<PanelSkeleton label="entitlements" />}>
+              <EntitlementsTab
+                tenantId={tenantId}
+                canWrite={can("flags:write")}
+                isConsoleHost={isConsole}
+                configureHref={consoleHref(
+                  `/platform/tenants/${tenant.id}/configure`,
+                  isConsole,
+                )}
+              />
+            </Suspense>
+          ),
+
+          billing: (
+            <Suspense fallback={<PanelSkeleton label="billing" />}>
+              <BillingTab tenantId={tenantId} tenant={tenant} />
+            </Suspense>
+          ),
+
+          activity: (
+            <Suspense fallback={<PanelSkeleton label="platform activity" />}>
+              <ActivityTab tenantId={tenantId} />
+            </Suspense>
+          ),
+
+          access: (
+            <AccessTab
+              tenant={tenant}
+              isConsoleHost={isConsole}
+              canRename={can("tenants:provision")}
+              canTerminate={can("tenants:suspend")}
+            />
+          ),
+        }}
+      />
+    </div>
+  );
+}
+
+/* ================================================================== */
+/* PANELS — each one owns its own read and its own failure             */
+/* ================================================================== */
+
+/**
+ * ⚠️ EMPTY IS NOT THE SAME AS NOTHING HAPPENED, and this banner is the
+ * only thing standing between those two readings. It stays above the
+ * tabs, not inside one, because the operator who needs it is the one who
+ * is about to say "no, there were no failed sign-ins".
+ */
+async function DegradedNotice({ tenantId }: { tenantId: string }) {
+  const insights = await insightsOnce(tenantId);
+  if (!insights.ok || insights.data.degraded.length === 0) return null;
+  return (
+    <p
+      role="alert"
+      className="rounded-md border border-destructive/40 bg-destructive/5 p-3 text-sm"
+    >
+      Some panels could not be read ({insights.data.degraded.join(", ")}). Empty is not the
+      same as nothing happened — treat those tabs as unknown, not as clear.
+    </p>
+  );
+}
+
+async function ActionBar({
+  tenant,
+  hasConsent,
+  canSuspend,
+  canImpersonate,
+  canBreakGlass,
+}: {
+  tenant: TenantDetail;
+  hasConsent: boolean;
+  canSuspend: boolean;
+  canImpersonate: boolean;
+  canBreakGlass: boolean;
+}) {
+  const insights = await insightsOnce(tenant.id);
+  const users = insights.ok ? insights.data.users : [];
+
+  return (
+    <TenantActions
+      tenantId={tenant.id}
+      tenantSlug={tenant.slug}
+      tenantName={tenant.name}
+      status={tenant.status}
+      hasConsent={hasConsent}
+      canSuspend={canSuspend}
+      canImpersonate={canImpersonate}
+      canBreakGlass={canBreakGlass}
+      onSuspend={suspendTenantAction}
+      onReactivate={reactivateTenantAction}
+      onImpersonate={startImpersonationAction}
+      subjectUsers={users
+        .filter((u) => u.status === "active" && !u.isPlatformStaff)
+        .map((u) => ({ id: u.id, email: u.email, role: u.role }))}
+    />
+  );
+}
+
+function OverviewPanel({ tenant }: { tenant: TenantDetail }) {
+  return (
+    <div>
+      <dl className="grid gap-4 rounded-md border border-border p-4 text-sm sm:grid-cols-3">
+        <Fact label="Plan" value={tenant.planTier} />
+        <Fact label="Subscription" value={tenant.subscriptionStatus ?? "none"} />
+        {/* 🔴 paise as `bigint`. Never `Number`, never `toFixed`. */}
+        <Fact
+          label="Committed MRR"
+          value={formatMoney(BigInt(tenant.mrrMinor), tenant.currency)}
+        />
+        <Fact label="Seats" value={`${tenant.seatsInUse} of ${tenant.seatLimit}`} />
+        <Fact
+          label="Storage"
+          value={`${formatStorage(tenant.storageUsedMb)} of ${formatStorage(
+            tenant.storageLimitMb,
+          )}`}
+        />
+        <Fact label="Failed payments" value={String(tenant.failedPaymentCount)} />
+        <Fact label="Created" value={tenant.createdAt.slice(0, 10)} />
+        <Fact label="Renews" value={tenant.currentPeriodEnd?.slice(0, 10) ?? "—"} />
+        <Fact label="Last activity" value={tenant.lastActivityAt?.slice(0, 10) ?? "never"} />
+      </dl>
+    </div>
+  );
+}
+
+async function PeopleTab({ tenantId }: { tenantId: string }) {
+  const insights = await insightsOnce(tenantId);
+  if (!insights.ok) {
+    return <ReadFailed what="The workspace people" error={insights.error} />;
+  }
+  return <PeoplePanel users={insights.data.users} />;
+}
+
+/**
+ * ⭐ HEALTH IS THE VERDICT AND THE EVIDENCE ON ONE TAB.
+ *
+ * The badge in the header says "at risk". This tab is why: the signals
+ * that produced the verdict, then the metered usage those signals were
+ * computed from. A score with no evidence under it is a number an
+ * operator either believes or ignores — never one they can argue with.
+ */
+async function HealthTab({
+  tenantId,
+  tenant,
+}: {
+  tenantId: string;
+  tenant: TenantDetail;
+}) {
+  const insights = await insightsOnce(tenantId);
+
+  return (
+    <div className="space-y-6">
+      <section aria-labelledby="health-verdict-heading">
+        <h2 id="health-verdict-heading" className="text-sm font-medium">
+          Verdict: {HEALTH_LABELS[tenant.health.level]}
+        </h2>
+        {tenant.health.signals.length === 0 ? (
+          <p className="mt-2 text-sm text-muted-foreground">
+            No signal fired. Nothing about this workspace looks wrong.
+          </p>
+        ) : (
+          <ul className="mt-2 space-y-1 text-sm">
             {tenant.health.signals.map((s) => (
               <li key={s.key} className="flex items-center gap-2">
+                {/* The severity WORD is the meaning; the colour repeats it. */}
                 <Badge variant={s.severity === "risk" ? "destructive" : "outline"}>
                   {s.severity}
                 </Badge>
@@ -292,176 +509,270 @@ async function TenantDetailBody({ tenantId }: { tenantId: string }) {
               </li>
             ))}
           </ul>
-        </TabsContent>
+        )}
+      </section>
 
-        <TabsContent value="usage">
-          {insights ? (
-            <UsagePanel usage={insights.usage} levels={insights.levels} />
+      <section aria-labelledby="health-usage-heading">
+        <h2 id="health-usage-heading" className="text-sm font-medium">
+          The usage those signals were read from
+        </h2>
+        <div className="mt-2">
+          {insights.ok ? (
+            <UsagePanel usage={insights.data.usage} levels={insights.data.levels} />
           ) : (
-            <p className="text-sm text-destructive">Usage could not be read.</p>
+            <ReadFailed what="Usage" error={insights.error} />
           )}
-        </TabsContent>
+        </div>
+      </section>
+    </div>
+  );
+}
 
-        <TabsContent value="billing">
-          <div className="space-y-4">
-            {tenant.subscription ? (
-              <dl className="grid gap-4 rounded-md border border-border p-4 text-sm sm:grid-cols-3">
-                <Fact label="Status" value={tenant.subscription.status} />
-                <Fact label="Billed" value={tenant.subscription.interval} />
-                <Fact label="Provider" value={tenant.subscription.provider} />
-                <Fact
-                  label="Seats purchased"
-                  value={String(tenant.subscription.seatsPurchased)}
-                />
-                <Fact
-                  label="Base amount"
-                  value={formatMoney(
-                    BigInt(tenant.subscription.unitAmountMinor),
-                    tenant.subscription.currency,
-                  )}
-                />
-                <Fact
-                  label="Per seat"
-                  value={formatMoney(
-                    BigInt(tenant.subscription.perSeatAmountMinor),
-                    tenant.subscription.currency,
-                  )}
-                />
-                <Fact
-                  label="Current period"
-                  value={`${tenant.subscription.currentPeriodStart?.slice(0, 10) ?? "—"} → ${
-                    tenant.subscription.currentPeriodEnd?.slice(0, 10) ?? "—"
-                  }`}
-                />
-                <Fact
-                  label="Cancels at period end"
-                  value={tenant.subscription.cancelAtPeriodEnd ? "yes" : "no"}
-                />
-                <Fact
-                  label="Cancelled"
-                  value={tenant.subscription.cancelledAt?.slice(0, 10) ?? "—"}
-                />
-              </dl>
-            ) : (
-              <p className="text-sm text-muted-foreground">
-                No subscription record. This workspace is not being billed.
-              </p>
+/**
+ * ⚠️ ENTITLEMENTS ON THIS PAGE MEANS THE PER-WORKSPACE OVERRIDES — the
+ * flags somebody flipped for this customer specifically, with a reason
+ * and an expiry.
+ *
+ * The MODULE MATRIX (which product areas this plan includes) deliberately
+ * is not duplicated here. It lives on the configure screen, behind
+ * `getWorkspaceConfiguration()`, which writes its own audit row against
+ * the customer — and rendering it here would write a THIRD row into their
+ * log for every glance at this page. The link says where it is instead.
+ */
+async function EntitlementsTab({
+  tenantId,
+  canWrite,
+  isConsoleHost,
+  configureHref,
+}: {
+  tenantId: string;
+  canWrite: boolean;
+  isConsoleHost: boolean;
+  configureHref: string;
+}) {
+  const flags = await listTenantFlags(tenantId);
+  if (!flags.ok) return <ReadFailed what="Entitlement overrides" error={flags.error} />;
+
+  return (
+    <div className="space-y-4">
+      <FlagEditor
+        tenantId={tenantId}
+        flags={flags.data}
+        canWrite={canWrite}
+        onSet={setTenantFlagAction}
+        isConsoleHost={isConsoleHost}
+      />
+      <p className="text-xs text-muted-foreground">
+        These are the overrides written for this workspace. Which modules the PLAN itself
+        includes is on the configure screen — not repeated here, because reading it writes
+        another row into this customer&rsquo;s audit log.{" "}
+        <Link href={configureHref} className="underline underline-offset-2">
+          Open the configure screen
+        </Link>
+        .
+      </p>
+    </div>
+  );
+}
+
+async function BillingTab({
+  tenantId,
+  tenant,
+}: {
+  tenantId: string;
+  tenant: TenantDetail;
+}) {
+  const insights = await insightsOnce(tenantId);
+  const sub = tenant.subscription;
+
+  return (
+    <div className="space-y-4">
+      {sub ? (
+        <dl className="grid gap-4 rounded-md border border-border p-4 text-sm sm:grid-cols-3">
+          <Fact label="Status" value={sub.status} />
+          <Fact label="Billed" value={sub.interval} />
+          <Fact label="Provider" value={sub.provider} />
+          <Fact label="Seats purchased" value={String(sub.seatsPurchased)} />
+          {/* 🔴 Every amount below is paise as `bigint`. */}
+          <Fact
+            label="Base amount"
+            value={formatMoney(BigInt(sub.unitAmountMinor), sub.currency)}
+          />
+          <Fact
+            label="Per seat"
+            value={formatMoney(BigInt(sub.perSeatAmountMinor), sub.currency)}
+          />
+          <Fact
+            label="Seats at the per-seat price"
+            value={formatMoney(
+              BigInt(sub.perSeatAmountMinor) * BigInt(sub.seatsPurchased),
+              sub.currency,
             )}
+          />
+          <Fact
+            label="Current period"
+            value={`${sub.currentPeriodStart?.slice(0, 10) ?? "—"} → ${
+              sub.currentPeriodEnd?.slice(0, 10) ?? "—"
+            }`}
+          />
+          <Fact
+            label="Cancels at period end"
+            value={sub.cancelAtPeriodEnd ? "yes" : "no"}
+          />
+          <Fact label="Cancelled" value={sub.cancelledAt?.slice(0, 10) ?? "—"} />
+        </dl>
+      ) : (
+        <p className="text-sm text-muted-foreground">
+          No subscription record. This workspace is not being billed.
+        </p>
+      )}
 
-            {insights ? (
-              <InvoicePanel invoices={insights.invoices} />
-            ) : (
-              <p className="text-sm text-destructive">Invoices could not be read.</p>
-            )}
+      {insights.ok ? (
+        <InvoicePanel invoices={insights.data.invoices} />
+      ) : (
+        <ReadFailed what="Invoices" error={insights.error} />
+      )}
 
-            <p className="text-xs text-muted-foreground">
-              The console can read billing and cannot change it: the platform clause is on
-              the read policy of <code className="font-mono">subscriptions</code> and{" "}
-              <code className="font-mono">invoices</code> and on neither write policy. A
-              plan change is a purchase decision and belongs to the customer.
-            </p>
-          </div>
-        </TabsContent>
+      <p className="text-xs text-muted-foreground">
+        The console can read billing and cannot change it: the platform clause is on the
+        read policy of <code className="font-mono">subscriptions</code> and{" "}
+        <code className="font-mono">invoices</code> and on neither write policy. A plan
+        change is a purchase decision and belongs to the customer.
+      </p>
+    </div>
+  );
+}
 
-        <TabsContent value="people">
-          {insights ? (
-            <PeoplePanel users={insights.users} />
-          ) : (
-            <p className="text-sm text-destructive">The workspace people could not be read.</p>
-          )}
-        </TabsContent>
+async function ActivityTab({ tenantId }: { tenantId: string }) {
+  const insights = await insightsOnce(tenantId);
+  if (!insights.ok) {
+    return <ReadFailed what="Platform activity" error={insights.error} />;
+  }
 
-        <TabsContent value="security">
-          {insights ? (
-            <SecurityPanel events={insights.securityEvents} />
-          ) : (
-            <p className="text-sm text-destructive">Security events could not be read.</p>
-          )}
-        </TabsContent>
+  return (
+    <div className="space-y-2">
+      <p className="text-xs text-muted-foreground">
+        Read back from this customer&rsquo;s own audit log — the same rows they can see.
+        There is no private platform copy.
+      </p>
+      <TenantActivityTable
+        rows={insights.data.activity.map((r) => ({
+          id: r.id,
+          actorEmail: r.actorEmail,
+          action: r.action,
+          resourceType: r.resourceType,
+          reason: r.reason,
+          severity: r.severity,
+          impersonationId: r.impersonationId,
+          createdAt: r.createdAt,
+        }))}
+      />
+    </div>
+  );
+}
 
-        <TabsContent value="flags">
-          {flagsResult.ok ? (
-            <FlagEditor
-              tenantId={tenant.id}
-              flags={flagsResult.data}
-              canWrite={can("flags:write")}
-              onSet={setTenantFlagAction}
-            />
-          ) : (
-            <p className="text-sm text-destructive">{flagsResult.error}</p>
-          )}
-        </TabsContent>
+/**
+ * ⭐ ACCESS IS "WHO CAN GET IN, AND UNDER WHAT NAME".
+ *
+ * ⚠️ THE TWO IRREVERSIBLE ACTS LIVE HERE, TOGETHER AND AT THE BOTTOM,
+ * away from the action bar. That bar holds suspend, reactivate and
+ * impersonate — reversible things done while a customer is on the phone.
+ * A rename burns a public hostname for 365 days and a termination ends
+ * the relationship; neither should sit one mis-click from "reactivate".
+ */
+function AccessTab({
+  tenant,
+  isConsoleHost,
+  canRename,
+  canTerminate,
+}: {
+  tenant: TenantDetail;
+  isConsoleHost: boolean;
+  canRename: boolean;
+  canTerminate: boolean;
+}) {
+  return (
+    <div className="space-y-6">
+      <section aria-labelledby="consent-heading">
+        <h2 id="consent-heading" className="text-sm font-medium">
+          Consent on file
+        </h2>
+        <p className="mb-2 text-xs text-muted-foreground">
+          Granted by the customer, in their own session. The platform can read these rows
+          and the database refuses to let it write one — consent we could write ourselves
+          would not be consent.
+        </p>
+        <Suspense fallback={<PanelSkeleton label="consent" />}>
+          <ConsentTab tenantId={tenant.id} />
+        </Suspense>
+      </section>
 
-        <TabsContent value="access">
-          <div className="space-y-6">
-            <section aria-labelledby="consent-heading">
-              <h2 id="consent-heading" className="text-sm font-medium">
-                Consent on file
-              </h2>
-              <p className="mb-2 text-xs text-muted-foreground">
-                Granted by the customer, in their own session. The platform can read these
-                rows and the database refuses to let it write one — consent we could write
-                ourselves would not be consent.
-              </p>
-              {insights ? (
-                <ConsentPanel consents={insights.consents} />
-              ) : (
-                <p className="text-sm text-destructive">Consent could not be read.</p>
-              )}
-            </section>
+      <section aria-labelledby="sessions-heading">
+        <h2 id="sessions-heading" className="text-sm font-medium">
+          Who has been inside this workspace
+        </h2>
+        {tenant.recentImpersonations.length === 0 ? (
+          <p className="mt-2 text-sm text-muted-foreground">
+            Nobody from the platform has ever entered this workspace.
+          </p>
+        ) : (
+          <ul className="mt-2 space-y-2">
+            {tenant.recentImpersonations.map((s) => (
+              <li key={s.id} className="rounded-md border border-border p-3 text-sm">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="font-medium">{s.actorEmail}</span>
+                  <Badge variant={s.mode === "break_glass" ? "destructive" : "outline"}>
+                    {MODE_LABELS[s.mode as ImpersonationMode] ?? s.mode}
+                  </Badge>
+                  <Badge variant="secondary">
+                    {SCOPE_LABELS[s.scope as ImpersonationScope] ?? s.scope}
+                  </Badge>
+                  <span className="ml-auto text-xs text-muted-foreground">
+                    {s.startedAt.slice(0, 16).replace("T", " ")} →{" "}
+                    {(s.endedAt ?? s.expiresAt).slice(11, 16)}
+                  </span>
+                </div>
+                <p className="mt-1 text-xs text-muted-foreground">{s.justification}</p>
+              </li>
+            ))}
+          </ul>
+        )}
+        <div className="mt-3">
+          <SessionHistoryLink tenantId={tenant.id} isConsoleHost={isConsoleHost} />
+        </div>
+      </section>
 
-            <section aria-labelledby="sessions-heading">
-              <h2 id="sessions-heading" className="text-sm font-medium">
-                Who has been inside this workspace
-              </h2>
-              {tenant.recentImpersonations.length === 0 ? (
-                <p className="mt-2 text-sm text-muted-foreground">
-                  Nobody from the platform has ever entered this workspace.
-                </p>
-              ) : (
-                <ul className="mt-2 space-y-2">
-                  {tenant.recentImpersonations.map((s) => (
-                    <li key={s.id} className="rounded-md border border-border p-3 text-sm">
-                      <div className="flex flex-wrap items-center gap-2">
-                        <span className="font-medium">{s.actorEmail}</span>
-                        <Badge variant={s.mode === "break_glass" ? "destructive" : "outline"}>
-                          {MODE_LABELS[s.mode as ImpersonationMode] ?? s.mode}
-                        </Badge>
-                        <Badge variant="secondary">
-                          {SCOPE_LABELS[s.scope as ImpersonationScope] ?? s.scope}
-                        </Badge>
-                        <span className="ml-auto text-xs text-muted-foreground">
-                          {s.startedAt.slice(0, 16).replace("T", " ")} →{" "}
-                          {(s.endedAt ?? s.expiresAt).slice(11, 16)}
-                        </span>
-                      </div>
-                      <p className="mt-1 text-xs text-muted-foreground">{s.justification}</p>
-                    </li>
-                  ))}
-                </ul>
-              )}
-              <div className="mt-3">
-                <SessionHistoryLink tenantId={tenant.id} />
-              </div>
-            </section>
-          </div>
-        </TabsContent>
+      <section aria-labelledby="failed-access-heading">
+        <h2 id="failed-access-heading" className="text-sm font-medium">
+          Who tried and did not get in
+        </h2>
+        <p className="mb-2 text-xs text-muted-foreground">
+          Sign-in failures and other access events from the last 30 days. Metadata only —
+          the IP is a prefix and the detail blob is never fetched.
+        </p>
+        <Suspense fallback={<PanelSkeleton label="security events" />}>
+          <SecurityTab tenantId={tenant.id} />
+        </Suspense>
+      </section>
 
-        <TabsContent value="activity">
-          <div className="space-y-2">
-            <p className="text-xs text-muted-foreground">
-              Read back from this customer&rsquo;s own audit log — the same rows they can
-              see. There is no private platform copy.
-            </p>
-            {insights ? (
-              <ActivityPanel rows={insights.activity} />
-            ) : (
-              <p className="text-sm text-destructive">Activity could not be read.</p>
-            )}
-          </div>
-        </TabsContent>
+      {/*
+        ⚠️ THE ADDRESS. On its own card and below the reading material,
+        because a rename changes a public hostname and burns the old one
+        for 365 days. `canRename` is a courtesy — the capability is
+        re-checked inside `renameTenantSlug()`.
+      */}
+      <RenameSlugCard
+        tenantId={tenant.id}
+        currentSlug={tenant.slug}
+        canRename={canRename}
+        onRename={renameTenantSlugAction}
+      />
 
-        <TabsContent value="offboarding">
+      <section aria-labelledby="offboarding-heading">
+        <h2 id="offboarding-heading" className="text-sm font-medium">
+          Ending the relationship
+        </h2>
+        <div className="mt-2">
           <OffboardingPanel
             tenantId={tenant.id}
             tenantSlug={tenant.slug}
@@ -473,15 +784,47 @@ async function TenantDetailBody({ tenantId }: { tenantId: string }) {
               `scheduleTenantTermination`. It is the strictest gate
               available: owner grade, and on the step-up list.
             */
-            canTerminate={can("tenants:suspend")}
+            canTerminate={canTerminate}
             offboarding={tenant.offboarding}
             onRequest={requestTerminationAction}
             onCancel={cancelTerminationAction}
             onExport={exportOffboardingSnapshotAction}
           />
-        </TabsContent>
-      </Tabs>
+        </div>
+      </section>
     </div>
+  );
+}
+
+async function ConsentTab({ tenantId }: { tenantId: string }) {
+  const insights = await insightsOnce(tenantId);
+  if (!insights.ok) return <ReadFailed what="Consent" error={insights.error} />;
+  return <ConsentPanel consents={insights.data.consents} />;
+}
+
+async function SecurityTab({ tenantId }: { tenantId: string }) {
+  const insights = await insightsOnce(tenantId);
+  if (!insights.ok) return <ReadFailed what="Security events" error={insights.error} />;
+  return <SecurityPanel events={insights.data.securityEvents} />;
+}
+
+/* ------------------------------------------------------------------ */
+/* SHARED                                                              */
+/* ------------------------------------------------------------------ */
+
+/**
+ * 🔴 A FAILED READ MUST NOT LOOK LIKE AN EMPTY ONE. The word "could not
+ * be read" is the whole point — an operator who mistakes this for "there
+ * is nothing here" tells a customer the wrong thing with confidence.
+ */
+function ReadFailed({ what, error }: { what: string; error: string }) {
+  return (
+    <p
+      role="alert"
+      className="rounded-md border border-destructive/40 bg-destructive/5 p-3 text-sm"
+    >
+      {what} could not be read — this is a failure, not an empty result. {error}
+    </p>
   );
 }
 

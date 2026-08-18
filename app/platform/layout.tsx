@@ -30,13 +30,17 @@
  */
 
 import { consoleHref, onConsoleHost } from "@/lib/platform/console-href";
+import { CONSOLE_NAV } from "@/lib/platform/console-paths";
 import { Suspense } from "react";
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { ShieldCheck } from "lucide-react";
 import { getPlatformOperator } from "@/server/platform/guard";
 import { getActiveImpersonation } from "@/server/platform/impersonation";
-import { stopImpersonationAction } from "@/server/platform/actions";
+import {
+  stopImpersonationAction,
+  liftImpersonationScopeAction,
+} from "@/server/platform/actions";
 import { LiveImpersonationBanner } from "@/components/platform/impersonation-banner-live";
 import { GRADE_LABELS } from "@/lib/platform/roles";
 import { Badge } from "@/components/ui/badge";
@@ -44,45 +48,25 @@ import { Badge } from "@/components/ui/badge";
 export const dynamic = "force-dynamic";
 
 /**
- * ⚠️ THIS LIST IS NOT AN ACCESS CONTROL.
+ * ⚠️ THE NAV LIST MOVED TO `lib/platform/console-paths.ts` AND IS NOT
+ * RETYPED HERE. It is rendered below and it is also what the command
+ * palette jumps to, and two hand-maintained copies is a palette that
+ * silently stops matching the nav bar the first time somebody adds a
+ * screen.
  *
- * Every one of these pages guards itself with `requireCapability()`, and
- * each server action behind them guards itself again. Hiding a link from a
- * grade that cannot use it is a courtesy — it stops support staff clicking
- * into a redirect — not a boundary. A link nobody can see is still a URL
- * anybody can type.
+ * It did NOT move into this file's exports, deliberately: a client
+ * component importing from `app/platform/layout.tsx` would drag
+ * `server/platform/guard.ts` (server-only) into the browser bundle and
+ * fail the webpack build. The shared module imports nothing privileged,
+ * so both sides can have it.
  *
- * Observatory sits second because it is the screen you want to open first:
- * churn alarms before workspaces.
+ * ⚠️ IT IS STILL NOT AN ACCESS CONTROL. Every one of these pages guards
+ * itself with `requireCapability()`, and each server action behind them
+ * guards itself again. Hiding a link from a grade that cannot use it is a
+ * courtesy — it stops support staff clicking into a redirect — not a
+ * boundary. A link nobody can see is still a URL anybody can type.
  */
-const NAV = [
-  { href: "/platform", label: "Workspaces" },
-  { href: "/platform/users", label: "Users" },
-  // Sits beside the directory rather than inside it: the directory
-  // answers "find me Acme", this answers "who needs me today?" — see the
-  // header of `app/platform/tenants/page.tsx`.
-  { href: "/platform/tenants", label: "Needs attention" },
-  // ⭐ Health sits beside "Needs attention" and answers a different
-  // question: that page recomputes a score, this one lists the problems
-  // somebody still owes an answer for.
-  { href: "/platform/health", label: "Health" },
-  { href: "/platform/observatory", label: "Observatory" },
-  // ⚠️ Approvals is high in the list on purpose. A queue nobody passes
-  // is a queue that expires, and an expired request is a customer
-  // waiting for something that quietly did not happen.
-  { href: "/platform/approvals", label: "Approvals" },
-  { href: "/platform/incidents", label: "Incidents" },
-  // ⭐ The isolation canary. Linked rather than left as a URL somebody
-  // has to know, because the screen exists to be opened by whoever was
-  // just paged by `/api/cron/canary` — and a person being paged at 3am
-  // does not remember paths.
-  { href: "/platform/canary", label: "Canary" },
-  { href: "/platform/provision", label: "Provision" },
-  { href: "/platform/sessions", label: "Sessions" },
-  { href: "/platform/search", label: "Search" },
-  { href: "/platform/log", label: "Action register" },
-  { href: "/platform/staff", label: "Staff access" },
-] as const;
+const NAV = CONSOLE_NAV;
 
 /**
  * ⚠️ THE NAV ABOVE IS WRITTEN IN CANONICAL `/platform/...` PATHS, WHICH
@@ -176,10 +160,14 @@ async function ImpersonationBannerSlot() {
       tenantName={active.tenantName}
       tenantSlug={active.tenantSlug}
       scope={active.scope}
+      grantedScope={active.grantedScope}
       mode={active.mode}
       minutesLeft={active.minutesLeft}
       expiresAt={active.expiresAt.toISOString()}
+      reason={active.justification}
+      writeAccessReason={active.scopeLiftReason}
       onEnd={stopImpersonationAction}
+      onLift={liftImpersonationScopeAction}
     />
   );
 }

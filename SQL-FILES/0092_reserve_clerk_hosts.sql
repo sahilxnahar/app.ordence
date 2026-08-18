@@ -66,18 +66,48 @@
 BEGIN;
 
 -- ============================================================================
+-- SECTION 0 , 🔴 THE PLATFORM SCOPE. THIS LINE IS WHY THE FIRST VERSION FAILED
+-- ============================================================================
+--
+-- `0091` put FORCE ROW LEVEL SECURITY on `reserved_slugs`, with
+--
+--     reserved_slugs_write  FOR ALL  WITH CHECK (app_platform_scope())
+--
+-- and `app_platform_scope()` reads `current_setting('app.platform_scope')`,
+-- which is unset by default. So a plain INSERT into that table is refused:
+--
+--     ERROR: new row violates row-level security policy for table "reserved_slugs"
+--
+-- ⚠️ FORCE IS THE WHOLE POINT, AND IT IS WHY THIS WAS EASY TO MISS. Plain
+--    ENABLE does not apply to the table OWNER, and migrations run as the
+--    owner. FORCE exists precisely so the owner is NOT exempt. That is right
+--    for the application and surprising for a migration, because every
+--    migration written before the table was forced worked without this line.
+--
+-- ⚠️ AND A SUPERUSER BYPASSES IT ENTIRELY, WHICH IS HOW THE FIRST VERSION
+--    PASSED ITS DRILL. Applying this file as a local superuser proves
+--    nothing. The reproduction that matters is a non-superuser role without
+--    BYPASSRLS, which is what refused it.
+--
+-- `SET LOCAL` is scoped to this transaction and unwinds at COMMIT. It is
+-- exactly what `withPlatformScope(reason, cb)` does in the application.
+-- ============================================================================
+
+SET LOCAL app.platform_scope = 'on';
+
+-- ============================================================================
 -- SECTION 1 , THE THREE NAMES
 -- ============================================================================
 
 INSERT INTO public.reserved_slugs (slug, category, reason, added_by) VALUES
     ('clkmail', 'mail',
-     'live CNAME to Clerk outbound mail; an explicit CNAME beats the Railway wildcard, so a tenant claiming this gets a workspace whose hostname resolves to Clerk',
+     'live CNAME to Clerk outbound mail, and an explicit CNAME beats the Railway wildcard, so a tenant claiming this gets a workspace whose hostname resolves to Clerk',
      'migration:0092'),
     ('clk', 'mail',
-     'DKIM selector label (clk._domainkey); sits above the record mail receivers use to authenticate mail from ordence.com',
+     'DKIM selector label (clk._domainkey). Sits above the record mail receivers use to authenticate mail from ordence.com',
      'migration:0092'),
     ('clk2', 'mail',
-     'DKIM selector label (clk2._domainkey); rotation partner of clk',
+     'DKIM selector label (clk2._domainkey). Rotation partner of clk',
      'migration:0092')
 ON CONFLICT (slug) DO NOTHING;
 
@@ -100,5 +130,48 @@ SELECT
     'this workspace''s hostname resolves to Clerk, not to Ordence' AS consequence
 FROM public.tenants t
 WHERE t.slug IN ('clkmail', 'clk', 'clk2');
+
+-- ============================================================================
+-- SECTION 3 , ⭐ THE DIAGNOSTIC THAT CLOSES A NINE-SESSION-OLD QUESTION
+-- ============================================================================
+--
+-- The first version of this file failed and there were two candidate causes.
+-- One of them, a semicolon inside a string literal being read as a statement
+-- boundary by the browser console, was DISPROVED: `0089` carries the same
+-- shape in a COMMENT ON literal and applied to this database cleanly, so the
+-- Neon splitter is quote-aware.
+--
+-- That leaves RLS, and it means something specific and useful:
+--
+-- 🔴 IF THE FIRST VERSION FAILED WITH "violates row-level security policy",
+--    THEN `neondb_owner` ON THIS PROJECT DOES NOT HAVE BYPASSRLS.
+--
+--    That is the GOOD answer, and it is the question I have been asking for
+--    nine sessions. `rolbypassrls` is one of three ways RLS can be silently
+--    ineffective, and a connection role that carries it makes every FORCE
+--    ROW LEVEL SECURITY in this database decoration. If the role does not
+--    carry it, the tenant-isolation model rests on something real.
+--
+-- The row below answers it directly, plus the tenant count, which decides
+-- whether 0091's section 6 backfill was a genuine success or a no-op that
+-- never exercised the same policy.
+-- ============================================================================
+
+SELECT
+    '0092 · diagnostic'                                  AS finding,
+    current_user                                         AS running_as,
+    (SELECT rolbypassrls FROM pg_roles WHERE rolname = current_user)
+                                                         AS bypasses_rls,
+    (SELECT rolsuper     FROM pg_roles WHERE rolname = current_user)
+                                                         AS is_superuser,
+    (SELECT count(*) FROM public.tenants)                AS tenant_count,
+    (SELECT count(*) FROM public.tenant_slug_history)    AS history_rows,
+    (SELECT count(*) FROM public.reserved_slugs)         AS reserved_count,
+    CASE
+        WHEN (SELECT rolbypassrls FROM pg_roles WHERE rolname = current_user)
+          OR (SELECT rolsuper     FROM pg_roles WHERE rolname = current_user)
+            THEN 'This role bypasses RLS. Every FORCE ROW LEVEL SECURITY in this database is decoration for it, and the isolation model rests on the application never using it.'
+        ELSE 'This role does NOT bypass RLS. FORCE ROW LEVEL SECURITY is real here, which is the answer we wanted.'
+    END                                                  AS what_that_means;
 
 COMMIT;

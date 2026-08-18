@@ -34,6 +34,7 @@ import {
   recordStepUpAction,
 } from "@/server/platform/actions";
 import { StaffConsole } from "@/components/platform/staff-console";
+import { onConsoleHost } from "@/lib/platform/console-href";
 
 export const dynamic = "force-dynamic";
 
@@ -60,6 +61,10 @@ export default function PlatformStaffPage() {
 }
 
 async function StaffDirectory() {
+  // ⚠️ The console is served at two base paths. A grant held by
+  // `staff.elevate` links to the approvals queue, and `/platform/...` on
+  // the console host is not a rewritten path — it is a 404.
+  const isConsole = await onConsoleHost();
   const result = await getStaffDirectory();
   if (!result.ok) return <p className="text-sm text-destructive">{result.error}</p>;
 
@@ -92,6 +97,7 @@ async function StaffDirectory() {
       onGrant={grantPlatformStaffAction}
       onRevoke={revokePlatformStaffAction}
       onStepUp={recordStepUpAction}
+      isConsoleHost={isConsole}
     />
   );
 }

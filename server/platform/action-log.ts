@@ -50,7 +50,7 @@ import "server-only";
  * other's contradiction.
  */
 
-import { and, desc, eq, gte, ilike, isNull, sql, type SQL } from "drizzle-orm";
+import { and, desc, eq, gte, ilike, inArray, isNull, sql, type SQL } from "drizzle-orm";
 import { z } from "zod";
 import { withPlatformScope } from "@/db";
 import { tenants } from "@/db/schema";
@@ -58,9 +58,32 @@ import {
   platformActionLog,
   platformImpersonationSessions,
 } from "@/db/schema/platform";
+import {
+  cappedExpiry,
+  endReasonLabel,
+  isSessionLive,
+  minutesRemaining,
+  HARD_CAP_MINUTES,
+  SCOPE_LIFT_RESOURCE,
+} from "@/lib/platform/impersonation-policy";
 import type { PlatformResult } from "@/lib/platform/schemas";
 import { requireCapability, recordPlatformAudit } from "./guard";
 import { recordSecurityEvent } from "@/server/security/record";
+
+/**
+ * ⚠️ THE HARD CAP IN SQL, so `live` in the register means the same thing
+ * as `live` in the gate. Duplicated from `impersonation.ts` rather than
+ * imported from `server/platform/impersonation.ts`, because importing it
+ * would make this module depend on the one that pulls in Clerk and the
+ * mail provider for the sake of one expression. The expression is one
+ * line, both copies read `HARD_CAP_MINUTES` from the same pure module, and
+ * a test asserts the two agree.
+ *
+ * `least()` — never `greatest()`. It can only ever shorten a session.
+ */
+function cappedExpirySql() {
+  return sql`least(${platformImpersonationSessions.expiresAt}, ${platformImpersonationSessions.startedAt} + make_interval(mins => ${HARD_CAP_MINUTES}))`;
+}
 
 /* ------------------------------------------------------------------ */
 /* THE ACTION REGISTER                                                 */
@@ -232,12 +255,25 @@ export type ImpersonationSessionRow = {
   tenantName: string | null;
   actorEmail: string;
   mode: string;
+  /** The frozen ceiling — the most the customer's consent permitted. */
   scope: string;
+  /**
+   * ⭐ WHETHER WRITE ACCESS WAS ACTUALLY TAKEN — Batch 28.
+   *
+   * ⚠️ NOT THE SAME QUESTION AS `scope`. A session whose consent
+   * permitted changes but where nobody ever lifted it never had write
+   * access at all, and a register that showed only the ceiling would
+   * report every consented session as if we had been changing things.
+   */
+  writeAccessTaken: boolean;
   justification: string;
   startedAt: string;
+  /** ⚠️ THE CAPPED expiry — start + 30 minutes, or sooner. */
   expiresAt: string;
   endedAt: string | null;
   endedReason: string | null;
+  /** The end reason in WORDS. Never a colour, never a bare enum value. */
+  endedReasonLabel: string;
   /** Computed from the CLOCK, never from `ended_at`. */
   live: boolean;
   minutesLeft: number;
@@ -281,6 +317,39 @@ export async function listImpersonationSessions(
   }>
 > {
   await requireCapability("tenants:read");
+
+  /**
+   * ⭐⭐ TIDY BEFORE READING — Batch 28, and it follows the precedent set
+   * by `getOpenHealthEvents()`.
+   *
+   * ══════════════════════════════════════════════════════════════════
+   * 🔴 `sweepExpiredImpersonations()` HAD NO CALLER
+   * ══════════════════════════════════════════════════════════════════
+   * It was written, correct, tested — and nothing anywhere invoked it,
+   * which is the ninth complete engine in this codebase that nothing
+   * reached. It did not matter while its only job was cosmetic: a
+   * session is over when its clock says so whether or not a row records
+   * it, and every liveness test in the product reads the clock.
+   *
+   * ⚠️ IT MATTERS NOW, because the sweep is what writes "this session
+   * ended, and it ended by EXPIRY" into the register. Of the three ways
+   * a session can end, expiry is the one with nobody in the room — so
+   * it was the one ending a reviewer could not see afterwards.
+   *
+   * ⚠️ SWEPT ON READ RATHER THAN ON A SCHEDULE, for the reason the
+   * health sweep gives: a cron would be tidier and would also mean this
+   * screen is silently incomplete on the morning the scheduler is the
+   * thing that broke — which is a morning somebody is looking at this
+   * screen specifically. Each row is swept exactly once, ever, so the
+   * cost of doing it here is bounded and does not recur.
+   */
+  const { sweepExpiredImpersonations } = await import("./impersonation");
+  await sweepExpiredImpersonations().catch((err) => {
+    // ⚠️ A FAILED TIDY MUST NOT BLANK THE REGISTER. The rows below are
+    // the evidence; the sweep only annotates them.
+    console.error("[platform] impersonation sweep failed during register read", err);
+  });
+
   const parsed = sessionFilterSchema.safeParse(input ?? {});
   if (!parsed.success) return { ok: false, error: "Invalid filters." };
   const f = parsed.data;
@@ -296,7 +365,7 @@ export async function listImpersonationSessions(
   }
   if (f.liveOnly) {
     conditions.push(isNull(platformImpersonationSessions.endedAt));
-    conditions.push(sql`${platformImpersonationSessions.expiresAt} > now()`);
+    conditions.push(sql`${cappedExpirySql()} > now()`);
   }
 
   const where = and(...conditions);
@@ -318,7 +387,11 @@ export async function listImpersonationSessions(
         .where(
           and(
             isNull(platformImpersonationSessions.endedAt),
-            sql`${platformImpersonationSessions.expiresAt} > now()`,
+            // ⚠️ THE CAPPED expiry, so this agrees with the gate. A count
+            // that said "1 live" for a session no request would accept
+            // would send somebody looking for an intruder who is not
+            // there — and, far worse, would teach them the number lies.
+            sql`${cappedExpirySql()} > now()`,
           ),
         );
 
@@ -337,12 +410,31 @@ export async function listImpersonationSessions(
         .limit(f.limit)
         .offset(f.offset);
 
+      /* ---- ⭐ WHICH OF THESE ACTUALLY TOOK WRITE ACCESS ----------- */
+      //
+      // ⚠️ ONE QUERY FOR THE WHOLE PAGE, not one per row. Fifty round
+      // trips to render a table is how a register screen becomes a
+      // screen nobody opens.
+      const sessionIds = rows.map((r) => r.session.id);
+      const lifted = new Set<string>();
+      if (sessionIds.length > 0) {
+        const liftRows = await db
+          .select({ resourceId: platformActionLog.resourceId })
+          .from(platformActionLog)
+          .where(
+            and(
+              eq(platformActionLog.resourceType, SCOPE_LIFT_RESOURCE),
+              inArray(platformActionLog.resourceId, sessionIds),
+            ),
+          );
+        for (const r of liftRows) if (r.resourceId) lifted.add(r.resourceId);
+      }
+
       return {
         ok: true as const,
         data: {
           rows: rows.map(({ session: s, tenantName }) => {
-            const live =
-              s.endedAt === null && s.expiresAt.getTime() > now.getTime();
+            const live = isSessionLive(s, now);
             return {
               id: s.id,
               tenantId: s.tenantId,
@@ -351,15 +443,22 @@ export async function listImpersonationSessions(
               actorEmail: s.actorEmail,
               mode: s.mode,
               scope: s.scope,
+              writeAccessTaken: lifted.has(s.id),
               justification: s.justification,
               startedAt: s.startedAt.toISOString(),
-              expiresAt: s.expiresAt.toISOString(),
+              expiresAt: cappedExpiry(s).toISOString(),
               endedAt: s.endedAt?.toISOString() ?? null,
               endedReason: s.endedReason,
+              // ⚠️ `?? "expired"` AND NOT `?? "still open"`. A row that is
+              // not live and has no recorded end is a session the clock
+              // closed and the sweeper has not tidied. Reading the empty
+              // column as "still open" is exactly the mistake the whole
+              // "expires_at is the authority" rule exists to prevent.
+              endedReasonLabel: live
+                ? "Live now"
+                : endReasonLabel(s.endedReason ?? "expired"),
               live,
-              minutesLeft: live
-                ? Math.max(0, Math.ceil((s.expiresAt.getTime() - now.getTime()) / 60_000))
-                : 0,
+              minutesLeft: minutesRemaining(s, now),
               consentId: s.consentId,
               tenantNotifiedAt: s.tenantNotifiedAt?.toISOString() ?? null,
               actionCount: s.actionCount,

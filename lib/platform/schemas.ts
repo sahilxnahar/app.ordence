@@ -30,7 +30,10 @@
 import { z } from "zod";
 import { SEARCH_SCOPES, MIN_SEARCH_JUSTIFICATION } from "./search-scopes";
 import { isFlagKey, FLAG_KEYS } from "./flags-catalog";
-import { MIN_JUSTIFICATION_LENGTH } from "./impersonation-policy";
+import {
+  MIN_JUSTIFICATION_LENGTH,
+  SCOPE_LIFT_MIN_REASON,
+} from "./impersonation-policy";
 import { PLATFORM_GRADES } from "./roles";
 
 /* ------------------------------------------------------------------ */
@@ -130,6 +133,41 @@ export type StartImpersonationInput = z.infer<typeof startImpersonationSchema>;
 
 export const stopImpersonationSchema = z.object({
   sessionId: uuidField,
+});
+
+/**
+ * ⭐ TAKING WRITE ACCESS INSIDE A LIVE SESSION — Batch 28.
+ *
+ * ⚠️ THE REASON IS NOT THE SESSION'S JUSTIFICATION AND MUST NOT BE
+ * COPIED FROM IT. The justification says why the operator went in; this
+ * says what they are about to CHANGE, and those are different sentences
+ * with different readers. The first is for the ticket; the second is
+ * what the customer sees in their own audit log next to the row that
+ * says our staff modified their data.
+ */
+export const liftImpersonationScopeSchema = z.object({
+  sessionId: uuidField,
+  reason: justification(
+    SCOPE_LIFT_MIN_REASON,
+    "the customer's own audit log and the platform action register",
+  ),
+});
+
+/**
+ * ⚠️ SUBMITTED BY A TENANT OWNER OR ADMIN, ENDING OUR STAFF'S ACCESS.
+ * The `sessionId` is checked against the caller's OWN workspace server
+ * side; a session id from anywhere else closes nothing.
+ */
+export const endSupportSessionSchema = z.object({
+  sessionId: uuidField,
+  /**
+   * Shorter than the platform-side minimums on purpose. This is the
+   * customer, in their own workspace, ending access they granted — the
+   * bar for explaining themselves to us is low, and a long form here
+   * would be an obstacle between somebody who is uncomfortable and the
+   * control that makes them comfortable.
+   */
+  reason: z.string().trim().max(500).default(""),
 });
 
 /* ------------------------------------------------------------------ */

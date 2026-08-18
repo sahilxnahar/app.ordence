@@ -34,7 +34,7 @@ import "server-only";
  * were ever staff.
  */
 
-import { and, desc, eq, gt, inArray, isNull, ne, or, sql } from "drizzle-orm";
+import { and, desc, eq, gt, inArray, isNull, notInArray, or, sql } from "drizzle-orm";
 import { withPlatformScope } from "@/db";
 import { users } from "@/db/schema";
 import { platformStaff } from "@/db/schema/platform";
@@ -51,6 +51,17 @@ import {
   type PlatformResult,
 } from "@/lib/platform/schemas";
 import { requireCapability, recordPlatformAudit } from "./guard";
+// 🔴 SIDE EFFECT: registers every approval executor. Without it this
+// module could hold a write and then fail to queue it, because
+// `queueForApproval` refuses a kind with no executor.
+import "./approval-executors";
+import {
+  approvalGate,
+  queueForApproval,
+  recordApprovalRefusal,
+  type ApprovalTicket,
+} from "./approvals";
+import { elevatesGrade } from "@/lib/platform/approvals";
 
 export type StaffRow = {
   id: string;
@@ -358,7 +369,35 @@ export async function getStaffDirectory(): Promise<PlatformResult<StaffDirectory
 /* GRANT                                                               */
 /* ------------------------------------------------------------------ */
 
-export async function grantPlatformStaff(input: unknown): Promise<PlatformResult<void>> {
+/**
+ * ⭐ SAME SHAPE AS THE OTHER TWO ENFORCEMENT POINTS: `queued` is on the
+ * success type so a caller cannot mistake "waiting" for "done".
+ */
+export type StaffGrantOutcome =
+  | { readonly queued: false }
+  | { readonly queued: true; readonly requestId: string; readonly note: string };
+
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * ⭐⭐⭐ THE ENFORCEMENT POINT FOR `staff.elevate`
+ * ══════════════════════════════════════════════════════════════════════
+ * The hold is inside this function rather than in front of
+ * `grantPlatformStaffAction`, because `onConflictDoUpdate` on
+ * `clerk_user_id` makes this the RENEWAL path as well as the grant path
+ * and it has more than one caller. `BLOCKED_BECAUSE` in
+ * `lib/platform/approvals.ts` named exactly this: "a control with an open
+ * door next to it is decoration".
+ *
+ * ⚠️ ONLY AN ELEVATION IS HELD. A renewal at the same grade and a
+ * downgrade are not — see `elevatesGrade` for why each of the three cases
+ * is decided the way it is. The existing controls (owner grade, fresh
+ * step-up, deploy-time allowlist, mandatory expiry, no self-grant) apply
+ * to all of them regardless.
+ */
+export async function grantPlatformStaff(
+  input: unknown,
+  ticket?: ApprovalTicket,
+): Promise<PlatformResult<StaffGrantOutcome>> {
   const operator = await requireCapability("staff:manage");
 
   const parsed = grantPlatformStaffSchema.safeParse(input);
@@ -414,9 +453,58 @@ export async function grantPlatformStaff(input: unknown): Promise<PlatformResult
     return { ok: false, error: "The end date is in the past." };
   }
 
-  await withPlatformScope(
+  const outcome = await withPlatformScope(
     `Platform console: grant ${grade} platform access to ${email} — ${reason.slice(0, 80)}`,
     async (db) => {
+      /*
+       * ══════════════════════════════════════════════════════════════
+       * 🔴🔴 THE GATE, ON THE GRADE THIS ACCOUNT HOLDS *NOW*
+       * ══════════════════════════════════════════════════════════════
+       * Read in this transaction, immediately before the upsert that
+       * would change it. A grade read on the staff SCREEN a minute ago
+       * is a different question: another owner can have granted,
+       * revoked or re-graded this account since, and "is this an
+       * elevation" has a different answer either way.
+       *
+       * ⚠️ USABLE, NOT MERELY PRESENT. A revoked or expired grant is
+       * not a grade somebody holds, so promoting from it is a rise from
+       * nothing — which is an elevation, and is held.
+       */
+      const [existing] = await db
+        .select({ grade: platformStaff.grade })
+        .from(platformStaff)
+        .where(
+          and(
+            eq(platformStaff.clerkUserId, clerkUserId),
+            eq(platformStaff.status, "active"),
+            isNull(platformStaff.revokedAt),
+            or(isNull(platformStaff.expiresAt), gt(platformStaff.expiresAt, new Date())),
+          ),
+        )
+        .limit(1);
+
+      const heldGrade = (existing?.grade ?? null) as PlatformGrade | null;
+
+      const approval = await approvalGate(db, {
+        kind: "staff.elevate",
+        held: elevatesGrade(heldGrade, grade),
+        ticket,
+        /*
+         * ⚠️ NULL, AND NOT AN OVERSIGHT. `target_id` is a uuid column
+         * and the identity of this request is a Clerk user id, which is
+         * not one. The identity that matters is in the stored payload,
+         * which only the server ever wrote and which the executor
+         * replays verbatim — a ticket cannot arrive from a browser at
+         * all, because it is a second argument and every public door
+         * forwards exactly one.
+         */
+        targetId: null,
+      });
+
+      if (!approval.proceed) {
+        return { step: "held", approval, heldGrade } as const;
+      }
+
       await db
         .insert(platformStaff)
         .values({
@@ -449,8 +537,82 @@ export async function grantPlatformStaff(input: unknown): Promise<PlatformResult
             updatedAt: new Date(),
           },
         });
+
+      return { step: "written", heldGrade } as const;
     },
   );
+
+  /* ---------------------------------------------------------------- */
+  /* THE HELD PATH — NOTHING WAS WRITTEN                               */
+  /* ---------------------------------------------------------------- */
+  if (outcome.step === "held") {
+    const { approval } = outcome;
+    const label = `${email} → ${GRADE_LABELS[grade] ?? grade}`;
+
+    if (!approval.queue) {
+      await recordApprovalRefusal({
+        operator,
+        kind: "staff.elevate",
+        targetType: "platform_staff",
+        targetId: null,
+        targetLabel: label,
+        reason: approval.reason,
+      });
+      return { ok: false, error: approval.reason };
+    }
+
+    const queued = await queueForApproval({
+      kind: "staff.elevate",
+      operator,
+      targetType: "platform_staff",
+      targetId: null,
+      targetLabel: label,
+      justification: reason,
+      proposedBefore: { grade: outcome.heldGrade },
+      proposedAfter: {
+        email,
+        grade,
+        expiresAt: expiry.toISOString(),
+        effect:
+          outcome.heldGrade === null
+            ? `Creates a new ${grade}-grade operator. Everything on the approvals list becomes something ${email} can ask for, and — at owner grade — approve.`
+            : `Raises ${email} from ${outcome.heldGrade} to ${grade}.`,
+      },
+      // ⭐ THE VALIDATED ARGUMENTS, REPLAYED VERBATIM. This is also the
+      // only record of WHO the grant is for; see the note on `targetId`.
+      payload: {
+        clerkUserId,
+        email,
+        displayName: displayName ?? undefined,
+        grade,
+        reason,
+        expiresAt: expiry.toISOString(),
+      },
+      heldWrite: true,
+      now: new Date(),
+    });
+
+    if (!queued.queued) {
+      await recordApprovalRefusal({
+        operator,
+        kind: "staff.elevate",
+        targetType: "platform_staff",
+        targetId: null,
+        targetLabel: label,
+        reason: queued.error,
+      });
+      return {
+        ok: false,
+        error: queued.error,
+        fieldErrors: { reason: [queued.error] },
+      };
+    }
+
+    return {
+      ok: true,
+      data: { queued: true, requestId: queued.requestId, note: queued.note },
+    };
+  }
 
   await recordPlatformAudit({
     operator,
@@ -461,17 +623,114 @@ export async function grantPlatformStaff(input: unknown): Promise<PlatformResult
     newValue: { email, grade, expiresAt: expiry.toISOString() },
     severity: "critical",
     reason,
-    metadata: { grantedTo: email, grade },
+    metadata: {
+      grantedTo: email,
+      grade,
+      /*
+       * ⭐ THE GRADE IT CAME FROM, AND WHICH APPROVAL ALLOWED IT. A row
+       * saying only "granted owner" cannot answer "was this an
+       * elevation, and did a second person agree to it" — which is the
+       * only question an auditor asks about this table.
+       */
+      previousGrade: outcome.heldGrade,
+      wasElevation: elevatesGrade(outcome.heldGrade, grade),
+      approvedRequestId: ticket?.approvedRequestId ?? null,
+    },
   });
 
-  return { ok: true, data: undefined };
+  return { ok: true, data: { queued: false } };
 }
 
 /* ------------------------------------------------------------------ */
 /* REVOKE                                                              */
 /* ------------------------------------------------------------------ */
 
-export async function revokePlatformStaff(input: unknown): Promise<PlatformResult<void>> {
+/* ------------------------------------------------------------------ */
+/* ⭐ THE OWNER FLOOR — ONE PREDICATE, TWO CALLERS                      */
+/* ------------------------------------------------------------------ */
+
+/**
+ * The transaction handle `withPlatformScope()` hands its callback.
+ * Exported so a caller in another module can pass its own `db` in and
+ * ask this question INSIDE its own transaction, rather than opening a
+ * second one that could see a different world.
+ */
+export type PlatformScopeTx = Parameters<Parameters<typeof withPlatformScope<unknown>>[1]>[0];
+
+/**
+ * Owners who could still sign in if `excludeStaffIds` were all revoked.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 WHY THIS IS A FUNCTION AND NOT INLINE IN `revokePlatformStaff`
+ * ══════════════════════════════════════════════════════════════════════
+ * Batch 130 added a BULK revoke on the access-review screen, and a bulk
+ * revoke breaks the single-row version of this check in a way that is
+ * invisible: revoking two owners one at a time is refused on the second
+ * call, but revoking both IN ONE BATCH passes if each is checked with
+ * only itself excluded — each sees the other as the survivor, and the
+ * console locks for everybody.
+ *
+ * ⚠️ SO THE EXCLUSION IS A LIST, ALWAYS. The caller passes the WHOLE
+ * batch it is about to revoke, and the answer is "who is left when all
+ * of that is gone".
+ *
+ * ⚠️ THE ALLOWLIST TERM IS APPLIED IN TYPESCRIPT, NOT IN SQL, and the
+ * long note at the call site explains why: `guard.ts` decides key 1 with
+ * `isAllowlisted` over `parseAdminAllowlist`, and a `lower(email) IN (…)`
+ * here would be a second normalisation of an address. The day the two
+ * disagree is the day this refusal disagrees with who can actually get
+ * in. That is also why there is no `LIMIT 1` — the row the database would
+ * have stopped at may be exactly the stale one.
+ */
+export async function usableOwnersExcluding(
+  db: PlatformScopeTx,
+  excludeStaffIds: readonly string[],
+): Promise<{ id: string; email: string }[]> {
+  const allowlist = parseAdminAllowlist(getServerEnv().PLATFORM_ADMIN_EMAILS);
+  const conditions = [
+    eq(platformStaff.grade, "owner"),
+    eq(platformStaff.status, "active"),
+    isNull(platformStaff.revokedAt),
+    or(isNull(platformStaff.expiresAt), gt(platformStaff.expiresAt, new Date())),
+  ];
+  if (excludeStaffIds.length > 0) {
+    conditions.push(notInArray(platformStaff.id, [...excludeStaffIds]));
+  }
+
+  const rows = await db
+    .select({ id: platformStaff.id, email: platformStaff.email })
+    .from(platformStaff)
+    .where(and(...conditions))
+    .limit(200);
+
+  return rows.filter((r) => isAllowlisted(r.email, allowlist));
+}
+
+/**
+ * The sentence shown when the floor would be breached. One copy, because
+ * two screens refusing the same thing in two different words is how an
+ * operator concludes one of them is a bug.
+ */
+export const LAST_OWNER_REFUSAL =
+  "This is the last usable owner. Revoking it would lock the " +
+  "console for everybody, including you, and the only way back " +
+  "in would be a hand-written row in the production database. " +
+  "Grant somebody else owner grade first. An owner whose address " +
+  "is no longer in PLATFORM_ADMIN_EMAILS does not count here: " +
+  "that row holds the grant but not the config key, so it cannot " +
+  "sign in either.";
+
+/**
+ * ⚠️ SAME SUCCESS TYPE AS THE GRANT, WITH `queued` PERMANENTLY FALSE, and
+ * that is a statement rather than a formality: revocation is NEVER held
+ * for approval. Reducing somebody's access must always be cheaper than
+ * increasing it — the same asymmetry offboarding uses between cancel and
+ * terminate — and being unable to kill a compromised grant at 3am while
+ * an approver is asleep is worse than every problem this queue solves.
+ */
+export async function revokePlatformStaff(
+  input: unknown,
+): Promise<PlatformResult<StaffGrantOutcome>> {
   const operator = await requireCapability("staff:manage");
 
   const parsed = revokePlatformStaffSchema.safeParse(input);
@@ -541,37 +800,12 @@ export async function revokePlatformStaff(input: unknown): Promise<PlatformResul
          * ⚠️ AND SO THERE IS NO `LIMIT 1`. The row the database would
          * have stopped at may be exactly the stale one.
          */
-        const allowlist = parseAdminAllowlist(getServerEnv().PLATFORM_ADMIN_EMAILS);
-        const remaining = (
-          await db
-            .select({ id: platformStaff.id, email: platformStaff.email })
-            .from(platformStaff)
-            .where(
-              and(
-                eq(platformStaff.grade, "owner"),
-                eq(platformStaff.status, "active"),
-                isNull(platformStaff.revokedAt),
-                ne(platformStaff.id, staffId),
-                or(
-                  isNull(platformStaff.expiresAt),
-                  gt(platformStaff.expiresAt, new Date()),
-                ),
-              ),
-            )
-            .limit(200)
-        ).filter((r) => isAllowlisted(r.email, allowlist));
+        const remaining = await usableOwnersExcluding(db, [staffId]);
 
         if (remaining.length === 0) {
           return {
-            error:
-              "This is the last usable owner. Revoking it would lock the " +
-              "console for everybody, including you, and the only way back " +
-              "in would be a hand-written row in the production database. " +
-              "Grant somebody else owner grade first. An owner whose address " +
-              "is no longer in PLATFORM_ADMIN_EMAILS does not count here: " +
-              "that row holds the grant but not the config key, so it cannot " +
-              "sign in either.",
-          } as const;
+            error: LAST_OWNER_REFUSAL,
+                    } as const;
         }
       }
 
@@ -613,5 +847,5 @@ export async function revokePlatformStaff(input: unknown): Promise<PlatformResul
     metadata: { revokedFrom: outcome.email, selfRevoke: outcome.email === operator.email },
   });
 
-  return { ok: true, data: undefined };
+  return { ok: true, data: { queued: false } };
 }

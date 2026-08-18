@@ -652,7 +652,17 @@ describe("the scheduled entry point", () => {
 describe("the platform console panel", () => {
   it("exists and is linked from the console nav", () => {
     expect(existsSync(join(ROOT, "app/platform/canary/page.tsx"))).toBe(true);
-    expect(codeOnly(LAYOUT)).toContain('"/platform/canary"');
+    /*
+     * ⚠️ THE NAV MOVED OUT OF THE LAYOUT AND THE ASSERTION FOLLOWED IT.
+     * `CONSOLE_NAV` now lives in `lib/platform/console-paths.ts` so the
+     * command palette — a `"use client"` component — can share the one
+     * mapping; `console-href.ts` reads `headers()` and cannot be imported
+     * from a client file. The property is unchanged: the console offers a
+     * way to this screen, and the layout renders whatever registry holds
+     * it.
+     */
+    expect(read("lib/platform/console-paths.ts")).toContain('"/platform/canary"');
+    expect(codeOnly(LAYOUT)).toContain("CONSOLE_NAV");
   });
 
   it("is gated on platform staff in the page as well as the middleware", () => {

@@ -86,6 +86,30 @@ import type { ImpersonationMode, ImpersonationScope } from "@/db/schema/platform
 /* ------------------------------------------------------------------ */
 
 /**
+ * 🔴 THE HARD CAP — Batch 28. THIRTY MINUTES, FOR EVERY MODE, ALWAYS.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * ⚠️ THIS IS A CEILING ON THE STORED ROW, NOT ONLY ON NEW SESSIONS
+ * ══════════════════════════════════════════════════════════════════════
+ * `expires_at` is written once at INSERT and frozen by the tamper trigger,
+ * so lowering `SESSION_MINUTES` alone would leave every session started
+ * before this change running for its original sixty minutes. There is no
+ * migration that can fix that — the column cannot be updated, by design.
+ *
+ * ⭐ SO LIVENESS IS COMPUTED, NOT READ. `cappedExpiry()` takes the LOWER
+ * of the stored `expires_at` and `started_at + 30 minutes`, and every
+ * liveness question in the product goes through it. A sixty-minute row
+ * written last month is over at minute thirty whatever its own column
+ * says, and nothing had to be rewritten to make that true.
+ *
+ * ⚠️ `started_at` IS ALSO FROZEN by the same trigger, which is what makes
+ * it safe to derive from. The one number an operator could otherwise move
+ * to buy themselves more time is the one number the database refuses to
+ * let anybody move.
+ */
+export const HARD_CAP_MINUTES = 30;
+
+/**
  * Session length per mode, in minutes.
  *
  * Short by design. The cost of a session that expires mid-diagnosis is
@@ -93,15 +117,21 @@ import type { ImpersonationMode, ImpersonationScope } from "@/db/schema/platform
  * who is inside a customer's workspace at 18:00 having forgotten they
  * started at 09:00 — with every action they take from then on wrongly
  * attributed to the customer's own user in that customer's own audit log.
+ *
+ * ⚠️ SIXTY WAS TOO LONG AND THE ARGUMENT FOR IT WAS COMFORT. An hour is
+ * long enough for an operator to start a session, get pulled into
+ * something else, and come back to a workspace they have stopped thinking
+ * about. Half an hour is long enough to diagnose anything and short
+ * enough that nobody forgets they are in it.
  */
 export const SESSION_MINUTES: Readonly<Record<ImpersonationMode, number>> = Object.freeze({
-  standing_consent: 60,
-  incident_consent: 60,
+  standing_consent: HARD_CAP_MINUTES,
+  incident_consent: HARD_CAP_MINUTES,
   break_glass: 15,
 });
 
 /** Hard ceiling. Nothing may request more, whatever it passes in. */
-export const MAX_SESSION_MINUTES = 60;
+export const MAX_SESSION_MINUTES = HARD_CAP_MINUTES;
 
 /** How long a standing consent lasts before the customer is re-asked. */
 export const STANDING_CONSENT_DAYS = 90;
@@ -161,9 +191,32 @@ export function expiryFor(mode: ImpersonationMode, startedAt: Date): Date {
 /* ------------------------------------------------------------------ */
 
 export type SessionLike = {
+  /**
+   * ⭐ THE STORED START, AND THE ONLY INPUT THE CAP TRUSTS — Batch 28.
+   *
+   * ⚠️ OPTIONAL, and the omission means "cap unknown, use the stored
+   * expiry". Every DB row has it; the pure helpers are also called with
+   * hand-built literals in tests and in the policy's own reasoning, and
+   * demanding it there would have bought nothing.
+   */
+  startedAt?: Date;
   expiresAt: Date;
   endedAt: Date | null;
 };
+
+/**
+ * ⭐ THE EFFECTIVE END OF A SESSION: the EARLIER of what the row says and
+ * what the hard cap allows.
+ *
+ * ⚠️ NEVER THE LATER. This function can only ever shorten a session, so a
+ * row written by a future bug — or by anything that reaches the table
+ * outside the application — cannot buy itself extra minutes through it.
+ */
+export function cappedExpiry(session: SessionLike): Date {
+  if (!session.startedAt) return session.expiresAt;
+  const cap = new Date(session.startedAt.getTime() + HARD_CAP_MINUTES * 60_000);
+  return cap.getTime() < session.expiresAt.getTime() ? cap : session.expiresAt;
+}
 
 /**
  * A session is live iff it has not been closed AND has not expired.
@@ -172,15 +225,159 @@ export type SessionLike = {
  * a sweeper writing `ended_at`, a failed sweeper would silently extend
  * every open session in the system — the exact failure that "time-limited"
  * is supposed to rule out. The sweeper only tidies.
+ *
+ * ⚠️ AND THE AUTHORITY IS NOW THE CAPPED EXPIRY. `now` is supplied by the
+ * caller, which on every server path is `new Date()` on the server. A
+ * value that arrived from a browser must never reach this argument.
  */
 export function isSessionLive(session: SessionLike, now: Date): boolean {
   if (session.endedAt !== null) return false;
-  return session.expiresAt.getTime() > now.getTime();
+  return cappedExpiry(session).getTime() > now.getTime();
 }
 
 export function minutesRemaining(session: SessionLike, now: Date): number {
   if (!isSessionLive(session, now)) return 0;
-  return Math.max(0, Math.ceil((session.expiresAt.getTime() - now.getTime()) / 60_000));
+  return Math.max(0, Math.ceil((cappedExpiry(session).getTime() - now.getTime()) / 60_000));
+}
+
+/* ------------------------------------------------------------------ */
+/* ⭐⭐⭐ READ-ONLY BY DEFAULT, AND LIFTING IT IS A SEPARATE ACT        */
+/* ------------------------------------------------------------------ */
+
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 THE `scope` COLUMN IS A CEILING. IT IS NOT WHAT THE SESSION CAN DO.
+ * ══════════════════════════════════════════════════════════════════════
+ * Before Batch 28, a consent that said "read and write" produced a
+ * session that WAS read-write from its first millisecond. That is the
+ * wrong default, and the reason is not theoretical:
+ *
+ *   • The overwhelming majority of support sessions only ever READ. An
+ *     engineer opens a workspace to see which invoice is wrong. Granting
+ *     write for that is granting a capability nobody asked to use.
+ *   • The customer's consent answers "may you change things IF you need
+ *     to". It does not answer "are you about to". Treating the first as
+ *     the second collapses a permission into an intention.
+ *   • A mistyped keystroke in the wrong tab is the failure this whole
+ *     subsystem exists for, and in a read-only session it is nothing.
+ *
+ * ⭐ SO: `resolveScope()` still computes what the CUSTOMER PERMITTED and
+ * that is what is stored, frozen, as evidence. What the session may
+ * actually DO starts at `read_only` for every mode, and only becomes
+ * `read_write` when an operator performs a separate, reasoned act that is
+ * written to the action register.
+ *
+ * ⚠️ THE STORED COLUMN COULD NOT HAVE CARRIED THE LIFT ANYWAY. `scope` is
+ * in the frozen-columns list of `prevent_impersonation_tamper()` — an
+ * UPDATE that changes it is refused by the database. That constraint is
+ * correct and this design agrees with it rather than working around it:
+ * the register is append-only too, so the lift is recorded in the one
+ * kind of storage that cannot be quietly un-recorded.
+ */
+export function effectiveScope(input: {
+  /** The frozen `scope` column: what the customer's consent permitted. */
+  ceiling: ImpersonationScope;
+  /** Has a lift been recorded in the action register for this session? */
+  lifted: boolean;
+}): ImpersonationScope {
+  if (input.ceiling !== "read_write") return "read_only";
+  return input.lifted ? "read_write" : "read_only";
+}
+
+/** Minimum characters in the reason given for taking write access. */
+export const SCOPE_LIFT_MIN_REASON = 20;
+
+/**
+ * The `resource_type` a scope lift is filed under in the action register.
+ *
+ * ⚠️ IT LIVES IN THE PURE MODULE because three files need it and none of
+ * them should have to import the one that pulls in Clerk and the mail
+ * provider to get a string. `server/platform/impersonation.ts` writes it,
+ * `server/platform/action-log.ts` reports on it, and
+ * `server/platform/tenant-support-access.ts` reads the customer's own
+ * copy of it. Three spellings of one string is three chances to have two
+ * of them agree and one not.
+ */
+export const SCOPE_LIFT_RESOURCE = "impersonation_scope_lift";
+
+/**
+ * May this session be lifted to read-write? Returns the refusal sentence,
+ * or null to allow.
+ *
+ * ⚠️ PURE, AND THAT IS THE POINT. The refusal that keeps break-glass
+ * read-only is the load-bearing line of the consent model, and a refusal
+ * that can only be exercised by standing up Postgres is a refusal that
+ * gets tested once and then trusted forever.
+ */
+export function scopeLiftProblem(input: {
+  mode: ImpersonationMode;
+  ceiling: ImpersonationScope;
+  alreadyLifted: boolean;
+  reason: string;
+}): string | null {
+  // ⭐ The one refusal that must never be negotiable. Break-glass exists
+  // precisely because the customer could not be reached, and "we could
+  // not reach anyone" must REDUCE what we may do, never increase it.
+  if (input.mode === "break_glass") {
+    return (
+      "Break-glass is read-only and cannot be lifted. Nobody at this workspace " +
+      "agreed to this session, so nothing in it may be changed. If a change is " +
+      "genuinely needed, reach a human at the customer and start a consented session."
+    );
+  }
+  if (input.ceiling !== "read_write") {
+    return (
+      "This workspace granted support access for reading only. Ask them to widen " +
+      "the grant in their own settings — we cannot widen it for them."
+    );
+  }
+  if (input.alreadyLifted) {
+    return "This session already has write access.";
+  }
+  if (input.reason.trim().length < SCOPE_LIFT_MIN_REASON) {
+    return (
+      `Say what you are about to change, in at least ${SCOPE_LIFT_MIN_REASON} ` +
+      `characters. This sentence goes into the customer's own audit log.`
+    );
+  }
+  return null;
+}
+
+/* ------------------------------------------------------------------ */
+/* HOW A SESSION ENDED                                                 */
+/* ------------------------------------------------------------------ */
+
+/**
+ * ⭐ EVERY END REASON CARRIES A WORD, NOT A COLOUR.
+ *
+ * The register shows ended sessions in a table where the temptation is a
+ * coloured dot. One in twelve Indian men is colour-blind, and "how did
+ * this session end" is precisely the question a reviewer is there to
+ * answer — so the answer is in words and the colour is emphasis.
+ *
+ * ⚠️ KEYED ON THE DATABASE ENUM. A reason added to
+ * `impersonation_end_reason` without an entry here is a `TypeScript`
+ * error at the call site rather than a blank cell in the register.
+ */
+export const END_REASON_LABELS = Object.freeze({
+  operator_ended: "Ended by the operator",
+  expired: "Expired on its own clock",
+  revoked_by_tenant: "Ended by the workspace owner",
+  revoked_by_platform: "Ended by a platform owner",
+  session_binding_failed: "Terminated — used from a different address",
+}) satisfies Readonly<Record<string, string>>;
+
+export type ImpersonationEndReasonKey = keyof typeof END_REASON_LABELS;
+
+export function endReasonLabel(reason: string | null): string {
+  if (!reason) return "Still open";
+  return (
+    (END_REASON_LABELS as Record<string, string | undefined>)[reason] ??
+    // An unknown value is reported as unknown rather than rendered blank.
+    // A blank cell reads as "nothing happened", which is the one thing it
+    // definitely does not mean.
+    `Ended (${reason})`
+  );
 }
 
 /* ------------------------------------------------------------------ */

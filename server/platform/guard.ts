@@ -419,8 +419,42 @@ export async function recordStepUp(operator: PlatformOperator): Promise<void> {
 /* PLATFORM AUDIT                                                      */
 /* ------------------------------------------------------------------ */
 
+/**
+ * ⭐ WHO AN AUDIT ROW IS ATTRIBUTED TO — Batch 28.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * ⚠️ WHY THIS IS NARROWER THAN `PlatformOperator`
+ * ══════════════════════════════════════════════════════════════════════
+ * `recordPlatformAudit()` only ever reads six fields off the operator. It
+ * demanded the whole `PlatformOperator` — including the `platform_staff`
+ * row and the resolved capability list — which meant an event with NO
+ * live caller could not be recorded at all.
+ *
+ * That is not hypothetical. A session that ends because its clock ran out
+ * ends with nobody in the room: there is no request, no Clerk session and
+ * no staff row to resolve. Before this, the expiry of an impersonation
+ * session wrote NOTHING to the register — the one of the three endings
+ * that happens without a human was the one nobody could see afterwards.
+ *
+ * ⭐ `grade: "system"` IS ALLOWED HERE AND NOWHERE ELSE. It produces
+ * `actor_role = 'platform_system'` on the audit row, which is a free-text
+ * column, and it is deliberately NOT a `platform_grade` — nothing can
+ * mistake it for a person or use it to pass a capability check.
+ *
+ * ⚠️ `PlatformOperator` is structurally assignable to this, so every
+ * existing call site is unchanged.
+ */
+export type PlatformAuditActor = {
+  clerkUserId: string | null;
+  email: string;
+  grade: PlatformGrade | "system";
+  ipAddress: string | null;
+  userAgent: string | null;
+  requestId: string | null;
+};
+
 export type PlatformAuditEntry = {
-  operator: PlatformOperator;
+  operator: PlatformAuditActor;
   /**
    * The tenant this concerns, or null for genuinely cross-tenant events
    * (a directory search spans everybody and belongs to nobody).
@@ -567,10 +601,40 @@ export async function recordPlatformAudit(entry: PlatformAuditEntry): Promise<vo
         }
       }
     } else {
+      /**
+       * 🔴 THE TENANT-LESS REGISTER DEMANDS A HUMAN, AND THE DATABASE
+       * SAYS SO: `platform_action_log.actor_clerk_id` is NOT NULL and
+       * `actor_grade` is the `platform_grade` ENUM. There is no honest
+       * value to write for "the clock did it".
+       *
+       * ⚠️ THAT IS NOT A GAP. A system-actor event is always ABOUT a
+       * workspace — a session in it expired — so it is written to that
+       * customer's own audit log, where they can see it, by the branch
+       * above. Reaching here with a system actor means a caller passed
+       * `tenantId: null` for an event that has a tenant, which is a
+       * defect in the caller and is reported as one rather than
+       * silently mislabelled as a person.
+       */
+      const humanGrade = entry.operator.grade;
+      const humanClerkId = entry.operator.clerkUserId;
+      // ⚠️ Narrowed into LOCALS, not read off `values` in the closures
+      // below. TypeScript cannot carry a narrowing on an object property
+      // across a callback boundary, and the alternative — a non-null
+      // assertion at each use — is the shape that survives a refactor
+      // which makes it wrong.
+      if (humanGrade === "system" || humanClerkId === null) {
+        console.error("[PLATFORM AUDIT] system actor with no tenant to attribute to", {
+          action: entry.action,
+          resourceType: entry.resourceType,
+          resourceId: entry.resourceId ?? null,
+        });
+        return;
+      }
+
       const { withPlatformScope } = await import("@/db");
       const { desc, and, eq, isNotNull } = await import("drizzle-orm");
       const { MAX_CHAIN_ATTEMPTS } = await import("@/server/audit");
-      
+
       for (let attempt = 1; attempt <= MAX_CHAIN_ATTEMPTS; attempt++) {
         try {
           await withPlatformScope(
@@ -589,9 +653,9 @@ export async function recordPlatformAudit(entry: PlatformAuditEntry): Promise<vo
                   : null;
                   
               const content = {
-                actorClerkId: entry.operator.clerkUserId,
+                actorClerkId: humanClerkId,
                 actorEmail: entry.operator.email,
-                actorGrade: entry.operator.grade,
+                actorGrade: humanGrade,
                 action: entry.action,
                 resourceType: entry.resourceType,
                 resourceId: entry.resourceId ?? null,
@@ -627,9 +691,9 @@ export async function recordPlatformAudit(entry: PlatformAuditEntry): Promise<vo
               `Record a platform action: ${entry.action} on ${entry.resourceType}`,
               (tx) =>
                 tx.insert(platformActionLog).values({
-                  actorClerkId: entry.operator.clerkUserId,
+                  actorClerkId: humanClerkId,
                   actorEmail: entry.operator.email,
-                  actorGrade: entry.operator.grade,
+                  actorGrade: humanGrade,
                   action: entry.action,
                   resourceType: entry.resourceType,
                   resourceId: entry.resourceId ?? null,

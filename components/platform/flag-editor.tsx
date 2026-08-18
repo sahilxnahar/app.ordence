@@ -31,6 +31,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
+import { HeldForApproval } from "@/components/platform/held-for-approval";
 
 export type FlagRowView = {
   key: string;
@@ -44,13 +45,28 @@ export type FlagRowView = {
   grantsPaidCapability: boolean;
 };
 
-type ActionResult = { ok: true } | { ok: false; error: string };
+/**
+ * ⚠️ `data.queued` IS OPTIONAL IN THE TYPE AND REQUIRED IN THE SERVER'S.
+ * `setTenantFlag` returns it on every success; it is optional here only
+ * because this prop is also satisfied by test doubles, and a component
+ * that cannot be rendered without a live server is a component nobody
+ * writes a test for.
+ *
+ * 🔴 WHAT IS NOT OPTIONAL IS CHECKING IT. An `entitlement:` write against
+ * a PAYING workspace is held by the approval queue and nothing changes;
+ * reporting that as "enabled" is the bug that has already shipped once on
+ * the suspend button.
+ */
+type ActionResult =
+  | { ok: true; data?: { queued?: boolean; note?: string } }
+  | { ok: false; error: string };
 
 export function FlagEditor({
   tenantId,
   flags,
   canWrite,
   onSet,
+  isConsoleHost = false,
 }: {
   tenantId: string;
   flags: FlagRowView[];
@@ -62,11 +78,14 @@ export function FlagEditor({
     reason: string;
     expiresAt: string | null;
   }) => Promise<ActionResult>;
+  /** ⚠️ The console answers on two base paths. See `console-paths.ts`. */
+  isConsoleHost?: boolean;
 }) {
   const router = useRouter();
   const [editing, setEditing] = useState<string | null>(null);
   const [reason, setReason] = useState("");
   const [expiresAt, setExpiresAt] = useState("");
+  const [heldNote, setHeldNote] = useState<string | null>(null);
   const [pending, startTransition] = useTransition();
 
   function submit(flag: FlagRowView, nextEnabled: boolean) {
@@ -86,7 +105,18 @@ export function FlagEditor({
         setEditing(null);
         setReason("");
         setExpiresAt("");
-        toast.success(`${flag.label} ${nextEnabled ? "enabled" : "disabled"}.`);
+        /*
+         * 🔴 NOT A SUCCESS TOAST WHEN NOTHING HAPPENED. Green with a tick
+         * is read as "it worked", and the flag row below still shows the
+         * old value — which the operator then reads as a stale render and
+         * clicks again.
+         */
+        if (result.data?.queued) {
+          setHeldNote(result.data.note ?? "This change is waiting for approval.");
+        } else {
+          setHeldNote(null);
+          toast.success(`${flag.label} ${nextEnabled ? "enabled" : "disabled"}.`);
+        }
         router.refresh();
       } else {
         toast.error(result.error);
@@ -96,6 +126,20 @@ export function FlagEditor({
 
   return (
     <div className="space-y-3">
+      {/*
+        ⭐ ABOVE THE LIST, NOT INSIDE ONE ROW. The change that was held is
+        no longer visible as a pending edit anywhere — the row it came
+        from has closed — so a notice attached to that row would vanish
+        with it.
+      */}
+      {heldNote ? (
+        <HeldForApproval
+          note={heldNote}
+          isConsoleHost={isConsoleHost}
+          testId="flag-held-for-approval"
+        />
+      ) : null}
+
       {flags.map((flag) => (
         <Card key={flag.key} data-testid={`flag-${flag.key}`}>
           <CardContent className="space-y-2 pt-4">

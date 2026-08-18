@@ -50,6 +50,7 @@ import {
   startImpersonation as startImpersonationImpl,
   stopImpersonation as stopImpersonationImpl,
   getActiveImpersonation as getActiveImpersonationImpl,
+  liftImpersonationScope as liftImpersonationScopeImpl,
 } from "./impersonation";
 import { renameTenantSlug as renameTenantSlugImpl } from "./rename-slug";
 import { platformSearch as platformSearchImpl } from "./search";
@@ -269,19 +270,45 @@ export async function stopImpersonationAction(input: unknown) {
 }
 
 /**
+ * ⭐ TAKE WRITE ACCESS INSIDE A LIVE SESSION — Batch 28.
+ *
+ * A session is READ-ONLY from the moment it starts, whatever the customer
+ * consented to. This is the separate, reasoned act that lifts it, and the
+ * record of the act IS the grant — see `SCOPE_LIFT_RESOURCE` in
+ * `server/platform/impersonation.ts`.
+ */
+export async function liftImpersonationScopeAction(input: unknown) {
+  const result = await liftImpersonationScopeImpl(input);
+  if (result.ok) {
+    revalidatePath("/platform");
+    revalidatePath("/platform/sessions");
+  }
+  return result;
+}
+
+/**
  * Returns a plain object, never the internal session row.
  *
- * The banner needs four strings and a number. Returning the record would
- * ship the justification, the consent id and the recorded IP into a
- * client bundle for no reason at all.
+ * The banner needs a handful of strings and a number. Returning the
+ * record would ship the consent id and the recorded IP into a client
+ * bundle for no reason at all.
+ *
+ * ⚠️ `scope` HERE IS THE EFFECTIVE SCOPE, and `grantedScope` is the
+ * ceiling. Shipping only one of the two would leave the banner unable to
+ * tell "read-only because that is all they consented to" apart from
+ * "read-only because nobody has taken write access yet", and those need
+ * different words in front of an operator.
  */
 export async function getActiveImpersonationAction(): Promise<{
   sessionId: string;
   tenantName: string;
   tenantSlug: string;
   scope: string;
+  grantedScope: string;
   mode: string;
   banner: string;
+  reason: string;
+  writeAccessReason: string | null;
   minutesLeft: number;
   expiresAt: string;
 } | null> {
@@ -292,8 +319,11 @@ export async function getActiveImpersonationAction(): Promise<{
     tenantName: active.tenantName,
     tenantSlug: active.tenantSlug,
     scope: active.scope,
+    grantedScope: active.grantedScope,
     mode: active.mode,
     banner: active.banner,
+    reason: active.justification,
+    writeAccessReason: active.scopeLiftReason,
     minutesLeft: active.minutesLeft,
     expiresAt: active.expiresAt.toISOString(),
   };

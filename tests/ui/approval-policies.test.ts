@@ -48,7 +48,7 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { createElement } from "react";
 import { render, screen } from "@testing-library/react";
@@ -76,20 +76,58 @@ const codeOnly = (s: string) =>
 
 const ENGINE = read("server/platform/approvals.ts");
 const CONTROL = read("server/platform/control-actions.ts");
+const REGISTRY = read("server/platform/approval-executors.ts");
 const PAGE = read("app/platform/approvals/page.tsx");
 const BOARD = read("components/platform/approval-policy-board.tsx");
 const QUEUE = read("components/platform/approval-queue.tsx");
 const TENANT_ACTIONS = read("components/platform/tenant-actions.tsx");
 
-/** Every kind an executor is registered for, read from the wiring file. */
+/**
+ * ⚠️ ONE REGISTRY FILE SINCE BATCH 43. The registrations used to sit in
+ * `control-actions.ts` beside the only two request paths. Three of the
+ * five request paths are now inside the WRITING functions, which are
+ * reachable from server actions that never import `control-actions.ts` —
+ * and `queueForApproval` refuses a kind with no registered executor, so a
+ * held write would have failed to queue.
+ */
 const registeredKinds = [
-  ...codeOnly(CONTROL).matchAll(/registerApprovalExecutor\(\s*"([a-z._]+)"/g),
+  ...codeOnly(REGISTRY).matchAll(/registerApprovalExecutor\(\s*"([a-z._]+)"/g),
 ].map((m) => m[1] as string);
 
-/** Every kind actually handed to `queueForApproval`, from the same file. */
-const queuedKinds = [...codeOnly(CONTROL).matchAll(/kind:\s*"([a-z._]+)"/g)].map(
-  (m) => m[1] as string,
-);
+/**
+ * ⭐ EVERY KIND ACTUALLY HANDED TO `queueForApproval`, FOUND BY SCANNING
+ * RATHER THAN BY NAMING FILES.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 A HAND-WRITTEN LIST OF WHERE REQUESTS ARE RAISED IS THE ARTEFACT
+ *    THIS WHOLE SUITE EXISTS TO KILL
+ * ══════════════════════════════════════════════════════════════════════
+ * The first version of this constant read one file. That was fine while
+ * one file could raise a request and became silently wrong the moment
+ * another could: a policy wired from `flags.ts` would have been invisible
+ * to the both-ways check below, which is precisely the drift the check is
+ * for. So the directory is walked, and adding a request path anywhere
+ * under `server/platform/` is caught wherever somebody puts it.
+ */
+const PLATFORM_DIR = join(ROOT, "server", "platform");
+const queuedKinds = readdirSync(PLATFORM_DIR)
+  .filter((f) => f.endsWith(".ts"))
+  .flatMap((f) => {
+    const source = codeOnly(readFileSync(join(PLATFORM_DIR, f), "utf8"));
+    // ⚠️ Only `kind:` inside a `queueForApproval({ ... })` call counts.
+    // `approvalGate({ kind: ... })` names the policy being CHECKED, which
+    // is not the same fact — a gate can hold a write for a policy this
+    // file does not raise.
+    return [...source.matchAll(/queueForApproval\(\{/g)].flatMap((call) => {
+      // ⚠️ A WINDOW, NOT A BRACE MATCHER. These call sites nest objects
+      // several levels deep and a regex that tries to find the matching
+      // `}` is a parser with no tests. The first `kind:` after the call
+      // opens is the call's own, because every one of them puts it first.
+      const window = source.slice(call.index, call.index + 2_000);
+      const kind = /kind:\s*"([a-z._]+)"/.exec(window);
+      return kind ? [kind[1] as string] : [];
+    });
+  });
 
 /* ================================================================== */
 /* ① THE DECLARATION CANNOT GO STALE                                   */
@@ -111,15 +149,32 @@ describe("the request-path table", () => {
    * nothing raises, and this fails too. The table cannot drift away from
    * the code in either direction without somebody being told.
    */
-  it("matches the kinds control-actions actually queues, both ways", () => {
+  it("matches the kinds the server actually queues, both ways", () => {
     expect(queuedKinds.length).toBeGreaterThan(0);
     expect(new Set(Object.keys(REQUEST_PATHS))).toEqual(new Set(queuedKinds));
   });
 
-  /** ⚠️ And every declared path names WHERE, not just THAT. */
-  it("says where each request is raised from", () => {
+  /**
+   * ⚠️ AND EVERY DECLARED PATH NAMES WHERE, NOT JUST THAT.
+   *
+   * ⭐ ASSERTED AS "NAMES A SERVER MODULE THAT EXISTS", not as "contains
+   * control-actions.ts". Pinning the one file was right while one file
+   * raised everything and became a lie the moment the hold moved into the
+   * writing functions — and a test that pins yesterday's topology fails
+   * on the improvement rather than on the regression.
+   */
+  it("says where each request is raised from, and the file is real", () => {
     for (const [kind, path] of Object.entries(REQUEST_PATHS)) {
-      expect(path, kind).toContain("server/platform/control-actions.ts");
+      const named = [...(path ?? "").matchAll(/server\/platform\/[a-z-]+\.ts/g)].map(
+        (m) => m[0],
+      );
+      expect(named.length, kind).toBeGreaterThan(0);
+      for (const file of named) {
+        expect(existsSync(join(ROOT, file)), `${kind} → ${file}`).toBe(true);
+      }
+      // A function name, not just a file: "somewhere in flags.ts" is not
+      // an answer somebody can chase.
+      expect(path, kind).toMatch(/[a-zA-Z]+\(\)/);
       expect((path ?? "").length, kind).toBeGreaterThan(30);
     }
   });
@@ -159,10 +214,10 @@ describe("enforcementReport", () => {
   });
 
   /**
-   * ⭐ THE ONE THAT IS ACTUALLY WIRED. Both halves present, no caveat
-   * printed, and the caveat text is BLANKED rather than merely hidden —
-   * a note that outlives its own fix is how a screen starts lying in the
-   * other direction.
+   * ⭐ THE FIRST ONE THAT WAS ACTUALLY WIRED, and still the reference
+   * case. Both halves present, no caveat printed, and the caveat text is
+   * BLANKED rather than merely hidden — a note that outlives its own fix
+   * is how a screen starts lying in the other direction.
    */
   it("reports tenant.suspend as enforced and prints no caveat for it", () => {
     const p = by("tenant.suspend");
@@ -174,22 +229,34 @@ describe("enforcementReport", () => {
   });
 
   /**
-   * 🔴🔴 THE HALF-BUILT ONE, AND THE REASON `enforced` IS NOT
+   * 🔴🔴 THE HALF-BUILT CASE, AND THE REASON `enforced` IS NOT
    * `hasExecutor`.
    *
-   * ⚠️ An executor is registered for `entitlement.override_paid`, so a
-   * queued row would run correctly. There is simply no way to create
-   * one, and `applyEntitlementChange` writes the flag immediately. A
-   * report that keyed off the registry alone would print "Enforced"
-   * next to an override that is not held at all — a more confident lie
-   * than the one being fixed.
+   * ⚠️ THIS USED TO BE A LIVE DEFECT AND IS NOW A HYPOTHETICAL, which is
+   * the correct direction for it to move. `entitlement.override_paid` had
+   * an executor and no request path: a queued row would have run, and
+   * there was no way to create one, so the override took effect on the
+   * click. Batch 43 gave it a request path inside the two functions that
+   * write an `entitlement:` key.
+   *
+   * ⭐ THE RULE IT PROVED STILL HAS TO HOLD, so it is proved against a
+   * constructed report rather than deleted with the bug. A report that
+   * keyed off the registry alone would print "Enforced" next to something
+   * nothing raises — a more confident lie than the one being fixed.
    */
   it("refuses to call an executor-only policy enforced", () => {
-    const p = by("entitlement.override_paid");
+    const unraisable = APPROVAL_POLICIES.map((p) => p.kind).find(
+      (k) => !REQUEST_PATHS[k],
+    );
+    expect(unraisable, "every policy now has a request path — read this test").toBeTruthy();
+
+    const p = enforcementReport(APPROVAL_POLICIES.map((x) => x.kind)).find(
+      (x) => x.kind === unraisable,
+    )!;
     expect(p.hasExecutor).toBe(true);
     expect(p.hasRequestPath).toBe(false);
     expect(p.enforced).toBe(false);
-    expect(p.blockedBecause).toContain("setTenantFlag directly");
+    expect(p.blockedBecause.length).toBeGreaterThan(120);
   });
 
   /** And the mirror case: a request path with nothing to run it. */

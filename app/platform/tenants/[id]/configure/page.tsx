@@ -157,6 +157,7 @@ async function ConfigureBody({ tenantId }: { tenantId: string }) {
             matrix={config.matrix}
             canWrite={canOverride}
             onSet={setModuleEntitlementAction}
+            isConsoleHost={isConsole}
             onStepUp={recordStepUpAction}
             /*
               ⭐⭐⭐ THE GAP THIS SESSION CLOSED. Until now this screen
@@ -180,6 +181,7 @@ async function ConfigureBody({ tenantId }: { tenantId: string }) {
             subscriptionGrantsAccess={config.subscriptionGrantsAccess}
             canWrite={canConfigure}
             onSave={setPlanAndLimitsAction}
+            isConsoleHost={isConsole}
             onStepUp={recordStepUpAction}
           />
         </TabsContent>

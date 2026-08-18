@@ -42,6 +42,16 @@ import "server-only";
  *      is being reproduced could do themselves — impersonating a viewer
  *      must not grant an operator more than the viewer has.
  *
+ *      ⭐ AND SINCE BATCH 28 THE SCOPE IT READS IS THE EFFECTIVE ONE —
+ *      `read_only` until an operator has deliberately taken write access
+ *      and the action register has recorded it. So this ceiling is where
+ *      the read-only default reaches the several hundred write paths
+ *      that are guarded by `requirePermission()` alone and never call
+ *      `assertImpersonationAllows()`: the `read_only` role holds no
+ *      write permission at all, so every one of them refuses. Two
+ *      independent layers, and this is the one that needs no call site
+ *      to remember anything.
+ *
  *   4. IT CARRIES `impersonationId`, so `writeAudit()` can stamp it and
  *      `withTenant(..., { impersonationId })` can arm the database DELETE
  *      guard. An action attributed to the real human but NOT FLAGGED as

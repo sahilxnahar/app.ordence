@@ -31,6 +31,18 @@
  * the capability, re-checks the step-up and re-validates the
  * justification length. This dialog can be bypassed entirely with a curl
  * command and nothing about the outcome changes.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * ⭐ TWO OPTIONAL PROPS ADDED FOR `<ConfirmDestructive>` (v1.52.0-alpha)
+ * ══════════════════════════════════════════════════════════════════════
+ * `headline` and `confirmMatch`. Both default to exactly what this dialog
+ * did before, so every existing caller is unchanged.
+ *
+ * They were added HERE rather than in a second dialog on purpose. Four
+ * bespoke confirmations drift and the fourth one ends up without the
+ * typed check — the same argument that produced this file. A wrapper that
+ * had to reimplement the body to change the match rule would BE that
+ * fourth confirmation.
  */
 
 import { useState, type ReactNode } from "react";
@@ -56,7 +68,25 @@ export type DangerDialogProps = {
   consequences: string[];
   /** When set, the operator must type this string exactly. */
   confirmValue?: string;
+  /**
+   * Overrides the exact-string comparison used to arm the button.
+   *
+   * ⚠️ Defaults to `typed.trim() === expected` — the original, strict
+   * behaviour. `<ConfirmDestructive>` passes a case-insensitive
+   * comparison, because a workspace called "Acme Constructions Pvt Ltd"
+   * typed as "acme constructions pvt ltd" is the same human being
+   * demonstrating the same thing. This is a mistake guard; making it
+   * case-sensitive catches no additional mistakes and only teaches
+   * operators to copy-paste the field, which defeats it entirely.
+   */
+  confirmMatch?: (typed: string, expected: string) => boolean;
   confirmLabel?: string;
+  /**
+   * One sentence, rendered above the bullet list in the dialog's loudest
+   * type. The bullets say what happens; this says the one thing the
+   * operator must not miss. The WORD carries it — the border is emphasis.
+   */
+  headline?: ReactNode;
   justificationLabel?: string;
   minJustification?: number;
   actionLabel: string;
@@ -74,7 +104,9 @@ export function DangerDialog({
   description,
   consequences,
   confirmValue,
+  confirmMatch,
   confirmLabel = "Type the workspace address to confirm",
+  headline,
   justificationLabel = "Why are you doing this?",
   minJustification = 20,
   actionLabel,
@@ -87,7 +119,9 @@ export function DangerDialog({
   const [typed, setTyped] = useState("");
   const [justification, setJustification] = useState("");
 
-  const slugOk = !confirmValue || typed.trim() === confirmValue;
+  const slugOk =
+    !confirmValue ||
+    (confirmMatch ? confirmMatch(typed, confirmValue) : typed.trim() === confirmValue);
   const reasonOk = justification.trim().length >= minJustification;
   const ready = slugOk && reasonOk && !pending;
 
@@ -98,6 +132,15 @@ export function DangerDialog({
           <DialogTitle>{title}</DialogTitle>
           <DialogDescription>{description}</DialogDescription>
         </DialogHeader>
+
+        {headline ? (
+          <p
+            data-testid="danger-headline"
+            className="rounded-md border-2 border-destructive p-3 text-sm font-medium"
+          >
+            {headline}
+          </p>
+        ) : null}
 
         <ul className="space-y-1 rounded-md border border-border bg-muted/40 p-3 text-xs">
           {consequences.map((line) => (

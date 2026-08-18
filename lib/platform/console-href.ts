@@ -1,6 +1,8 @@
 import "server-only";
 import { headers } from "next/headers";
 
+export { consoleHref, CONSOLE_NAV, type ConsoleNavItem } from "./console-paths";
+
 /**
  * Ordence — ⭐⭐ ONE LINK HELPER, BECAUSE THE CONSOLE HAS TWO BASE PATHS
  *
@@ -39,6 +41,19 @@ import { headers } from "next/headers";
  * ⚠️ THE HOST IS THE ONLY INPUT. Not an env var read at build time, not
  * a prop threaded through twelve components , the request's own `Host`
  * header, which is the same thing the middleware decided on.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * ⚠️ WHERE `consoleHref` ACTUALLY LIVES NOW, AND WHY IT MOVED
+ * ══════════════════════════════════════════════════════════════════════
+ * This module reads `headers()`, so it carries `import "server-only"` and
+ * a `"use client"` file may not import it — webpack refuses, and so does
+ * `scripts/check-server-boundaries.mjs`. The command palette is a client
+ * component and needs the SAME mapping, so the pure half was moved to
+ * `lib/platform/console-paths.ts` and is re-exported below.
+ *
+ * ⭐ RE-EXPORTED RATHER THAN MOVED-AND-UPDATED so that every existing
+ * `import { consoleHref } from "@/lib/platform/console-href"` keeps
+ * compiling. There is still exactly one implementation.
  */
 
 /**
@@ -57,21 +72,8 @@ export async function onConsoleHost(): Promise<boolean> {
   return zone ? raw === `admin.${zone}` : false;
 }
 
-/**
- * Turn a canonical `/platform/...` path into the right link for THIS host.
- *
- *   on app.    `/platform/tenants` → `/platform/tenants`
- *   on admin.  `/platform/tenants` → `/tenants`
- *   on admin.  `/platform`         → `/`
- *
- * ⚠️ TAKES THE CANONICAL PATH, ALWAYS. Call sites keep writing
- * `/platform/...` , the path that exists on disk , so a reader can find
- * the file. This function is the only place that knows about the other
- * form.
+/*
+ * `consoleHref()` is re-exported at the top of this file from
+ * `./console-paths`. It is not defined here because a client component
+ * needs it and cannot import a server-only module.
  */
-export function consoleHref(canonical: string, isConsoleHost: boolean): string {
-  if (!isConsoleHost) return canonical;
-  if (canonical === "/platform") return "/";
-  if (canonical.startsWith("/platform/")) return canonical.slice("/platform".length);
-  return canonical;
-}

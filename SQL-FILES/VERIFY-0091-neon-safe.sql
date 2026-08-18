@@ -260,6 +260,19 @@ DECLARE
     v_probe   text;
     v_target  text;
 BEGIN
+    -- 🔴 WITHOUT THIS LINE THIS WHOLE SECTION LIES.
+    --    `tenants` carries FORCE ROW LEVEL SECURITY with
+    --    `WITH CHECK (id = app_current_tenant_id() OR app_platform_scope())`
+    --    from 0014. For any role without BYPASSRLS, every INSERT below is
+    --    refused by RLS rather than by the thing being tested, so the CONTROL
+    --    probe reports "the guard is refusing legal names" and rows 2 to 5
+    --    report PASS for the wrong reason. A verify file that passes for the
+    --    wrong reason is worse than no verify file.
+    --
+    --    `set_config(..., true)` is transaction-local, the plpgsql equivalent
+    --    of SET LOCAL, and unwinds with the block.
+    PERFORM set_config('app.platform_scope', 'on', true);
+
     -- =================================================================
     -- ⚠️ THE PATTERN BELOW IS NOT STYLISTIC. READ IT ONCE.
     --

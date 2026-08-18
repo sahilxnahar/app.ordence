@@ -22,6 +22,7 @@ import { join } from "node:path";
 
 import {
   APPROVAL_POLICIES,
+  REQUEST_PATHS,
   MIN_JUSTIFICATION,
   SELF_APPROVAL_WAIT_MINUTES,
   expiryFor,
@@ -519,11 +520,28 @@ describe("🔴 everything built this session is actually reachable", () => {
   const controlActions = read("server/platform/control-actions.ts");
   const layout = read("app/platform/layout.tsx");
 
+  /**
+   * ⚠️ THE NAV IS NO LONGER A LITERAL IN THE LAYOUT. It was moved into
+   * `lib/platform/console-paths.ts` so a client component (the command
+   * palette) could share the one mapping — `console-href.ts` reads
+   * `headers()` and cannot be imported from a `"use client"` file.
+   *
+   * ⭐ SO THE ASSERTION IS "THE CONSOLE OFFERS A WAY TO THIS SCREEN",
+   * which is what it always meant, rather than "this string appears in
+   * this file", which is what it happened to check. The layout must
+   * still render whatever registry holds it.
+   */
+  const navSource = read("lib/platform/console-paths.ts");
+  const expectNavOffers = (href: string) => {
+    expect(navSource, href).toContain(href);
+    expect(layout).toContain("CONSOLE_NAV");
+  };
+
   it("the approval queue has a screen, and the screen calls the action", () => {
     const page = read("app/platform/approvals/page.tsx");
     expect(page).toContain("getApprovalQueue(");
     expect(page).toContain("decideRequest");
-    expect(layout).toContain("/platform/approvals");
+    expectNavOffers("/platform/approvals");
   });
 
   it("the health screen calls the reader, and the reader calls the SWEEP", () => {
@@ -533,7 +551,7 @@ describe("🔴 everything built this session is actually reachable", () => {
     const page = read("app/platform/health/page.tsx");
     expect(page).toContain("getOpenHealthEvents(");
     expect(controlActions).toContain("sweepTenantHealth(");
-    expect(layout).toContain("/platform/health");
+    expectNavOffers("/platform/health");
   });
 
   it("the incidents screen reaches incidents AND the break-glass ledger", () => {
@@ -541,7 +559,7 @@ describe("🔴 everything built this session is actually reachable", () => {
     expect(page).toContain("declareIncident");
     expect(page).toContain("getMyBreakGlassDebt");
     expect(page).toContain("writeBreakGlassNote");
-    expect(layout).toContain("/platform/incidents");
+    expectNavOffers("/platform/incidents");
   });
 
   it("⭐ the toggle preview is wired to the switchboard the operator uses", () => {
@@ -567,9 +585,31 @@ describe("🔴 everything built this session is actually reachable", () => {
     expect(blockAt).toBeLessThan(insertAt);
   });
 
+  /**
+   * ⚠️ THE REGISTRATIONS MOVED IN BATCH 43, AND THE ASSERTION FOLLOWED
+   * THEM RATHER THAN BEING RELAXED. They live in
+   * `server/platform/approval-executors.ts`, which `control-actions.ts`
+   * imports for its side effect — along with `flags.ts`,
+   * `configuration.ts` and `staff.ts`, which are the three enforcement
+   * points that can now queue and are reachable from server actions that
+   * never import `control-actions.ts`.
+   *
+   * ⭐ ASSERTED AS A PROPERTY: every policy with a request path must have
+   * an executor. A hard-coded pair of names would have to be edited every
+   * time another policy is wired, which is how a pin stops being read.
+   */
   it("the executors are registered, or an approved row could never run", () => {
-    expect(controlActions).toContain('registerApprovalExecutor("tenant.suspend"');
-    expect(controlActions).toContain('registerApprovalExecutor("entitlement.override_paid"');
+    const registry = read("server/platform/approval-executors.ts");
+    const registered = new Set(
+      [...registry.matchAll(/registerApprovalExecutor\(\s*"([a-z._]+)"/g)].map((m) => m[1]),
+    );
+    expect(registered.size).toBeGreaterThan(0);
+    for (const kind of Object.keys(REQUEST_PATHS)) {
+      expect(registered.has(kind), kind).toBe(true);
+    }
+    // And `control-actions.ts` still pulls the registry in, or the
+    // approvals screen would report a cold registry on every boot.
+    expect(controlActions).toContain('import "./approval-executors"');
   });
 });
 

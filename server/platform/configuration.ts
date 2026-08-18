@@ -98,6 +98,22 @@ import {
   type TenantOverrideInput,
 } from "@/lib/platform/config-chain";
 import { requireCapability, recordPlatformAudit, PlatformAccessError } from "./guard";
+// 🔴 SIDE EFFECT: registers every approval executor. Without it this
+// module could hold a write and then fail to queue it, because
+// `queueForApproval` refuses a kind with no executor.
+import "./approval-executors";
+import {
+  approvalGate,
+  commercialStandingIn,
+  queueForApproval,
+  recordApprovalRefusal,
+  type ApprovalTicket,
+} from "./approvals";
+import {
+  entitlementOverrideIsHeld,
+  planChangeIsHeld,
+} from "@/lib/platform/approvals";
+import { formatMoney } from "@/lib/billing/money";
 import type { PlanTier } from "@/db/schema/core";
 import type { PlatformOperator } from "./guard";
 
@@ -409,12 +425,29 @@ export async function getWorkspaceConfiguration(
 /* C · WRITE — ONE MODULE, ONE WORKSPACE                               */
 /* ------------------------------------------------------------------ */
 
+/**
+ * ⭐ THE SECOND OF THE TWO WRITERS OF AN `entitlement:` KEY. The other is
+ * `setTenantFlag`. Both are enforcement points for
+ * `entitlement.override_paid` and both hold the write themselves, because
+ * a gate in front of one of them leaves the other open.
+ */
+export type ModuleEntitlementOutcome =
+  | { readonly feature: string; readonly state: string; readonly queued: false }
+  | {
+      readonly feature: string;
+      readonly state: "waiting_for_approval";
+      readonly queued: true;
+      readonly requestId: string;
+      readonly note: string;
+    };
+
 export async function setModuleEntitlement(
   input: unknown,
-): Promise<ConfigResult<{ feature: string; state: string }>> {
-  const gate = await capabilityOrStepUp("entitlements:override");
-  if (!gate.ok) return gate.result;
-  const operator = gate.operator;
+  ticket?: ApprovalTicket,
+): Promise<ConfigResult<ModuleEntitlementOutcome>> {
+  const stepUp = await capabilityOrStepUp("entitlements:override");
+  if (!stepUp.ok) return stepUp.result;
+  const operator = stepUp.operator;
 
   const parsed = setModuleEntitlementSchema.safeParse(input);
   if (!parsed.success) {
@@ -475,9 +508,29 @@ export async function setModuleEntitlement(
     .flatMap((g) => g.modules)
     .find((m) => m.feature === feature);
 
-  await withPlatformScope(
+  const outcome = await withPlatformScope(
     `Platform console: ${mode} entitlement ${feature} on tenant ${tenantId} — ${reason.slice(0, 80)}`,
     async (tx) => {
+      /*
+       * ══════════════════════════════════════════════════════════════
+       * 🔴🔴 THE GATE, BEFORE EITHER BRANCH WRITES ANYTHING
+       * ══════════════════════════════════════════════════════════════
+       * Above the `clear` branch as well as the grant/revoke one:
+       * clearing an override on a paying customer is a change to what
+       * they can use just as much as setting one, and it is the branch
+       * that DELETES rather than writes, which is the easier one to
+       * forget.
+       */
+      const standing = await commercialStandingIn(tx, tenantId);
+      const approval = await approvalGate(tx, {
+        kind: "entitlement.override_paid",
+        held: entitlementOverrideIsHeld({ flagKey: key, ...standing }),
+        ticket,
+        targetId: tenantId,
+      });
+
+      if (!approval.proceed) return { step: "held", approval } as const;
+
       if (mode === "clear") {
         /*
          * ⭐ DELETE, NOT "SET TO THE PLAN'S CURRENT ANSWER".
@@ -496,7 +549,7 @@ export async function setModuleEntitlement(
               eq(platformTenantFlags.flagKey, key),
             ),
           );
-        return;
+        return { step: "written" } as const;
       }
 
       await tx
@@ -522,8 +575,93 @@ export async function setModuleEntitlement(
             updatedAt: new Date(),
           },
         });
+
+      return { step: "written" } as const;
     },
   );
+
+  /* ---------------------------------------------------------------- */
+  /* THE HELD PATH — NOTHING WAS WRITTEN                               */
+  /* ---------------------------------------------------------------- */
+  if (outcome.step === "held") {
+    const { approval } = outcome;
+    const label = `${current.data.name} (${current.data.slug})`;
+
+    if (!approval.queue) {
+      await recordApprovalRefusal({
+        operator,
+        kind: "entitlement.override_paid",
+        targetType: "tenant",
+        targetId: tenantId,
+        targetLabel: label,
+        reason: approval.reason,
+      });
+      return { ok: false, error: approval.reason };
+    }
+
+    const queued = await queueForApproval({
+      kind: "entitlement.override_paid",
+      operator,
+      targetType: "tenant",
+      targetId: tenantId,
+      targetLabel: label,
+      justification: reason,
+      proposedBefore: { state: previous?.state ?? null },
+      proposedAfter: {
+        feature,
+        mode,
+        /*
+         * ⚠️ THE THREE MODES SPELLED OUT, because `clear` is the one an
+         * approver will misread. It is not "switch it off" — it is
+         * "stop overriding, and let the plan decide", which can turn a
+         * module ON as easily as off.
+         */
+        effect:
+          mode === "grant"
+            ? `Turns ${definition.label} ON for a paying customer, above what their plan includes.`
+            : mode === "revoke"
+              ? `Turns ${definition.label} OFF for a paying customer, below what their plan includes.`
+              : `Removes the override on ${definition.label} so their plan decides again — which may switch it on or off.`,
+      },
+      payload: {
+        writer: "module",
+        tenantId,
+        feature,
+        mode,
+        reason,
+        expiresAt: expiresAt ?? null,
+      },
+      heldWrite: true,
+      now: new Date(),
+    });
+
+    if (!queued.queued) {
+      await recordApprovalRefusal({
+        operator,
+        kind: "entitlement.override_paid",
+        targetType: "tenant",
+        targetId: tenantId,
+        targetLabel: label,
+        reason: queued.error,
+      });
+      return {
+        ok: false,
+        error: queued.error,
+        fieldErrors: { reason: [queued.error] },
+      };
+    }
+
+    return {
+      ok: true,
+      data: {
+        feature,
+        state: "waiting_for_approval",
+        queued: true,
+        requestId: queued.requestId,
+        note: queued.note,
+      },
+    };
+  }
 
   const nextState =
     mode === "clear"
@@ -573,10 +711,12 @@ export async function setModuleEntitlement(
         .map((m) => m.label),
       newStateLabel:
         MODULE_STATE_LABELS[nextState as keyof typeof MODULE_STATE_LABELS] ?? nextState,
+      // ⭐ WHICH APPROVAL MADE THIS LEGAL, in the customer's own log.
+      approvedRequestId: ticket?.approvedRequestId ?? null,
     },
   });
 
-  return { ok: true, data: { feature, state: nextState } };
+  return { ok: true, data: { feature, state: nextState, queued: false } };
 }
 
 /* ------------------------------------------------------------------ */
@@ -977,12 +1117,29 @@ export async function listConfigVersions(
 /* D · WRITE — PLAN AND LIMITS                                         */
 /* ------------------------------------------------------------------ */
 
+/**
+ * ⭐ THE ENFORCEMENT POINT FOR `tenant.plan_change`, and the reason the
+ * hold is HERE rather than in `setPlanAndLimitsAction`: this function is
+ * also the only place `limits.storage_mb` is reconciled between the
+ * column and the configuration chain, so it has callers that are not the
+ * plan form and a wrapper in front of the form would leave them open.
+ */
+export type PlanAndLimitsOutcome =
+  | {
+      readonly planTier: PlanTier;
+      readonly seatLimit: number;
+      readonly storageLimitMb: number;
+      readonly queued: false;
+    }
+  | { readonly queued: true; readonly requestId: string; readonly note: string };
+
 export async function setPlanAndLimits(
   input: unknown,
-): Promise<ConfigResult<{ planTier: PlanTier; seatLimit: number; storageLimitMb: number }>> {
-  const gate = await capabilityOrStepUp("tenants:configure");
-  if (!gate.ok) return gate.result;
-  const operator = gate.operator;
+  ticket?: ApprovalTicket,
+): Promise<ConfigResult<PlanAndLimitsOutcome>> {
+  const stepUp = await capabilityOrStepUp("tenants:configure");
+  if (!stepUp.ok) return stepUp.result;
+  const operator = stepUp.operator;
 
   const parsed = setPlanAndLimitsSchema.safeParse(input);
   if (!parsed.success) {
@@ -1057,9 +1214,37 @@ export async function setPlanAndLimits(
   const storageIsPlanDefault = storageLimitMb === planStorage;
   const storageFlagKey = configOverrideKeyFor("limits.storage_mb");
 
-  await withPlatformScope(
+  const outcome = await withPlatformScope(
     `Platform console: set plan/limits on tenant ${tenantId} — ${reason.slice(0, 80)}`,
     async (tx) => {
+      /*
+       * ══════════════════════════════════════════════════════════════
+       * 🔴🔴 THE GATE, ON THE TIER READ IN THIS TRANSACTION
+       * ══════════════════════════════════════════════════════════════
+       * NOT on `current.data.planTier`, which was read on a different
+       * connection a moment ago. Between that read and this write another
+       * operator's approved plan change can land, and the difference
+       * decides whether this write is held at all — a stale "they are
+       * already on advanced" is how a tier change slips past the queue
+       * without anybody doing anything wrong.
+       */
+      const live = await tx
+        .select({ planTier: tenants.planTier })
+        .from(tenants)
+        .where(eq(tenants.id, tenantId))
+        .limit(1);
+
+      const liveTier = live[0]?.planTier ?? current.data.planTier;
+
+      const approval = await approvalGate(tx, {
+        kind: "tenant.plan_change",
+        held: planChangeIsHeld(liveTier, planTier),
+        ticket,
+        targetId: tenantId,
+      });
+
+      if (!approval.proceed) return { step: "held", approval, liveTier } as const;
+
       await tx
         .update(tenants)
         .set({ planTier, seatLimit, storageLimitMb, updatedAt: new Date() })
@@ -1074,7 +1259,7 @@ export async function setPlanAndLimits(
               eq(platformTenantFlags.flagKey, storageFlagKey),
             ),
           );
-        return;
+        return { step: "written" } as const;
       }
 
       await tx
@@ -1101,8 +1286,110 @@ export async function setPlanAndLimits(
             updatedAt: new Date(),
           },
         });
+
+      return { step: "written" } as const;
     },
   );
+
+  /* ---------------------------------------------------------------- */
+  /* THE HELD PATH — NOTHING WAS WRITTEN                               */
+  /* ---------------------------------------------------------------- */
+  if (outcome.step === "held") {
+    const { approval } = outcome;
+    const label = `${current.data.name} (${current.data.slug})`;
+
+    if (!approval.queue) {
+      await recordApprovalRefusal({
+        operator,
+        kind: "tenant.plan_change",
+        targetType: "tenant",
+        targetId: tenantId,
+        targetLabel: label,
+        reason: approval.reason,
+      });
+      return { ok: false, error: approval.reason };
+    }
+
+    /*
+     * ══════════════════════════════════════════════════════════════
+     * ⭐⭐ WHAT IT DOES TO THE INVOICE, IN MONEY, ON THE APPROVER'S
+     *      SCREEN
+     * ══════════════════════════════════════════════════════════════
+     * The policy's own sentence is "it changes the invoice, and the
+     * customer sees it before we do". An approver looking at
+     * "basic → advanced" is being asked to agree to a number nobody
+     * has shown them.
+     *
+     * 🔴 EVERY VALUE HERE IS bigint MINOR UNITS AND IS COMPARED AS
+     * ONE. `catalogue - contracted` is bigint arithmetic; there is no
+     * `Number()`, no `* 100`, and no rounding step where
+     * `Math.round(Number("1.005") * 100)` could quietly produce 100
+     * instead of 101. `formatMoney` takes the bigint and is the ONLY
+     * place a float appears, on its way to pixels.
+     *
+     * ⚠️ AND IT IS LABELLED AS AN INDICATION, NOT A QUOTE. The
+     * subscription's price is the contract and the catalogue's is
+     * today's list price; a grandfathered customer's next invoice is
+     * neither. Printing a confident number would be worse than
+     * printing an honest range.
+     */
+    const money = await planChangeMoneyIndication({
+      tenantId,
+      toTier: planTier,
+    });
+
+    const queued = await queueForApproval({
+      kind: "tenant.plan_change",
+      operator,
+      targetType: "tenant",
+      targetId: tenantId,
+      targetLabel: label,
+      justification: reason,
+      proposedBefore: { planTier: outcome.liveTier },
+      proposedAfter: {
+        planTier,
+        seatLimit,
+        storageLimitMb,
+        effect: `Moves this workspace from ${outcome.liveTier} to ${planTier}. ${money.sentence}`,
+        // ⚠️ CARRIED AS STRINGS. `JSON.stringify` throws on a bigint,
+        // and a JSON column is not a place to discover that.
+        contractedUnitAmountMinor: money.contractedMinor?.toString() ?? null,
+        catalogueUnitAmountMinor: money.catalogueMinor?.toString() ?? null,
+        currency: money.currency,
+      },
+      payload: {
+        tenantId,
+        planTier,
+        seatLimit,
+        storageLimitMb,
+        acceptOverCommit,
+        reason,
+      },
+      heldWrite: true,
+      now: new Date(),
+    });
+
+    if (!queued.queued) {
+      await recordApprovalRefusal({
+        operator,
+        kind: "tenant.plan_change",
+        targetType: "tenant",
+        targetId: tenantId,
+        targetLabel: label,
+        reason: queued.error,
+      });
+      return {
+        ok: false,
+        error: queued.error,
+        fieldErrors: { reason: [queued.error] },
+      };
+    }
+
+    return {
+      ok: true,
+      data: { queued: true, requestId: queued.requestId, note: queued.note },
+    };
+  }
 
   await recordPlatformAudit({
     operator,
@@ -1140,10 +1427,105 @@ export async function setPlanAndLimits(
        */
       storageLayer: storageIsPlanDefault ? "plan" : "tenant",
       storagePlanDefaultMb: planStorage,
+      // ⭐ WHICH APPROVAL MADE THIS LEGAL, in the customer's own log.
+      approvedRequestId: ticket?.approvedRequestId ?? null,
     },
   });
 
-  return { ok: true, data: { planTier, seatLimit, storageLimitMb } };
+  return { ok: true, data: { planTier, seatLimit, storageLimitMb, queued: false } };
+}
+
+/* ------------------------------------------------------------------ */
+/* ⭐ WHAT A TIER MOVE IS WORTH, IN PAISE                               */
+/* ------------------------------------------------------------------ */
+
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 MONEY IS bigint MINOR UNITS END TO END, INCLUDING HERE
+ * ══════════════════════════════════════════════════════════════════════
+ * Both amounts are selected as TEXT and parsed with `BigInt`. Neither is
+ * ever a JavaScript number: `subscriptions.unit_amount_minor` and
+ * `plans.amount_minor` are both `bigint` in Postgres, and a driver that
+ * hands one back as a float is the last place anybody looks when a
+ * customer's invoice is eleven paise out.
+ *
+ * ⚠️ TWO DIFFERENT PRICES, AND THE DIFFERENCE IS THE POINT. The
+ * subscription carries what this customer AGREED to pay — copied at
+ * purchase precisely so a catalogue change never rewrites history — and
+ * `plans` carries today's list price for the tier being moved to. A
+ * grandfathered customer's real next invoice is neither, which is why
+ * the sentence says "list price" rather than pretending to quote.
+ *
+ * ⭐ FAILS QUIET, NOT LOUD. A missing plan row or a workspace with no
+ * subscription returns a sentence saying the number is unknown. An
+ * approval must not be blocked because the price list has a gap; being
+ * told "we could not price this" is a fine thing for an approver to read
+ * and act on.
+ */
+async function planChangeMoneyIndication(args: {
+  tenantId: string;
+  toTier: PlanTier;
+}): Promise<{
+  contractedMinor: bigint | null;
+  catalogueMinor: bigint | null;
+  currency: string;
+  sentence: string;
+}> {
+  const snapshot = await withPlatformScope(
+    `Platform console: price a tier move for tenant ${args.tenantId}`,
+    async (tx) => {
+      const [sub] = await tx
+        .select({
+          amount: sql<string>`${subscriptions.unitAmountMinor}::text`,
+          currency: subscriptions.currency,
+        })
+        .from(subscriptions)
+        .where(eq(subscriptions.tenantId, args.tenantId))
+        .orderBy(desc(subscriptions.createdAt))
+        .limit(1);
+
+      const [plan] = await tx
+        .select({
+          amount: sql<string>`${plans.amountMinor}::text`,
+          currency: plans.currency,
+        })
+        .from(plans)
+        .where(and(eq(plans.tier, args.toTier), eq(plans.isActive, true)))
+        .orderBy(plans.sortOrder)
+        .limit(1);
+
+      return { sub: sub ?? null, plan: plan ?? null };
+    },
+  );
+
+  const contractedMinor = snapshot.sub ? BigInt(snapshot.sub.amount) : null;
+  const catalogueMinor = snapshot.plan ? BigInt(snapshot.plan.amount) : null;
+  const currency = snapshot.sub?.currency ?? snapshot.plan?.currency ?? "INR";
+
+  if (contractedMinor === null || catalogueMinor === null) {
+    return {
+      contractedMinor,
+      catalogueMinor,
+      currency,
+      sentence:
+        "This screen could not price the move — there is no live subscription, no active plan for that tier, or both. Check what they are actually billed before approving.",
+    };
+  }
+
+  // 🔴 bigint MINUS bigint. No Number(), no rounding, no intermediate float.
+  const deltaMinor = catalogueMinor - contractedMinor;
+  const direction = deltaMinor > 0n ? "more" : deltaMinor < 0n ? "less" : "the same";
+  const absolute = deltaMinor < 0n ? -deltaMinor : deltaMinor;
+
+  return {
+    contractedMinor,
+    catalogueMinor,
+    currency,
+    sentence:
+      deltaMinor === 0n
+        ? `They pay ${formatMoney(contractedMinor, currency)} today and the list price of that tier is the same, so this move does not change the headline amount.`
+        : `They pay ${formatMoney(contractedMinor, currency)} today; the list price of that tier is ${formatMoney(catalogueMinor, currency)} — ${formatMoney(absolute, currency)} ${direction}. That is an indication, not a quote: their price is whatever their subscription says.`,
+  };
 }
 
 /* ------------------------------------------------------------------ */

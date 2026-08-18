@@ -49,6 +49,7 @@ import { Select } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { HeldForApproval } from "@/components/platform/held-for-approval";
 import {
   Table,
   TableHeader,
@@ -119,11 +120,20 @@ export type StaffConsoleProps = {
   onGrant: (input: unknown) => Promise<ActionResult>;
   onRevoke: (input: unknown) => Promise<ActionResult>;
   onStepUp: () => Promise<{ ok: true }>;
+  /** ⚠️ The console answers on two base paths. See `console-paths.ts`. */
+  isConsoleHost?: boolean;
 };
 
 /** `needsStepUp` is the one refusal with a remedy — see `actions.ts`. */
+/**
+ * ⚠️ `data.queued` IS THE DIFFERENCE BETWEEN "THEY NOW HOLD OWNER" AND
+ * "SOMEBODY HAS BEEN ASKED WHETHER THEY SHOULD". `staff.elevate` holds
+ * any grant that RAISES an account's grade, inside `grantPlatformStaff`'s
+ * own transaction. Announcing "X now holds owner platform access" when
+ * nothing was written is how the next person stops checking the list.
+ */
 type ActionResult =
-  | { ok: true }
+  | { ok: true; data?: { queued?: boolean; note?: string } }
   | { ok: false; error: string; needsStepUp?: boolean; fieldErrors?: Record<string, string[]> };
 
 /* ------------------------------------------------------------------ */
@@ -195,16 +205,29 @@ export function StaffConsole(props: StaffConsoleProps) {
   const [pending, start] = useTransition();
   const [revoking, setRevoking] = useState<StaffRow | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [heldNote, setHeldNote] = useState<string | null>(null);
 
   const live = props.rows.filter((r) => r.usable);
   const ended = props.rows.filter((r) => !r.usable);
 
   function run(fn: () => Promise<ActionResult>, success: string) {
     setError(null);
+    setHeldNote(null);
     start(async () => {
       const result = await fn();
       if (result.ok) {
         setRevoking(null);
+        /*
+         * 🔴 NOT A SUCCESS TOAST FOR SOMETHING THAT HAS NOT HAPPENED.
+         * The list below still shows the old grade — or no row at all —
+         * and a green "X now holds owner platform access" turns that
+         * into an apparently stale screen.
+         */
+        if (result.data?.queued) {
+          setHeldNote(result.data.note ?? "This grant is waiting for approval.");
+          router.refresh();
+          return;
+        }
         toast.success(success);
         router.refresh();
         return;
@@ -227,6 +250,19 @@ export function StaffConsole(props: StaffConsoleProps) {
 
   return (
     <div className="space-y-6">
+      {/*
+        ⭐ AT THE TOP, ABOVE THE LIST IT CONTRADICTS. An elevation held by
+        `staff.elevate` leaves this page looking exactly as it did before
+        the click, which is the state a fading toast is worst at.
+      */}
+      {heldNote ? (
+        <HeldForApproval
+          note={heldNote}
+          isConsoleHost={props.isConsoleHost ?? false}
+          testId="staff-held-for-approval"
+        />
+      ) : null}
+
       {/* ============================================================ */}
       {/* ① RIGHT NOW                                                  */}
       {/* ============================================================ */}

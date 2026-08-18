@@ -86,6 +86,24 @@ export const FLAG_CATALOG = {
     grantsPaidCapability: false,
     isKillSwitch: true,
   },
+  /**
+   * ⭐ MAINTENANCE MODE, PER WORKSPACE. Enforced in
+   * `server/platform/maintenance.ts`, one hop from the same call every
+   * tenant mutation already makes for impersonation — not in the UI.
+   *
+   * `expires_at` on the flag row IS the end of the window, and `value`
+   * carries `{ message }`, the sentence the CUSTOMER reads. Declared a
+   * kill switch because it REMOVES capability, which is also what exempts
+   * it from the expiry requirement: a workspace frozen because it is
+   * damaging its own data must stay frozen until a human says otherwise.
+   */
+  "killswitch.maintenance_read_only": {
+    label: "Maintenance mode (read-only)",
+    description:
+      "Refuse every write in this workspace and show its users a non-dismissible notice. Value: { message: string }.",
+    grantsPaidCapability: false,
+    isKillSwitch: true,
+  },
   "support.verbose_errors": {
     label: "Verbose errors",
     description:

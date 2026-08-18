@@ -37,6 +37,10 @@ import {
 } from "@/components/ui/table";
 import { Badge } from "@/components/ui/badge";
 import { formatMoney } from "@/lib/billing/money";
+// ⚠️ `console-paths`, not `console-href`: the latter is `server-only`.
+// These panels are server components today, but the import that survives
+// somebody adding `"use client"` at the top of this file is the pure one.
+import { consoleHref } from "@/lib/platform/console-paths";
 import type {
   UsagePoint,
   UsageLevelRow,
@@ -522,13 +526,97 @@ export function ActivityPanel({ rows }: { rows: PlatformActivityRow[] }) {
 /* IMPERSONATION HISTORY (per tenant)                                  */
 /* ------------------------------------------------------------------ */
 
-export function SessionHistoryLink({ tenantId }: { tenantId: string }) {
+/**
+ * ⚠️ `isConsoleHost` IS A PROP, NOT SOMETHING THIS COMPONENT WORKS OUT.
+ * `onConsoleHost()` reads request headers and is `server-only`; a link
+ * built from `window.location` would be right in the browser and wrong
+ * during SSR, which is the hydration mismatch that makes a link change
+ * under the cursor. The page calls `onConsoleHost()` once and passes the
+ * boolean down.
+ *
+ * It defaults to `false` so an older call site keeps producing the
+ * canonical `/platform/...` path, which is correct on app.ordence.com.
+ */
+export function SessionHistoryLink({
+  tenantId,
+  isConsoleHost = false,
+}: {
+  tenantId: string;
+  isConsoleHost?: boolean;
+}) {
   return (
     <Link
-      href={`/platform/sessions?tenant=${tenantId}`}
+      href={consoleHref(`/platform/sessions?tenant=${tenantId}`, isConsoleHost)}
       className="text-sm underline underline-offset-2"
     >
       Open the full session register for this workspace
     </Link>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* INCIDENTS — THE TAB WITH NOTHING BEHIND IT YET                      */
+/* ------------------------------------------------------------------ */
+
+/**
+ * ⭐⭐ AN HONEST EMPTY TAB, NOT AN INVENTED ONE.
+ *
+ * "Which incidents hit THIS customer?" is a real question and the answer
+ * is not in the database. `platform_incidents` records a `reference`, a
+ * `severity`, who declared it and an `affected_filter` JSONB blob — and
+ * that blob is a FILTER, not a membership list: nothing resolves it to a
+ * set of workspace ids, and `getIncidents()` in
+ * `server/platform/control-actions.ts` takes no tenant argument at all.
+ *
+ * 🔴 SO THIS PANEL SHOWS NOTHING RATHER THAN SOMETHING PLAUSIBLE. The
+ * tempting move is to list every open incident here and let the operator
+ * judge. That is worse than blank: an operator on a call would read out
+ * "you were affected by INC-14" from a screen that never checked, and
+ * the customer would believe them. A tab that says "we cannot answer
+ * this" is a tab nobody misquotes.
+ *
+ * What is missing, precisely, so the next person can close it:
+ *   • a resolver that turns `platform_incidents.affected_filter` into
+ *     tenant ids (or a join table, if filters turn out to be the wrong
+ *     shape), and
+ *   • a tenant-scoped read beside `getIncidents()`.
+ *
+ * The link is a link to the global board, labelled as global.
+ */
+export function IncidentsNotWiredPanel({
+  tenantName,
+  incidentsHref,
+}: {
+  tenantName: string;
+  incidentsHref: string;
+}) {
+  return (
+    <div
+      data-testid="incidents-not-wired"
+      className="space-y-3 rounded-md border border-dashed border-border p-6 text-sm"
+    >
+      <p className="font-medium">Not wired yet — this tab cannot answer for {tenantName}.</p>
+      <p className="text-muted-foreground">
+        Incidents are recorded platform-wide. An incident row carries an{" "}
+        <code className="font-mono">affected_filter</code> describing who was hit, and
+        nothing in the codebase resolves that filter to workspace ids — so there is no
+        honest way to say whether this workspace was one of them.
+      </p>
+      <p className="text-muted-foreground">
+        Two things would close this: a resolver from{" "}
+        <code className="font-mono">platform_incidents.affected_filter</code> to tenant
+        ids, and a tenant-scoped read beside{" "}
+        <code className="font-mono">getIncidents()</code> in{" "}
+        <code className="font-mono">server/platform/control-actions.ts</code>, which today
+        takes no tenant argument.
+      </p>
+      <p className="text-muted-foreground">
+        Until then: blank is the truthful answer. An operator must not read a guess out to
+        a customer as if the system had checked.
+      </p>
+      <Link href={incidentsHref} className="inline-block underline underline-offset-2">
+        Open the platform-wide incident board (all workspaces, not this one)
+      </Link>
+    </div>
   );
 }

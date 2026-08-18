@@ -31,7 +31,7 @@ import "server-only";
  * validator and a callback; it does not know what suspension means.
  */
 
-import { and, desc, eq, lt, sql } from "drizzle-orm";
+import { and, desc, eq, lt, sql, type SQL } from "drizzle-orm";
 import { withPlatformScope } from "@/db";
 import { platformApprovalQueue } from "@/db/schema/platform-control";
 import { tenants } from "@/db/schema/core";
@@ -44,7 +44,9 @@ import {
   mayApprove,
   mayReject,
   needsApproval,
+  replayVerdict,
   type ApprovalKind,
+  type ApprovalReplayRow,
   type PlatformGrade,
   type PolicyEnforcement,
 } from "@/lib/platform/approvals";
@@ -55,9 +57,37 @@ import type { PlatformResult } from "@/lib/platform/schemas";
 /* THE REGISTRY                                                        */
 /* ------------------------------------------------------------------ */
 
-export type ApprovalExecutor = (payload: unknown) => Promise<
-  { ok: true } | { ok: false; error: string }
->;
+/**
+ * ⭐⭐ THE SECOND ARGUMENT IS THE WHOLE OF v1.58.0's WIRING.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 AN EXECUTOR CALLS THE SAME FUNCTION THE OPERATOR WOULD HAVE CALLED,
+ *    AND THAT FUNCTION NOW REFUSES TO WRITE WITHOUT AN APPROVAL
+ * ══════════════════════════════════════════════════════════════════════
+ * The three policies wired in this batch put their gate INSIDE the
+ * writing function, in the transaction that writes — not in a wrapper in
+ * front of it, because each of those functions has more than one caller
+ * and a wrapper in front of one door leaves the others open.
+ *
+ * ⚠️ WHICH MEANS THE EXECUTOR WOULD BE HELD BY ITS OWN GATE. It needs to
+ * say "this IS the approved replay", and it must say it in a way a
+ * browser cannot forge. So the ticket is a SECOND ARGUMENT, never a
+ * field in `payload`: every public door parses `input` with Zod and
+ * passes exactly one argument, so there is no shape a POST body can take
+ * that becomes an `ApprovalTicket`.
+ *
+ * 🔴 AND THE TICKET IS NOT TRUSTED EITHER. It is an id; the writing
+ * function re-reads that row inside its own transaction and runs
+ * `replayVerdict` against it — right kind, right target, still approved,
+ * not already executed, and an approver who is a different human from
+ * the requester. A stolen id opens nothing.
+ */
+export type ApprovalTicket = { readonly approvedRequestId: string };
+
+export type ApprovalExecutor = (
+  payload: unknown,
+  ticket: ApprovalTicket,
+) => Promise<{ ok: true } | { ok: false; error: string }>;
 
 const EXECUTORS = new Map<string, ApprovalExecutor>();
 
@@ -131,6 +161,216 @@ export async function getApprovalEnforcement(): Promise<
   return { ok: true, data: enforcementReport([...EXECUTORS.keys()]) };
 }
 
+/* ================================================================== */
+/* ⭐⭐⭐ THE GATE, INSIDE THE TRANSACTION THAT WRITES                  */
+/* ================================================================== */
+
+/**
+ * ⚠️ STRUCTURAL, NOT THE DRIZZLE TRANSACTION TYPE. This is called from
+ * three different modules' write transactions and the only thing it needs
+ * from any of them is the ability to run one statement on THAT
+ * connection. Naming the concrete type would drag Drizzle's generic
+ * transaction signature through three more files for no benefit; what
+ * matters is that the caller passes its own `tx` and not a fresh one,
+ * which is what puts this read and the write it guards in the same
+ * transaction.
+ */
+export type ApprovalGateTx = {
+  execute: (query: SQL) => Promise<unknown>;
+};
+
+export type ApprovalGate =
+  /** Write. Either the policy does not apply, or an approval was verified. */
+  | { readonly proceed: true; readonly viaApproval: boolean; readonly selfApproved: boolean }
+  /** Do not write. Raise a request instead — the caller has the arguments. */
+  | { readonly proceed: false; readonly queue: true }
+  /** Do not write, and do not queue: something is wrong with the claim. */
+  | { readonly proceed: false; readonly queue: false; readonly reason: string };
+
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴🔴 THIS RUNS BEFORE THE WRITE, ON THE SAME CONNECTION, IN THE SAME
+ *      TRANSACTION
+ * ══════════════════════════════════════════════════════════════════════
+ * Not in the server action, not in the page, not in the component that
+ * hides the button. A screen that hides a control is a mistake guard and
+ * it is worth having; it is not the control. The refusal has to be at the
+ * point the row would have changed, or there is a path that skips it —
+ * and every one of the three policies wired in v1.58.0 had two or three
+ * such paths already.
+ *
+ * ⚠️ `held` IS COMPUTED BY THE CALLER FROM FACTS IT READ IN THIS SAME
+ * TRANSACTION. That is not laziness about where the logic lives: the
+ * facts differ per policy (a subscription's amount, a tenant's tier, a
+ * staff row's grade) and reading them here would mean this function knew
+ * about all three. What it must NOT be is a fact the caller read before
+ * the transaction opened — a workspace can stop being a trial between a
+ * pre-read and a write, and the whole point of being in the transaction
+ * is that it cannot.
+ *
+ * ⭐ `FOR UPDATE` ON THE QUEUE ROW. Two concurrent replays of the same
+ * approval would otherwise both see `executed_at IS NULL` and both write.
+ * The lock plus the `executed_at` check in `replayVerdict` is what makes
+ * one approval mean one write.
+ */
+export async function approvalGate(
+  tx: ApprovalGateTx,
+  args: {
+    readonly kind: ApprovalKind;
+    /** The pure policy verdict, from facts read in this transaction. */
+    readonly held: boolean;
+    /** Present only when this call is an approved replay. */
+    readonly ticket: ApprovalTicket | undefined;
+    /** The workspace or account being written to, or null. */
+    readonly targetId: string | null;
+  },
+): Promise<ApprovalGate> {
+  if (!args.ticket) {
+    if (!args.held) return { proceed: true, viaApproval: false, selfApproved: false };
+    return { proceed: false, queue: true };
+  }
+
+  /*
+   * ⚠️ A TICKET IS VERIFIED EVEN WHEN THE POLICY WOULD NOT HAVE HELD
+   * THIS WRITE. Ignoring it in that case would mean a rejected or
+   * already-executed approval quietly becomes harmless rather than
+   * loudly wrong, and "the ticket was ignored" is not a sentence anybody
+   * wants to find in an incident review.
+   */
+  const rows = await tx.execute(sql`
+    SELECT action_kind::text          AS action_kind,
+           status::text               AS status,
+           target_id::text            AS target_id,
+           requested_by::text         AS requested_by,
+           approver_id::text          AS approver_id,
+           self_approved              AS self_approved,
+           executed_at                AS executed_at
+      FROM platform_approval_queue
+     WHERE id = ${args.ticket.approvedRequestId}::uuid
+       FOR UPDATE
+  `);
+
+  const raw =
+    (Array.isArray(rows) ? rows[0] : (rows as { rows?: unknown[] }).rows?.[0]) ?? null;
+
+  const row: ApprovalReplayRow | null = raw
+    ? {
+        actionKind: String((raw as { action_kind?: string }).action_kind ?? ""),
+        status: String((raw as { status?: string }).status ?? ""),
+        targetId: (raw as { target_id?: string | null }).target_id ?? null,
+        requestedBy: String((raw as { requested_by?: string }).requested_by ?? ""),
+        approverId: (raw as { approver_id?: string | null }).approver_id ?? null,
+        selfApproved: Boolean((raw as { self_approved?: boolean }).self_approved),
+        executedAt: (() => {
+          const value = (raw as { executed_at?: unknown }).executed_at;
+          if (value === null || value === undefined) return null;
+          return value instanceof Date ? value : new Date(String(value));
+        })(),
+      }
+    : null;
+
+  const verdict = replayVerdict({ row, kind: args.kind, targetId: args.targetId });
+  if (!verdict.ok) return { proceed: false, queue: false, reason: verdict.reason };
+
+  return { proceed: true, viaApproval: true, selfApproved: verdict.selfApproved };
+}
+
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * ⭐⭐ WHAT "PAYING" MEANS, READ IN THE CALLER'S OWN TRANSACTION
+ * ══════════════════════════════════════════════════════════════════════
+ * `entitlement.override_paid` turns on a fact about money, and the fact
+ * has to be read where the write happens. A workspace can convert from
+ * trial to paid between a page render and a form submission, and the
+ * screen that offered the toggle would then be wrong about the only
+ * thing that decides whether the toggle is held.
+ *
+ * 🔴 `unit_amount_minor` IS SELECTED AS TEXT AND PARSED WITH `BigInt`.
+ * It is `bigint` in Postgres and money in paise; letting the driver hand
+ * it back as a JavaScript number is exactly the silent precision loss
+ * this codebase forbids end to end. `BigInt("499900")` is exact;
+ * `BigInt(499900.0)` happens to work and `BigInt(4999.5)` throws, which
+ * is the sort of difference that surfaces on one customer's row.
+ *
+ * ⚠️ THE NEWEST SUBSCRIPTION WINS. A tenant is meant to have at most one
+ * live subscription — there is a partial unique index saying so — but
+ * cancelled rows persist, and reading "some subscription" would let a
+ * two-year-old cancelled row decide today's policy.
+ */
+export type CommercialStanding = {
+  readonly planTier: string;
+  readonly subscriptionStatus: string | null;
+  readonly unitAmountMinor: bigint | null;
+};
+
+export async function commercialStandingIn(
+  tx: ApprovalGateTx,
+  tenantId: string,
+): Promise<CommercialStanding> {
+  const rows = await tx.execute(sql`
+    SELECT t.plan_tier::text            AS plan_tier,
+           s.status::text               AS sub_status,
+           s.unit_amount_minor::text    AS unit_amount_minor
+      FROM tenants t
+      LEFT JOIN LATERAL (
+        SELECT status, unit_amount_minor
+          FROM subscriptions
+         WHERE tenant_id = t.id
+         ORDER BY created_at DESC
+         LIMIT 1
+      ) s ON TRUE
+     WHERE t.id = ${tenantId}::uuid
+  `);
+
+  const raw =
+    (Array.isArray(rows) ? rows[0] : (rows as { rows?: unknown[] }).rows?.[0]) ?? {};
+  const r = raw as {
+    plan_tier?: string;
+    sub_status?: string | null;
+    unit_amount_minor?: string | null;
+  };
+
+  return {
+    planTier: r.plan_tier ?? "trial",
+    subscriptionStatus: r.sub_status ?? null,
+    unitAmountMinor:
+      r.unit_amount_minor === null || r.unit_amount_minor === undefined
+        ? null
+        : BigInt(r.unit_amount_minor),
+  };
+}
+
+/**
+ * ⭐ A REFUSAL THAT IS NOT RECORDED CANNOT BE AUDITED, AND THE AUDIT IS
+ * THE WHOLE POINT.
+ *
+ * ⚠️ SEVERITY `warning`, NOT `notice`. A refused write on a policy path
+ * is either somebody being stopped by a control that is working — which
+ * is the event the control exists to produce — or somebody replaying an
+ * approval that does not say what they think it says. Both are worth
+ * finding without a filter.
+ */
+export async function recordApprovalRefusal(args: {
+  readonly operator: PlatformOperator;
+  readonly kind: ApprovalKind;
+  readonly targetType: string;
+  readonly targetId: string | null;
+  readonly targetLabel: string;
+  readonly reason: string;
+}): Promise<void> {
+  const policy = POLICY_BY_KIND[args.kind];
+  await recordPlatformAudit({
+    operator: args.operator,
+    tenantId: args.targetType === "tenant" ? args.targetId : null,
+    action: "config_change",
+    resourceType: args.targetType,
+    resourceId: args.targetId,
+    reason: `Refused by "${policy?.label ?? args.kind}" on ${args.targetLabel}: ${args.reason.slice(0, 300)}`,
+    metadata: { approvalKind: args.kind, stage: "refused" },
+    severity: "warning",
+  });
+}
+
 /* ------------------------------------------------------------------ */
 /* REQUEST                                                             */
 /* ------------------------------------------------------------------ */
@@ -149,6 +389,16 @@ export async function queueForApproval(args: {
   readonly proposedBefore?: Record<string, unknown> | null;
   readonly proposedAfter?: Record<string, unknown>;
   readonly payload: Record<string, unknown>;
+  /**
+   * ⭐ TRUE WHEN A WRITE WAS STOPPED TO CREATE THIS ROW, rather than an
+   * operator having deliberately pressed "Send for approval".
+   *
+   * ⚠️ IT CHANGES NOTHING ABOUT THE REQUEST AND EVERYTHING ABOUT THE
+   * AUDIT. "Somebody asked" and "somebody tried and was stopped" are
+   * different facts about the same queue row, and only the second one
+   * tells an auditor the control fired.
+   */
+  readonly heldWrite?: boolean;
   readonly now: Date;
 }): Promise<QueueOutcome> {
   const policy = POLICY_BY_KIND[args.kind];
@@ -229,9 +479,18 @@ export async function queueForApproval(args: {
     action: "config_change",
     resourceType: args.targetType,
     resourceId: args.targetId,
-    reason: `${policy.label} requested for ${args.targetLabel}: ${args.justification.trim().slice(0, 200)}`,
-    metadata: { approvalKind: args.kind, stage: "requested" },
-    severity: "notice",
+    reason: `${args.heldWrite ? "Held by" : "Requested under"} "${policy.label}" for ${args.targetLabel}: ${args.justification.trim().slice(0, 200)}`,
+    metadata: {
+      approvalKind: args.kind,
+      stage: "requested",
+      // 🔴 THE FACT THAT MAKES THIS ROW EVIDENCE. Without it a queue row
+      // raised by a refused write is indistinguishable from one raised by
+      // an operator who chose to ask, and only the first proves the
+      // policy actually stopped something.
+      heldWrite: args.heldWrite ?? false,
+    },
+    // ⚠️ A STOPPED WRITE IS A WARNING, A DELIBERATE REQUEST IS A NOTICE.
+    severity: args.heldWrite ? "warning" : "notice",
   });
 
   return {
@@ -439,7 +698,33 @@ export async function decideApproval(args: {
     },
   );
 
-  const result = await executor(row.payload);
+  /**
+   * ⭐ THE TICKET IS THE ROW'S OWN ID. The writing function re-reads the
+   * row it names, inside its own transaction, and decides for itself.
+   *
+   * ══════════════════════════════════════════════════════════════════
+   * 🔴 AND A THROW IS AN OUTCOME, NOT AN ACCIDENT
+   * ══════════════════════════════════════════════════════════════════
+   * `requireCapability` THROWS `PlatformAccessError("step_up_required")`
+   * — and `staff:manage`, `tenants:configure` and `entitlements:override`
+   * are all step-up capabilities. An approver who has not re-confirmed
+   * their identity recently is a completely ordinary situation, and
+   * without this catch it left the row marked `approved` forever while
+   * the browser was handed an opaque digest.
+   *
+   * ⚠️ THE ROW IS THEN `failed` WITH THE REASON, WHICH IS THE HONEST
+   * STATE: the approval stands, the write did not happen, and it is
+   * visible on the screen rather than inferred from a missing effect.
+   */
+  const result = await executor(row.payload, { approvedRequestId: args.requestId }).catch(
+    (error: unknown) => ({
+      ok: false as const,
+      error:
+        error instanceof Error
+          ? `It did not run: ${error.message}`
+          : "It did not run, and the failure did not say why.",
+    }),
+  );
 
   await withPlatformScope(
     `Platform console: record execution of ${args.requestId}`,

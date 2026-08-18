@@ -74,6 +74,25 @@ const REVOKE_CODE = ENGINE_CODE.slice(
   ENGINE_CODE.indexOf("export async function revokePlatformStaff"),
 );
 
+/**
+ * ⚠️ THE WHOLE MODULE, NOT ONE FUNCTION'S SLICE.
+ *
+ * `REVOKE_CODE` above is a slice starting at `revokePlatformStaff`. That
+ * was fine while the owner floor was inline inside it, and stopped being
+ * fine the moment batch 130 extracted the floor into the exported
+ * `usableOwnersExcluding()` so a whole batch of revocations could be
+ * evaluated at once. Every term survived; only its address changed, and
+ * two assertions here failed a change that was strictly better.
+ *
+ * 🔴 SIXTH INSTANCE IN THIS PROJECT of a test pinning an incidental form
+ *    rather than the property, and the first where two separate test
+ *    files pinned the same literal, so fixing one left the other red.
+ *
+ * Assertions about WHERE a rule is enforced use `REVOKE_CODE`.
+ * Assertions about WHETHER the rule exists use `STAFF_CODE`.
+ */
+const STAFF_CODE = ENGINE_CODE;
+
 /* ================================================================== */
 /* ① THE LAST ADMIN                                                    */
 /* ================================================================== */
@@ -208,14 +227,19 @@ describe("the boundary is in the engine, not only on the screen", () => {
    * as a server action; a curl request never evaluates a disabled
    * button.
    */
+  /**
+   * ⚠️ Reads the whole MODULE, not one function's slice. Batch 130 moved
+   *    the floor into `usableOwnersExcluding()`; the term is unchanged,
+   *    its address is not. See the note in four-eyes.test.ts.
+   */
   it("the remaining-owner count reads the allowlist", () => {
-    expect(REVOKE_CODE).toContain(
+    expect(STAFF_CODE).toContain(
       "parseAdminAllowlist(getServerEnv().PLATFORM_ADMIN_EMAILS)",
     );
-    expect(REVOKE_CODE).toContain("isAllowlisted(r.email, allowlist)");
+    expect(STAFF_CODE).toContain("isAllowlisted(r.email, allowlist)");
     // It cannot filter on an address it did not select.
-    expect(REVOKE_CODE).toContain("email: platformStaff.email");
-    expect(REVOKE_CODE).toContain("remaining.length === 0");
+    expect(STAFF_CODE).toContain("email: platformStaff.email");
+    expect(STAFF_CODE).toContain("remaining.length === 0");
   });
 
   /**
@@ -228,13 +252,22 @@ describe("the boundary is in the engine, not only on the screen", () => {
     expect(count.slice(0, count.indexOf("remaining.length"))).not.toContain(".limit(1)");
   });
 
-  /** The five original terms survive the change. */
+  /** The five original terms survive the change, wherever they now live. */
   it("keeps the terms it always had", () => {
-    expect(REVOKE_CODE).toContain('eq(platformStaff.grade, "owner")');
-    expect(REVOKE_CODE).toContain('eq(platformStaff.status, "active")');
-    expect(REVOKE_CODE).toContain("isNull(platformStaff.revokedAt)");
-    expect(REVOKE_CODE).toContain("ne(platformStaff.id, staffId)");
-    expect(REVOKE_CODE).toContain("gt(platformStaff.expiresAt, new Date())");
+    expect(STAFF_CODE).toContain('eq(platformStaff.grade, "owner")');
+    expect(STAFF_CODE).toContain('eq(platformStaff.status, "active")');
+    expect(STAFF_CODE).toContain("isNull(platformStaff.revokedAt)");
+    // ⚠️ `ne(id, staffId)` for one grant and `notInArray(id, ids)` for a
+    //    batch are the SAME property: the floor excludes what is being
+    //    revoked. Batch 130 moved from the first to the second so a bulk
+    //    revoke could be evaluated as one decision instead of N. Assert
+    //    the property, not whichever operator today's arity needs.
+    expect(
+      /ne\(\s*platformStaff\.id/.test(STAFF_CODE) ||
+        /notInArray\(\s*platformStaff\.id/.test(STAFF_CODE),
+      "the owner floor must exclude the grants being revoked",
+    ).toBe(true);
+    expect(STAFF_CODE).toContain("gt(platformStaff.expiresAt, new Date())");
   });
 
   /** And says out loud why an allowlist-stale owner is not a survivor. */

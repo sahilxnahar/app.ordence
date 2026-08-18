@@ -51,9 +51,17 @@ import {
 } from "@/lib/platform/configuration";
 import { configDefinition } from "@/lib/platform/config-chain";
 import type { PlanTier } from "@/db/schema/core";
+import { HeldForApproval } from "@/components/platform/held-for-approval";
 
+/**
+ * ⚠️ A TIER MOVE IS HELD BY `tenant.plan_change` AND DOES NOT HAPPEN ON
+ * THE CLICK. `setPlanAndLimits` holds it inside its own transaction and
+ * raises a request; seat and storage edits at the same tier are not held
+ * and still save immediately. Reporting the first as "updated" is the
+ * bug that already shipped once on the suspend button.
+ */
 type SetResult =
-  | { ok: true }
+  | { ok: true; data?: { queued?: boolean; note?: string } }
   | { ok: false; error: string; needsStepUp?: boolean };
 
 const MIN_REASON = 20;
@@ -69,6 +77,7 @@ export function PlanLimitsEditor({
   canWrite,
   onSave,
   onStepUp,
+  isConsoleHost = false,
 }: {
   tenantId: string;
   planTier: PlanTier;
@@ -87,8 +96,11 @@ export function PlanLimitsEditor({
     reason: string;
   }) => Promise<SetResult>;
   onStepUp: () => Promise<{ ok: true }>;
+  /** ⚠️ The console answers on two base paths. See `console-paths.ts`. */
+  isConsoleHost?: boolean;
 }) {
   const router = useRouter();
+  const [heldNote, setHeldNote] = useState<string | null>(null);
   const [tier, setTier] = useState<PlanTier>(planTier);
   const [seatLimit, setSeatLimit] = useState(String(seats.limit));
   const [storageLimit, setStorageLimit] = useState(String(storage.limit));
@@ -128,6 +140,15 @@ export function PlanLimitsEditor({
       if (result.ok) {
         setReason("");
         setAcknowledged(false);
+        if (result.data?.queued) {
+          // 🔴 The tier select below still shows what the operator chose
+          // and the workspace is still on the old plan. Say so, and keep
+          // saying it.
+          setHeldNote(result.data.note ?? "This change is waiting for approval.");
+          router.refresh();
+          return;
+        }
+        setHeldNote(null);
         toast.success("Plan and limits updated.");
         router.refresh();
         return;
@@ -142,6 +163,14 @@ export function PlanLimitsEditor({
 
   return (
     <div className="space-y-4">
+      {heldNote ? (
+        <HeldForApproval
+          note={heldNote}
+          isConsoleHost={isConsoleHost}
+          testId="plan-held-for-approval"
+        />
+      ) : null}
+
       {subscriptionIsAuthority ? (
         <p
           role="alert"

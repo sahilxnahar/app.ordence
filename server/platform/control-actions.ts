@@ -26,16 +26,25 @@ import {
 } from "@/db/schema/platform-control";
 import { tenants } from "@/db/schema/core";
 import { requireCapability, recordPlatformAudit } from "./guard";
+// 🔴 SIDE-EFFECT IMPORT. Registers every approval executor. See the note
+// under "① THE EXECUTORS" below, and that module's own header.
+import "./approval-executors";
 import {
   countActiveOperators,
   decideApproval,
   listPending,
   queueForApproval,
-  registerApprovalExecutor,
   tenantLabel,
 } from "./approvals";
-import { suspendTenant, scheduleTenantTermination } from "./tenants";
 import { setTenantFlag, getTenantFlags } from "./flags";
+import { readGlobalMaintenance } from "./maintenance";
+import { platformTenantFlags } from "@/db/schema/platform";
+import {
+  MAINTENANCE_FLAG_KEY,
+  MAINTENANCE_LOG_RESOURCE,
+  MAINTENANCE_LOG_RESOURCE_ID,
+  type MaintenanceState,
+} from "@/lib/platform/maintenance-policy";
 import { previewChange, verifyChange } from "@/lib/platform/entitlement-diff";
 import { MODULE_REGISTRY } from "@/lib/modules/registry";
 import { effectiveTier, featuresForTier } from "@/lib/entitlements/features";
@@ -51,42 +60,25 @@ import type { PlanTier } from "@/db/schema/core";
 /* ================================================================== */
 
 /**
- * 🔴 REGISTERED AT IMPORT TIME, AND THEY CALL THE EXISTING FUNCTIONS
- * UNCHANGED.
+ * ══════════════════════════════════════════════════════════════════════
+ * ⭐ THEY MOVED, AND THE MOVE IS THE POINT — BATCH 43
+ * ══════════════════════════════════════════════════════════════════════
+ * All five registrations now live in `./approval-executors`, imported
+ * above for its side effect. They were here while the only two request
+ * paths were also here; three of the five are now raised by the WRITING
+ * FUNCTIONS themselves (`flags.ts`, `configuration.ts`, `staff.ts`),
+ * which are reachable from server actions that never import this file.
  *
- * ⚠️ THIS IS THE WHOLE POINT OF THE WRAPPER DESIGN. There is one
- * implementation of suspension. The queue delays it; it does not
- * reimplement it, and there is no second code path to drift.
+ * 🔴 `queueForApproval` REFUSES A KIND WITH NO REGISTERED EXECUTOR. Left
+ * here, a plan change would have been held, tried to queue, and been told
+ * "nothing in this build can carry that out" — a true sentence about an
+ * untrue situation, on a path that had just correctly stopped a write.
+ * That file's header has the rest of the argument.
+ *
+ * ⚠️ NOTHING ABOUT THE WRAPPER DESIGN CHANGED. There is still exactly one
+ * implementation of suspension; the queue still delays it rather than
+ * reimplementing it; there is still no second code path to drift.
  */
-registerApprovalExecutor("tenant.suspend", async (payload) => {
-  const result = await suspendTenant(payload);
-  return result.ok ? { ok: true } : { ok: false, error: result.error };
-});
-
-registerApprovalExecutor("entitlement.override_paid", async (payload) => {
-  const result = await setTenantFlag(payload);
-  return result.ok ? { ok: true } : { ok: false, error: result.error };
-});
-
-/**
- * ⭐⭐⭐ BATCH 46 — TERMINATION. `tenant.terminate` HAS BEEN IN
- * `APPROVAL_POLICIES` SINCE v1.22.0 WITH NOTHING REGISTERED AGAINST IT.
- *
- * ⚠️ THE EXECUTOR SCHEDULES. IT DOES NOT DELETE. Approving a termination
- * writes a date, locks the workspace read-only and starts a cancel
- * window — see the header of the offboarding section in `tenants.ts` for
- * why the window, and not the confirmations, is the control that
- * actually protects anybody.
- *
- * 🔴 AN APPROVED ROW WHOSE EXECUTOR IS MISSING CANNOT RUN — the queue
- * says so and leaves the request pending. Registering this one is
- * therefore the difference between "termination is not built" and
- * "termination silently does nothing".
- */
-registerApprovalExecutor("tenant.terminate", async (payload) => {
-  const result = await scheduleTenantTermination(payload);
-  return result.ok ? { ok: true } : { ok: false, error: result.error };
-});
 
 /* ================================================================== */
 /* ② SUSPEND, THROUGH THE QUEUE                                        */
@@ -435,7 +427,7 @@ const applySchema = z.object({
  */
 export async function applyEntitlementChange(
   input: unknown,
-): Promise<PlatformResult<{ verified: boolean; note: string }>> {
+): Promise<PlatformResult<{ verified: boolean; note: string; queued: boolean }>> {
   const operator = await requireCapability("entitlements:override");
   const parsed = applySchema.safeParse(input);
   if (!parsed.success) return { ok: false, error: "Check the form." };
@@ -453,6 +445,29 @@ export async function applyEntitlementChange(
   });
 
   if (!written.ok) return { ok: false, error: written.error };
+
+  /**
+   * ══════════════════════════════════════════════════════════════════
+   * 🔴 HELD. NOTHING WAS WRITTEN, SO THERE IS NOTHING TO VERIFY.
+   * ══════════════════════════════════════════════════════════════════
+   * `setTenantFlag` is the enforcement point for
+   * `entitlement.override_paid` and holds the write itself when the
+   * workspace is a paying one. Falling through to the verify step would
+   * read the flag back, correctly find it unchanged, and write a history
+   * row saying the change FAILED — turning a control that worked into an
+   * error report.
+   *
+   * ⚠️ AND NO HISTORY ROW EITHER. `platform_entitlement_history` records
+   * changes that happened; a queued request is recorded in the approval
+   * queue and in the action log, which is where it belongs until
+   * somebody agrees to it.
+   */
+  if (written.data.queued) {
+    return {
+      ok: true,
+      data: { verified: false, queued: true, note: written.data.note },
+    };
+  }
 
   // 🔴 A FRESH READ. Confirming a write by reading back the value you
   // just sent confirms nothing at all.
@@ -481,7 +496,7 @@ export async function applyEntitlementChange(
   );
 
   revalidatePath(`/platform/tenants/${parsed.data.tenantId}`);
-  return { ok: true, data: { verified: verdict.ok, note: verdict.note } };
+  return { ok: true, data: { verified: verdict.ok, queued: false, note: verdict.note } };
 }
 
 /**
@@ -521,6 +536,21 @@ export async function revertEntitlementChange(
   });
 
   if (!written.ok) return { ok: false, error: written.error };
+
+  /**
+   * 🔴 A REVERT ON A PAYING CUSTOMER IS HELD LIKE ANY OTHER CHANGE TO
+   * WHAT THEY CAN USE, and no history row is written until it runs.
+   *
+   * ⚠️ THIS IS NOT THE "SWITCHING SOMETHING OFF IS NEVER BLOCKED" RULE
+   * BEING BROKEN. That rule is about kill switches, where the moment you
+   * most need to act is the moment a refusal is most expensive. An
+   * `entitlement:` key is what the customer bought; taking it back is
+   * the same commercial act as granting it, in the other direction. See
+   * `entitlementOverrideIsHeld` for the full argument.
+   */
+  if (written.data.queued) {
+    return { ok: true, data: { note: written.data.note } };
+  }
 
   await withPlatformScope("Platform console: record revert", async (db) => {
     await db.insert(platformEntitlementHistory).values({
@@ -785,3 +815,212 @@ export async function writeBreakGlassNote(
 
 void and;
 void platformApprovalQueue;
+
+/* ================================================================== */
+/* ⑧ MAINTENANCE MODE — TURNING THE PRODUCT READ-ONLY, DELIBERATELY    */
+/* ================================================================== */
+
+/**
+ * ⚠️ NOTHING BELOW ENFORCES ANYTHING. These are the doors that record a
+ * decision; the refusal happens in `server/platform/maintenance.ts`, one
+ * hop inside `assertImpersonationAllows()`, on the write itself. If you
+ * are reading this file to find out whether a save is blocked, you are in
+ * the wrong file — and that separation is the point.
+ */
+
+const maintenanceWindow = {
+  /** ISO. Optional: "until somebody turns it off" is a legitimate window. */
+  endsAt: z.string().datetime({ message: "Use an ISO timestamp." }).optional().nullable(),
+  /**
+   * The sentence the CUSTOMER reads. Optional, and empty is honest — a
+   * placeholder written by us ("We are performing maintenance") says less
+   * than nothing when the operator knows what actually broke.
+   */
+  message: z.string().max(400).optional(),
+} as const;
+
+const globalMaintenanceSchema = z.object({
+  enabled: z.boolean(),
+  /**
+   * 🔴 TWENTY CHARACTERS, ENFORCED HERE AND NOT ONLY IN THE DIALOG. The
+   * typed-confirmation dialog is a client component and a server action is
+   * a POST to whatever URL the browser is on: treating "the dialog was
+   * satisfied" as authorisation means the dialog is the security control.
+   */
+  reason: z.string().trim().min(20).max(2000),
+  ...maintenanceWindow,
+});
+
+/**
+ * ⭐⭐ GLOBAL READ-ONLY. Every workspace, at once.
+ *
+ * Recorded as an event in `platform_action_log` — see
+ * `MAINTENANCE_LOG_RESOURCE` for why that is the store rather than a
+ * settings row this batch is not allowed to create. `recordPlatformAudit`
+ * writes through `withPlatformScope`, so the tenant-less RLS rule holds.
+ */
+export async function setGlobalMaintenance(
+  input: unknown,
+): Promise<PlatformResult<{ enabled: boolean }>> {
+  // Tier-2 guard, one hop from the export. `tenants:configure` is the
+  // grade that already changes plans and declares incidents; pausing the
+  // fleet belongs in that company, not below it.
+  const operator = await requireCapability("tenants:configure");
+
+  const parsed = globalMaintenanceSchema.safeParse(input);
+  if (!parsed.success) {
+    return {
+      ok: false,
+      error:
+        "A written reason of at least twenty characters is required. It is shown to whoever asks why the product stopped accepting changes.",
+    };
+  }
+  const { enabled, reason, endsAt, message } = parsed.data;
+
+  await recordPlatformAudit({
+    operator,
+    tenantId: null,
+    action: "config_change",
+    resourceType: MAINTENANCE_LOG_RESOURCE,
+    resourceId: MAINTENANCE_LOG_RESOURCE_ID,
+    reason,
+    // 🔴 `critical` BOTH WAYS. Turning it off is as consequential as
+    // turning it on — an operator who lifts a freeze early, during the
+    // migration it was protecting, has done the more dangerous of the two.
+    severity: "critical",
+    metadata: {
+      enabled,
+      endsAt: endsAt ?? null,
+      message: message ?? "",
+    },
+  });
+
+  revalidatePath("/platform/maintenance");
+  return { ok: true, data: { enabled } };
+}
+
+const tenantMaintenanceSchema = z.object({
+  tenantId: z.string().uuid(),
+  enabled: z.boolean(),
+  reason: z.string().trim().min(20).max(2000),
+  ...maintenanceWindow,
+});
+
+/**
+ * ⭐ ONE WORKSPACE READ-ONLY.
+ *
+ * ⚠️ GOES THROUGH `setTenantFlag`, NOT AROUND IT. That function is the
+ * enforcement point for the flag write itself — capability check, RLS
+ * `WITH CHECK`, approval gate, audit — and a second writer straight into
+ * `platform_tenant_flags` would be a hole in all four.
+ */
+export async function setTenantMaintenance(
+  input: unknown,
+): Promise<PlatformResult<{ enabled: boolean }>> {
+  // Guard here too, even though `setTenantFlag` guards again: the gate
+  // must be visible one hop from the export for `check-action-guards`,
+  // and a reader must not have to follow a call to learn who may do this.
+  await requireCapability("flags:write");
+
+  const parsed = tenantMaintenanceSchema.safeParse(input);
+  if (!parsed.success) {
+    return {
+      ok: false,
+      error:
+        "A written reason of at least twenty characters is required, and the workspace must be identified.",
+    };
+  }
+  const { tenantId, enabled, reason, endsAt, message } = parsed.data;
+
+  const result = await setTenantFlag({
+    tenantId,
+    flagKey: MAINTENANCE_FLAG_KEY,
+    enabled,
+    reason,
+    // ⭐ THE FLAG'S OWN EXPIRY IS THE END OF THE WINDOW. Storing the end
+    // time anywhere else would mean a window that has passed while the
+    // flag is still enabled — and the flag is what the gate reads.
+    expiresAt: endsAt ?? null,
+    value: { message: message ?? "" },
+  });
+
+  if (!result.ok) return result;
+
+  revalidatePath("/platform/maintenance");
+  return { ok: true, data: { enabled } };
+}
+
+/**
+ * Everything the console screen shows, in one call.
+ *
+ * ⚠️ INCLUDES WINDOWS WHOSE END TIME HAS PASSED, marked rather than
+ * hidden. A flag still switched on with an expiry in the past is no
+ * longer enforcing anything, and an operator who cannot see that row
+ * cannot tidy it up — they can only be surprised by it later.
+ */
+export async function getMaintenanceOverview(): Promise<
+  PlatformResult<{
+    global: MaintenanceState | null;
+    tenants: ReadonlyArray<{
+      tenantId: string;
+      tenantName: string;
+      tenantSlug: string;
+      state: MaintenanceState;
+    }>;
+  }>
+> {
+  await requireCapability("observatory:read");
+
+  const global = await readGlobalMaintenance();
+
+  const rows = await withPlatformScope(
+    "Platform console: list workspaces currently in maintenance mode",
+    async (db) =>
+      db
+        .select({
+          tenantId: platformTenantFlags.tenantId,
+          tenantName: tenants.name,
+          tenantSlug: tenants.slug,
+          enabled: platformTenantFlags.enabled,
+          expiresAt: platformTenantFlags.expiresAt,
+          value: platformTenantFlags.value,
+          reason: platformTenantFlags.reason,
+          createdAt: platformTenantFlags.createdAt,
+          setByEmail: platformTenantFlags.setByEmail,
+        })
+        .from(platformTenantFlags)
+        .innerJoin(tenants, eq(tenants.id, platformTenantFlags.tenantId))
+        .where(
+          and(
+            eq(platformTenantFlags.flagKey, MAINTENANCE_FLAG_KEY),
+            eq(platformTenantFlags.enabled, true),
+          ),
+        )
+        .orderBy(desc(platformTenantFlags.updatedAt))
+        .limit(200),
+  );
+
+  return {
+    ok: true,
+    data: {
+      global,
+      tenants: rows.map((r) => ({
+        tenantId: r.tenantId,
+        tenantName: r.tenantName,
+        tenantSlug: r.tenantSlug,
+        state: {
+          scope: "tenant" as const,
+          enabled: r.enabled,
+          endsAt: r.expiresAt ? r.expiresAt.toISOString() : null,
+          message:
+            typeof (r.value as Record<string, unknown>)?.message === "string"
+              ? String((r.value as Record<string, unknown>).message)
+              : "",
+          reason: r.reason,
+          since: r.createdAt ? r.createdAt.toISOString() : null,
+          setBy: r.setByEmail,
+        },
+      })),
+    },
+  };
+}
