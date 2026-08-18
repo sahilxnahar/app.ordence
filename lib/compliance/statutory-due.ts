@@ -308,3 +308,270 @@ export function summariseDue(items: readonly DueItem[]): string {
   const total = owed.reduce((s, i) => s + i.amountMinor, 0n);
   return `${rupees(total)} is owed for this period, none of it due yet.`;
 }
+
+/* ================================================================== */
+/* ⭐⭐⭐ THE PAYMENT OF WAGES ACT, 1936 — THE DATE WAGES WERE PAID     */
+/* ================================================================== */
+
+/**
+ * 🔴🔴 THIS SECTION EXISTS BECAUSE `payroll_runs` COULD NOT STORE THE
+ * ONLY FACT THE ACT IS ABOUT.
+ *
+ * The run recorded what was computed — gross, PF, ESI, TDS, net — and
+ * when it was APPROVED and when it was POSTED. It recorded nothing at
+ * all about when the money reached the employee. The Payment of Wages
+ * Act, 1936 is, end to end, about that day:
+ *
+ *   • s.5(1) — wages must be paid before the expiry of the SEVENTH day
+ *     after the last day of the wage period in an establishment
+ *     employing fewer than one thousand persons, and before the expiry
+ *     of the TENTH day otherwise.
+ *   • s.4 — a wage period may not exceed one month, which is why the
+ *     day is counted from the end of the period and not from the run.
+ *   • s.13A — the employer must maintain registers, and the register an
+ *     inspector opens is a register of DATES PAID.
+ *
+ * ⚠️ SO A RUN THAT IS "approved" AND "posted" AND SILENT ON PAYMENT IS
+ * NOT EVIDENCE OF COMPLIANCE. It is evidence that an accrual was made.
+ *
+ * ⭐ WHY THIS LIVES HERE AND NOT IN A NEW MODULE. `dueDateFor` above
+ * already means "the Nth day of the month following the period", and
+ * `DueState` already means "overdue / due today / due soon". A second
+ * due-date notion in `lib/payroll/` would drift from this one within a
+ * release. Wages are simply an eighth obligation with a different payee
+ * — the employee rather than an authority — so they reuse the machinery
+ * and are kept out of `OBLIGATIONS` only because that list feeds the
+ * ledger-balance assembly and wages are not a ledger role.
+ */
+
+/**
+ * 🔴 THE THRESHOLD IN s.5(1) IS A HEADCOUNT, AND IT IS THE
+ * ESTABLISHMENT'S HEADCOUNT, NOT THE RUN'S. A run covering forty
+ * employees inside a factory of twelve hundred is a 10th-of-the-month
+ * establishment. Deriving the band from `employee_count` on the run
+ * would give the wrong date to every partial run, so it is stated.
+ */
+export type EstablishmentWageBand = "under_1000" | "1000_or_more";
+
+/** s.5(1) — the two days the Act names, as data rather than literals. */
+export const WAGE_PAYMENT_DUE_DAY: Readonly<Record<EstablishmentWageBand, number>> =
+  Object.freeze({
+    under_1000: 7,
+    "1000_or_more": 10,
+  });
+
+/**
+ * 🔴🔴 THE TERMINATED EMPLOYEE IS ON A DIFFERENT CLOCK, AND GETTING
+ * THIS WRONG IS THE COMMONEST WAGE CLAIM THERE IS.
+ *
+ * Somebody whose employment ends on the 3rd does NOT wait until the 7th
+ * of the following month for the wages they have already earned. The
+ * ordinary wage-period rule in s.5(1) does not govern them at all.
+ *
+ * ⚠️⚠️ WHAT THE OFFSET SHOULD BE IS NOT SOMETHING ORDENCE MAY DECIDE,
+ * AND IT IS CONFIGURATION FOR THAT REASON. Three readings are live:
+ *
+ *   ① the last working day itself — the reading Ordence's own
+ *     compliance brief states, and the one that is safest for the
+ *     employee, so it is the DEFAULT (offset 0);
+ *   ② "before the expiry of the second working day from the day on
+ *     which his employment is terminated" — the wording that appears in
+ *     the Payment of Wages Act's termination limb as commonly printed;
+ *   ③ two working days under s.17(2) of the Code on Wages, 2019, which
+ *     is enacted but whose sections were not all in force as this was
+ *     written.
+ *
+ * 🔴 THE DEFAULT OF ZERO IS DELIBERATELY THE STRICTEST OF THE THREE.
+ * Being strict produces a false "overdue" flag on a settlement paid two
+ * days late; being lax produces a settlement that is genuinely late and
+ * that Ordence reported as fine. Only the first of those is recoverable.
+ * ⚠️ A CA OR THE ESTABLISHMENT'S COUNSEL MUST CONFIRM WHICH READING THE
+ * ESTABLISHMENT FOLLOWS BEFORE THIS IS MOVED OFF ZERO — and note that
+ * ② and ③ count WORKING days, which this function cannot count without
+ * the establishment's holiday calendar, so a non-zero offset here is
+ * calendar days and is an approximation that must be said out loud.
+ */
+export const TERMINATION_WAGE_DUE_OFFSET_DAYS_DEFAULT = 0;
+
+export interface WagePaymentDue {
+  /** The date by which the wages had to be in the employee's hands. */
+  readonly dueOn: string;
+  /** ⭐ Which limb produced it, in words the register can print. */
+  readonly basis: "wage_period" | "termination";
+  /** The section, so the figure can be checked against the bare Act. */
+  readonly section: string;
+  readonly note: string;
+}
+
+/**
+ * ⭐ ONE FUNCTION, TWO LIMBS, AND THE TERMINATION LIMB WINS.
+ *
+ * ⚠️ `terminatedOn` is the LAST WORKING DAY, not the resignation date
+ * and not the date the paperwork cleared. Where it is present the
+ * ordinary s.5(1) date is not merely earlier — it does not apply.
+ */
+export function wagePaymentDueDate(args: {
+  readonly periodEnd: string;
+  readonly band: EstablishmentWageBand;
+  /** Null for an ordinary monthly run. */
+  readonly terminatedOn?: string | null;
+  readonly terminationOffsetDays?: number;
+}): WagePaymentDue {
+  const terminatedOn =
+    typeof args.terminatedOn === "string" && args.terminatedOn.length > 0
+      ? args.terminatedOn
+      : null;
+
+  if (terminatedOn !== null) {
+    const offset = Math.max(
+      0,
+      Math.trunc(args.terminationOffsetDays ?? TERMINATION_WAGE_DUE_OFFSET_DAYS_DEFAULT),
+    );
+    return {
+      dueOn: shiftIsoDays(terminatedOn, offset),
+      basis: "termination",
+      section: "Payment of Wages Act, 1936 s.5 (termination limb)",
+      note:
+        offset === 0
+          ? `Employment ended on ${terminatedOn}, so the wages earned fell due on the last working day itself. The seventh-of-the-following-month rule in s.5(1) governs a wage period, and this employee no longer has one.`
+          : `Employment ended on ${terminatedOn}; the establishment applies a ${offset}-day allowance after the last working day. ⚠️ That allowance is counted in CALENDAR days here because Ordence does not hold the establishment's holiday calendar, and the Act's termination limb counts working days.`,
+    };
+  }
+
+  const day = WAGE_PAYMENT_DUE_DAY[args.band];
+  return {
+    // ⭐ REUSES `dueDateFor`, so wages clamp to the end of a short month
+    // exactly as every other obligation on this page does.
+    dueOn: dueDateFor(args.periodEnd, day),
+    basis: "wage_period",
+    section: "Payment of Wages Act, 1936 s.5(1)",
+    note:
+      args.band === "under_1000"
+        ? "Fewer than one thousand persons employed, so wages fell due before the expiry of the seventh day after the end of the wage period (s.5(1))."
+        : "One thousand or more persons employed, so wages fell due before the expiry of the tenth day after the end of the wage period (s.5(1)).",
+  };
+}
+
+/** ⚠️ Calendar arithmetic in UTC. No time zone reaches a due date. */
+function shiftIsoDays(iso: string, days: number): string {
+  const at = Date.parse(`${iso}T00:00:00Z`);
+  if (!Number.isFinite(at)) return iso;
+  const moved = new Date(at + days * 86_400_000);
+  return moved.toISOString().slice(0, 10);
+}
+
+/**
+ * ⭐⭐ THE THING WORTH SURFACING: A RUN PAST ITS DATE AND NOT MARKED PAID.
+ *
+ * 🔴 NOT "a run that is unapproved", AND NOT "a run that is unposted".
+ * Approval is a signature and posting is a journal; neither one is money
+ * leaving a bank. A run approved on the 3rd whose NEFT file bounced on
+ * the 6th is the exact case this exists to catch, and every status-based
+ * view in Ordence shows it as green.
+ */
+export interface WageRunFacts {
+  readonly runNo: string;
+  readonly periodEnd: string;
+  readonly netPayMinor: bigint;
+  readonly employeeCount: number;
+  /** 🔴 NULL MEANS UNPAID. It never means "assume approved is paid". */
+  readonly paidOn: string | null;
+  /** ⚠️ Set when a transfer was attempted and failed. Still unpaid. */
+  readonly paymentFailedOn: string | null;
+  readonly band: EstablishmentWageBand;
+  /** The last working day, for a final-settlement run. */
+  readonly terminatedOn: string | null;
+}
+
+export interface WagePaymentStatus {
+  readonly runNo: string;
+  readonly due: WagePaymentDue;
+  readonly state: DueState;
+  readonly daysUntil: number;
+  readonly amountMinor: bigint;
+  readonly paidOn: string | null;
+  /** ⭐ True only where the money is late, which is the actionable set. */
+  readonly lateBy: number;
+  readonly message: string;
+}
+
+export function wagePaymentStatus(
+  run: WageRunFacts,
+  today: string,
+  terminationOffsetDays?: number,
+): WagePaymentStatus {
+  const due = wagePaymentDueDate({
+    periodEnd: run.periodEnd,
+    band: run.band,
+    terminatedOn: run.terminatedOn,
+    terminationOffsetDays,
+  });
+
+  const daysUntil = daysBetween(today, due.dueOn);
+
+  if (run.paidOn !== null) {
+    // ⭐ A PAID RUN IS STILL REPORTED AGAINST ITS DUE DATE, because the
+    // register the inspector reads is a register of dates paid and a run
+    // paid on the 12th is a finding whatever today is.
+    const lateBy = daysBetween(due.dueOn, run.paidOn);
+    return {
+      runNo: run.runNo,
+      due,
+      state: "nothing_owed",
+      daysUntil,
+      amountMinor: run.netPayMinor,
+      paidOn: run.paidOn,
+      lateBy: lateBy > 0 ? lateBy : 0,
+      message:
+        lateBy > 0
+          ? `Paid on ${run.paidOn}, ${lateBy} day${lateBy === 1 ? "" : "s"} after the ${due.dueOn} the Act allowed. ⚠️ The delay is on the record and s.20 makes it an offence; the register cannot be corrected by paying now.`
+          : `Paid on ${run.paidOn}, within the ${due.dueOn} the Act allowed.`,
+    };
+  }
+
+  const state: DueState =
+    daysUntil < 0
+      ? "overdue"
+      : daysUntil === 0
+        ? "due_today"
+        : daysUntil <= DUE_SOON_DAYS
+          ? "due_soon"
+          : "not_due";
+
+  const failed =
+    run.paymentFailedOn === null
+      ? ""
+      : ` A transfer was attempted on ${run.paymentFailedOn} and failed, so the run is approved and still unpaid.`;
+
+  const rupees = `₹${(run.netPayMinor / 100n).toLocaleString("en-IN")}`;
+
+  return {
+    runNo: run.runNo,
+    due,
+    state,
+    daysUntil,
+    amountMinor: run.netPayMinor,
+    paidOn: null,
+    lateBy: daysUntil < 0 ? -daysUntil : 0,
+    message:
+      state === "overdue"
+        ? `${rupees} of net wages for ${run.employeeCount} employee${run.employeeCount === 1 ? "" : "s"} is ${-daysUntil} day${daysUntil === -1 ? "" : "s"} past the ${due.dueOn} required by ${due.section}, and is not marked paid.${failed}`
+        : `${rupees} of net wages falls due on ${due.dueOn} under ${due.section}.${failed}`,
+  };
+}
+
+/**
+ * ⭐ SORTED BY HOW LATE THE MONEY IS. ⚠️ Unlike `buildDueList` this does
+ * NOT drop nil rows: a run with a net of zero and no payment date is a
+ * data problem worth seeing, not an obligation that has been met.
+ */
+export function overdueWagePayments(
+  runs: readonly WageRunFacts[],
+  today: string,
+  terminationOffsetDays?: number,
+): readonly WagePaymentStatus[] {
+  return runs
+    .map((r) => wagePaymentStatus(r, today, terminationOffsetDays))
+    .filter((s) => s.paidOn === null && s.state === "overdue")
+    .sort((a, b) => b.lateBy - a.lateBy || a.due.dueOn.localeCompare(b.due.dueOn));
+}

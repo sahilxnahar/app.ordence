@@ -207,6 +207,70 @@ export async function requireSeat(
 }
 
 /* ------------------------------------------------------------------ */
+/* THE GATE, INSIDE THE TRANSACTION THAT TAKES THE SEAT                */
+/* ------------------------------------------------------------------ */
+
+/**
+ * 🔴 WHY THE CHECK ABOVE IS NOT SUFFICIENT ON ITS OWN.
+ *
+ * `requireSeat()` counts in one connection, returns, and the caller then
+ * opens a SECOND transaction to write the user row. Between those two
+ * moments the count is a fact about the past. Two admins clicking at once
+ * — or one admin and one `curl` replaying the same request — both read
+ * "4 of 5", both pass, and both write. The workspace ends up at 6 of 5
+ * with no error anywhere, and the only evidence is a seat figure that
+ * looks wrong on the team page.
+ *
+ * A limit that a second browser tab can exceed is not a limit. So the
+ * count happens INSIDE the transaction that performs the write, against
+ * the same snapshot, and the refusal aborts that transaction.
+ *
+ * ⚠️ `purchased` is passed in rather than re-read here. Seat COUNT races
+ * with itself constantly; seats PURCHASED changes only when somebody buys,
+ * which cannot interleave with an invite in a way that matters — and
+ * re-reading it would add a join to the hot path for no protection.
+ *
+ * ⚠️ Throwing rolls the transaction back. That is the point: the refusal
+ * and the write are the same atomic unit, so there is no state in which
+ * the user exists and the check said no.
+ */
+export async function requireSeatTx(
+  tx: SeatCountingTx,
+  tenantId: string,
+  purchased: number,
+  count = 1,
+): Promise<SeatVerdict> {
+  const [row] = await tx
+    .select({ count: sql<number>`count(*)::int` })
+    .from(users)
+    .where(
+      and(
+        eq(users.tenantId, tenantId),
+        sql`${users.deletedAt} IS NULL`,
+        sql`${users.status} = ANY(${sql.raw(
+          `ARRAY[${SEAT_CONSUMING_STATUSES.map((s) => `'${s}'`).join(",")}]::user_status[]`,
+        )})`,
+        sql`${users.role} <> ALL(${sql.raw(
+          `ARRAY[${SEAT_EXEMPT_ROLES.map((r) => `'${r}'`).join(",")}]::system_role[]`,
+        )})`,
+      ),
+    );
+
+  const verdict = canTakeSeats(row?.count ?? 0, purchased, count);
+  if (!verdict.allowed) throw new SeatLimitError(verdict);
+  return verdict;
+}
+
+/**
+ * The transaction handle, derived from `withTenant` rather than named.
+ *
+ * Writing the Drizzle transaction type out by hand here would pin this
+ * file to a Drizzle internal that changes between minor versions, and the
+ * failure mode is a type error in a file nobody touched.
+ */
+export type SeatCountingTx = Parameters<Parameters<typeof withTenant>[1]>[0];
+
+/* ------------------------------------------------------------------ */
 /* SUMMARY FOR THE UI                                                  */
 /* ------------------------------------------------------------------ */
 

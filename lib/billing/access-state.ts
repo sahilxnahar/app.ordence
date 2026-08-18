@@ -53,6 +53,7 @@
  * and, under DPDP, probably unlawful.
  */
 
+import { gracePolicy, isStatutoryWrite, STATUTORY_WRITE_PREFIXES } from "./grace";
 import type { SubscriptionStatus } from "@/db/schema/billing";
 import type { PlanTier } from "@/db/schema/core";
 
@@ -116,8 +117,20 @@ export function permitsBilling(_level: AccessLevel): boolean {
 /* TIMING                                                              */
 /* ------------------------------------------------------------------ */
 
-/** Days before a trial ends that we start saying so. */
-export const TRIAL_NOTICE_DAYS = 5;
+/**
+ * ⭐ NOW RESOLVED FROM CONFIGURATION, NOT HARDCODED — see `./grace.ts`.
+ *
+ * These stay exported under their original names because the callers that
+ * matter are a banner and a test, and renaming a value in order to change
+ * where it comes from is churn that hides the actual change.
+ *
+ * ⚠️ Resolved ONCE, at module load. A grace window is a commercial promise
+ * measured in days; re-reading it per call would let the answer change
+ * halfway through a single render and show a customer two different
+ * countdowns on one page. Changing the setting takes a restart, which is
+ * what env-var configuration means in Next anyway.
+ */
+export const TRIAL_NOTICE_DAYS = gracePolicy().trialNoticeDays;
 
 /**
  * Days after a trial ends before writes are restricted.
@@ -126,7 +139,16 @@ export const TRIAL_NOTICE_DAYS = 5;
  * mid-evaluation, often the very people who were about to buy. Three days
  * of read-write grace costs nothing and removes a bad first impression.
  */
-export const TRIAL_GRACE_DAYS = 3;
+export const TRIAL_GRACE_DAYS = gracePolicy().trialGraceDays;
+
+/**
+ * Days of write access after a subscription goes `unpaid`.
+ *
+ * 🔴 Read by `server/billing/dunning` when it stamps `graceEndsAt`. It is
+ * exported here so the banner and the stamper cannot disagree about how
+ * long the customer was told they had.
+ */
+export const DUNNING_GRACE_DAYS = gracePolicy().dunningGraceDays;
 
 /* ------------------------------------------------------------------ */
 /* THE INPUT                                                           */
@@ -475,8 +497,20 @@ export const ALWAYS_PERMITTED_WRITE_PREFIXES = [
   "export:",
   "session:",
   "support:",
+  /**
+   * 🔴 STATUTORY WORK. Spread from `./grace.ts` rather than re-typed —
+   * a hand-copied list of exemptions drifts, and the symptom of drift
+   * here is a customer who cannot run payroll because a card failed.
+   * The reason each prefix earns its place is documented there, against
+   * the specific filing deadline it protects.
+   */
+  ...STATUTORY_WRITE_PREFIXES,
 ] as const;
 
 export function isExemptWrite(operation: string): boolean {
+  // Statutory first, and named separately, so the reason a write survived
+  // dunning is legible in a stack trace and in this file's tests. Folding
+  // it into the generic prefix scan would work and would say nothing.
+  if (isStatutoryWrite(operation)) return true;
   return ALWAYS_PERMITTED_WRITE_PREFIXES.some((prefix) => operation.startsWith(prefix));
 }

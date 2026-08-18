@@ -472,3 +472,126 @@ export function renderLedgerAlertEmail(props: LedgerAlertEmailProps): RenderedEm
     }),
   };
 }
+
+/* ------------------------------------------------------------------ */
+/* 3. THE DUNNING LETTER                                               */
+/* ------------------------------------------------------------------ */
+
+/**
+ * ⭐⭐ THE MESSAGE THAT CHASES MONEY AN SMB IS OWED.
+ *
+ * 🔴 IT EXISTS BECAUSE UNTIL NOW THERE WAS NOTHING TO SEND. The sweep in
+ * `server/actions/credit.ts` wrote a row saying a reminder had been
+ * queued and its own header admitted "there is no SMTP call, no Resend
+ * call and no webhook anywhere below". The owner believed they were
+ * chasing; the customer had heard nothing.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * ⚠️ THE TONE IS A DESIGN DECISION, NOT A DRAFTING PREFERENCE
+ * ══════════════════════════════════════════════════════════════════════
+ * This letter goes to a CUSTOMER THE BUSINESS WANTS TO KEEP. An Indian
+ * SMB chasing a ₹4,00,000 invoice is usually chasing somebody they will
+ * sell to again next quarter, often somebody they know personally. So:
+ *
+ *   · No threats, and no invented consequence. The stage's own label
+ *     carries the escalation; the words do not need to add to it.
+ *   · The figures are stated once and are the ones on the invoice.
+ *   · "If this has already been paid, please ignore this" is in every
+ *     letter. Payments cross reminders constantly in a business that
+ *     reconciles weekly, and a reminder that cannot be wrong reads as an
+ *     accusation.
+ *
+ * ⚠️ NO PAYMENT LINK AND NO BANK DETAILS. Account numbers in an automated
+ * email are the single most impersonated thing in Indian B2B fraud, and a
+ * letter that trains a customer to pay whatever account arrives by mail
+ * is a letter that eventually costs them the invoice twice.
+ */
+export type DunningLetterEmailProps = {
+  /** Who is being written to. May be null — a company can be a recipient. */
+  recipientName: string | null;
+  /** The tenant's own name. The sender, as far as the reader is concerned. */
+  organizationName: string;
+  customerName: string;
+  invoiceNumber: string;
+  /** Formatted for display, e.g. "₹4,00,000.00". Never a raw float. */
+  amountDue: string;
+  dueDate: string | null;
+  daysPastDue: number;
+  /** The rung's own name, e.g. "Second reminder". */
+  stageLabel: string;
+  /** Who to reply to about it. Optional. */
+  contactLine?: string | null;
+};
+
+export function renderDunningLetterEmail(props: DunningLetterEmailProps): RenderedEmail {
+  const greeting = props.recipientName?.trim()
+    ? `Dear ${props.recipientName.trim()},`
+    : `Dear ${props.customerName},`;
+
+  /*
+   * ⚠️ THE SUBJECT NAMES THE INVOICE, NOT THE STAGE. "Second reminder"
+   * in a subject line tells the recipient's colleagues how many times
+   * they have been chased; the invoice number tells the accounts payable
+   * clerk which document to look up. Only one of those helps get paid.
+   */
+  const subject = `${props.organizationName} — invoice ${props.invoiceNumber} is outstanding`;
+
+  const ageSentence =
+    props.daysPastDue > 0
+      ? `It was due on ${props.dueDate ?? "the agreed date"} and is now ${props.daysPastDue} day${props.daysPastDue === 1 ? "" : "s"} past due.`
+      : `It is due on ${props.dueDate ?? "the agreed date"}.`;
+
+  const body = `
+    <p style="margin:0 0 16px 0;">${esc(greeting)}</p>
+    <p style="margin:0 0 16px 0;">
+      This is a reminder about invoice <strong>${esc(props.invoiceNumber)}</strong>
+      from ${esc(props.organizationName)}. ${esc(ageSentence)}
+    </p>
+    <table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin:20px 0;">
+      ${detailRow("Invoice", props.invoiceNumber)}
+      ${detailRow("Amount outstanding", props.amountDue)}
+      ${detailRow("Due date", props.dueDate ?? "—")}
+      ${detailRow("Days past due", String(props.daysPastDue))}
+      ${detailRow("Account", props.customerName)}
+    </table>
+    <p style="margin:0 0 16px 0;">
+      If payment has already been made, please ignore this message — it may have
+      crossed with your remittance. If there is a query on the invoice, replying
+      to whoever sent it is the fastest way to settle it.
+    </p>
+    ${props.contactLine ? `<p style="margin:0 0 16px 0;">${esc(props.contactLine)}</p>` : ""}
+    <p style="margin:0;">Thank you,<br/>${esc(props.organizationName)}</p>
+  `;
+
+  const text = [
+    greeting,
+    "",
+    `This is a reminder about invoice ${props.invoiceNumber} from ${props.organizationName}. ${ageSentence}`,
+    "",
+    `Invoice:            ${props.invoiceNumber}`,
+    `Amount outstanding: ${props.amountDue}`,
+    `Due date:           ${props.dueDate ?? "—"}`,
+    `Days past due:      ${props.daysPastDue}`,
+    `Account:            ${props.customerName}`,
+    "",
+    "If payment has already been made, please ignore this message — it may have crossed with your remittance. If there is a query on the invoice, replying to whoever sent it is the fastest way to settle it.",
+    props.contactLine ? "" : "",
+    props.contactLine ?? "",
+    "",
+    `Thank you,`,
+    props.organizationName,
+  ]
+    .filter((line, index, all) => !(line === "" && all[index - 1] === ""))
+    .join("\n");
+
+  return {
+    subject,
+    text,
+    html: shell({
+      title: subject,
+      preheader: `Invoice ${props.invoiceNumber} — ${props.amountDue} outstanding.`,
+      body,
+      footerNote: `Sent on behalf of ${props.organizationName}. ${props.stageLabel}.`,
+    }),
+  };
+}

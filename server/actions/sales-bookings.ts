@@ -70,6 +70,13 @@ import {
   FORFEITURE_GUIDANCE,
 } from "@/lib/sales/cancellation";
 import { bookingLedgerFacts } from "@/server/sales/booking-ledger";
+/**
+ * ⭐ THE EVIDENCE GRADE IS IMPORTED, NOT RE-DERIVED. A cancellation screen
+ * that decided for itself what "served" means would be the second
+ * vocabulary, and the two would disagree on the day a grade is added.
+ */
+import { noticeServiceForBooking } from "@/server/receivables/dunning";
+import type { ServiceGapFinding } from "@/lib/receivables/service-evidence";
 import { postCancellation, postBuyerRefund } from "@/server/accounting/post-sales";
 import { toCivilDay } from "@/lib/gst/constants";
 import { z } from "zod";
@@ -741,6 +748,23 @@ export type CancellationPreview = {
   problem: string | null;
   /** Null when the forfeiture is within the usual limit. */
   warning: string | null;
+  /**
+   * ⭐⭐⭐ THE FINDING THAT IS WORTH MORE THAN THE REST OF THIS SCREEN.
+   *
+   * 🔴 A cancellation and a forfeiture are lawful only after the ladder of
+   * demand notices was climbed AND SERVED. Until SQL 0098 this screen
+   * could see that a notice EXISTED — `dunning_events` stamped `sent_at`
+   * when the row was created — but not whether anything ever left the
+   * building. So the operator posted a forfeiture on the strength of a
+   * timestamp for a letter the allottee never received.
+   *
+   * ⚠️ IT WARNS, IT DOES NOT REFUSE, for the same reason
+   * `forfeitureWarning` warns: the developer may have served the notice
+   * by a route this system never saw, and a product that refuses on
+   * incomplete knowledge is worked around inside a week. What it may not
+   * do is stay silent at the one moment saying it changes anything.
+   */
+  serviceFinding: ServiceGapFinding;
   /** Section 34: when the credit-note window closes, and whether it has. */
   creditNoteWindowCloses: string | null;
   creditNoteWindowClosed: boolean;
@@ -827,6 +851,17 @@ export async function previewCancellationPosting(input: {
      */
     const problem = facts.hasPostings ? cancellationProblem(cancellationFacts) : null;
 
+    /*
+     * 🔴 READ AFTER THE LEDGER, SHOWN BEFORE THE BUTTON. This asks the
+     * question the old schema could not answer: of the demand notices
+     * raised against this booking, which ones can this system actually
+     * show were dispatched or served?
+     */
+    const { finding: serviceFinding } = await noticeServiceForBooking(
+      ctx.tenant.id,
+      booking.id,
+    );
+
     const closes = facts.firstSupplyDate
       ? creditNoteWindowCloses(facts.firstSupplyDate)
       : null;
@@ -852,6 +887,7 @@ export async function previewCancellationPosting(input: {
           forfeitMinor: booking.forfeitAmountMinor ?? 0n,
           considerationMinor: booking.agreementValueMinor,
         }),
+        serviceFinding,
         creditNoteWindowCloses: closes,
         creditNoteWindowClosed: facts.firstSupplyDate
           ? creditNoteWindowClosed(facts.firstSupplyDate, today)

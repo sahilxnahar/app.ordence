@@ -44,7 +44,12 @@ import { PermissionDeniedError } from "@/lib/permissions";
 import { permissionsForRole } from "@/db/schema/auth";
 import type { ActionResult } from "@/lib/validators/crm";
 import { ASSIGNABLE_ROLES, ROLE_RANK } from "@/lib/validators/team";
-import { requireSeat, SeatLimitError, getSeatSummary } from "@/server/billing/seats";
+import {
+  requireSeatTx,
+  countSeatsPurchased,
+  SeatLimitError,
+  getSeatSummary,
+} from "@/server/billing/seats";
 import type { AssignableRole } from "@/lib/validators/team";
 import type { SystemRole } from "@/db/schema";
 
@@ -331,17 +336,38 @@ export async function updateUserStatus(input: {
      * Suspension itself is never blocked. Preventing a customer from
      * reducing their usage would be indefensible.
      */
-    if (data.status === "active") {
-      await requireSeat(ctx.tenant.id, ctx.tenant.seatLimit, 1);
-    }
+    /**
+     * 🔴 THE SEAT COUNT AND THE SEAT WRITE ARE ONE TRANSACTION.
+     *
+     * This used to be `await requireSeat(...)` on the line before the
+     * update — two separate connections, and therefore two separate
+     * snapshots. Two admins reinstating two people at once both read the
+     * same "4 of 5", both passed, and both wrote. A `curl` replay did the
+     * same thing on its own. The screen that hides the button is a
+     * mistake guard; this is the boundary, and it has to hold when the
+     * screen is bypassed entirely.
+     *
+     * `seatsPurchased` is resolved OUTSIDE the transaction on purpose —
+     * see `requireSeatTx`. It races with nothing that matters.
+     */
+    const seatsPurchased =
+      data.status === "active"
+        ? await countSeatsPurchased(ctx.tenant.id, ctx.tenant.seatLimit)
+        : 0;
 
-    const [updated] = await withTenant(ctx.tenant.id, (tx) =>
-      tx
+    const [updated] = await withTenant(ctx.tenant.id, async (tx) => {
+      if (data.status === "active") {
+        // Throws `SeatLimitError`, which aborts this transaction. There is
+        // no ordering in which the row is written and the check said no.
+        await requireSeatTx(tx, ctx.tenant.id, seatsPurchased, 1);
+      }
+
+      return tx
         .update(users)
         .set({ status: data.status, updatedAt: new Date() })
         .where(and(eq(users.id, data.userId), eq(users.tenantId, ctx.tenant.id)))
-        .returning({ id: users.id, status: users.status })
-    );
+        .returning({ id: users.id, status: users.status });
+    });
 
     if (!updated) return fail("Could not update that person's status.");
 

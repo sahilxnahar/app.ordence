@@ -61,6 +61,13 @@ import {
   type RunLopRow,
 } from "@/server/payroll/attendance-bridge";
 import {
+  coverageDecidedTheMoney,
+  resolveEsiCoverage,
+  type EsiCoveragePosition,
+  type EsiHistoryRow,
+} from "@/lib/payroll/esi-coverage";
+import { contributionPeriodRange } from "@/lib/payroll/returns/esic";
+import {
   pickEffective,
   type EsiRules,
   type PfRules,
@@ -299,6 +306,13 @@ export interface ComputeOutcome {
   readonly attendance: RunAttendance;
   /** Days on the rolls per employee, from `daysOnRollsIn()`. */
   readonly payableDaysByEmployee: ReadonlyMap<string, number>;
+  /**
+   * ⭐⭐ WHERE EACH PERSON'S ESI COVERAGE-AT-PERIOD-START CAME FROM, and
+   * which already-approved runs the evidence says under-contributed.
+   * Carried out with the answer so a caller can report a correction
+   * WITHOUT re-deriving it from a second read that may disagree.
+   */
+  readonly esiCoverage: ReadonlyMap<string, EsiCoveragePosition>;
 }
 
 /** ⚠️ Calendar days, from the period itself. Never a fixed thirty. */
@@ -407,6 +421,93 @@ async function tdsDeductedThisFy(
 
   for (const r of rows) {
     out.set(r.employeeId, (out.get(r.employeeId) ?? 0n) + BigInt(r.tdsMinor));
+  }
+  return out;
+}
+
+/**
+ * ⭐⭐⭐ THE ESI CONTRIBUTION-PERIOD EVIDENCE, ONE QUERY FOR THE RUN.
+ *
+ * 🔴 THIS IS THE READ THAT ENDS `esiCoveredAtPeriodStart: false`. Under
+ * reg.4 of the ESI (General) Regulations 1950 a person covered when the
+ * contribution period began (1 April or 1 October) stays covered until
+ * it ends, whatever their wages do in between. The hardcoded `false`
+ * dropped them the month of the rise — see `lib/payroll/esi-coverage.ts`
+ * for what that costs the person.
+ *
+ * ⚠️ ONLY APPROVED AND POSTED RUNS ARE EVIDENCE. A draft run is a
+ * working paper; a cancelled one is money that never moved. Reading
+ * either would let a half-finished recompute of last month decide
+ * whether somebody has medical cover this month.
+ *
+ * ⚠️ AND STRICTLY BEFORE THIS PERIOD, so a recompute of the current
+ * month never reads its own previous payslip and reasons in a circle.
+ */
+async function esiCoverageForRun(
+  tx: Tx,
+  args: {
+    tenantId: string;
+    periodStart: string;
+    periodEnd: string;
+    esiRules: EsiRules | null;
+    staff: readonly { id: string; joinedOn: string; esiExempt: boolean }[];
+  },
+): Promise<ReadonlyMap<string, EsiCoveragePosition>> {
+  const out = new Map<string, EsiCoveragePosition>();
+  if (args.staff.length === 0) return out;
+
+  const { from: periodFrom } = contributionPeriodRange(args.periodEnd);
+
+  const rows =
+    args.esiRules === null
+      ? []
+      : await tx
+          .select({
+            employeeId: payslips.employeeId,
+            runPeriodStart: payrollRuns.periodStart,
+            runPeriodEnd: payrollRuns.periodEnd,
+            employeeEsiMinor: payslips.employeeEsiMinor,
+            employerEsiMinor: payslips.employerEsiMinor,
+          })
+          .from(payslips)
+          .innerJoin(payrollRuns, eq(payrollRuns.id, payslips.runId))
+          .where(
+            and(
+              eq(payslips.tenantId, args.tenantId),
+              inArray(payslips.employeeId, args.staff.map((p) => p.id)),
+              inArray(payrollRuns.status, ["approved", "posted"]),
+              gte(payrollRuns.periodStart, periodFrom),
+              lt(payrollRuns.periodStart, args.periodStart),
+            ),
+          );
+
+  const historyByEmployee = new Map<string, EsiHistoryRow[]>();
+  for (const r of rows) {
+    const list = historyByEmployee.get(r.employeeId) ?? [];
+    // 🔴 `BigInt` OF THE STRING, NEVER OF A NUMBER. These arrive as
+    // numeric strings; `Number` them first and a large annual figure
+    // loses paise silently, and `BigInt(30.5)` throws outright.
+    list.push({
+      runPeriodStart: String(r.runPeriodStart),
+      runPeriodEnd: String(r.runPeriodEnd),
+      employeeEsiMinor: BigInt(r.employeeEsiMinor),
+      employerEsiMinor: BigInt(r.employerEsiMinor),
+    });
+    historyByEmployee.set(r.employeeId, list);
+  }
+
+  for (const person of args.staff) {
+    out.set(
+      person.id,
+      resolveEsiCoverage({
+        periodStart: args.periodStart,
+        periodEnd: args.periodEnd,
+        joinedOn: person.joinedOn,
+        esiExempt: person.esiExempt,
+        hasRules: args.esiRules !== null,
+        history: historyByEmployee.get(person.id) ?? [],
+      }),
+    );
   }
   return out;
 }
@@ -537,10 +638,51 @@ export async function computeRun(
     employeeIds: staff.map((p) => p.id),
   });
 
+  /**
+   * ⭐⭐⭐ v1.52.0 (BATCH 79): COVERAGE AT THE START OF THE ESI
+   * CONTRIBUTION PERIOD, FROM THE PAYSLIPS THIS EMPLOYER ACTUALLY PAID.
+   *
+   * 🔴 THE LINE BELOW USED TO READ `esiCoveredAtPeriodStart: false` with
+   * a comment calling it an approximation. It is not an approximation:
+   * it is the answer that ends a covered person's medical cover the
+   * month they get a rise. Same transaction as the payslip write, for
+   * the same reason attendance is.
+   */
+  const esiCoverage = await esiCoverageForRun(tx, {
+    tenantId: args.tenantId,
+    periodStart: args.periodStart,
+    periodEnd: args.periodEnd,
+    esiRules: rates.esi,
+    staff: staff.map((p) => ({
+      id: p.id,
+      joinedOn: String(p.joinedOn),
+      esiExempt: p.esiExempt,
+    })),
+  });
+
   const slips: { employeeId: string; result: PayslipResult }[] = [];
 
   for (const person of staff) {
     const position = attendance.byEmployee.get(person.id);
+
+    /**
+     * ⚠️ THE FALLBACK IS THE SAFE ANSWER, NOT A CONVENIENT ONE.
+     * `esiCoverageForRun()` fills this map for everybody in `staff`, so
+     * the miss is unreachable — but `noUncheckedIndexedAccess` makes us
+     * write down what happens if it ever is reached, and "no evidence"
+     * is the truthful description of a lookup that came back empty. It
+     * resolves to covered-and-flagged, never to silently uncovered.
+     */
+    const coveragePosition: EsiCoveragePosition =
+      esiCoverage.get(person.id) ??
+      resolveEsiCoverage({
+        periodStart: args.periodStart,
+        periodEnd: args.periodEnd,
+        joinedOn: String(person.joinedOn),
+        esiExempt: person.esiExempt,
+        hasRules: rates.esi !== null,
+        history: [],
+      });
 
     /**
      * ⭐ AN EMPLOYEE WITH NO ATTENDANCE ROW IS PAID THE FULL MONTH.
@@ -582,11 +724,12 @@ export async function computeRun(
         pfExempt: person.pfExempt,
         pfOnFullWages: person.pfOnFullWages,
         esiExempt: person.esiExempt,
-        // ⚠️ APPROXIMATED, AND SAID SO. Proper handling of the ESI
-        // contribution period needs last period's payslips; until the
-        // history exists, an employee under the limit is treated as
-        // covered and one above it as not. See the batch notes.
-        esiCoveredAtPeriodStart: false,
+        /**
+         * ⭐ FROM EVIDENCE NOW, NOT FROM AN ASSUMPTION. See
+         * `esiCoverageForRun()` above and `resolveEsiCoverage()` for
+         * what counts as evidence and what happens when there is none.
+         */
+        esiCoveredAtPeriodStart: coveragePosition.coveredAtPeriodStart,
         taxRegime: person.taxRegime,
         declaredDeductionsMinor: String(person.declaredDeductionsMinor),
         tdsOverrideMinor:
@@ -624,7 +767,11 @@ export async function computeRun(
      * is the worst of both: the objection is on the record and nobody had
      * to answer it.
      */
-    const result = withAttendanceStory(built, position, days);
+    const result = withEsiCoverageStory(
+      withAttendanceStory(built, position, days),
+      coveragePosition,
+      rates.esi,
+    );
 
     slips.push({ employeeId: person.id, result });
   }
@@ -634,7 +781,78 @@ export async function computeRun(
     slips,
     attendance,
     payableDaysByEmployee,
+    esiCoverage,
   };
+}
+
+/**
+ * ⭐⭐ WHY THIS PAYSLIP DEDUCTED ESI, OR DID NOT, IN WORDS.
+ *
+ * 🔴 THE ONE BLOCKING CASE. The wages are above the ESI limit, so this
+ * month's contribution turns entirely on whether the person was covered
+ * when the contribution period began — and the payslip history cannot
+ * say. Contributions have been computed as if covered, because of the
+ * two possible errors only one of them can put somebody in a hospital
+ * without cover; but "the safe guess" is not an answer anybody should be
+ * paid on, so it goes on the run as a PROBLEM and a human decides.
+ *
+ * ⚠️ THE PAST-RUN CASE IS DELIBERATELY A NOTE, NOT A PROBLEM. Those runs
+ * are approved or posted: the omission is already real, it is remedied
+ * by a correction run with its own trail and its s.85B interest, and
+ * nothing about it is fixed by refusing to pay THIS month's wages to
+ * everybody in the company.
+ */
+export function withEsiCoverageStory(
+  slip: PayslipResult,
+  coverage: EsiCoveragePosition,
+  esiRules: EsiRules | null,
+): PayslipResult {
+  if (esiRules === null) return slip;
+
+  const notes = [...slip.notes];
+  const problems = [...slip.problems];
+  const limit = BigInt(esiRules.wageLimitMinor);
+  const decisive = coverageDecidedTheMoney(slip.esiGrossMinor, limit);
+
+  if (decisive && coverage.basis === "evidence_missing") {
+    problems.push(
+      "ESI wages this month are above the wage limit, so whether anything is due depends entirely on " +
+        `whether this employee was an insured person on ${coverage.windowStart}, the day the current ESI ` +
+        "contribution period began for them. No approved or posted payslip exists for that month, so " +
+        "Ordence cannot tell. Contribution has been computed AS IF COVERED, because dropping somebody " +
+        "who was in fact covered ends their medical cover and their dependants' — under reg.4 of the ESI " +
+        "(General) Regulations 1950 coverage runs to the end of the contribution period however far wages " +
+        "rise. Confirm the position with the ESIC register before approving this run.",
+    );
+  } else if (decisive && coverage.basis === "evidence_covered") {
+    notes.push(
+      "ESI wages are above the wage limit, but an earlier payslip in this contribution period shows this " +
+        "employee contributing, so under reg.4 of the ESI (General) Regulations 1950 they remain covered " +
+        `until ${contributionPeriodRange(coverage.windowStart).to} and contribute on actual wages.`,
+    );
+  } else if (decisive && coverage.basis === "evidence_not_covered") {
+    notes.push(
+      `ESI wages are above the wage limit and this employee was already above it on ${coverage.windowStart}, ` +
+        "when the current contribution period began for them, so they are outside the scheme for the whole " +
+        "of it. Nothing is due.",
+    );
+  } else if (decisive && coverage.basis === "window_opens_now") {
+    notes.push(
+      "ESI wages are above the wage limit and this is the first month of the contribution period for this " +
+        "employee, so there is no earlier coverage to carry in. Nothing is due.",
+    );
+  }
+
+  if (coverage.underContributedPeriodEnds.length > 0) {
+    notes.push(
+      "⚠️ EARLIER RUNS IN THIS CONTRIBUTION PERIOD DEDUCTED NO ESI FROM THIS EMPLOYEE WHILE THEY WERE " +
+        `COVERED: ${coverage.underContributedPeriodEnds.join(", ")}. Those runs are approved or posted and ` +
+        "have NOT been altered — the employee holds those payslips. The omitted contributions are payable " +
+        "with interest and damages under s.85B of the ESI Act 1948 and need a correction run of their own.",
+    );
+  }
+
+  return { ...slip, notes, problems };
 }
 
 /**

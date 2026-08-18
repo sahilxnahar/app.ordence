@@ -120,6 +120,14 @@ import {
 import { relations, sql } from "drizzle-orm";
 import { tenants, users } from "./core";
 import { bookings, leads, paymentMilestones, projects } from "./sales";
+/**
+ * ⭐ THE GRADE UNION LIVES IN `lib/`, NOT HERE, because the screen that
+ * renders "recorded by a person" and the server that refuses to treat it
+ * as a dispatch have to agree on the same five words. A second copy in
+ * the schema is a second vocabulary, and the two diverge on the day a
+ * grade is added.
+ */
+import type { ServiceEvidenceGrade } from "@/lib/receivables/service-evidence";
 
 /* ------------------------------------------------------------------ */
 /* ENUMS — THE DEMAND                                                  */
@@ -888,7 +896,86 @@ export const dunningEvents = pgTable(
     /** The address, number or handle it went to. Service evidence. */
     recipient: varchar("recipient", { length: 320 }),
 
-    sentAt: timestamp("sent_at", { withTimezone: true }).defaultNow().notNull(),
+    /**
+     * 🔴🔴 LEGACY AND FROZEN. DO NOT READ THIS AS EVIDENCE OF ANYTHING.
+     *
+     * Until SQL 0098 this was `NOT NULL DEFAULT now()` — it was populated
+     * BY THE ACT OF INSERTING THE ROW, in a table whose whole purpose is
+     * to prove the buyer was given every chance. Nothing sent anything.
+     * On every pre-0098 row it records a person pressing a button.
+     *
+     * ⚠️ 0098 dropped the default and the NOT NULL, and added
+     * `dunning_events_sent_at_is_not_a_claim` — a CHECK that refuses a
+     * `sent_at` on any row still graded `none`. Since `none` is what
+     * every INSERT gets, creating a notice can no longer assert a send.
+     * Use `dispatchedAt`, `servedAt` and `serviceEvidence`.
+     */
+    sentAt: timestamp("sent_at", { withTimezone: true }),
+
+    /* ---- ⭐⭐ THE THREE FACTS, SEPARATED BY 0098 ------------------ */
+
+    /**
+     * ① RAISED. A person at the developer decided to demand. True of
+     * every row that exists — which is exactly why it is not evidence of
+     * service and must not sit in the same column as one.
+     *
+     * ⚠️ Nullable only for legacy rows; a CHECK requires it on the rest.
+     * A NOT NULL DEFAULT now() would have stamped migration day onto
+     * notices raised two years ago.
+     */
+    raisedAt: timestamp("raised_at", { withTimezone: true }),
+
+    /**
+     * ② DISPATCHED. It left our system and the provider acknowledged it.
+     *
+     * 🔴 WRITTEN ONLY BY `server/email/outbox.ts`, NEVER BY A FORM. It
+     * cannot exist without `dispatchProviderMessageId` (CHECK), and that
+     * id can only come back from Resend — so no human interface can
+     * reach this state however the UI is wired.
+     */
+    dispatchedAt: timestamp("dispatched_at", { withTimezone: true }),
+    dispatchProviderMessageId: varchar("dispatch_provider_message_id", { length: 200 }),
+    /** Which outbox row is carrying it. Null for post and hand delivery. */
+    dispatchOutboxId: uuid("dispatch_outbox_id"),
+    /**
+     * ⚠️ A DEAD LETTER IS A FACT, AND IT IS THE ONE NOBODY LOOKS FOR. A
+     * notice whose address hard-bounced is not "pending" — it is NOT
+     * SERVED, and the person about to cancel an allotment needs the
+     * reason in words rather than an absence.
+     */
+    dispatchFailedAt: timestamp("dispatch_failed_at", { withTimezone: true }),
+    dispatchFailureReason: varchar("dispatch_failure_reason", { length: 500 }),
+
+    /** ③ SERVED. It reached the allottee, or is deemed to have. */
+    servedAt: timestamp("served_at", { withTimezone: true }),
+
+    /**
+     * 🔴 WHICH KIND OF CLAIM THIS ROW IS. See
+     * `lib/receivables/service-evidence.ts` for the grades and what each
+     * one may be relied on for.
+     *
+     * ⭐ DEFAULTS TO `none` — raised, and nothing more. Every existing
+     * row was filled with `legacy_unverified` by the ADD COLUMN itself,
+     * which is how 0098 marks three years of history without an UPDATE
+     * and without inventing a single dispatch.
+     */
+    serviceEvidence: varchar("service_evidence", { length: 24 })
+      .$type<ServiceEvidenceGrade>()
+      .default("none")
+      .notNull(),
+
+    /**
+     * ⚠️ POST AND HAND DELIVERY ARE REAL AND MUST BE RECORDABLE — most
+     * builder-buyer agreements name registered post to the address in the
+     * agreement as the mode of valid service, and an unopened email is
+     * not service. So a human may record them, but only as a NAMED person
+     * with a reference somebody can look up, and never as a dispatch.
+     */
+    serviceRecordedBy: uuid("service_recorded_by"),
+    serviceRecordedAt: timestamp("service_recorded_at", { withTimezone: true }),
+    /** Speed post / RPAD consignment or courier AWB. Required by CHECK. */
+    serviceReference: varchar("service_reference", { length: 120 }),
+
     /** Days past due at the moment it was sent. Frozen; never recomputed. */
     daysOverdue: integer("days_overdue").notNull(),
     outstandingMinor: bigint("outstanding_minor", { mode: "bigint" }).notNull(),
@@ -940,6 +1027,63 @@ export const dunningEvents = pgTable(
     amountsSane: check(
       "dunning_events_amounts_sane",
       sql`${t.outstandingMinor} >= 0 AND ${t.interestMinor} >= 0`,
+    ),
+
+    /* ---- 🔴🔴 0098 · THREE FACTS, ENFORCED ----------------------- */
+
+    evidenceKnown: check(
+      "dunning_events_service_evidence_known",
+      sql`${t.serviceEvidence} IN ('none','system_dispatch','human_recorded','deemed','legacy_unverified')`,
+    ),
+
+    /**
+     * 🔴🔴 THE ONE THAT KILLS THE OLD BEHAVIOUR. Every INSERT gets
+     * `service_evidence = 'none'` from the column default, so a row
+     * cannot be born carrying a send timestamp. Asserting a send now
+     * needs a second statement with something to show for itself.
+     */
+    sentAtIsNotAClaim: check(
+      "dunning_events_sent_at_is_not_a_claim",
+      sql`${t.sentAt} IS NULL OR ${t.serviceEvidence} <> 'none'`,
+    ),
+    /** Dispatch and its proof are one fact; neither may exist alone. */
+    dispatchNeedsProof: check(
+      "dunning_events_dispatch_needs_proof",
+      sql`(${t.dispatchedAt} IS NULL AND ${t.dispatchProviderMessageId} IS NULL)
+          OR (${t.dispatchedAt} IS NOT NULL AND ${t.dispatchProviderMessageId} IS NOT NULL)`,
+    ),
+    /** ⚠️ A posted letter can never wear the machine's badge. */
+    systemDispatchIsMachineOnly: check(
+      "dunning_events_system_dispatch_is_machine_only",
+      sql`${t.serviceEvidence} <> 'system_dispatch'
+          OR (${t.dispatchedAt} IS NOT NULL AND ${t.channel} IN ('email','whatsapp'))`,
+    ),
+    humanRecordIsNotADispatch: check(
+      "dunning_events_human_record_is_not_a_dispatch",
+      sql`${t.serviceEvidence} NOT IN ('human_recorded','deemed') OR ${t.dispatchedAt} IS NULL`,
+    ),
+    humanRecordNamesAPerson: check(
+      "dunning_events_human_record_names_a_person",
+      sql`${t.serviceEvidence} <> 'human_recorded'
+          OR (${t.serviceRecordedBy} IS NOT NULL
+              AND ${t.serviceRecordedAt} IS NOT NULL
+              AND btrim(coalesce(${t.serviceReference}, '')) <> '')`,
+    ),
+    servedNeedsEvidence: check(
+      "dunning_events_served_needs_evidence",
+      sql`${t.servedAt} IS NULL OR ${t.serviceEvidence} <> 'none'`,
+    ),
+    raisedAtPresent: check(
+      "dunning_events_raised_at_present",
+      sql`${t.raisedAt} IS NOT NULL OR ${t.serviceEvidence} = 'legacy_unverified'`,
+    ),
+    /** 🔴 A legacy row can never be promoted into evidence it never had. */
+    legacyIsNeverPromoted: check(
+      "dunning_events_legacy_is_never_promoted",
+      sql`${t.serviceEvidence} <> 'legacy_unverified'
+          OR (${t.dispatchedAt} IS NULL
+              AND ${t.dispatchProviderMessageId} IS NULL
+              AND ${t.servedAt} IS NULL)`,
     ),
   }),
 );

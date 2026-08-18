@@ -313,6 +313,12 @@ export * from "./ai-patterns";
 export * from "./notifications";
 
 /**
+ * ⭐ THE MAIL OUTBOX AND THE SUPPRESSION LIST (0097). The thing that
+ * finally drains the queues four other tables were writing into.
+ */
+export * from "./email";
+
+/**
  * Deployment releases/backups, the 460-batch tracker, and quick-flow
  * submissions — the four tables created by `SQL-FILES/0046`.
  *

@@ -80,7 +80,13 @@ import {
   type SerializedReconciliation,
 } from "@/lib/reconciliation/gate";
 import { todayInIndia } from "@/lib/accounting/periods";
-import { serializeAmount, toBigIntAmount } from "@/lib/billing/money";
+import { formatMoney, serializeAmount, toBigIntAmount } from "@/lib/billing/money";
+/**
+ * ⭐⭐ THE DRAIN THAT DID NOT EXIST. See the header of `runDunningSweep`
+ * below: this file wrote letters into a queue and nothing emptied it.
+ */
+import { enqueueEmail } from "@/server/email/outbox";
+import { renderDunningLetterEmail } from "@/lib/email/templates";
 import type { ActionResult } from "@/lib/validators/crm";
 
 const FEATURE_ORDERS = "sales.orders" as const;
@@ -846,12 +852,32 @@ export async function recordCreditHoldOverride(
 /**
  * ⭐⭐ WORK OUT WHICH REMINDERS ARE DUE AND RECORD THEM.
  *
- * 🔴 IT QUEUES. IT DOES NOT SEND. There is no SMTP call, no Resend call
- * and no webhook anywhere below. Every row is written with `delivery:
- * "queued"` and whatever eventually delivers them writes `sent` or
- * `failed` back. Recording `sent` here because the row is "about to" go
- * out would produce a collections call opening with "we have written to
- * you three times" against a customer who can prove otherwise.
+ * 🔴 IT STILL QUEUES. IT STILL DOES NOT SEND — AND NOW SOMETHING EMPTIES
+ * THE QUEUE. This header used to read "there is no SMTP call, no Resend
+ * call and no webhook anywhere below", and that was true of the whole
+ * product, not only of this function. The letters were written with
+ * `delivery: "queued"` and stayed there forever. The screen said a
+ * reminder had been recorded; the customer received nothing; the invoice
+ * aged; the owner believed they were chasing money they were not
+ * chasing.
+ *
+ * ⚠️ THE FIX IS NOT A `send()` IN THIS FUNCTION, AND THAT IS THE POINT.
+ * A sweep that mails inline is a sweep that dies on invoice 40 of 300
+ * with 39 letters gone and no record of which, then reruns from the top.
+ * The queue was always right. What was missing was the drain.
+ *
+ * ⭐ SO EACH ACTIONED EMAIL RUNG ALSO GETS AN `email_outbox` ROW, in THIS
+ * transaction, and `server/email/outbox.ts` sends it and writes `sent`
+ * or `failed` back onto the dunning row. Recording `sent` here because
+ * the row is "about to" go out would produce a collections call opening
+ * with "we have written to you three times" against a customer who can
+ * prove otherwise.
+ *
+ * 🔴 ONLY THE ROWS THIS RUN ACTUALLY INSERTED ARE MAILED. The insert is
+ * `ON CONFLICT DO NOTHING ... RETURNING`, so a row another container
+ * already recorded comes back absent and earns no letter. Enqueueing
+ * from `plan.actions` instead would mail a second copy of every reminder
+ * every time two sweeps overlapped.
  *
  * 🔴 AND IT IS SAFE TO RUN TWICE. `ON CONFLICT DO NOTHING` against
  * `credit_dunning_log_once_per_stage_key` is the guarantee — not the
@@ -925,7 +951,7 @@ export async function runDunningSweep(input: unknown): Promise<
         let holdsPlaced = 0;
 
         if (!preview && plan.actions.length > 0) {
-          await tx
+          const recorded = await tx
             .insert(creditDunningLog)
             .values(
               plan.actions.map((a) => ({
@@ -953,8 +979,89 @@ export async function runDunningSweep(input: unknown): Promise<
              * run rather than an exception — a sweep that dies on invoice
              * 40 of 300 because another container got there first is a
              * sweep that never finishes.
+             *
+             * ⭐ AND `RETURNING` TURNS IT INTO A CLAIM. What comes back is
+             * exactly the set of rungs THIS run recorded; a rung another
+             * container got to first is absent. That set, and only that
+             * set, earns a letter below.
              */
-            .onConflictDoNothing();
+            .onConflictDoNothing()
+            .returning({
+              id: creditDunningLog.id,
+              invoiceId: creditDunningLog.invoiceId,
+              stageId: creditDunningLog.stageId,
+            });
+
+          /*
+           * ══════════════════════════════════════════════════════════
+           * ⭐⭐ THE LETTERS. THIS IS THE PART THAT DID NOT EXIST.
+           * ══════════════════════════════════════════════════════════
+           * 🔴 `delivery` STAYS `queued` HERE. The outbox row is the
+           * instruction to send; `server/email/outbox.ts` is the only
+           * thing that may write `sent`, and only when Resend hands back
+           * a message id. Marking it here would be the same lie in a
+           * different table.
+           *
+           * ⚠️ ONLY `channel = "email"` RUNGS. A rung whose channel is
+           * `call` or `visit` is a diary entry for a person; queueing an
+           * email for it would silently replace the phone call somebody
+           * was supposed to make with a letter nobody chose to send.
+           *
+           * ⚠️ AND ONLY WHERE THERE IS AN ADDRESS. A rung with no
+           * recipient email keeps its `queued` row — it is still a
+           * chase that is owed — but there is nothing to send it to, and
+           * inventing one is worse than the gap.
+           */
+          const actionByKey = new Map(
+            plan.actions.map((a) => [`${a.invoiceId}:${a.stageId}`, a]),
+          );
+
+          for (const written of recorded) {
+            const action = actionByKey.get(`${written.invoiceId}:${written.stageId}`);
+            if (!action) continue;
+            if (action.delivery !== "queued") continue;
+            if (action.channel !== "email") continue;
+            if (!action.recipientEmail) continue;
+
+            const letter = renderDunningLetterEmail({
+              recipientName: action.recipientName,
+              organizationName: ctx.tenant.name,
+              customerName: action.companyName,
+              invoiceNumber: action.invoiceNumber,
+              amountDue: formatMoney(action.amountDueMinor),
+              dueDate: null,
+              daysPastDue: action.daysPastDue,
+              stageLabel: action.stageLabel,
+            });
+
+            await enqueueEmail(tx, {
+              tenantId: ctx.tenant.id,
+              purpose: "dunning",
+              /**
+               * ⭐ THE THREAD BACK. The dispatcher writes the outcome
+               * onto this exact dunning row, so the collections board
+               * stops saying "queued" the moment the letter actually
+               * goes — and says "failed", with the reason, when it does
+               * not.
+               */
+              subjectType: "credit_dunning_log",
+              subjectId: written.id,
+              toEmail: action.recipientEmail,
+              subject: letter.subject,
+              html: letter.html,
+              text: letter.text,
+              category: "receivables",
+              severity: "warning",
+              /**
+               * 🔴 DERIVED FROM THE DUNNING ROW, NOT FROM THE CLOCK. It
+               * is the same value on a re-run, which is what lets the
+               * unique index refuse a second letter for a rung that has
+               * already been chased.
+               */
+              idempotencyKey: `dunning:${written.id}`,
+              createdBy: ctx.user.id,
+            });
+          }
 
           /**
            * ⭐ THE RUNGS THAT PLACE A HOLD. `ON CONFLICT DO NOTHING`

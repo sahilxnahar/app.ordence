@@ -43,6 +43,7 @@ import {
   statutoryRates,
 } from "@/db/schema/payroll";
 import { requirePermission, writeAudit } from "@/server/audit";
+import { requireAccess } from "@/server/billing/access";
 import { toSalesActionError } from "@/server/sales/guards";
 import { postPayrollRun } from "@/server/accounting/post-sales";
 import { computeRun, daysInPeriod, daysOnRollsIn, writeRun } from "@/server/payroll/run";
@@ -875,6 +876,23 @@ export async function approvePayrollRun(
 ): Promise<ActionResult<{ note: string }>> {
   try {
     const ctx = await requirePermission(APPROVE);
+    /**
+     * 🔴 CALLED SO THAT THE EXEMPTION IS LOAD-BEARING, NOT ACCIDENTAL.
+     *
+     * Payroll survived dunning until now only because nobody had got
+     * round to gating it — which is not a guarantee, it is an oversight
+     * that happens to point the right way. The first person to add
+     * `requireAccess("payroll:approve")` without reading
+     * `STATUTORY_WRITE_PREFIXES` would have turned a failed card on the
+     * 5th into a missed salary run on the 7th.
+     *
+     * So the call is here, the `payroll:` prefix is exempt at every rung
+     * of the ladder, and `tests/ui/entitlement-enforcement.test.ts` fails
+     * if that exemption is ever removed. An SMB whose card bounced must
+     * still be able to pay its staff; the money we are owed is a smaller
+     * problem than the PF deadline they would miss.
+     */
+    await requireAccess("payroll:approve", ctx);
     const parsed = approveSchema.safeParse(input);
     if (!parsed.success) {
       return {
@@ -959,6 +977,10 @@ export async function postPayroll(
 ): Promise<ActionResult<{ note: string }>> {
   try {
     const ctx = await requirePermission(POST);
+    // ⭐ Same reasoning as `approvePayrollRun`. Posting payroll to the
+    // ledger is the write that makes the statutory liability real; a
+    // billing dispute is not a reason to leave it unrecorded.
+    await requireAccess("payroll:post", ctx);
     const { runId } = z.object({ runId: z.string().uuid() }).parse(input);
 
     const outcome = await withTenant(

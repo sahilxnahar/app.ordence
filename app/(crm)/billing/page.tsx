@@ -609,6 +609,13 @@ async function UsagePanel() {
                   <th className="px-2 py-2 text-right font-medium">Used</th>
                   <th className="px-2 py-2 text-right font-medium">Allowance</th>
                   <th className="px-2 py-2 font-medium">Standing</th>
+                  {/* 🔴 THE OVERAGE POLICY IS A COLUMN, NOT A FOOTNOTE.
+                      A customer decides whether to care about a metric
+                      based on what happens when they exceed it, and that
+                      answer differs per metric here. Burying it in prose
+                      under the table meant nobody read it until after the
+                      refusal — or after the invoice. */}
+                  <th className="px-2 py-2 font-medium">Over the limit</th>
                 </tr>
               </thead>
               <tbody className="divide-y">
@@ -626,18 +633,28 @@ async function UsagePanel() {
                         {m.level}
                       </Badge>
                     </td>
+                    <td className="px-2 py-2 text-xs text-muted-foreground">
+                      {/* ⭐ The sentence travels with the state from
+                          `lib/metering/overage.ts`, which derives it from
+                          the SAME `hardBlockBps` that enforces it. Typing
+                          the policy into this page instead is how a screen
+                          ends up promising something the engine refuses. */}
+                      {m.overageSentence}
+                    </td>
                   </tr>
                 ))}
               </tbody>
             </table>
           </div>
+          {/* ⚠️ This paragraph no longer restates WHICH metric blocks —
+              that is the "Over the limit" column above, generated from the
+              policy itself. What is left here is the part the column
+              cannot say: the two things that are never gated at all. */}
           <p className="text-xs text-muted-foreground">
-            ⚠️ Not every metric blocks at its limit, and that is deliberate.
-            Storage refuses the next UPLOAD at 100% — deleting always works,
-            because a system that blocks the remedy is a trap. Email has 50%
-            headroom, because refusing the 501st transactional email breaks a
-            workflow for a third party who has no idea a quota exists. API
-            calls never block; they are billed as overage instead.
+            ⚠️ Deleting always works, even when you are over — a system that
+            blocks the remedy is a trap. Downloading and exporting your own
+            data always works too, at every level of usage and of billing
+            standing. Nothing you have uploaded is hidden or removed by us.
           </p>
         </CardContent>
       </Card>

@@ -47,6 +47,7 @@ import {
   reallocateReceiptSchema,
   recordReceiptSchema,
   renderDemandNoticeSchema,
+  recordPostalServiceSchema,
   sendDunningSchema,
   statementQuerySchema,
   supersedeDemandSchema,
@@ -61,7 +62,13 @@ import {
   supersedeDemand,
 } from "@/server/receivables/demands";
 import { bounceReceipt, recordReceipt, reallocateReceipt } from "@/server/receivables/receipts";
-import { planDunningSweep, sendDunningLetter } from "@/server/receivables/dunning";
+import {
+  describeNoticeService,
+  planDunningSweep,
+  recordPostalService,
+  sendDunningLetter,
+  type NoticeServiceView,
+} from "@/server/receivables/dunning";
 import { assembleStatement } from "@/server/receivables/statement";
 import {
   ageingRows,
@@ -1237,26 +1244,92 @@ export async function planDunning(
   }
 }
 
+/**
+ * ⭐⭐ THE LADDER, WITH WHAT IS ACTUALLY BEHIND EACH RUNG.
+ *
+ * 🔴 `sentAt` USED TO BE THE ONLY FIELD HERE AND IT WAS ALWAYS PRESENT,
+ * because the old schema wrote it when the row was created. Every screen
+ * consuming this action rendered "sent on 12 March" for letters nothing
+ * had ever sent. It is gone from the payload — not renamed, GONE — so a
+ * page that has not been updated fails to compile rather than continuing
+ * to display a date it should never have had.
+ *
+ * ⚠️ WHAT REPLACES IT CARRIES THE GRADE ON EVERY ROW. `evidenceLabel`
+ * says "Dispatched by the system" or "Recorded by a person" or "Raised —
+ * not dispatched", and `machineVerified` is the boolean a badge colours
+ * itself from. A person's tick and a verified send can no longer render
+ * identically, because they no longer arrive identically.
+ */
 export async function getDunningHistory(
   demandId: string,
-): Promise<
-  ActionResult<Array<{ stage: string; rung: number; sentAt: string; channel: string; authorised: boolean }>>
-> {
+): Promise<ActionResult<NoticeServiceView[]>> {
   try {
     const ctx = await requirePermission("receivables:read");
     const events = await listDunningEvents(ctx.tenant.id, demandId);
-    return {
-      ok: true,
-      data: events.map((e) => ({
-        stage: e.stage,
-        rung: e.rung,
-        sentAt: e.sentAt.toISOString(),
-        channel: e.channel,
-        authorised: e.authorisedBy !== null,
-      })),
-    };
+    return { ok: true, data: events.map(describeNoticeService) };
   } catch (err) {
     return toReceivablesActionError(err, "getDunningHistory");
+  }
+}
+
+/**
+ * ⭐⭐ RECORD THAT A POSTED OR HAND-DELIVERED NOTICE WAS SERVED.
+ *
+ * ⚠️ THE PERMISSION IS `receivables:dun`, NOT A READ KEY. Recording
+ * service changes what the cancellation screen is willing to say about
+ * this booking, so it is a write in the sense that matters.
+ *
+ * 🔴 AND IT CANNOT PRODUCE A DISPATCH RECORD, WHATEVER IT IS SENT. The
+ * grade it writes is `human_recorded`; `dunning_events_human_record_is_
+ * not_a_dispatch` in 0098 refuses the row a `dispatched_at` at all. This
+ * action is structurally incapable of manufacturing the evidence the old
+ * `sent_at` manufactured by accident.
+ */
+export async function recordNoticePostalService(
+  input: unknown,
+): Promise<ActionResult<{ id: string; evidenceWord: string }>> {
+  try {
+    const data = recordPostalServiceSchema.parse(input);
+
+    const ctx = await guardReceivablesWrite({
+      operation: "receivables:dun",
+      feature: FEATURE,
+      permission: "receivables:dun",
+      resource: { type: "dunning_event", id: data.eventId },
+    });
+
+    const outcome = await recordPostalService({
+      tenantId: ctx.tenant.id,
+      userId: ctx.user.id,
+      eventId: data.eventId,
+      reference: data.reference,
+      servedOn: data.servedOn ?? null,
+      notes: data.notes ?? null,
+    });
+
+    if (!outcome.ok) return receivablesFail(outcome.error);
+
+    await writeAudit(ctx, {
+      action: "update",
+      resourceType: "dunning_event",
+      resourceId: outcome.event.id,
+      // ⚠️ NOTICE, NOT INFO. This is a human asserting service that no
+      // machine can check, on the file that decides a forfeiture.
+      severity: "notice",
+      metadata: {
+        evidence: "human_recorded",
+        channel: outcome.event.channel,
+        reference: data.reference,
+      },
+    });
+
+    revalidatePath("/receivables");
+    return {
+      ok: true,
+      data: { id: outcome.event.id, evidenceWord: outcome.event.serviceEvidence },
+    };
+  } catch (err) {
+    return toReceivablesActionError(err, "recordNoticePostalService");
   }
 }
 

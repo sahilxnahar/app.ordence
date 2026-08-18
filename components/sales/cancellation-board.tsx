@@ -22,6 +22,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import type { ServiceGapFinding } from "@/lib/receivables/service-evidence";
 
 export type CancellationView = {
   id: string;
@@ -53,6 +54,13 @@ type PreviewData = {
   hasPostings: boolean;
   problem: string | null;
   warning: string | null;
+  /**
+   * ⭐⭐⭐ WAS THE LADDER ACTUALLY SERVED? See
+   * `lib/receivables/service-evidence.ts`. Not optional and not nullable
+   * on purpose: a screen that can render without this field is a screen
+   * that will.
+   */
+  serviceFinding: ServiceGapFinding;
   creditNoteWindowCloses: string | null;
   creditNoteWindowClosed: boolean;
   forfeitureCapBps: number;
@@ -327,6 +335,47 @@ export function CancellationBoard({
                         />
                       </div>
                     </div>
+
+                    {/*
+                      ══════════════════════════════════════════════════
+                      🔴🔴 THE BLOCKING FINDING, AT THE ONE MOMENT IT
+                           CHANGES ANYTHING
+                      ══════════════════════════════════════════════════
+                      Until SQL 0098 a demand notice recorded `sent_at`
+                      the instant its row was created and nothing sent
+                      anything, so this screen could show an operator a
+                      complete-looking ladder for letters the allottee
+                      never received. Forfeiting a family's money on that
+                      basis is the developer's case collapsing at the
+                      Authority — and the allottee is the one who was
+                      actually wronged.
+
+                      ⚠️ It warns rather than disabling the button: the
+                      notice may have been served by a route this system
+                      never saw. What it may not do is stay quiet.
+                    */}
+                    {preview.serviceFinding.blocking ? (
+                      <div
+                        className="rounded-md border border-destructive/50 bg-destructive/5 p-3"
+                        data-testid="cancel-service-finding"
+                        data-word={preview.serviceFinding.word}
+                      >
+                        <p className="text-xs font-medium text-destructive">
+                          {preview.serviceFinding.headline}
+                        </p>
+                        <p className="mt-1 text-xs text-muted-foreground">
+                          {preview.serviceFinding.detail}
+                        </p>
+                      </div>
+                    ) : (
+                      <p
+                        className="text-xs text-muted-foreground"
+                        data-testid="cancel-service-finding"
+                        data-word={preview.serviceFinding.word}
+                      >
+                        {preview.serviceFinding.headline}
+                      </p>
+                    )}
 
                     {preview.problem ? (
                       <p className="text-xs text-destructive">{preview.problem}</p>

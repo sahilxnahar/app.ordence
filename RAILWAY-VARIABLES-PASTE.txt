@@ -103,6 +103,12 @@ CRON_SECRET=
 # email sending
 RESEND_API_KEY=
 RESEND_FROM_EMAIL=
+# Signing secret from the Resend dashboard's webhook page (Svix format, whsec_...).
+# Without it /api/webhooks/resend returns 503 and refuses every delivery, so
+# bounces and spam complaints are NOT suppressed automatically. That is
+# deliberate: an unauthenticated endpoint that can suppress an address is a
+# denial of service on a customer's mail, so it fails closed rather than open.
+RESEND_WEBHOOK_SECRET=
 FINANCE_ALERT_EMAILS=
 # who can reach the admin console
 PLATFORM_ADMIN_EMAILS=

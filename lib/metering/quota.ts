@@ -69,6 +69,8 @@
  *     for Phase 16 and for support, and it refuses nothing.
  */
 
+import { overagePolicy, overageSentence, type OveragePolicy } from "./overage";
+
 /* ------------------------------------------------------------------ */
 /* THE METRICS                                                         */
 /* ------------------------------------------------------------------ */
@@ -637,6 +639,16 @@ export type SerialisedQuotaState = Omit<QuotaState, "used" | "limit" | "remainin
   usedLabel: string;
   limitLabel: string | null;
   message: string | null;
+  /**
+   * 🔴 WHAT HAPPENS ABOVE THE LINE, IN WORDS, ON EVERY SCREEN THAT SHOWS
+   * A LIMIT — before the customer is over it, not after.
+   *
+   * Carried on the serialised state rather than looked up in the
+   * component, so the usage card, the upgrade dialog and the refusal
+   * message are physically incapable of stating different policies.
+   */
+  overagePolicy: OveragePolicy;
+  overageSentence: string;
 };
 
 export function serialiseQuotaState(state: QuotaState): SerialisedQuotaState {
@@ -649,6 +661,8 @@ export function serialiseQuotaState(state: QuotaState): SerialisedQuotaState {
     usedLabel: formatUsage(state.metric, state.used),
     limitLabel: state.limit === null ? null : formatUsage(state.metric, state.limit),
     message: describeQuota(state),
+    overagePolicy: overagePolicy(state.metric),
+    overageSentence: overageSentence(state.metric),
   };
 }
 

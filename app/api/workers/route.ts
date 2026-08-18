@@ -72,6 +72,11 @@ import { timingSafeEqual } from "node:crypto";
 import { eq, and, isNull } from "drizzle-orm";
 import { Receiver } from "@upstash/qstash";
 import { db, withPlatformScope } from "@/db";
+/**
+ * ⭐ THE MAIL DRAIN. See `runCronSweep` below — queued dunning letters
+ * had no drain at all before this import existed.
+ */
+import { dispatchTenantOutbox } from "@/server/email/outbox";
 import { tenants } from "@/db/schema";
 import {
   assertJobTenant,
@@ -349,6 +354,40 @@ async function runCronSweep(args: {
     );
   }
 
+  /*
+   * ══════════════════════════════════════════════════════════════════
+   * ⭐⭐ DRAIN THE MAIL OUTBOX. THE STEP THAT DID NOT EXIST.
+   * ══════════════════════════════════════════════════════════════════
+   * 🔴 Until this line, `credit_dunning_log` rows were written `queued`
+   * and nothing ever emptied them. The screen said a reminder had been
+   * recorded; the customer received nothing.
+   *
+   * ⚠️ IT RUNS INLINE HERE RATHER THAN AS AN ENQUEUED JOB, and that is a
+   * deliberate trade. The drain is already idempotent, already claims
+   * atomically, and already bounded — so the worst a duplicate sweep can
+   * do is find nothing to take. Routing it through the job queue would
+   * add a hop whose only failure mode is the one this whole batch is
+   * about: work that is queued and never performed.
+   *
+   * ⚠️ A DRAIN FAILURE DOES NOT FAIL THE SWEEP. `ok` above is about
+   * whether work was ENQUEUED. One tenant whose mail could not be sent
+   * must not mark the nightly run red for every other tenant — the
+   * per-row state carries that fact, with the reason, and the mail
+   * console shows it.
+   */
+  let mailSent = 0;
+  let mailFailed = 0;
+  for (const tenant of activeTenants) {
+    try {
+      const drained = await dispatchTenantOutbox({ tenantId: tenant.id, limit: 50 });
+      mailSent += drained.sent;
+      mailFailed += drained.dead + drained.suppressed;
+    } catch (err) {
+      console.error(`[workers] mail outbox drain failed for ${tenant.id}`, err);
+      mailFailed += 1;
+    }
+  }
+
   const failed = results.filter((r) => !r.queued);
 
   if (failed.length > 0) {
@@ -370,6 +409,10 @@ async function runCronSweep(args: {
       transport: describeJobTransport(),
       tenantsSwept: results.length,
       failed: failed.length,
+      // ⭐ Reported so "did the letters go out" is answerable from the
+      // cron log alone, without opening the console.
+      mailSent,
+      mailUndelivered: mailFailed,
       truncated: results.length >= MAX_TENANTS_PER_SWEEP,
       tookMs: Date.now() - args.startedAt,
     },

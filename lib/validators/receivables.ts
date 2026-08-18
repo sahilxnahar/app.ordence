@@ -413,6 +413,37 @@ export type RecordReceiptInput = z.infer<typeof recordReceiptSchema>;
 export type BounceReceiptInput = z.infer<typeof bounceReceiptSchema>;
 export type ReallocateReceiptInput = z.infer<typeof reallocateReceiptSchema>;
 export type SendDunningInput = z.infer<typeof sendDunningSchema>;
+
+/**
+ * ⭐⭐ RECORDING SERVICE OF A POSTED OR HAND-DELIVERED NOTICE.
+ *
+ * 🔴 THE REFERENCE IS REQUIRED AND ITS FORMAT IS NOT CHECKED, ON PURPOSE.
+ * India Post speed post numbers, RPAD receipts and courier AWBs have
+ * three shapes and every courier invents a fourth, so a regex would
+ * refuse real evidence. What is refused is an EMPTY one — because
+ * "posted" with nothing anybody can look up is a tick box, and a tick box
+ * that renders like a verified send is the whole defect being removed.
+ *
+ * ⚠️ THERE IS NO `channel` FIELD AND NO `dispatched` FIELD. The channel
+ * is read from the row that already exists, and dispatch is not a thing
+ * this form is allowed to talk about.
+ */
+export const recordPostalServiceSchema = z.object({
+  eventId: z.string().uuid(),
+  reference: z
+    .string()
+    .trim()
+    .min(4, "Give the speed post, RPAD or courier reference.")
+    .max(120),
+  /** Civil day the delivery happened. Defaults to now when omitted. */
+  servedOn: z
+    .string()
+    .regex(/^\d{4}-\d{2}-\d{2}$/, "Use YYYY-MM-DD.")
+    .optional(),
+  notes: z.string().trim().max(2000).optional(),
+});
+
+export type RecordPostalServiceInput = z.infer<typeof recordPostalServiceSchema>;
 export type DunningSweepInput = z.infer<typeof dunningSweepSchema>;
 export type AgeingQueryInput = z.infer<typeof ageingQuerySchema>;
 export type StatementQueryInput = z.infer<typeof statementQuerySchema>;

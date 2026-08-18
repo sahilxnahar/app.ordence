@@ -1,4 +1,5 @@
 import "server-only";
+import { deriveStorageBytesIn } from "./derive";
 
 /**
  * Ordence — Usage & Quota Queries
@@ -281,6 +282,38 @@ export async function getCurrentUsage(
 
     for (const row of levels) {
       reading[row.metric as UsageMetric] = toBigIntUsage(row.value);
+    }
+
+    /**
+     * 🔴 THE DECISION IS MADE AGAINST THE ROWS, NOT AGAINST THE COUNTER.
+     *
+     * Everything above read `usage_levels` / `usage_counters` — caches
+     * maintained by best-effort writes that are ALLOWED to fail, because
+     * metering must never fail a customer's upload. A cache that is
+     * allowed to fail is a cache that drifts, and for storage the drift
+     * refuses uploads from customers who provably have space.
+     *
+     * So for every metric that CAN be derived from rows, the cached value
+     * is overwritten here with the derived one before any quota is
+     * evaluated. See `server/metering/derive.ts` for which metrics those
+     * are and why `api_calls` is not among them.
+     *
+     * ⚠️ ONE EXTRA INDEXED AGGREGATE PER QUOTA CHECK, and that is the
+     * whole cost. It is paid on the upload path and on the usage page,
+     * neither of which is hot. It is NOT paid per API call, which is
+     * exactly why `api_calls` stays a counter.
+     *
+     * ⚠️ FALLS BACK TO THE CACHE ON FAILURE rather than to zero. A
+     * timed-out aggregate must not hand out unlimited storage, and it
+     * must not refuse a customer who is well inside their plan either —
+     * the stale cache is the least wrong answer available, and the drift
+     * it carries is bounded and repairable.
+     */
+    try {
+      reading.storage_bytes = await deriveStorageBytesIn(tx, tenantId);
+    } catch {
+      // Intentionally swallowed: `reading.storage_bytes` keeps the cached
+      // value read above. Nothing here is worth failing a page render for.
     }
 
     return reading;

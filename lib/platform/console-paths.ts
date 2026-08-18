@@ -58,6 +58,16 @@ export type ConsoleNavItem = {
 export const CONSOLE_NAV: readonly ConsoleNavItem[] = [
   { href: "/platform", label: "Workspaces", keywords: "tenants customers directory home" },
   { href: "/platform/users", label: "Users", keywords: "people accounts staff members" },
+  /**
+   * ⭐ ADDED WITH THE OUTBOX (0097). Deliverability is the one operational
+   * problem no single tenant can see: every workspace's mail leaves under
+   * one sending domain, so a bounce anywhere costs delivery everywhere.
+   */
+  {
+    href: "/platform/mail",
+    label: "Mail",
+    keywords: "outbox email queue bounces suppressions dunning delivery resend",
+  },
   // Sits beside the directory rather than inside it: the directory
   // answers "find me Acme", this answers "who needs me today?" — see the
   // header of `app/platform/tenants/page.tsx`.
