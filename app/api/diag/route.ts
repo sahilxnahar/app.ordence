@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { ENV_CATEGORIES as CATEGORIES } from "@/lib/platform/env-catalog";
+import { interpretRlsPosture } from "@/lib/platform/rls-posture";
 
 /**
  * Ordence — Deployment diagnostic
@@ -146,21 +147,73 @@ export async function GET() {
     try {
       const { neon } = await import("@neondatabase/serverless");
       const sql = neon(readRuntimeEnv("DATABASE_URL") as string);
+      /**
+       * ⭐ `rolbypassrls` AND `rolsuper` ARE ON THIS QUERY DELIBERATELY.
+       *
+       * This route already reported `current_user`, and a role NAME is not
+       * the fact that matters. Tenant isolation in this product IS
+       * row-level security, and a role with `rolbypassrls` skips every one
+       * of the FORCE ROW LEVEL SECURITY policies while `check:rls` keeps
+       * passing, because that gate reads pg_catalog and the catalog is
+       * still correct. On Neon the default owner `neondb_owner` HAS
+       * `rolbypassrls`.
+       *
+       * 🔴 WHICH ROLE `DATABASE_URL` AUTHENTICATES AS DECIDED WHETHER
+       *    ISOLATION WAS ENFORCED BY THE DATABASE OR RESTING ENTIRELY ON
+       *    THE APPLICATION, AND NOTHING IN THE PRODUCT COULD SEE IT. It
+       *    took ten sessions and a hand-written catalog query to answer,
+       *    and every signal was green throughout.
+       *
+       * The answer today is the good one. This exists so that if it ever
+       * silently changes , a new environment, a debugging session, someone
+       * pasting the owner URL into Railway , an operator finds out from
+       * the product rather than from an incident.
+       *
+       * ⚠️ ADVISORY, NEVER FATAL. Refusing to boot on a database condition
+       *    means a Neon blip takes the product down, which is a worse
+       *    failure than a posture nobody can see.
+       */
       const rows = (await sql`
         SELECT current_user AS role,
+               (SELECT COALESCE(r.rolbypassrls, false)
+                  FROM pg_roles r WHERE r.rolname = current_user) AS bypasses_rls,
+               (SELECT COALESCE(r.rolsuper, false)
+                  FROM pg_roles r WHERE r.rolname = current_user) AS is_superuser,
                (SELECT count(*) FROM information_schema.tables
                  WHERE table_schema = 'public') AS tables,
                (SELECT count(*) FROM pg_policies
                  WHERE schemaname = 'public') AS policies
-      `) as Array<{ role: string; tables: number; policies: number }>;
+      `) as Array<{
+        role: string;
+        bypasses_rls: boolean;
+        is_superuser: boolean;
+        tables: number;
+        policies: number;
+      }>;
 
       const row = rows[0];
+      const posture = interpretRlsPosture(
+        row
+          ? {
+              role: row.role,
+              bypassesRls: row.bypasses_rls === true,
+              isSuperuser: row.is_superuser === true,
+            }
+          : null,
+      );
+
       database = {
         attempted: true,
         connected: true,
         role: row?.role ?? null,
         tables: Number(row?.tables ?? 0),
         policies: Number(row?.policies ?? 0),
+        rls: {
+          level: posture.level,
+          label: posture.label,
+          detail: posture.detail,
+          remedy: posture.remedy,
+        },
       };
     } catch (error) {
       database = {
