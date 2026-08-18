@@ -2,75 +2,101 @@
 
 /**
  * Ordence — Settings · Notifications
- * Version: v0.83.0-alpha
+ * Version: v1.53.0-alpha
  *
- * Per-user notification preferences. Controls which categories of
- * notifications the user receives and whether email delivery is enabled.
- * Stored in the user's settings JSONB column.
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 WHAT THIS SCREEN USED TO BE
+ * ══════════════════════════════════════════════════════════════════════
+ * Every switch on this page wrote to `localStorage` under
+ * `ordence_notification_prefs`, and its own comment admitted it: "in
+ * production this would come from the user's settings JSONB."
+ *
+ * The device-sync problem was the least of it. The mail is sent by
+ * `server/notifications/create.ts`, which runs in a background worker
+ * and cannot read a browser's storage under any circumstances. So the
+ * user turned off "Inventory", got a green toast saying the preference
+ * was saved, and kept receiving inventory mail forever. A switch that
+ * reports success and switches nothing is worse than no switch: the
+ * user stops watching for the mail they think they silenced, so the one
+ * person who could notice the failure has been trained not to.
+ *
+ * ⭐ NOW: loaded by the server component from `users.preferences`, saved
+ *    through a server action, read on the send path by the SAME parser
+ *    this file imports. There is no local fallback and there must never
+ *    be one — a fallback is how the old behaviour comes back for the
+ *    users whose save happened to fail.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * ⚠️ EVERY STATE CARRIES A WORD, NOT ONLY A COLOUR
+ * ══════════════════════════════════════════════════════════════════════
+ * One in twelve Indian men is colour-blind. A grey-versus-blue pill is
+ * unreadable to them, and on this screen the two colours mean "you will
+ * be emailed" and "you will not" — the difference between noticing a GST
+ * deadline and missing it. So every toggle prints "On" or "Off" beside
+ * itself, and the chosen severity prints "Selected".
  */
 
-import { useState, useTransition, useEffect } from "react";
+import { useState, useTransition } from "react";
 import { toast } from "sonner";
+import {
+  NOTIFICATION_CATEGORIES,
+  NOTIFICATION_SEVERITIES,
+  type NotificationCategoryKey,
+  type NotificationPreferences,
+  type NotificationSeverity,
+} from "@/lib/notifications/preferences";
+import { saveNotificationPreferences } from "@/server/actions/notification-preferences";
 
-const CATEGORIES = [
-  { key: "compliance", label: "Compliance", description: "GST deadlines, licence expirations, overdue tasks" },
-  { key: "finance", label: "Finance", description: "Receivables aging, reconciliation drift, payment events" },
-  { key: "gst", label: "GST", description: "GSTR-2B reconciliation, ITC at risk, filing reminders" },
-  { key: "receivables", label: "Receivables", description: "Overdue demands, collections, dunning events" },
-  { key: "inventory", label: "Inventory", description: "Low stock alerts, reorder triggers" },
-  { key: "field_ops", label: "Field operations", description: "Site labour anomalies, repeat visits" },
-  { key: "system", label: "System", description: "Platform events, user changes, security alerts" },
-];
+type Props = {
+  /** Resolved server-side from `users.preferences`. Never optional. */
+  initial: NotificationPreferences;
+  /** Set when the row could not be read; the form shows defaults and says so. */
+  loadError: string | null;
+};
 
-const SEVERITIES = [
-  { key: "critical", label: "Critical only", description: "Only receive critical alerts" },
-  { key: "warning", label: "Critical and warnings", description: "Receive critical and warning alerts" },
-  { key: "info", label: "Everything", description: "Receive all notifications including info" },
-];
-
-export default function NotificationsSettingsClient() {
-  const [prefs, setPrefs] = useState<Record<string, boolean>>({});
-  const [emailEnabled, setEmailEnabled] = useState(true);
-  const [minSeverity, setMinSeverity] = useState("warning");
+export default function NotificationsSettingsClient({ initial, loadError }: Props) {
+  /*
+   * ⚠️ SEEDED FROM PROPS, NOT FROM AN EFFECT. There is no loading state
+   * and no skeleton because there is nothing left to load — which is
+   * also why there is no window in which the form shows one thing and
+   * the server believes another.
+   */
+  const [prefs, setPrefs] = useState<NotificationPreferences>(initial);
   const [pending, start] = useTransition();
-  const [loaded, setLoaded] = useState(false);
-
-  useEffect(() => {
-    // Load preferences from localStorage as a simple per-user store.
-    // In production this would come from the user's settings JSONB.
-    try {
-      const stored = localStorage.getItem("ordence_notification_prefs");
-      if (stored) {
-        const parsed = JSON.parse(stored);
-        setPrefs(parsed.categories ?? {});
-        setEmailEnabled(parsed.emailEnabled ?? true);
-        setMinSeverity(parsed.minSeverity ?? "warning");
-      } else {
-        // Default: all categories enabled
-        const defaults: Record<string, boolean> = {};
-        CATEGORIES.forEach((c) => (defaults[c.key] = true));
-        setPrefs(defaults);
-      }
-    } catch {
-      // ignore
-    }
-    setLoaded(true);
-  }, []);
 
   function save() {
-    start(() => {
-      const data = { categories: prefs, emailEnabled, minSeverity };
-      localStorage.setItem("ordence_notification_prefs", JSON.stringify(data));
-      toast.success("Notification preferences saved.");
+    start(async () => {
+      const result = await saveNotificationPreferences({
+        emailEnabled: prefs.emailEnabled,
+        minSeverity: prefs.minSeverity,
+        categories: prefs.categories,
+      });
+
+      if (!result.ok) {
+        toast.error(result.error);
+        return;
+      }
+
+      /*
+       * ⭐ THE SERVER'S ANSWER REPLACES LOCAL STATE. The action returns
+       * the row it actually stored, run back through the same parser the
+       * sender uses. If normalisation changed anything, the user sees
+       * what will really happen rather than what they typed.
+       */
+      setPrefs(result.data);
+      toast.success("Notification preferences saved to your account.");
     });
   }
 
-  function toggleCategory(key: string) {
-    setPrefs((prev) => ({ ...prev, [key]: !prev[key] }));
+  function toggleCategory(key: NotificationCategoryKey) {
+    setPrefs((prev) => ({
+      ...prev,
+      categories: { ...prev.categories, [key]: !prev.categories[key] },
+    }));
   }
 
-  if (!loaded) {
-    return <div className="h-32 animate-pulse rounded-md bg-muted" />;
+  function setSeverity(key: NotificationSeverity) {
+    setPrefs((prev) => ({ ...prev, minSeverity: key }));
   }
 
   return (
@@ -78,9 +104,20 @@ export default function NotificationsSettingsClient() {
       <div>
         <h2 className="text-lg font-medium">Notifications</h2>
         <p className="mt-1 text-sm text-muted-foreground">
-          Control which alerts you receive and how they are delivered.
+          Control which alerts you receive and how they are delivered. These settings are stored on
+          your account, so they apply on every device and to email sent while you are signed out.
         </p>
       </div>
+
+      {loadError ? (
+        <p
+          role="status"
+          className="rounded-md border border-border px-3 py-2 text-sm text-muted-foreground"
+        >
+          Not loaded — your saved preferences could not be read ({loadError}). The defaults are
+          shown below; saving will replace whatever is stored.
+        </p>
+      ) : null}
 
       {/* Email delivery */}
       <div className="rounded-lg border border-border p-4">
@@ -91,19 +128,26 @@ export default function NotificationsSettingsClient() {
               Send notifications to your email in addition to the in-app bell.
             </p>
           </div>
-          <button
-            type="button"
-            onClick={() => setEmailEnabled((v) => !v)}
-            className={`relative h-6 w-11 rounded-full transition-colors ${
-              emailEnabled ? "bg-primary" : "bg-muted"
-            }`}
-          >
-            <span
-              className={`absolute top-0.5 h-5 w-5 rounded-full bg-white transition-transform ${
-                emailEnabled ? "translate-x-5" : "translate-x-0.5"
+          <div className="flex items-center gap-2">
+            {/* ⚠️ THE WORD, NOT ONLY THE COLOUR. */}
+            <span className="text-xs font-medium">{prefs.emailEnabled ? "On" : "Off"}</span>
+            <button
+              type="button"
+              role="switch"
+              aria-checked={prefs.emailEnabled}
+              aria-label="Email delivery"
+              onClick={() => setPrefs((prev) => ({ ...prev, emailEnabled: !prev.emailEnabled }))}
+              className={`relative h-6 w-11 rounded-full transition-colors ${
+                prefs.emailEnabled ? "bg-primary" : "bg-muted"
               }`}
-            />
-          </button>
+            >
+              <span
+                className={`absolute top-0.5 h-5 w-5 rounded-full bg-white transition-transform ${
+                  prefs.emailEnabled ? "translate-x-5" : "translate-x-0.5"
+                }`}
+              />
+            </button>
+          </div>
         </div>
       </div>
 
@@ -114,27 +158,32 @@ export default function NotificationsSettingsClient() {
           Only receive notifications at or above this severity level.
         </p>
         <div className="mt-3 space-y-2">
-          {SEVERITIES.map((s) => (
-            <label
-              key={s.key}
-              className={`flex cursor-pointer items-start gap-3 rounded-md border p-3 ${
-                minSeverity === s.key ? "border-primary bg-primary/5" : "border-border"
-              }`}
-            >
-              <input
-                type="radio"
-                name="severity"
-                value={s.key}
-                checked={minSeverity === s.key}
-                onChange={() => setMinSeverity(s.key)}
-                className="mt-0.5"
-              />
-              <div>
-                <p className="text-sm font-medium">{s.label}</p>
-                <p className="text-xs text-muted-foreground">{s.description}</p>
-              </div>
-            </label>
-          ))}
+          {NOTIFICATION_SEVERITIES.map((s) => {
+            const chosen = prefs.minSeverity === s.key;
+            return (
+              <label
+                key={s.key}
+                className={`flex cursor-pointer items-start gap-3 rounded-md border p-3 ${
+                  chosen ? "border-primary bg-primary/5" : "border-border"
+                }`}
+              >
+                <input
+                  type="radio"
+                  name="severity"
+                  value={s.key}
+                  checked={chosen}
+                  onChange={() => setSeverity(s.key)}
+                  className="mt-0.5"
+                />
+                <div className="flex-1">
+                  <p className="text-sm font-medium">{s.label}</p>
+                  <p className="text-xs text-muted-foreground">{s.description}</p>
+                </div>
+                {/* ⚠️ The border tint alone does not say which one is chosen. */}
+                {chosen ? <span className="text-xs font-medium">Selected</span> : null}
+              </label>
+            );
+          })}
         </div>
       </div>
 
@@ -145,30 +194,39 @@ export default function NotificationsSettingsClient() {
           Choose which types of notifications you want to receive.
         </p>
         <div className="mt-3 space-y-2">
-          {CATEGORIES.map((cat) => (
-            <div
-              key={cat.key}
-              className="flex items-center justify-between rounded-md border border-border px-3 py-2.5"
-            >
-              <div className="flex-1">
-                <p className="text-sm font-medium">{cat.label}</p>
-                <p className="text-xs text-muted-foreground">{cat.description}</p>
-              </div>
-              <button
-                type="button"
-                onClick={() => toggleCategory(cat.key)}
-                className={`relative h-6 w-11 rounded-full transition-colors ${
-                  prefs[cat.key] ? "bg-primary" : "bg-muted"
-                }`}
+          {NOTIFICATION_CATEGORIES.map((cat) => {
+            const on = prefs.categories[cat.key];
+            return (
+              <div
+                key={cat.key}
+                className="flex items-center justify-between rounded-md border border-border px-3 py-2.5"
               >
-                <span
-                  className={`absolute top-0.5 h-5 w-5 rounded-full bg-white transition-transform ${
-                    prefs[cat.key] ? "translate-x-5" : "translate-x-0.5"
-                  }`}
-                />
-              </button>
-            </div>
-          ))}
+                <div className="flex-1">
+                  <p className="text-sm font-medium">{cat.label}</p>
+                  <p className="text-xs text-muted-foreground">{cat.description}</p>
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className="text-xs font-medium">{on ? "On" : "Off"}</span>
+                  <button
+                    type="button"
+                    role="switch"
+                    aria-checked={on}
+                    aria-label={cat.label}
+                    onClick={() => toggleCategory(cat.key)}
+                    className={`relative h-6 w-11 rounded-full transition-colors ${
+                      on ? "bg-primary" : "bg-muted"
+                    }`}
+                  >
+                    <span
+                      className={`absolute top-0.5 h-5 w-5 rounded-full bg-white transition-transform ${
+                        on ? "translate-x-5" : "translate-x-0.5"
+                      }`}
+                    />
+                  </button>
+                </div>
+              </div>
+            );
+          })}
         </div>
       </div>
 

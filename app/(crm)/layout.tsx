@@ -31,6 +31,12 @@ import { auth } from "@clerk/nextjs/server";
 import { OrganizationSwitcher, UserButton } from "@clerk/nextjs";
 import { getTenantContext } from "@/server/tenant-context";
 import {
+  evaluateSession,
+  readFactorEvidence,
+  readSessionExpiryMs,
+  readSessionPolicy,
+} from "@/lib/security/session-policy";
+import {
   resolveIndustryTemplate,
   filterNavigationByRole,
 } from "@/lib/industry-templates";
@@ -42,6 +48,8 @@ import { IndustryProvider } from "@/components/layout/industry-provider";
 import { NotificationBell } from "@/components/layout/notification-bell";
 import { CommandBar } from "@/components/layout/command-bar";
 import { ThemeToggle } from "@/components/layout/theme-toggle";
+import { ThemeSync } from "@/components/layout/theme-provider";
+import { parseAppearancePreferences } from "@/lib/appearance/preferences";
 import { MobileSidebar, MobileMenuTrigger, SearchTriggerBridge } from "@/components/layout/mobile-sidebar";
 import { SearchTrigger } from "@/components/layout/search-trigger";
 import { SupportAccessBanner } from "@/components/platform/support-access-banner";
@@ -108,6 +116,44 @@ export default async function CrmLayout({
   }
 
   const { tenant, user, role } = ctx;
+
+  /*
+   * ══════════════════════════════════════════════════════════════════════
+   * 🔴 THE WORKSPACE'S SECURITY SETTINGS, ENFORCED — Batch 136
+   * ══════════════════════════════════════════════════════════════════════
+   * `settings.requireMfa` and `settings.sessionIdleMinutes` were saved by
+   * the settings form, displayed back as enabled, and read by NO gate in
+   * the product. A customer ticking "require MFA" was told their books sat
+   * behind two factors when they sat behind one password.
+   *
+   * ⭐ WHY HERE AS WELL AS IN `middleware.ts`. The middleware is the
+   * request boundary and refuses first — but it runs in the Edge Runtime,
+   * where there is no database, so it can only see this policy if the
+   * Clerk JWT template publishes it as a claim. Publishing that claim is a
+   * dashboard change this batch does not own. THIS layout has the database
+   * row, so the control is real for every CRM page from the moment the
+   * code ships, and merely moves earlier once the claim exists.
+   *
+   * ⚠️ ONE FUNCTION, TWO CALL SITES. `evaluateSession` is pure and lives in
+   * `lib/security/session-policy.ts`; neither runtime carries a copy of the
+   * rules, so the edge and the app cannot come to different answers.
+   *
+   * ⚠️ AN ALREADY-OPEN SESSION IS NOT GRANDFATHERED — the policy is read
+   * from the live row and the live claims on every render, so an admin
+   * turning MFA on refuses their colleagues' open sessions immediately.
+   * Argued at length in the policy module.
+   */
+  const { sessionClaims } = await auth();
+  const sessionVerdict = evaluateSession({
+    policy: readSessionPolicy(tenant.settings),
+    factors: readFactorEvidence(sessionClaims),
+    // 🔴 THE SERVER'S CLOCK, NEVER A CLIENT TIMESTAMP.
+    nowMs: Date.now(),
+    sessionExpiresAtMs: readSessionExpiryMs(sessionClaims),
+  });
+  if (sessionVerdict.outcome !== "allow" && sessionVerdict.redirectTo) {
+    redirect(`${sessionVerdict.redirectTo}?reason=${sessionVerdict.outcome}`);
+  }
 
   // `settings` is JSONB and may legitimately be missing the key.
   const industryValue = (tenant.settings as { industry?: unknown } | null)?.industry;
@@ -199,6 +245,23 @@ export default async function CrmLayout({
         <Suspense fallback={null}>
           <MaintenanceNotice tenantId={tenant.id} />
         </Suspense>
+
+        {/*
+          ⭐ Batch 142 — THE SERVER VALUE OVERRIDES THE PAINT-FLASH CACHE.
+          `theme-provider.tsx` writes the chosen theme into `localStorage`
+          so the pre-hydration script can paint the right palette before
+          React exists. That cache belongs to ONE BROWSER; this row
+          belongs to the PERSON. Handing the row's value down here means a
+          theme chosen on a phone reaches the shared site laptop on the
+          next load, and that signing in as somebody else does not leave
+          their palette behind.
+
+          ⚠️ NO EXTRA QUERY. `ctx.user` is the row already resolved by
+          `getTenantContext()` for this request; the column is `unknown`
+          by design, so it goes through the total parser rather than being
+          asserted into a shape the database does not enforce.
+        */}
+        <ThemeSync serverTheme={parseAppearancePreferences(user.preferences).theme} />
 
         <div className="flex min-h-0 flex-1 overflow-hidden">
           <Sidebar

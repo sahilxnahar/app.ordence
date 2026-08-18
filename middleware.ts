@@ -36,6 +36,12 @@ import { checkDeclaredBodySize, bodyTooLargeBody } from "@/lib/edge/body-limit";
 import { applySecurityHeaders } from "@/lib/edge/security-headers";
 import { decidePreflight } from "@/lib/edge/cors";
 import { verifyCsrf } from "@/lib/security/csrf";
+import {
+  evaluateSession,
+  readFactorEvidence,
+  readPolicyFromClaims,
+  readSessionExpiryMs,
+} from "@/lib/security/session-policy";
 
 /* ------------------------------------------------------------------ */
 /* RUNTIME ENVIRONMENT                                                 */
@@ -1072,6 +1078,90 @@ async function run(auth: ClerkAuth, req: NextRequest) {
   const surface = req.nextUrl.pathname.startsWith("/api/") ? "api" : "app";
   const gate = await edgeLimitGate(req, requestId, { kind: "tenant", orgId }, surface);
   if (gate.refusal) return gate.refusal;
+
+  /* -- 10. ⭐⭐⭐ THE WORKSPACE'S OWN SESSION POLICY — Batch 136 -------
+   *
+   * ══════════════════════════════════════════════════════════════════
+   * 🔴 `requireMfa` AND `sessionIdleMinutes` WERE SAVED, DISPLAYED, AND
+   *    ENFORCED BY NOTHING. THIS IS WHERE THEY START MEANING SOMETHING.
+   * ══════════════════════════════════════════════════════════════════
+   * A tenant admin ticked "require MFA", the settings page reported it
+   * ON, and no gate in the product ever read the value. That is not a
+   * missing feature, it is a false claim about the protection around
+   * somebody else's payroll and GST filings.
+   *
+   * ⚠️ THE DECISION IS NOT MADE IN THIS FILE. Every judgement lives in
+   * `lib/security/session-policy.ts` — pure, no I/O — so the refusals can
+   * be proved without a database, a Clerk instance or a request, and so
+   * that the Node-runtime backstop in `app/(crm)/layout.tsx` cannot drift
+   * away from what the edge does. Read that file for the trade-offs; the
+   * two that matter most are repeated here because they change behaviour
+   * people will notice:
+   *
+   *   • AN ALREADY-OPEN SESSION IS NOT GRANDFATHERED. The policy is read
+   *     from the live claims on every request, so the switch bites on the
+   *     next request rather than at the next sign-in. An admin turning MFA
+   *     on usually has a suspicion; exempting the sessions that are
+   *     already open exempts precisely the one they are worried about.
+   *
+   *   • THE ENROLMENT PAGE AND THE SIGN-OUT PAGE ARE EXEMPT, BY NAME, in
+   *     `SESSION_POLICY_EXEMPT_PATHS`. A gate that also blocks its own
+   *     cure is a locked door.
+   *
+   * ⚠️ THE POLICY ARRIVES AS A SIGNED CLAIM, NOT A QUERY. Edge Runtime:
+   * no database driver, for the same reasons written above
+   * `rewriteToHostResolver`. `null` means THIS RUNTIME CANNOT SEE the
+   * policy — not that there is none — and the CRM layout re-runs the
+   * identical function against `tenants.settings` in Node, which is what
+   * makes the control real before the JWT template is ever touched.
+   */
+  const edgePolicy = readPolicyFromClaims(sessionClaims);
+  if (edgePolicy) {
+    const verdict = evaluateSession({
+      path,
+      policy: edgePolicy,
+      factors: readFactorEvidence(sessionClaims),
+      // 🔴 THE SERVER'S CLOCK. Nothing from the request reaches this.
+      nowMs: Date.now(),
+      sessionExpiresAtMs: readSessionExpiryMs(sessionClaims),
+    });
+
+    if (verdict.outcome !== "allow") {
+      const refusal = req.nextUrl.pathname.startsWith("/api/")
+        ? jsonError(403, verdict.outcome, verdict.reason, requestId)
+        : (() => {
+            const url = new URL(verdict.redirectTo ?? "/", req.url);
+            /*
+             * ⭐ THE WORD TRAVELS WITH THE REDIRECT, AND IT IS A WORD.
+             * One in twelve Indian men is colour-blind; a page that
+             * signalled "expired" with a red bar alone would be
+             * unreadable to them. The destination pages print
+             * `verdict.word` and the sentence.
+             */
+            url.searchParams.set("reason", verdict.outcome);
+            if (verdict.outcome === "mfa_required") {
+              url.searchParams.set("redirect_url", path + req.nextUrl.search);
+            }
+            return applySecurityHeaders(NextResponse.redirect(url));
+          })();
+      refusal.headers.set("x-ordence-session-policy", verdict.word);
+      return withLimitHeaders(refusal, gate.headers);
+    }
+
+    /*
+     * ⚠️ "NOT MEASURED" MUST NEVER LOOK LIKE "WITHIN THE LIMIT". When the
+     * `fva` claim is absent the idle limit cannot be computed at all, and
+     * saying so in a header is the difference between a degraded control
+     * and a silent one — the same reason `edgeLimitGate` publishes
+     * `observe:` rather than hiding an uncounted request.
+     */
+    const allowed = withLimitHeaders(forward(), gate.headers);
+    allowed.headers.set(
+      "x-ordence-session-policy",
+      verdict.idleUnenforceable ? "idle-unmeasured" : "ok",
+    );
+    return allowed;
+  }
 
   return withLimitHeaders(forward(), gate.headers);
 };

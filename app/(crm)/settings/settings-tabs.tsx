@@ -22,6 +22,12 @@ const TABS = [
   { href: "/settings/connections", label: "Connections" },
   { href: "/settings/ai", label: "AI assistant" },
   { href: "/settings/notifications", label: "Notifications" },
+  // ⭐ Batch 142. Appearance is a PERSONAL preference stored on the user
+  // row, not a workspace setting — it sits here because this is the only
+  // settings surface an ordinary member can reach, and the alternative
+  // (a separate "my account" area) would be one screen deep for one
+  // control.
+  { href: "/settings/appearance", label: "Appearance" },
   // ⚠️ THE DEFINITIONS, NOT THE RECORDS. `/objects` is where the records
   // live and is reached from the main navigation; this tab is where the
   // shapes are inspected. Two routes, two questions.

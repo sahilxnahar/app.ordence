@@ -1,6 +1,6 @@
 {
   "name": "ordence",
-  "version": "1.60.0-alpha",
+  "version": "1.61.0-alpha",
   "private": true,
   "scripts": {
     "dev": "next dev",
@@ -48,7 +48,8 @@
     "check:route-exports": "node scripts/check-route-exports.mjs",
     "check:client-hooks": "node scripts/check-client-hooks.mjs",
     "check:console-links": "node scripts/check-console-links.mjs",
-    "check:sql-rls-writes": "node scripts/check-sql-rls-writes.mjs"
+    "check:sql-rls-writes": "node scripts/check-sql-rls-writes.mjs",
+    "verify:restore": "node scripts/verify-restore.mjs"
   },
   "dependencies": {
     "@clerk/nextjs": "^6.39.6",

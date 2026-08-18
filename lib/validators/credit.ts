@@ -152,6 +152,21 @@ export const APPROVAL_SCOPES = [
   "discount_pct",
   "purchase_order",
   "write_off",
+  /**
+   * 🔴 BATCH 48 — MONEY LEAVING, NOT MONEY EXTENDED.
+   *
+   * The four scopes above cap what a role may APPROVE. These two cap
+   * what a role may DO: the value of one credit note, and everything one
+   * person issues in an Indian civil day. `lib/sales/refund-cap.ts`
+   * holds the reasoning and `server/sales/refund-cap.ts` enforces it
+   * inside the transaction that writes the note.
+   *
+   * ⚠️ AND THEY DO NOT INHERIT THIS TABLE'S "NO ROW = NO AUTHORITY"
+   * READING. A missing row falls back to a stated default figure, never
+   * to zero and never to unlimited — see `DEFAULT_PER_NOTE_CAP_MINOR`.
+   */
+  "credit_note",
+  "credit_note_daily",
 ] as const;
 
 export type ApprovalScope = (typeof APPROVAL_SCOPES)[number];

@@ -36,6 +36,27 @@ export default function HomePage() {
         version you released, the domain is not being served by that release.
       */}
       <p className="text-xs text-muted-foreground">{APP_VERSION_LABEL}</p>
+
+      {/*
+        ⭐ THE ONLY FOOTER THIS PRODUCT HAS — Batch 134.
+
+        There is no marketing footer component to hang this off; the
+        marketing surface is this page. So the trust page is linked here,
+        because a trust page nobody can find answers nobody's question. The
+        people who look for it — a customer's chartered accountant, their
+        banker — arrive on this page first and look at the bottom.
+
+        ⚠️ Both destinations must exist or `scripts/check-links.mjs` fails:
+        `app/(marketing)/trust/page.tsx` and `app/security.txt/route.ts`.
+      */}
+      <footer className="mt-2 flex flex-wrap items-center justify-center gap-x-4 gap-y-1 text-xs text-muted-foreground">
+        <Link href="/trust" className="underline underline-offset-4 hover:text-foreground">
+          Trust &amp; security
+        </Link>
+        <Link href="/security.txt" className="underline underline-offset-4 hover:text-foreground">
+          Report a vulnerability
+        </Link>
+      </footer>
     </main>
   );
 }

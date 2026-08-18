@@ -132,7 +132,15 @@ export function FinancialSettingsForm({
         <CheckboxField
           name="requireMfa"
           label="Require multi-factor authentication for everyone"
-          help="Enforced by your identity provider at sign-in. Strongly recommended for any workspace holding client money."
+          /*
+           * ⚠️ THIS SENTENCE USED TO SAY "enforced by your identity
+           * provider at sign-in", WHICH NOTHING DID (Batch 136). The copy
+           * now describes what `lib/security/session-policy.ts` actually
+           * does, including the part people are surprised by: colleagues
+           * who are signed in right now are refused on their very next
+           * request, not at their next sign-in.
+           */
+          help="Checked on every request. Anyone without a second factor — including colleagues signed in right now — is sent to add one before they can carry on."
           register={register}
           errors={errors}
           disabled={isPending || !canEdit}
@@ -142,7 +150,9 @@ export function FinancialSettingsForm({
           name="sessionIdleMinutes"
           label="Sign out after inactivity (minutes)"
           type="number"
-          help="Between 5 and 1440. Shorter is safer on shared machines."
+          // ⚠️ Measured from the last factor verification, on the server's
+          // clock — see the policy module. A paused tab buys nothing.
+          help="Between 5 and 1440, counted from the last time you signed in or confirmed a factor. Past it, the session is signed out and must sign in again."
           register={register}
           errors={errors}
           disabled={isPending || !canEdit}

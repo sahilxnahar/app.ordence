@@ -14,6 +14,15 @@ it is discovering, on the worst day, that the file has been empty since
 March, or that nobody knows the password, or that it restores a database
 your application no longer understands.
 
+> ⭐ **The rehearsal lives in [`docs/current/RESTORE-DRILL.md`](current/RESTORE-DRILL.md).**
+> This file tells you what to do when something breaks. That one is the
+> drill you run when nothing is broken, and it carries the results table
+> where the measured numbers go. It is still empty — nobody has run it.
+>
+> ⚠️ **Two names below are stale.** This project deploys on **Railway**,
+> not Vercel, and uploads live in **Cloudflare R2**, not Vercel Blob. The
+> procedure is unchanged; the console you open is different.
+
 There is a command that proves it:
 
 ```bash

@@ -307,6 +307,29 @@ export const users = pgTable(
       .default(sql`'{}'::jsonb`)
       .notNull(),
 
+    /**
+     * ⭐ 0093 — PER-USER PREFERENCES THE SERVER CAN ACTUALLY READ.
+     *
+     * 🔴 NOT the same thing as `permissionOverrides` above, and kept
+     * apart on purpose: that column answers "what may this person do"
+     * and is written by an administrator. This one answers "what does
+     * this person want" and is written by the person themselves.
+     * Merging them would put a self-service write on the column that
+     * decides authorisation.
+     *
+     * ⚠️ THE TYPE IS `unknown`, WHICH IS THE HONEST ONE. Every value
+     * here was submitted by a user, may predate the current release,
+     * and is read on the mail send path. A `$type<...>` annotation
+     * would be a promise the database does not enforce, and the send
+     * path would trust it. `parseNotificationPreferences()` in
+     * `lib/notifications/preferences.ts` is where a shape is asserted,
+     * and it is total — junk resolves to defaults rather than throwing.
+     */
+    preferences: jsonb("preferences")
+      .$type<unknown>()
+      .default(sql`'{}'::jsonb`)
+      .notNull(),
+
     lastSeenAt: timestamp("last_seen_at", { withTimezone: true }),
 
     createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),

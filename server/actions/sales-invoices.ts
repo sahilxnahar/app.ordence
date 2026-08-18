@@ -76,6 +76,10 @@ import {
   type CreditableInvoiceLine,
   type CreditLineFinding,
 } from "@/lib/invoicing/credit-note";
+import {
+  assertCreditNoteWithinCaps,
+  readRequestFactors,
+} from "@/server/sales/refund-cap";
 import { rupeesInWords } from "@/lib/invoicing/amount-in-words";
 import { copyLabelsFor, printGaps, type PostalAddress, type PrintFinding } from "@/lib/invoicing/print";
 import { serializeAmount, toBigIntAmount } from "@/lib/billing/money";
@@ -1283,6 +1287,19 @@ export async function issueCreditNote(
       resource: { type: "sales_credit_note", id: data.creditNoteId },
     });
 
+    /**
+     * ⭐ THE SESSION'S FACTOR EVIDENCE — Batch 136's `fva` reader, not a
+     * second notion of "recently authenticated".
+     *
+     * ⚠️ READ HERE, AFTER THE GUARD AND BEFORE THE TRANSACTION. After,
+     * because `check:guards` requires the tier-2 guard one hop from the
+     * export and nothing may run ahead of it; before, because `auth()`
+     * can reach the network and a network call inside an open Postgres
+     * transaction pins a connection to somebody else's latency. The
+     * claim is signed into this request and cannot change while it runs.
+     */
+    const factors = await readRequestFactors();
+
     const issued = await withTenant(
       ctx.tenant.id,
       async (tx) => {
@@ -1340,6 +1357,37 @@ export async function issueCreditNote(
         if (lineFindings.length > 0) {
           throw new Error(creditLineRefusal(lineFindings));
         }
+
+        /**
+         * ══════════════════════════════════════════════════════════════
+         * 🔴🔴 THE CAP, AND THE STEP-UP, IN THE TRANSACTION THAT WRITES.
+         * ══════════════════════════════════════════════════════════════
+         * A credit note is money leaving the business on the say-so of
+         * one person at a keyboard. `server/sales/refund-cap.ts` reads
+         * this role's `approval_limits` rows and SUMS today's issued
+         * notes from the rows themselves — on this same `tx`, so two
+         * tabs pressing Issue in the same second cannot each miss the
+         * other — and throws, rolling back the number, the status, the
+         * ledger posting and the audit row together.
+         *
+         * ⚠️ IT SITS HERE RATHER THAN IN `raise-credit-note.tsx`
+         * BECAUSE A HIDDEN BUTTON IS A MISTAKE GUARD, NOT A BOUNDARY. A
+         * `curl` holding a stolen session never sees the button.
+         *
+         * 🔴 `note.totalMinor` GOES THROUGH `toBigIntAmount` — the
+         * driver hands back `bigint | string` depending on the column
+         * and the path, and a cap compared against a string is a cap
+         * compared with `>` on text.
+         */
+        await assertCreditNoteWithinCaps({
+          tx,
+          tenantId: ctx.tenant.id,
+          userId: ctx.user.id,
+          role: ctx.role,
+          creditNoteId: data.creditNoteId,
+          noteTotalMinor: toBigIntAmount(note.totalMinor),
+          factors,
+        });
 
         /**
          * 🔴 COUNTS ISSUED NOTES ONLY — FIXED IN v0.96.0.

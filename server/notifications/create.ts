@@ -56,6 +56,10 @@ import { and, eq } from "drizzle-orm";
 import { withTenant } from "@/db";
 import { notifications, users, tenants } from "@/db/schema";
 import { sendEmail, buildNotificationEmail } from "@/lib/email/notifications";
+import {
+  parseNotificationPreferences,
+  shouldEmailNotification,
+} from "@/lib/notifications/preferences";
 
 export async function createNotification(input: {
   tenantId: string;
@@ -132,16 +136,55 @@ export async function createNotification(input: {
         .where(eq(tenants.id, input.tenantId))
         .limit(1);
 
+      /*
+       * ⭐⭐ THE PREFERENCE COLUMN IS READ HERE, AND THIS IS THE POINT OF
+       * THE WHOLE CHANGE (0093 / v1.53.0).
+       *
+       * 🔴 UNTIL NOW THIS LINE SELECTED ONLY `email`, AND THAT WAS THE
+       *    DEFECT. The settings screen let a user switch off "Inventory"
+       *    or turn off email delivery entirely, and stored the answer in
+       *    that browser's `localStorage`. This function — a background
+       *    worker's function, running on a schedule with no browser
+       *    anywhere near it — could not read that store and so emailed
+       *    every active user regardless. The switch moved, went grey,
+       *    and changed nothing. A control that reports success and does
+       *    nothing is worse than no control, because the user stops
+       *    watching for the mail they believe they silenced.
+       *
+       * ⚠️ THE PREFERENCE IS APPLIED HERE, INSIDE THE QUERY'S OWN
+       *    TRANSACTION, RATHER THAN BY EACH CALLER. There are two
+       *    callers today (a background worker and the MCP dispatcher)
+       *    and neither knows the recipients — this function computes
+       *    them. A filter anywhere else would be a filter one future
+       *    caller forgets.
+       */
       const userRows = await tx
-        .select({ email: users.email })
+        .select({ email: users.email, preferences: users.preferences })
         .from(users)
         .where(and(eq(users.tenantId, input.tenantId), eq(users.status, "active")))
         .limit(50);
 
+      const recipients = userRows
+        .filter((u) =>
+          /*
+           * ⚠️ `parseNotificationPreferences` IS TOTAL AND THAT MATTERS
+           * MOST RIGHT HERE. One user's malformed JSONB must not throw
+           * inside this map and lose the notification for the other
+           * forty-nine. Junk resolves to the permissive defaults, so an
+           * unreadable preference delivers rather than silences.
+           */
+          shouldEmailNotification(parseNotificationPreferences(u.preferences), {
+            category: input.category,
+            severity,
+          }),
+        )
+        .map((u) => u.email)
+        .filter(Boolean);
+
       return {
         id,
         tenantName: tenantRow[0]?.name ?? null,
-        recipients: userRows.map((u) => u.email).filter(Boolean),
+        recipients,
       };
     });
 

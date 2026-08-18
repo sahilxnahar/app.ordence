@@ -21,7 +21,19 @@
 
 export default function PrintLayout({ children }: { children: React.ReactNode }) {
   return (
-    <div className="print-surface bg-neutral-100 py-8 print:bg-white print:py-0">
+    <div className="document-surface print-surface bg-neutral-100 py-8 print:bg-white print:py-0">
+      {/*
+        ⭐ Batch 142 — `document-surface` PINS THE LIGHT TOKENS FOR THIS
+        WHOLE SUBTREE, even when the rest of the application is in dark
+        mode. The sheet below already hard-codes `bg-white text-black`,
+        so the visible paper was never at risk; what WAS at risk is
+        everything token-driven around and inside it — the surrounding
+        tray, any badge, table border or muted caption a later batch drops
+        onto the document. Those read `--border`, `--muted-foreground` and
+        friends, and under `.dark` they would resolve to near-black lines
+        on white paper. The class is the one place that is fixed for all
+        of them. See the block in `app/globals.css`.
+      */}
       {/**
        * ⚠️ `@page` CANNOT BE SET FROM A TAILWIND CLASS. Page size and
        * margin belong to the print stylesheet and nowhere else, so this

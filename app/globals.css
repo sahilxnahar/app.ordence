@@ -42,6 +42,56 @@
     --input: 0 0% 20%;
     --ring: 38 45% 55%;
   }
+  /* ══════════════════════════════════════════════════════════════════
+     ⭐ DOCUMENT SURFACES STAY BRIGHT IN DARK MODE — Batch 142
+     ══════════════════════════════════════════════════════════════════
+     🔴 A DOCUMENT IS NOT A SCREEN. An invoice, a payslip, a challan, a
+     statement or a GSTR summary is a rendering of a piece of PAPER. It
+     gets printed, it gets photographed and WhatsApped to an accountant,
+     it gets attached to a mail and opened by a customer who has never
+     heard of this product. Inverting it because the person who happened
+     to open it prefers a dark editor produces a black invoice — which
+     wastes a cartridge if printed, and is simply wrong if forwarded.
+
+     ⚠️ THIS IS A VARIABLE OVERRIDE, NOT A PILE OF `dark:` CLASSES. Every
+     colour in the product resolves through these HSL tokens (see
+     `tailwind.config.ts`), so re-declaring the LIGHT values on the
+     document root makes every token-driven descendant — cards, tables,
+     borders, muted text — render light inside it, with no cooperation
+     required from the components themselves. A `dark:` class per
+     component would need to be remembered by whoever writes the NEXT
+     document, and it would not be.
+
+     ⚠️ `color-scheme: light` IS PART OF IT. Without it the browser still
+     paints native scrollbars, date pickers and form controls dark, which
+     is exactly the give-away that a "white" document is faked.
+
+     ⭐ APPLY `document-surface` TO ANY NEW DOCUMENT RENDERER. The
+     `(print)` route group already carries it on its wrapper; a document
+     that ever gets a screen-only route (a preview panel, an emailed HTML
+     receipt) needs it too and gets the same guarantee for one class. */
+  .document-surface,
+  .dark .document-surface {
+    color-scheme: light;
+    --background: 0 0% 100%;
+    --foreground: 0 0% 10%;
+    --card: 0 0% 100%;
+    --card-foreground: 0 0% 10%;
+    --primary: 38 45% 46%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 40 30% 96%;
+    --secondary-foreground: 0 0% 10%;
+    --muted: 40 20% 96%;
+    --muted-foreground: 0 0% 45%;
+    --accent: 38 45% 90%;
+    --accent-foreground: 0 0% 10%;
+    --destructive: 0 72% 51%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 40 20% 90%;
+    --input: 40 20% 90%;
+    --ring: 38 45% 46%;
+  }
+
   * { @apply border-border; }
   body { @apply bg-background text-foreground antialiased; }
 }

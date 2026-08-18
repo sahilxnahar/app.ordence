@@ -45,6 +45,7 @@ import {
   isBookingCollision,
   describeBookingCollision,
 } from "@/lib/sales/inventory";
+import { CreditNoteCapRefusal } from "@/server/sales/refund-cap";
 import type { PermissionKey } from "@/db/schema/auth";
 
 /**
@@ -189,6 +190,17 @@ export function toSalesActionError(err: unknown, scope: string): ActionResult<ne
    * set so we can. Splitting them across a log line and a toast means
    * only one of them reaches the person who can act.
    */
+  /**
+   * 🔴 BATCH 48 — THE CREDIT-NOTE CAP REFUSAL CARRIES ITS OWN SENTENCE.
+   *
+   * ⚠️ WITHOUT THIS LINE THE REFUSAL FALLS THROUGH TO "Something went
+   * wrong. Please try again." — and a person told that about a credit
+   * note above their limit concludes the product is broken and presses
+   * Issue until somebody phones support. The message already names the
+   * amount, the limit and the way forward; all this does is let it out.
+   */
+  if (err instanceof CreditNoteCapRefusal) return salesFail(err.message);
+
   if (err instanceof OrderTaxRefusal) {
     return salesFail(`${err.message} ${err.remedy}`);
   }
