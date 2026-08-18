@@ -140,12 +140,43 @@ for (const file of files) {
   const sql = stripComments(raw);
   scanned += 1;
 
-  // ⚠️ Both spellings count. `SET LOCAL` is the SQL form; `set_config(..., true)`
-  //    is the PL/pgSQL form and is the only one usable inside a DO block, which
-  //    is exactly where VERIFY-0091 needs it.
-  const setsScope =
-    /SET\s+(LOCAL\s+)?app\.platform_scope/i.test(sql) ||
-    /set_config\s*\(\s*'app\.platform_scope'/i.test(sql);
+  /**
+   * 🔴 ONLY ONE SPELLING COUNTS, AND THE OTHER ONE LOOKS FINE UNTIL IT IS NOT.
+   *
+   * `SET LOCAL app.platform_scope = 'on';` issued as its OWN statement is
+   * correct PostgreSQL and useless in a browser SQL console. The console
+   * sends each statement separately, so the setting is scoped to a
+   * transaction on a connection the next statement does not use. The console
+   * shows:
+   *
+   *     1: BEGIN   executed successfully
+   *     2: SET     executed successfully
+   *     3: ERROR   new row violates row-level security policy
+   *
+   * The SET tab is telling the truth about a setting that is already gone.
+   *
+   * ⚠️ `psql -f` DOES NOT REPRODUCE IT. psql sends the whole file on one
+   *    connection, so the file applies perfectly from a terminal and fails in
+   *    the browser. Every migration in this project is pasted into a browser.
+   *
+   * ⭐ So the scope and the write must be in ONE statement: a `DO $$ ... $$`
+   *    block using `set_config(name, value, true)`. One statement is one
+   *    connection and one transaction by construction, and there is no gap
+   *    for the setting to be lost in.
+   */
+  const setsScopeInStatement = /set_config\s*\(\s*'app\.platform_scope'/i.test(sql);
+  const setsScopeAcrossStatements = /SET\s+(LOCAL\s+)?app\.platform_scope/i.test(sql);
+  const setsScope = setsScopeInStatement;
+
+  if (setsScopeAcrossStatements && !setsScopeInStatement && !GRANDFATHERED.has(file)) {
+    fail(
+      `${DIR}/${file} — uses \`SET LOCAL app.platform_scope\` as its only scope mechanism. ` +
+      `That succeeds and then evaporates in a browser SQL console, which sends each statement ` +
+      `on its own connection, and the write is refused by RLS with the SET tab still reading ` +
+      `"executed successfully". Move the scope and the write into ONE statement: ` +
+      `DO $$ BEGIN PERFORM set_config('app.platform_scope','on',true); <the write> END $$;`,
+    );
+  }
 
   if (forced.size > 0 && !setsScope) {
     const dml = /\b(INSERT\s+INTO|UPDATE|DELETE\s+FROM)\s+(?:public\.)?([a-z_][a-z0-9_]*)/gi;
