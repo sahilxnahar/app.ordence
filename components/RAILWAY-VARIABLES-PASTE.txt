@@ -1,0 +1,268 @@
+# ============================================================
+# ORDENCE - Railway variables for the app.ordence service
+# ============================================================
+# GENERATED FROM lib/platform/env-catalog.ts.
+# Do not edit by hand - `npm run check:env-catalogue` will notice.
+# Regenerate: node scripts/generate-railway-variables.mjs
+#
+# Paste this WHOLE block into Railway > Variables > Raw Editor.
+# Then replace every PASTE_HERE with the real value.
+#
+# Lines starting with # are notes. Railway ignores them.
+# A line with nothing after the = is fine - that feature is
+# simply switched off until you fill it in.
+#
+# !! NEVER put these values in a file you push to GitHub. !!
+# ============================================================
+
+# ---- RUNTIME -------------------------------------
+# Set explicitly rather than relied upon.
+# Railway usually sets this. Pinning it means a misconfigured service cannot silently run in development mode with development-mode error pages.
+NODE_ENV=production
+
+# ---- DATABASE ------------------------------------
+# Neon Postgres, pooled for requests, unpooled for migrations.
+#
+# !! WHICH ROLE MATTERS AS MUCH AS WHICH DATABASE !!
+#
+# Use `ordence_app`, NOT `neondb_owner`.
+#
+# `neondb_owner` carries the BYPASSRLS attribute, which overrides even
+# FORCE ROW LEVEL SECURITY. Connected as that role, every row-level
+# policy on all 319 tenant tables is skipped - the app works perfectly
+# and one forgotten WHERE clause returns another tenant's data.
+#
+# `ordence_app` is NOSUPERUSER + NOBYPASSRLS, so the policies apply.
+# Verify before switching:
+#   SELECT rolname, rolcanlogin, rolbypassrls FROM pg_roles
+#    WHERE rolname = 'ordence_app';
+#   -- want: can_login = t, bypasses_rls = f
+#
+# If the password contains @ : / ? # or &, URL-encode it, or the
+# connection string parser will split the URL in the wrong place.
+# REQUIRED
+DATABASE_URL=PASTE_HERE
+#
+# Neon direct (non-pooled) string, for migrations. The running
+# application never reads it.
+DATABASE_URL_UNPOOLED=
+
+# ---- AUTHENTICATION ------------------------------
+# Clerk, sign-in, webhooks, encryption.
+# REQUIRED
+CLERK_SECRET_KEY=PASTE_HERE
+# REQUIRED
+NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY=PASTE_HERE
+CLERK_WEBHOOK_SIGNING_SECRET=
+#
+# Read by the Clerk SDK rather than by Ordence's own code. Ordence
+# never references it, and the deployment still needs it for handshake
+# encryption.
+CLERK_ENCRYPTION_KEY=
+#
+# The un-prefixed alias. Only needed if you would rather not maintain a
+# build-variable list; NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY above is the
+# normal answer.
+CLERK_PUBLISHABLE_KEY=
+NEXT_PUBLIC_CLERK_SIGN_IN_URL=/sign-in
+NEXT_PUBLIC_CLERK_SIGN_UP_URL=/sign-up
+
+# ---- HOSTS & DOMAINS -----------------------------
+# Subdomain routing, admin portal, platform identification.
+#
+# Clerk builds its sign-in redirects from this. A mismatch sends users
+# to a domain that does not resolve and the login loop never completes.
+# When app.ordence.com is connected, change this and update the Clerk
+# webhook endpoint to match.
+# REQUIRED
+NEXT_PUBLIC_APP_URL=https://appordence-production.up.railway.app
+# REQUIRED
+NEXT_PUBLIC_ROOT_DOMAIN=ordence.com
+# REQUIRED
+NEXT_PUBLIC_ZONE_DOMAIN=ordence.com
+#
+# 🔴 LEAVE THIS BLANK UNTIL THE CONSOLE HAS ITS OWN HOSTNAME.
+#
+# It used to be set to the same value as NEXT_PUBLIC_APP_URL, and that
+# combination makes the customer application unreachable: every request
+# to the canonical URL classifies as the platform host, and the
+# middleware rewrites /dashboard and /sign-in into /platform/*, which
+# 404. /api/* keeps working, so /api/health stays green while nothing
+# else does.
+#
+# When app.ordence.com is connected, set this to admin.ordence.com.
+PLATFORM_HOST=
+#
+# Read by lib/security/csrf.ts to decide which Origin headers a
+# state-changing request may carry. Set it to the customer-facing
+# hostname without the scheme.
+APP_HOST=
+#
+# The staff console hostname, for the same CSRF check as APP_HOST.
+ORDENCE_PLATFORM_HOST=
+
+# ---- PLATFORM ADMIN ------------------------------
+# Staff console access, platform tax identity for invoices.
+# REQUIRED
+PLATFORM_ADMIN_EMAILS=
+PLATFORM_LEGAL_NAME=
+PLATFORM_GSTIN=
+PLATFORM_GST_STATE_CODE=
+PLATFORM_ADDRESS=
+PLATFORM_INVOICE_PREFIX=
+
+# ---- OBJECT STORAGE (R2) -------------------------
+# Cloudflare R2 over S3 API, all four or none.
+#
+# 🔴 ALL FOUR S3_ NAMES OR NONE. These four were missing from this
+# file entirely until v1.66.0-alpha, so a deployment made by pasting it
+# had NO DOCUMENT STORAGE and nothing said so. Cloudflare R2 over the
+# S3 API; the endpoint looks like
+# https://<account>.r2.cloudflarestorage.com
+S3_ENDPOINT=
+S3_BUCKET=
+S3_ACCESS_KEY_ID=
+S3_SECRET_ACCESS_KEY=
+
+# ---- AI PROVIDERS --------------------------------
+# LLM routing, at least one enables the AI assistant.
+CLOUDFLARE_ACCOUNT_ID=
+CF_AI_TOKEN=
+GROQ_API_KEY=
+CEREBRAS_API_KEY=
+GOOGLE_AI_API_KEY=
+MISTRAL_API_KEY=
+COHERE_API_KEY=
+GITHUB_MODELS_TOKEN=
+OPENROUTER_API_KEY=
+
+# ---- EMAIL ---------------------------------------
+# Resend, transactional email delivery.
+RESEND_API_KEY=
+RESEND_FROM_EMAIL=
+#
+# Signing secret from the Resend dashboard's webhook page (Svix format,
+# whsec_...). Without it /api/webhooks/resend returns 503 and refuses
+# every delivery, so bounces and spam complaints are NOT suppressed
+# automatically. That is deliberate: an unauthenticated endpoint that
+# can suppress an address is a denial of service on a customer's mail,
+# so it fails closed rather than open.
+RESEND_WEBHOOK_SECRET=
+#
+# Read by nothing in the running application. Listed so a deployment
+# that already sets it is not told it does not exist.
+FINANCE_ALERT_EMAILS=
+
+# ---- PAYMENTS ------------------------------------
+# Razorpay and/or Stripe, billing and subscriptions.
+RAZORPAY_KEY_ID=
+RAZORPAY_KEY_SECRET=
+RAZORPAY_WEBHOOK_SECRET=
+STRIPE_SECRET_KEY=
+STRIPE_WEBHOOK_SECRET=
+
+# ---- CACHE & QUEUE -------------------------------
+# Upstash Redis for caching, QStash for scheduled jobs.
+UPSTASH_REDIS_REST_URL=
+UPSTASH_REDIS_REST_TOKEN=
+QSTASH_CURRENT_SIGNING_KEY=
+QSTASH_NEXT_SIGNING_KEY=
+
+# ---- WORKERS & SECRETS ---------------------------
+# Background job authentication and inline execution.
+#
+# Any long random text:  openssl rand -hex 32
+# Document uploads are inert without it.
+UPLOAD_TICKET_SECRET=
+#
+# Any long random text:  openssl rand -hex 32
+#
+# 🔴 EVERY SCHEDULED JOB IS INERT WITHOUT THIS. /api/workers refuses
+# with 503 when no authentication method is configured, so the dunning
+# sweep, the mail drain, workflow maintenance, the rhythm recompute and
+# storage reconciliation all stop. See docs/current/CRON-RUNBOOK.md.
+WORKER_API_SECRET=
+#
+# Any long random text:  openssl rand -hex 32
+#
+# The RLS canary at /api/cron/canary refuses to run without it, and an
+# isolation probe that never runs is indistinguishable from one that
+# always passes.
+CRON_SECRET=
+ORDENCE_INLINE_JOBS=true
+
+# ---- SECURITY ------------------------------------
+# CSP enforcement, cross-origin allowlist, edge rate-limit posture and seed safety catches.
+#
+# Turn on once you confirm nothing is blocked. Set CSP_REPORT_URI
+# first, or the report-only phase collects nothing and can never end.
+CSP_ENFORCE=false
+CSP_REPORT_URI=
+#
+# NEVER set this to true.
+SEED_ALLOW_PROD=false
+CORS_ALLOWED_ORIGINS=
+#
+# Set to `observe` to count rate-limit trips without refusing
+# anything. Anything else enforces.
+EDGE_LIMIT_MODE=
+#
+# `true` lets platform traffic through when the rate limiter itself is
+# unavailable. A deliberate door; leave it shut unless you are opening
+# it on purpose.
+EDGE_LIMIT_PLATFORM_FAIL_OPEN=
+
+# ---- VAULT ---------------------------------------
+# Application-level encryption for tenant integration credentials. Absent means connectors cannot be configured; nothing is stored in the clear.
+#
+# Generate LOCALLY and paste only into Railway:  openssl rand -hex 32
+#
+# ROTATING THIS ORPHANS EVERY EXISTING ROW. There is no key registry.
+# Set it once, keep it, and treat losing it as losing every stored
+# credential.
+VAULT_ENCRYPTION_KEY=
+#
+# Generate LOCALLY:  openssl rand -hex 32
+#
+# Rotating this makes every blind index in the database unsearchable at
+# once. Same rule as the key above: set it once, keep it.
+VAULT_BLIND_INDEX_PEPPER=
+
+# ---- TELEMETRY -----------------------------------
+# Error reporting, release tracking and telemetry opt-out.
+TELEMETRY_RELEASE=
+NEXT_PUBLIC_RELEASE=
+TELEMETRY_DISABLED=
+SENTRY_DSN=
+NEXT_PUBLIC_SENTRY_DSN=
+#
+# 🔴 BUILD-TIME, NOT RUNTIME. next.config.ts reads it on the build
+# machine to upload source maps. Setting it only at runtime uploads
+# nothing and every stack trace stays minified.
+SENTRY_AUTH_TOKEN=
+
+# ---- BILLING NOTICES -----------------------------
+# How many days of warning and grace a trial and an unpaid invoice get. Absent means the built-in defaults.
+#
+# How many days before a trial ends the customer is warned. Blank uses
+# the built-in default. The same number is printed to the customer, so
+# it is NEXT_PUBLIC_.
+NEXT_PUBLIC_ORDENCE_TRIAL_NOTICE_DAYS=
+NEXT_PUBLIC_ORDENCE_TRIAL_GRACE_DAYS=
+NEXT_PUBLIC_ORDENCE_DUNNING_GRACE_DAYS=
+
+# ---- LEGACY --------------------------------------
+# Kept for rollback safety; no live code path.
+#
+# Legacy Vercel Blob. No live code path reads it. Kept only for the
+# Cloudflare rollback; leave blank.
+BLOB_READ_WRITE_TOKEN=
+
+# ---- SCHEDULED WORK ------------------------------------------
+# Setting WORKER_API_SECRET above is only half of it. Nothing in
+# this deployment has a scheduler attached, so the dunning sweep,
+# the mail drain, workflow maintenance, the rhythm recompute and
+# storage reconciliation do not run until something calls
+# /api/workers on a schedule.
+#
+# docs/current/CRON-RUNBOOK.md has the exact calls.

@@ -1,0 +1,6 @@
+{
+  "gaps": [
+    "automation_events"
+  ],
+  "_why": "Each table below carries personal data that the data-principal export CANNOT reach. The list may shrink. It may not grow without somebody re-running --accept and explaining why, because a new gap is a table a customer will be told does not hold their data."
+}

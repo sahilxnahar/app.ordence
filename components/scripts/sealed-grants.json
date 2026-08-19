@@ -1,0 +1,113 @@
+{
+  "$comment": [
+    "\u2b50 THE SEALED GRANT LIST. Read by scripts/check-sealed-grants.mjs (gate 25).",
+    "",
+    "A privilege listed here MUST NOT be granted to the listed role by ANY .sql",
+    "file in this repository. The gate fails the build if it finds one, naming",
+    "the file and line.",
+    "",
+    "WHY THIS EXISTS: 0012_phase20_secops.sql refused EXECUTE on",
+    "prune_security_events() to ordence_app in a comment sitting inside the",
+    "grant block. 0087_hardening_narrow_grants.sql granted it, seventy-five",
+    "files later, in a list of thirty otherwise-correct signatures copied from",
+    "the modules that declare them. Every neighbour on that list is granted to",
+    "ordence_app by its own module; this one is granted to ordence_maintenance.",
+    "The signature was copied, the role was not read, and the line was",
+    "indistinguishable from its neighbours for four waves.",
+    "",
+    "A comment cannot enforce anything. This file can.",
+    "",
+    "TO ADD A SEAL: add an entry. TO REMOVE ONE: you are removing a security",
+    "control, so say why in `unsealedBecause` and expect it in review."
+  ],
+  "seals": [
+    {
+      "id": "app-cannot-prune-security-events",
+      "role": "ordence_app",
+      "object": "prune_security_events",
+      "privilege": "EXECUTE",
+      "kind": "function",
+      "why": "SECURITY DEFINER, and the only sanctioned way past the append-only trigger on security_events. Any role that can execute it can erase the record of its own compromise, whatever its table privileges say.",
+      "declaredBy": "SQL-FILES/0012_phase20_secops.sql",
+      "brokenBy": "SQL-FILES/0087_hardening_narrow_grants.sql:282",
+      "repairedBy": "SQL-FILES/0121_revoke_prune_from_app_role.sql"
+    },
+    {
+      "id": "app-cannot-prune-usage-counters",
+      "role": "ordence_app",
+      "object": "prune_usage_counters",
+      "privilege": "EXECUTE",
+      "kind": "function",
+      "why": "SECURITY DEFINER retention on metering counters, which are the evidence behind every invoice. The tenant-facing tier must not be able to delete what it is billed on.",
+      "declaredBy": "SQL-FILES/0013_phase15_metering.sql",
+      "brokenBy": null,
+      "repairedBy": "SQL-FILES/0121_revoke_prune_from_app_role.sql"
+    },
+    {
+      "id": "app-cannot-delete-security-events",
+      "role": "ordence_app",
+      "object": "security_events",
+      "privilege": "DELETE",
+      "kind": "table",
+      "why": "The table is append-only evidence. The trigger refuses DELETE, but a trigger can be dropped by a later migration and a missing privilege cannot be bypassed by dropping anything.",
+      "declaredBy": "SQL-FILES/0012_phase20_secops.sql",
+      "brokenBy": null,
+      "repairedBy": null
+    },
+    {
+      "id": "app-cannot-update-security-events",
+      "role": "ordence_app",
+      "object": "security_events",
+      "privilege": "UPDATE",
+      "kind": "table",
+      "why": "UPDATE has no legitimate path at all on security evidence. Amending an event is indistinguishable from erasing it.",
+      "declaredBy": "SQL-FILES/0012_phase20_secops.sql",
+      "brokenBy": null,
+      "repairedBy": null
+    },
+    {
+      "id": "app-cannot-delete-audit-log",
+      "role": "ordence_app",
+      "object": "audit_log",
+      "privilege": "DELETE",
+      "kind": "table",
+      "why": "The audit log is the record of who did what. A tier that can delete from it cannot be audited.",
+      "declaredBy": "SQL-FILES/ALL-IN-ONE-SETUP.sql",
+      "brokenBy": null,
+      "repairedBy": null
+    },
+    {
+      "id": "app-is-never-superuser",
+      "role": "ordence_app",
+      "object": "*",
+      "privilege": "BYPASSRLS",
+      "kind": "role-attribute",
+      "why": "Row-level security is the ONLY tenant isolation in this product. A role with BYPASSRLS sees every tenant's data on every query and nothing in the application layer would notice.",
+      "declaredBy": "SQL-FILES/ALL-IN-ONE-SETUP.sql",
+      "brokenBy": null,
+      "repairedBy": null
+    },
+    {
+      "id": "app-is-never-superuser-attr",
+      "role": "ordence_app",
+      "object": "*",
+      "privilege": "SUPERUSER",
+      "kind": "role-attribute",
+      "why": "A superuser bypasses RLS implicitly. Same consequence as BYPASSRLS, reached by a different word.",
+      "declaredBy": "SQL-FILES/ALL-IN-ONE-SETUP.sql",
+      "brokenBy": null,
+      "repairedBy": null
+    },
+    {
+      "id": "app-cannot-attach-triggers",
+      "role": "ordence_app",
+      "object": "attach_change_log_triggers",
+      "privilege": "EXECUTE",
+      "kind": "function",
+      "why": "SECURITY DEFINER and it CREATEs triggers, which requires table ownership. A role that can call it can attach an arbitrary AFTER trigger to any tenant table, executing under the owner's rights on every write.",
+      "declaredBy": "SQL-FILES/0122_change_log_coverage_sweep.sql",
+      "brokenBy": null,
+      "repairedBy": null
+    }
+  ]
+}
