@@ -1,0 +1,210 @@
+/**
+ * Ordence — Demand Notice Templates: Telugu (తెలుగు)
+ * Version: v0.38.0-alpha
+ *
+ * ⚠️ `amountInWords` IS `null`. Telugu numerals below 100 are not
+ * compositional and the compounds above them join with sandhi. A
+ * generated approximation would be wrong on the part of an Indian
+ * financial document that conventionally prevails over the figures.
+ *
+ * See `kn.ts` for the full argument. The words fall back to the figures
+ * in Indian grouping and `words_fell_back` is recorded on the stored
+ * document.
+ */
+
+import type { NoticeTemplatePack } from "./contract";
+
+export const TE_PACK: NoticeTemplatePack = {
+  language: "te",
+  version: "1.0.0",
+  endonym: "తెలుగు",
+  amountInWords: null,
+
+  demand: {
+    subject: "డిమాండ్ నోటీసు {{noticeNumber}} — {{unitLabel}}, {{projectName}}",
+    body: [
+      "{{developerName}}",
+      "",
+      "డిమాండ్ నోటీసు",
+      "నోటీసు సంఖ్య {{noticeNumber}}    తేదీ: {{noticeDate}}",
+      "",
+      "వీరికి: {{buyerName}}",
+      "యూనిట్: {{unitLabel}}, {{projectName}}",
+      "",
+      "ప్రియమైన {{buyerName}} గారికి,",
+      "",
+      "పైన పేర్కొన్న యూనిట్‌కు సంబంధించిన విక్రయ ఒప్పందం ప్రకారం, నిర్మాణంలో ఈ",
+      "క్రింది దశ పూర్తయినందున ఈ డిమాండ్ చేయబడుతోంది:",
+      "",
+      "    {{triggerLabel}}",
+      "    పూర్తయిన తేదీ: {{triggerAchievedOn}}",
+      "",
+      "ఈ క్రింది మొత్తం ఇప్పుడు చెల్లించవలసి ఉంది:",
+      "",
+      "    వాయిదా                          {{principalAmount}}",
+      "    జీఎస్‌టీ                         {{taxAmount}}",
+      "    మొత్తం చెల్లించవలసినది           {{totalAmount}}",
+      "",
+      "    ({{amountInWords}})",
+      "",
+      "చెల్లింపు గడువు తేదీ: {{dueDate}}",
+      "",
+      "{{interestBasis}}",
+      "",
+      "ఇప్పటికే చెల్లింపు జరిగి ఉంటే దయచేసి ఈ నోటీసును ఉపసంహరించుకున్నట్లు",
+      "పరిగణించి, మీ ఖాతాను నవీకరించడానికి చెల్లింపు వివరాలను మాకు పంపండి.",
+      "",
+      "{{contactLine}}",
+    ].join("\n"),
+  },
+
+  stages: {
+    reminder: {
+      subject: "గుర్తు చేయుట: {{noticeNumber}} — {{unitLabel}}, {{projectName}}",
+      body: [
+        "ప్రియమైన {{buyerName}} గారికి,",
+        "",
+        "{{projectName}} లోని {{unitLabel}} యూనిట్ కోసం {{triggerLabel}}",
+        "({{triggerAchievedOn}} నాడు పూర్తయింది) ఆధారంగా {{noticeDate}} నాడు",
+        "జారీ చేసిన డిమాండ్ నోటీసు {{noticeNumber}} మొత్తం {{dueDate}} నాడు",
+        "చెల్లించవలసి ఉందని గుర్తు చేస్తున్నాము.",
+        "",
+        "    బకాయి మొత్తం                    {{outstandingAmount}}",
+        "    నేటి వరకు వడ్డీ                  {{interestAmount}}",
+        "    నేడు చెల్లించవలసినది             {{payableAmount}}",
+        "",
+        "    ({{amountInWords}})",
+        "",
+        "{{interestBasis}}",
+        "",
+        "ఇప్పటికే చెల్లింపు జరిగి ఉంటే ఈ గుర్తు చేయుటను పట్టించుకోకండి; చెల్లింపు",
+        "వివరాలను మాకు పంపండి.",
+        "",
+        "{{contactLine}}",
+      ].join("\n"),
+    },
+
+    first_notice: {
+      subject: "మొదటి నోటీసు: {{noticeNumber}} బకాయి — {{unitLabel}}",
+      body: [
+        "{{developerName}}",
+        "",
+        "మొదటి నోటీసు",
+        "{{noticeDate}} తేదీ గల డిమాండ్ నోటీసు {{noticeNumber}} గురించి",
+        "",
+        "వీరికి: {{buyerName}}",
+        "యూనిట్: {{unitLabel}}, {{projectName}}",
+        "",
+        "{{triggerLabel}} ({{triggerAchievedOn}} నాడు పూర్తయింది) ఆధారంగా జారీ",
+        "చేసిన డిమాండ్ నోటీసు {{noticeNumber}} మొత్తం {{dueDate}} నాడు",
+        "చెల్లించవలసి ఉండగా, {{daysOverdue}} రోజుల తరువాత కూడా అందలేదు.",
+        "",
+        "    బకాయి మొత్తం                    {{outstandingAmount}}",
+        "    నేటి వరకు వడ్డీ                  {{interestAmount}}",
+        "    నేడు చెల్లించవలసినది             {{payableAmount}}",
+        "",
+        "    ({{amountInWords}})",
+        "",
+        "{{interestBasis}}",
+        "",
+        "దయచేసి పైన పేర్కొన్న మొత్తాన్ని చెల్లించండి. అందులో ఏదైనా భాగం వివాదంలో",
+        "ఉంటే, విషయం ముదిరే ముందు పరిష్కారమయ్యేలా మాకు వ్రాయండి.",
+        "",
+        "{{contactLine}}",
+      ].join("\n"),
+    },
+
+    final_notice: {
+      subject: "తుది నోటీసు: {{noticeNumber}} — {{unitLabel}}, {{projectName}}",
+      body: [
+        "{{developerName}}",
+        "",
+        "తుది నోటీసు",
+        "{{noticeDate}} తేదీ గల డిమాండ్ నోటీసు {{noticeNumber}} గురించి",
+        "",
+        "వీరికి: {{buyerName}}",
+        "యూనిట్: {{unitLabel}}, {{projectName}}",
+        "",
+        "{{triggerLabel}} ({{triggerAchievedOn}} నాడు పూర్తయింది) ఆధారంగా జారీ",
+        "చేసిన డిమాండ్ నోటీసు {{noticeNumber}} మొత్తం {{dueDate}} నాడు",
+        "చెల్లించవలసి ఉండగా, ఇప్పుడు {{daysOverdue}} రోజులు ఆలస్యమైంది. ఇంతకు",
+        "ముందు గుర్తు చేయుట మరియు మొదటి నోటీసు పంపబడ్డాయి.",
+        "",
+        "    బకాయి మొత్తం                    {{outstandingAmount}}",
+        "    నేటి వరకు వడ్డీ                  {{interestAmount}}",
+        "    నేడు చెల్లించవలసినది             {{payableAmount}}",
+        "",
+        "    ({{amountInWords}})",
+        "",
+        "{{interestBasis}}",
+        "",
+        "మొత్తం అందకపోతే, విక్రయ ఒప్పందం మరియు రియల్ ఎస్టేట్ (నియంత్రణ మరియు",
+        "అభివృద్ధి) చట్టం, 2016 ప్రకారం పైన పేర్కొన్న యూనిట్ కేటాయింపును రద్దు",
+        "చేయడాన్ని పరిగణించవచ్చు. మీకు ఏదైనా ఇబ్బంది ఉంటే దయచేసి మమ్మల్ని సంప్రదించండి —",
+        "నమోదైన ఏర్పాటు ఇద్దరికీ రద్దు కంటే మేలు.",
+        "",
+        "{{contactLine}}",
+      ].join("\n"),
+    },
+
+    cancellation_warning: {
+      subject: "కేటాయింపు రద్దుకు ముందు నోటీసు: {{unitLabel}}, {{projectName}}",
+      body: [
+        "{{developerName}}",
+        "",
+        "కేటాయింపు రద్దుకు ముందు నోటీసు",
+        "{{noticeDate}} తేదీ గల డిమాండ్ నోటీసు {{noticeNumber}} గురించి",
+        "",
+        "వీరికి: {{buyerName}}",
+        "యూనిట్: {{unitLabel}}, {{projectName}}",
+        "",
+        "{{triggerLabel}} ({{triggerAchievedOn}} నాడు పూర్తయింది) ఆధారంగా జారీ",
+        "చేసిన డిమాండ్ నోటీసు {{noticeNumber}} మొత్తం {{dueDate}} నాడు",
+        "చెల్లించవలసి ఉండగా, {{daysOverdue}} రోజులు ఆలస్యమైంది. గుర్తు చేయుట,",
+        "మొదటి నోటీసు మరియు తుది నోటీసు పంపబడ్డాయి; ఎటువంటి చెల్లింపు అందలేదు.",
+        "",
+        "    బకాయి మొత్తం                    {{outstandingAmount}}",
+        "    నేటి వరకు వడ్డీ                  {{interestAmount}}",
+        "    నేడు చెల్లించవలసినది             {{payableAmount}}",
+        "",
+        "    ({{amountInWords}})",
+        "",
+        "{{interestBasis}}",
+        "",
+        "పైన పేర్కొన్న మొత్తం అందకపోతే, విక్రయ ఒప్పందం ప్రకారం సదరు యూనిట్",
+        "కేటాయింపు రద్దు చేయబడవచ్చునని, మరియు ఆ ఒప్పందంలో పేర్కొన్న పరిణామాలు —",
+        "చట్టం అనుమతించిన మేరకు జప్తుతో సహా — వర్తిస్తాయని ఇందుమూలంగా",
+        "తెలియజేయడమైనది.",
+        "",
+        "ఈ నోటీసు మీ ఖాతాను పరిశీలించిన తరువాత జారీ చేయబడింది, స్వయంచాలకంగా కాదు.",
+        "మొత్తం చెల్లించవలసిన అవసరం లేదని ఏదైనా కారణం ఉంటే, లేదా చెల్లింపు",
+        "షెడ్యూల్‌ను ప్రతిపాదించాలనుకుంటే, వెంటనే మాకు వ్రాయండి; ఏదైనా చర్య",
+        "తీసుకునే ముందు అది పరిగణించబడుతుంది.",
+        "",
+        "{{contactLine}}",
+      ].join("\n"),
+    },
+  },
+
+  interestBasis: {
+    sentence:
+      "బకాయి ఉన్న అసలు మొత్తంపై సంవత్సరానికి {{rate}} చొప్పున వడ్డీ, {{rule}}, {{from}}, {{count}} ప్రాతిపదికన విధించబడుతుంది.",
+    none: "ఈ డిమాండ్‌పై ఎటువంటి వడ్డీ విధించబడదు.",
+    fromDueDate: "గడువు తేదీ {{dueDate}} నుండి",
+    fromGraceEnd:
+      "{{graceEnds}} నుండి (గడువు తేదీ {{dueDate}} నుండి {{graceDays}} రోజుల రాయితీ కాలం, దానిపై వడ్డీ లేదు)",
+    graceCharged:
+      "గడువు తేదీ {{dueDate}} నుండి, ఆ తేదీ నుండి {{graceDays}} రోజులలోపు చెల్లింపు జరగకపోతే మాత్రమే",
+    compounding: {
+      simple: "సాధారణ వడ్డీ",
+      monthly: "నెలవారీ చక్రవడ్డీ",
+      quarterly: "త్రైమాసిక చక్రవడ్డీ",
+      annual: "వార్షిక చక్రవడ్డీ",
+    },
+    dayCount: {
+      actual_365: "365 రోజుల సంవత్సరంలో వాస్తవ రోజుల",
+      actual_360: "360 రోజుల సంవత్సరంలో వాస్తవ రోజుల",
+      thirty_360: "360 రోజుల సంవత్సరంలో 30 రోజుల నెల",
+    },
+  },
+};

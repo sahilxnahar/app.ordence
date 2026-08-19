@@ -1,0 +1,345 @@
+import "server-only";
+
+/**
+ * Ordence — 🔴🔴 THE CREDIT-NOTE CAP ENFORCEMENT POINT
+ * Version: v1.48.0-alpha (Batch 48)
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 WHY THIS IS `import "server-only"` AND NOT IN `server/actions/`
+ * ══════════════════════════════════════════════════════════════════════
+ * Every export of a `"use server"` file is a browser-reachable RPC
+ * endpoint. `assertCreditNoteWithinCaps` takes a `tenantId`, a `userId`
+ * AND an open transaction — in a `"use server"` file that would be a
+ * published endpoint accepting the tenant and the user to measure, which
+ * is both a route past row-level security and a way to have the cap
+ * evaluated against somebody else's day. Same shape, same reason, as
+ * `lib/credit/enforce.ts` and `server/credit/position.ts`.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴🔴 IT RUNS INSIDE THE CALLER'S TRANSACTION AND IT ABORTS THE WRITE
+ * ══════════════════════════════════════════════════════════════════════
+ * ⚠️ NOT BEFORE THE TRANSACTION, AND NOT IN THE FORM. Summing today's
+ * credit notes on one connection and issuing on another is a race: two
+ * tabs pressing Issue in the same second each read a total that does not
+ * include the other, and the daily cap is passed by a business that
+ * never intended to. Sharing `tx` puts the sum behind the same lock as
+ * the write, and throwing from inside it rolls the whole issue back —
+ * the number, the status, the ledger posting and the audit row, all or
+ * nothing.
+ *
+ * 🔴 A `curl` AND A STALE TAB ARE REFUSED IDENTICALLY, because neither
+ * of them is consulted. The UI may hide the Issue button as a courtesy;
+ * this function is what makes hiding it merely a courtesy.
+ *
+ * ⚠️ AND IT DOES NOT FAIL OPEN. There is no `catch { return allowed }`
+ * here. If `approval_limits` cannot be read the issue fails, loudly,
+ * rather than degrading to "no row found, therefore no cap".
+ */
+
+import { and, eq, gte, notInArray } from "drizzle-orm";
+import { auth } from "@clerk/nextjs/server";
+import { approvalLimits } from "@/db/schema/credit";
+import { salesCreditNotes } from "@/db/schema/sales-invoices";
+import { toBigIntAmount } from "@/lib/billing/money";
+import { todayInIndia } from "@/lib/accounting/periods";
+import {
+  assessCreditNoteCap,
+  resolveCapMinor,
+  CREDIT_NOTE_SCOPE,
+  CREDIT_NOTE_DAILY_SCOPE,
+  DEFAULT_DAILY_CAP_MINOR,
+  DEFAULT_PER_NOTE_CAP_MINOR,
+  type CreditNoteCapVerdict,
+} from "@/lib/sales/refund-cap";
+import {
+  readFactorEvidence,
+  NO_FACTOR_EVIDENCE,
+  type FactorEvidence,
+} from "@/lib/security/session-policy";
+import type { SystemRole } from "@/db/schema/core";
+import { normaliseCurrencyCode } from "@/lib/fx/currency";
+import { sumByCurrency } from "@/lib/fx/aggregate";
+import { convertMinor, CLOSING_RATE_WINDOW } from "@/lib/fx/convert";
+import { resolveQuote } from "@/server/fx/rate-service";
+import type { withTenant } from "@/db";
+
+type Tx = Parameters<Parameters<typeof withTenant>[1]>[0];
+
+/**
+ * ⭐ ITS OWN ERROR CLASS, AND THE REASON IS THE MESSAGE.
+ *
+ * 🔴 `toSalesActionError()` turns a plain `Error` into "Something went
+ * wrong. Please try again." A cap refusal delivered as that sentence is
+ * read as an outage: the person presses Issue again, then again, then
+ * telephones support to report that credit notes are broken — while the
+ * actual answer, "this one is above your limit and needs your manager",
+ * sits in a server log nobody at the counter can see. The class exists
+ * to be caught by name in `server/sales/guards.ts`; that is its whole
+ * job.
+ */
+export class CreditNoteCapRefusal extends Error {
+  readonly verdict: CreditNoteCapVerdict;
+  readonly creditNoteId: string;
+
+  constructor(creditNoteId: string, verdict: CreditNoteCapVerdict) {
+    // ⚠️ THE WORD IS IN THE SENTENCE, not only in a badge on a screen.
+    super(`${verdict.word}. ${verdict.reason}`);
+    this.name = "CreditNoteCapRefusal";
+    this.verdict = verdict;
+    this.creditNoteId = creditNoteId;
+  }
+}
+
+/**
+ * Clerk's factor evidence for THIS request.
+ *
+ * ⚠️ READ BEFORE THE TRANSACTION OPENS, DELIBERATELY. `auth()` may reach
+ * the network, and a network call held inside an open Postgres
+ * transaction pins a connection for as long as an unrelated service
+ * takes to answer. Nothing is lost by reading it early: the claim is
+ * signed into the request's own session token and cannot change while
+ * that request runs, so it is a constant of the request rather than
+ * state the transaction has to protect.
+ *
+ * ⚠️ A FAILURE TO READ IT IS `NO_FACTOR_EVIDENCE`, WHICH REFUSES.
+ * `measured: false` is the strict answer — see `stepUpFresh()`.
+ */
+export async function readRequestFactors(): Promise<FactorEvidence> {
+  try {
+    const { sessionClaims } = await auth();
+    return readFactorEvidence(sessionClaims);
+  } catch {
+    return NO_FACTOR_EVIDENCE;
+  }
+}
+
+/**
+ * The instant the current Indian civil day began, as a `Date`.
+ *
+ * ⚠️ NOT `toISOString().slice(0, 10)`, AND NOT THE SERVER'S LOCAL ZONE.
+ * India is UTC+05:30, so a UTC day boundary hands every user a fresh
+ * daily cap at 05:30 in the morning and lets a second full day's worth
+ * of credit notes out between then and midnight. `todayInIndia()` is the
+ * civil date the rest of the product already agrees on; IST observes no
+ * daylight saving, so the fixed offset below is exact rather than
+ * approximately right.
+ */
+export function istDayStart(now: Date = new Date()): Date {
+  return new Date(`${todayInIndia(now)}T00:00:00+05:30`);
+}
+
+/**
+ * 🔴 THE GATE. Throws `CreditNoteCapRefusal`, aborting the caller's
+ * transaction, when this person may not issue this credit note now.
+ */
+export async function assertCreditNoteWithinCaps(args: {
+  tx: Tx;
+  tenantId: string;
+  /** The person pressing Issue. The day is measured against THEM. */
+  userId: string;
+  /** Their `system_role` — what `approval_limits.role` stores. */
+  role: SystemRole;
+  creditNoteId: string;
+  /** 🔴 The document total in minor units, tax included. Never a float. */
+  noteTotalMinor: bigint;
+  /**
+   * ⭐⭐ BATCH 0101 — THE CURRENCY THE NOTE IS IN, AND IT IS REQUIRED.
+   *
+   * 🔴 WHAT THIS FIXES. The daily total below used to be
+   * `coalesce(sum(total_minor), 0)` over every credit note the person
+   * issued today, WHATEVER CURRENCY EACH WAS IN, compared against a cap
+   * that is denominated in the workspace's own currency. A ₹5,00,000
+   * daily cap and three USD 5,000 credit notes consumed 15,000 of it
+   * instead of roughly ₹12,50,000 — so the cap let out about forty times
+   * what it was set to, silently, and nothing on any screen said so.
+   *
+   * ⚠️ IT IS A REQUIRED ARGUMENT RATHER THAN AN OPTIONAL ONE WITH A
+   * DEFAULT OF "INR". A default here is exactly how the original bug
+   * would come back: every existing caller compiles, and the one new
+   * caller that issues in dollars silently gets the old behaviour.
+   */
+  noteCurrency: string;
+  /**
+   * The workspace's functional currency — what the cap is denominated in.
+   * From `functionalCurrencyFromSettings(tenant.settings)`.
+   */
+  functionalCurrency: string;
+  factors: FactorEvidence;
+  now?: Date;
+}): Promise<CreditNoteCapVerdict> {
+  const now = args.now ?? new Date();
+  const noteCurrency = normaliseCurrencyCode(args.noteCurrency);
+  const functionalCurrency = normaliseCurrencyCode(args.functionalCurrency);
+
+  /* ── THE CAPS ─────────────────────────────────────────────────── */
+  const rows = await args.tx
+    .select({ scope: approvalLimits.scope, maxValueMinor: approvalLimits.maxValueMinor })
+    .from(approvalLimits)
+    .where(
+      and(
+        eq(approvalLimits.tenantId, args.tenantId),
+        eq(approvalLimits.role, args.role),
+      ),
+    );
+
+  // ⚠️ `noUncheckedIndexedAccess` — `find` returns `T | undefined`, and
+  // `resolveCapMinor` treats undefined as "no row", which is the default
+  // figure rather than unlimited. That is the whole point of the helper.
+  const perNote = resolveCapMinor(
+    rows.find((r) => r.scope === CREDIT_NOTE_SCOPE) ?? null,
+    DEFAULT_PER_NOTE_CAP_MINOR,
+  );
+  const daily = resolveCapMinor(
+    rows.find((r) => r.scope === CREDIT_NOTE_DAILY_SCOPE) ?? null,
+    DEFAULT_DAILY_CAP_MINOR,
+  );
+
+  /* ── THE DAY, SUMMED FROM THE LEDGER ──────────────────────────── */
+  //
+  // 🔴 SUMMED FROM THE ROWS THEMSELVES. There is no `issued_today_minor`
+  // counter anywhere in this schema and there must never be one: a
+  // counter is updated by exactly the code paths somebody remembered,
+  // survives rollbacks it should not, and when it drifts it drifts
+  // towards letting more money out — silently, because nothing compares
+  // it with anything.
+  //
+  // ⚠️ MEASURED ON `issuedAt`, NOT ON `noteDate`. `noteDate` is a date
+  // the person types and may lawfully backdate; using it would let
+  // yesterday's date on today's document reset today's cap.
+  //
+  // ⚠️ AND ON THE SAME STATUS PREDICATE AS THE NUMBERING SERIES —
+  // everything except drafts and cancellations. A draft has taken no
+  // money and a cancelled note has given it back.
+  //
+  // 🔴🔴 AND IT IS NO LONGER `sum(total_minor)` OVER EVERY CURRENCY AT
+  // ONCE. See the note on `noteCurrency` in the signature: that sum
+  // compared dollars with a rupee cap at one-to-one and let out about
+  // forty times what the cap said. The rows come back UNAGGREGATED and
+  // are grouped by currency in `lib/fx/aggregate.ts`, then each non-
+  // functional bucket is converted through a rate resolved for TODAY.
+  const issuedToday = await args.tx
+    .select({
+      currency: salesCreditNotes.currency,
+      totalMinor: salesCreditNotes.totalMinor,
+    })
+    .from(salesCreditNotes)
+    .where(
+      and(
+        eq(salesCreditNotes.tenantId, args.tenantId),
+        eq(salesCreditNotes.issuedBy, args.userId),
+        gte(salesCreditNotes.issuedAt, istDayStart(now)),
+        notInArray(salesCreditNotes.status, ["draft", "cancelled"]),
+      ),
+    );
+
+  // ⚠️ AN AGGREGATE THAT COMES BACK AS `undefined` IS NOT ZERO — it is a
+  // query that did not run the way we think it did. Refusing is the only
+  // safe reading; treating it as ₹0 issued today would hand a full fresh
+  // daily cap to whoever provoked it. (An EMPTY ARRAY genuinely is zero:
+  // a person who has issued nothing today has issued nothing.)
+  if (!Array.isArray(issuedToday)) {
+    throw new Error(
+      "The day's credit-note total could not be read, so this credit note has not been " +
+        "issued. Nothing has changed. Please try again.",
+    );
+  }
+
+  const today = todayInIndia(now);
+  const buckets = sumByCurrency(
+    issuedToday.map((r) => ({
+      currency: normaliseCurrencyCode(r.currency),
+      amountMinor: toBigIntAmount(r.totalMinor),
+    })),
+  );
+
+  /**
+   * 🔴 A BUCKET WITH NO RATE REFUSES THE ISSUE. It does NOT get counted at
+   * one-to-one and it does NOT get skipped.
+   *
+   *   • counting it at 1:1 is the bug being fixed
+   *   • skipping it is worse: the day's total comes back LOWER, so the cap
+   *     lets MORE out, and the failure mode of a control must never be
+   *     "the control relaxes"
+   *
+   * ⚠️ IT IS AN EXCEPTION AND NOT A VERDICT, because it is not a decision
+   * about this person's authority — it is the system saying it cannot
+   * measure the day. The caller's transaction rolls back, nothing is
+   * issued, and the message says which rate to enter.
+   */
+  let issuedTodayMinor = 0n;
+  for (const bucket of buckets) {
+    if (bucket.currency === functionalCurrency) {
+      issuedTodayMinor += bucket.amountMinor;
+      continue;
+    }
+    const quote = await resolveQuote(args.tx, {
+      tenantId: args.tenantId,
+      from: bucket.currency,
+      to: functionalCurrency,
+      on: today,
+      policy: CLOSING_RATE_WINDOW,
+    });
+    if (!quote) {
+      throw new Error(
+        `This credit note has NOT been issued. ${bucket.count} credit note(s) already issued ` +
+          `today are in ${bucket.currency}, and no exchange rate to ${functionalCurrency} is on ` +
+          `file for ${today} — so the day's total against your ${functionalCurrency} limit ` +
+          `cannot be measured. Enter the rate and try again. Nothing has changed.`,
+      );
+    }
+    issuedTodayMinor += convertMinor({
+      amountMinor: bucket.amountMinor,
+      from: bucket.currency,
+      to: functionalCurrency,
+      quote,
+      on: today,
+      policy: CLOSING_RATE_WINDOW,
+    }).amountMinor;
+  }
+
+  /**
+   * ⭐ THE NOTE BEING ISSUED IS MEASURED IN THE SAME CURRENCY AS THE CAP,
+   * for the same reason. A USD 5,000 note tested against a ₹5,00,000
+   * per-note cap as though it were ₹5,000 passes every time.
+   */
+  let noteTotalInFunctionalMinor = args.noteTotalMinor;
+  if (noteCurrency !== functionalCurrency) {
+    const quote = await resolveQuote(args.tx, {
+      tenantId: args.tenantId,
+      from: noteCurrency,
+      to: functionalCurrency,
+      on: today,
+      policy: CLOSING_RATE_WINDOW,
+    });
+    if (!quote) {
+      throw new Error(
+        `This credit note is in ${noteCurrency} and no exchange rate to ${functionalCurrency} ` +
+          `is on file for ${today}, so it cannot be measured against your limit. It has NOT ` +
+          `been issued and nothing has changed. Enter the rate and try again.`,
+      );
+    }
+    noteTotalInFunctionalMinor = convertMinor({
+      amountMinor: args.noteTotalMinor,
+      from: noteCurrency,
+      to: functionalCurrency,
+      quote,
+      on: today,
+      policy: CLOSING_RATE_WINDOW,
+    }).amountMinor;
+  }
+
+  const verdict = assessCreditNoteCap({
+    noteTotalMinor: noteTotalInFunctionalMinor,
+    issuedTodayMinor,
+    perNoteCapMinor: perNote.capMinor,
+    perNoteCapIsDefault: perNote.capIsDefault,
+    dailyCapMinor: daily.capMinor,
+    dailyCapIsDefault: daily.capIsDefault,
+    factors: args.factors,
+  });
+
+  if (verdict.outcome !== "allow") {
+    throw new CreditNoteCapRefusal(args.creditNoteId, verdict);
+  }
+  return verdict;
+}

@@ -1,0 +1,173 @@
+--- ①a POSITIVE: a payslip whose net equals gross minus deductions
+BEGIN
+SET
+INSERT 0 1
+COMMIT
+--- ①b NEGATIVE: a payslip that does NOT add up must be REFUSED
+    (an employee with a calculator checks this, and they are right to)
+BEGIN
+SET
+psql:SQL-FILES/DRILL-DO-NOT-RUN-IN-NEON-0075.sql:61: ERROR:  new row for relation "payslips" violates check constraint "payslips_adds_up"
+ROLLBACK
+--- ①c NEGATIVE: more loss of pay than payable days must be REFUSED
+BEGIN
+SET
+psql:SQL-FILES/DRILL-DO-NOT-RUN-IN-NEON-0075.sql:76: ERROR:  new row for relation "payslips" violates check constraint "payslips_days_sane"
+ROLLBACK
+--- ①d NEGATIVE: two payslips for one employee in one run must be REFUSED
+    (two is a duplicate payment)
+BEGIN
+SET
+psql:SQL-FILES/DRILL-DO-NOT-RUN-IN-NEON-0075.sql:92: ERROR:  duplicate key value violates unique constraint "payslips_run_employee_key"
+ROLLBACK
+--- ②a NEGATIVE: a SECOND live run for the same March must be REFUSED
+    (two runs post the wage bill twice, and every figure downstream
+     is then exactly twice the truth and entirely plausible)
+BEGIN
+SET
+psql:SQL-FILES/DRILL-DO-NOT-RUN-IN-NEON-0075.sql:106: ERROR:  duplicate key value violates unique constraint "payroll_runs_one_live_per_period"
+ROLLBACK
+--- ②b POSITIVE: a run for a DIFFERENT period must SUCCEED
+BEGIN
+SET
+INSERT 0 1
+COMMIT
+--- ②c NEGATIVE: a period that ends before it starts must be REFUSED
+BEGIN
+SET
+psql:SQL-FILES/DRILL-DO-NOT-RUN-IN-NEON-0075.sql:122: ERROR:  new row for relation "payroll_runs" violates check constraint "payroll_runs_period_ordered"
+ROLLBACK
+--- ③a POSITIVE: draft to computed must SUCCEED
+BEGIN
+SET
+UPDATE 1
+COMMIT
+--- ③b POSITIVE: computed back to draft is the ONE permitted reversal
+BEGIN
+SET
+UPDATE 1
+UPDATE 1
+COMMIT
+--- ③c POSITIVE: computed to approved must SUCCEED
+BEGIN
+SET
+UPDATE 1
+COMMIT
+--- ③d NEGATIVE: approved back to computed must be REFUSED
+    (a run that walks backwards can post the same wage bill twice)
+BEGIN
+SET
+psql:SQL-FILES/DRILL-DO-NOT-RUN-IN-NEON-0075.sql:154: ERROR:  A payroll run cannot go from approved back to computed. Cancel it with a reason and raise a new one.
+CONTEXT:  PL/pgSQL function ordence_guard_payroll_status() line 29 at RAISE
+ROLLBACK
+--- ③e NEGATIVE: a payslip in an APPROVED run may not change
+    (approval is a signature; if the figures can still move it
+     attaches to nothing)
+BEGIN
+SET
+psql:SQL-FILES/DRILL-DO-NOT-RUN-IN-NEON-0075.sql:169: ERROR:  This payroll run has been approved and its payslips can no longer change. Approval is a signature on a wage bill; if the figures are wrong, cancel the run with a reason and raise a new one so both are on the record.
+CONTEXT:  PL/pgSQL function ordence_guard_payroll_frozen() line 9 at RAISE
+ROLLBACK
+--- ③f NEGATIVE: an approved run may not be posted with no journal
+BEGIN
+SET
+psql:SQL-FILES/DRILL-DO-NOT-RUN-IN-NEON-0075.sql:176: ERROR:  new row for relation "payroll_runs" violates check constraint "payroll_runs_posted_has_journal"
+ROLLBACK
+--- ③g NEGATIVE: cancelling without a reason must be REFUSED
+BEGIN
+SET
+psql:SQL-FILES/DRILL-DO-NOT-RUN-IN-NEON-0075.sql:183: ERROR:  new row for relation "payroll_runs" violates check constraint "payroll_runs_cancel_explained"
+ROLLBACK
+--- ③h POSITIVE: cancelling WITH a reason must SUCCEED
+BEGIN
+SET
+UPDATE 1
+COMMIT
+--- ③i POSITIVE: with that one cancelled, the period is free again
+BEGIN
+SET
+INSERT 0 1
+COMMIT
+--- ④a NEGATIVE: a malformed PAN must be REFUSED
+BEGIN
+SET
+psql:SQL-FILES/DRILL-DO-NOT-RUN-IN-NEON-0075.sql:212: ERROR:  new row for relation "employees" violates check constraint "employees_pan_shape"
+ROLLBACK
+--- ④b POSITIVE: a well-formed PAN must SUCCEED
+BEGIN
+SET
+INSERT 0 1
+COMMIT
+--- ④c NEGATIVE: leaving before joining must be REFUSED
+BEGIN
+SET
+psql:SQL-FILES/DRILL-DO-NOT-RUN-IN-NEON-0075.sql:228: ERROR:  new row for relation "employees" violates check constraint "employees_dates_ordered"
+ROLLBACK
+--- ④d NEGATIVE: two employees with one UAN must be REFUSED
+    (one UAN on two people means an identity has been reused)
+BEGIN
+SET
+INSERT 0 1
+psql:SQL-FILES/DRILL-DO-NOT-RUN-IN-NEON-0075.sql:240: ERROR:  duplicate key value violates unique constraint "employees_uan_key"
+ROLLBACK
+--- ⑤a POSITIVE: the first open structure row must SUCCEED
+BEGIN
+SET
+INSERT 0 1
+COMMIT
+--- ⑤b NEGATIVE: a SECOND open row for the same component must be REFUSED
+    (two open Basic rows both apply, and the employee is paid Basic twice)
+BEGIN
+SET
+psql:SQL-FILES/DRILL-DO-NOT-RUN-IN-NEON-0075.sql:267: ERROR:  duplicate key value violates unique constraint "employee_pay_structure_one_open"
+ROLLBACK
+--- ⑤c POSITIVE: close the old one, then the new one is accepted
+BEGIN
+SET
+UPDATE 1
+INSERT 0 1
+COMMIT
+--- ⑥a POSITIVE: the owning tenant sees its own employees
+BEGIN
+SET
+ own_tenant_sees 
+-----------------
+               3
+(1 row)
+
+COMMIT
+--- ⑥b NEGATIVE: ANOTHER tenant sees none of them
+    (salary is the one figure people quit over knowing)
+BEGIN
+SET
+ other_tenant_sees 
+-------------------
+                 0
+(1 row)
+
+ other_tenant_sees_payslips 
+----------------------------
+                          0
+(1 row)
+
+COMMIT
+--- ⑥c NEGATIVE: and cannot WRITE into the first tenant either
+BEGIN
+SET
+psql:SQL-FILES/DRILL-DO-NOT-RUN-IN-NEON-0075.sql:307: ERROR:  new row violates row-level security policy for table "employees"
+ROLLBACK
+--- ⑥d POSITIVE: the platform scope may READ across tenants
+BEGIN
+SET
+ platform_sees 
+---------------
+             3
+(1 row)
+
+COMMIT
+--- ⑥e NEGATIVE: and may NOT write, because WITH CHECK excludes it
+BEGIN
+SET
+psql:SQL-FILES/DRILL-DO-NOT-RUN-IN-NEON-0075.sql:321: ERROR:  new row violates row-level security policy for table "employees"
+ROLLBACK
+--- DRILL COMPLETE ---
