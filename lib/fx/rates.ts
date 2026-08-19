@@ -108,6 +108,103 @@ export function isStorableFxRateSource(v: string): v is StorableFxRateSource {
   return (STORABLE_FX_RATE_SOURCES as readonly string[]).includes(v);
 }
 
+/**
+ * ⭐⭐⭐ WHICH SIDE OF THE SPREAD, AND IT IS A DIFFERENT AXIS FROM `source`.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 THREE NUMBERS, NOT ONE, AND THE STATUTE NAMES ONE OF THEM
+ * ══════════════════════════════════════════════════════════════════════
+ * A bank quoting USD/INR quotes at least three numbers on the same day:
+ * what it will PAY for a dollar arriving by telegraphic transfer (the TT
+ * BUYING rate), what it will CHARGE for a dollar it sends (TT SELLING),
+ * and the midpoint between them, which is what a reference rate and a
+ * market data feed publish. The spread between buying and selling is
+ * routinely 40–80 paise on the dollar, so on a ₹1 crore remittance the
+ * three numbers are half a lakh apart.
+ *
+ * 🔴 RULE 26 OF THE INCOME-TAX RULES 1962 NAMES THE TELEGRAPHIC TRANSFER
+ *    BUYING RATE AND NOTHING ELSE. For deducting tax at source on income
+ *    payable in foreign currency, the rupee value is the amount converted
+ *    at the TT buying rate "as on the date on which the tax is required to
+ *    be deducted". A mid rate used where the statute says TT buying
+ *    changes the chargeable base, and therefore the tax — and a short
+ *    deduction makes the deductor personally liable under s.201(1) for
+ *    the whole shortfall plus 201(1A) interest.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * ⚠️ WHY THIS IS NOT A NEW `source` VALUE
+ * ══════════════════════════════════════════════════════════════════════
+ * `source` answers WHO PUBLISHED IT — the Reserve Bank, a vendor feed, a
+ * person in the workspace. `rateType` answers WHICH OF THAT PUBLISHER'S
+ * THREE NUMBERS IT IS. They are orthogonal: the State Bank publishes a TT
+ * buying rate, the RBI publishes a reference (mid) rate, and a tenant can
+ * type either off an advice. Folding one into the other would make
+ * `source = 'tt_buying'` a publisher, which answers neither question, and
+ * `STORABLE_FX_RATE_SOURCES` is a closed list precisely so that it stays
+ * a list of publishers.
+ *
+ * 🔴 AND NOTHING ANYWHERE INFERS ONE AXIS FROM THE OTHER. There is no
+ *    `rateTypeOf(source)` in this codebase and there must never be one:
+ *    "rbi_reference means mid" is true today, is a fact about the RBI's
+ *    publication policy rather than about our data, and would silently
+ *    re-label every historic row the day it stopped being true.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * ⭐⭐ `unstated` IS A REAL VALUE AND IT IS WHAT EVERY PRE-0106 ROW IS
+ * ══════════════════════════════════════════════════════════════════════
+ * Every `fx_rates` and `fx_reference_rates` row written before this batch
+ * carries no side of the spread, because the column did not exist and
+ * nobody was ever asked. `unstated` records that ignorance as a fact.
+ *
+ * 🔴 IT IS NOT `mid`, AND CALLING IT `mid` WAS THE OBVIOUS WRONG MOVE. A
+ *    tenant who typed 83.60 off their bank's advice typed a TT buying or
+ *    a TT selling rate — the advice for a real remittance is never a mid
+ *    — so `mid` would be false for exactly the rows that matter most.
+ * 🔴 IT IS EMPHATICALLY NOT `tt_buying`, because that single word would
+ *    make every historical rate eligible to compute a s.195 deduction,
+ *    which is the mis-deduction this batch exists to prevent.
+ *
+ * ⚠️ AN `unstated` ROW IS STILL PERFECTLY USABLE for everything it was
+ *    already used for — AS 11 initial recognition, the closing-rate
+ *    revaluation, a receivables ageing — because none of those name a
+ *    side of the spread. It is refused ONLY where a statute names one.
+ *    That is why this migration changes no figure now on a screen.
+ */
+export const FX_RATE_TYPES = ["unstated", "mid", "tt_buying", "tt_selling"] as const;
+
+export type FxRateType = (typeof FX_RATE_TYPES)[number];
+
+export function isFxRateType(v: string): v is FxRateType {
+  return (FX_RATE_TYPES as readonly string[]).includes(v);
+}
+
+/**
+ * ⭐ WHAT A PERSON OR A FEED MAY WRITE TODAY. `unstated` is readable
+ * history and is never a choice on a new row: a rate being entered now
+ * has somebody looking at the advice it came from, and asking them which
+ * number it is costs one field and settles the question forever.
+ */
+export const STORABLE_FX_RATE_TYPES = ["mid", "tt_buying", "tt_selling"] as const;
+export type StorableFxRateType = (typeof STORABLE_FX_RATE_TYPES)[number];
+
+export function isStorableFxRateType(v: string): v is StorableFxRateType {
+  return (STORABLE_FX_RATE_TYPES as readonly string[]).includes(v);
+}
+
+/** How a rate type reads in a refusal, in the statute's own words. */
+export function describeRateType(t: FxRateType): string {
+  switch (t) {
+    case "tt_buying":
+      return "telegraphic transfer buying rate";
+    case "tt_selling":
+      return "telegraphic transfer selling rate";
+    case "mid":
+      return "mid rate";
+    case "unstated":
+      return "rate of unstated side of the spread";
+  }
+}
+
 export class FxRateError extends Error {}
 
 /**
@@ -123,6 +220,11 @@ export type FxQuote = {
   /** `YYYY-MM-DD`. The date the rate IS FOR, never the date it was typed. */
   readonly rateDate: string;
   readonly source: FxRateSource;
+  /**
+   * ⭐ WHICH SIDE OF THE SPREAD. Orthogonal to `source`, never derived
+   * from it, and `unstated` where nobody said. See `FX_RATE_TYPES`.
+   */
+  readonly rateType: FxRateType;
   /** RBI circular number, provider tick id, or the tenant's own note. */
   readonly sourceReference: string | null;
   /**
@@ -153,6 +255,13 @@ export function makeQuote(input: {
   rateScaled: bigint;
   rateDate: string;
   source: FxRateSource;
+  /**
+   * ⚠️ OMITTING IT MEANS `unstated`, WHICH FAILS CLOSED. An omitted rate
+   * type can never satisfy a statutory conversion — `assertStatutoryQuote`
+   * in `lib/fx/statutory.ts` refuses it by name — so the default costs a
+   * refusal and never a wrong deduction. It is NOT inferred from `source`.
+   */
+  rateType?: FxRateType;
   sourceReference?: string | null;
   derived?: boolean;
   rateId?: string | null;
@@ -180,6 +289,7 @@ export function makeQuote(input: {
     rateScaled: input.rateScaled,
     rateDate: input.rateDate,
     source: input.source,
+    rateType: input.rateType ?? "unstated",
     sourceReference: input.sourceReference ?? null,
     derived: input.derived ?? false,
     rateId: input.rateId ?? null,
@@ -194,13 +304,27 @@ export function makeQuote(input: {
  * INR, so every conversion the new code performs resolves to identity, is
  * exact, and changes no number that is on a screen now.
  */
-export function identityQuote(currency: string, rateDate: string): FxQuote {
+/**
+ * ⚠️ AN IDENTITY QUOTE CARRIES WHATEVER SIDE OF THE SPREAD WAS ASKED FOR,
+ * AND THAT IS NOT A LOOPHOLE. There is no spread between a currency and
+ * itself: the telegraphic transfer buying rate of rupees for rupees is
+ * one, the selling rate is one and the mid is one. So a caller that needs
+ * a TT buying rate to translate an INR payment gets one, exactly, from no
+ * table — and the refusal it would otherwise hit would be a refusal to
+ * multiply by 1.
+ */
+export function identityQuote(
+  currency: string,
+  rateDate: string,
+  rateType: FxRateType = "unstated",
+): FxQuote {
   return makeQuote({
     baseCurrency: currency,
     quoteCurrency: currency,
     rateScaled: RATE_SCALE,
     rateDate,
     source: "identity",
+    rateType,
     sourceReference: null,
   });
 }
@@ -237,7 +361,7 @@ export function formatRateScaled(rateScaled: bigint): string {
 /** How the pair reads on a screen: "USD/INR 83.215000000000". */
 export function describeQuote(q: FxQuote): string {
   const derived = q.derived ? " (derived by inversion)" : "";
-  return `${q.baseCurrency}/${q.quoteCurrency} ${formatRateScaled(q.rateScaled)} on ${q.rateDate} · ${q.source}${derived}`;
+  return `${q.baseCurrency}/${q.quoteCurrency} ${formatRateScaled(q.rateScaled)} on ${q.rateDate} · ${q.source} · ${describeRateType(q.rateType)}${derived}`;
 }
 
 /**
@@ -267,6 +391,26 @@ export function invertQuote(q: FxQuote): FxQuote {
     rateScaled: inverted,
     rateDate: q.rateDate,
     source: "derived_inverse",
+    /**
+     * 🔴🔴 THE SIDE OF THE SPREAD DOES NOT SURVIVE INVERSION.
+     *
+     * A TT buying rate for USD/INR is what a bank PAYS in rupees for a
+     * dollar arriving. Its reciprocal is a number of dollars per rupee
+     * that no bank quotes and that is certainly not the rate at which
+     * anybody buys rupees — the buying side of one pair is the selling
+     * side of the other, and the two sides are not reciprocals of each
+     * other because the spread is not symmetric.
+     *
+     * ⚠️ SO AN INVERTED SPREAD-SIDE RATE BECOMES `unstated`, WHICH MEANS
+     * A STATUTORY CONVERSION REFUSES IT. That refusal is the correct
+     * answer: Rule 26 names a published TT buying rate, and a reciprocal
+     * this code computed is not one, however close the arithmetic is.
+     *
+     * ⭐ `mid` SURVIVES, because `mid` asserts only "neither side of the
+     * spread", and the reciprocal of a number that is on neither side is
+     * still on neither side.
+     */
+    rateType: q.rateType === "mid" ? "mid" : "unstated",
     sourceReference: q.sourceReference,
     derived: true,
     rateId: q.rateId,

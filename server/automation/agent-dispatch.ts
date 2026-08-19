@@ -32,7 +32,12 @@ import "server-only";
 
 import { and, eq, sql } from "drizzle-orm";
 import { agentDefinitions, agentRuns, agentTriggers } from "@/db/schema/agents";
-import { chatCompletion } from "@/lib/ai/client";
+// ⭐ 0105 · the workspace's own provider keys, where it has supplied any.
+// ⚠️ `tx` is passed through: this function is ALREADY inside a
+// withTenant() opened by its caller, and resolving credentials in a
+// second transaction would take a second connection out of a shared pool
+// for the whole length of an AI call.
+import { tenantChatCompletion } from "@/server/ai/chat";
 import type { Sensitivity } from "@/lib/ai/router";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -161,7 +166,9 @@ export async function dispatchAgentsForEvent(args: {
     }
 
     try {
-      const answer = await chatCompletion({
+      const answer = await tenantChatCompletion({
+        tenantId,
+        tx,
         sensitivity: b.sensitivity as Sensitivity,
         messages: [
           { role: "system", content: String(b.systemPrompt) },

@@ -27,6 +27,7 @@
  */
 
 import { spawnSync } from "node:child_process";
+import { gatesInTier } from "./gates.mjs";
 
 const FULL = process.argv.includes("--full");
 
@@ -37,64 +38,33 @@ const FULL = process.argv.includes("--full");
  * first so that the common case fails in under a second rather than after
  * a four-minute build.
  */
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * ⭐⭐⭐ INFRA WAVE 12 — THIS LIST IS NO LONGER WRITTEN HERE
+ * ══════════════════════════════════════════════════════════════════════
+ * It used to be eight gates, hand-typed. There were twenty-three, and
+ * `.github/workflows/security-ci.yml` had a third list of five. The file
+ * header above says the design goal is "if the local command and the CI
+ * command are different lists, they drift" — and they had.
+ *
+ * `scripts/gates.mjs` is now the only list. Preflight reads it, CI reads
+ * it, and `check:gate-coverage` fails the build if they ever disagree
+ * again.
+ *
+ * ⚠️ THE SLOW CHECKS STAY HERE AND ARE NOT IN THE MANIFEST. `tsc`, the
+ * build and the two suites are not gates — they are the compiler and the
+ * tests, they take minutes rather than milliseconds, and CI runs each in
+ * its own job for that reason. Putting them in the manifest would make
+ * `gates:static` a five-minute command that nobody runs before a commit,
+ * which is exactly how a fast check stops being fast enough to use.
+ */
 const CHECKS = [
-  {
-    name: "server boundaries",
-    cmd: ["node", ["scripts/check-server-boundaries.mjs"]],
-    why: "a client component importing a server module, or a stripped server-only guard",
-  },
-  {
-    /**
-     * ⭐ ADDED IN v1.26.0-alpha, AND IT RUNS SECOND FOR A REASON.
-     *
-     * It is nearly free — one pass over `server/actions` — and it is the
-     * only check in this list that can find an UNAUTHENTICATED PUBLIC
-     * ENDPOINT. Everything below it is about whether the code is
-     * correct; this one is about whether it is reachable by people who
-     * should not reach it.
-     */
-    name: "action guards",
-    cmd: ["node", ["scripts/check-action-guards.mjs"]],
-    why: "a server action that does not ask who is calling it, or a write behind an identity check only",
-  },
-  {
-    name: "migration numbering",
-    cmd: ["node", ["scripts/check-migrations.mjs"]],
-    why: "duplicate or out-of-sequence SQL files",
-  },
-  {
-    name: "SQL completeness",
-    cmd: ["node", ["scripts/check-sql-completeness.mjs"]],
-    why: "a tenant table with no RLS anywhere in SQL, or a table drizzle-kit push would drop",
-  },
-  {
-    /**
-     * ⭐ ADDED IN v1.29.0-alpha, AND IT IS THE FIRST CHECK HERE THAT
-     * EXECUTES ANYTHING RATHER THAN READING IT.
-     *
-     * ⚠️ IT SKIPS WITHOUT `HARNESS_DATABASE_URL`, so it passes on a
-     * machine with no Postgres. That is deliberate and it is also the
-     * risk: a gate that skips can quietly stop running. Its skip message
-     * names exactly what went unchecked.
-     */
-    name: "SQL executes",
-    cmd: ["node", ["scripts/check-sql-executes.mjs"]],
-    why: "a query built by string concatenation that compiles and cannot run",
-  },
-  {
-    /**
-     * ⭐⭐⭐ THE ELEVENTH GATE, v1.33.0.
-     *
-     * 🔴 The scan half ALWAYS runs and can always fail: it counts write
-     * statements issued on the unscoped `db` client, every one of which
-     * raises 42501 under the database role every deployment document in
-     * this repository demands. The executing half proves the semantics
-     * against a throwaway Postgres as a non-superuser table owner.
-     */
-    name: "RLS writes",
-    cmd: ["node", ["scripts/check-rls-writes.mjs"]],
-    why: "a write the database will refuse under the role the deploy checklist demands",
-  },
+  ...gatesInTier("static").map((gate) => ({
+    name: `check:${gate.id}`,
+    cmd: ["node", [gate.script]],
+    why: gate.why,
+  })),
+
   {
     name: "typecheck",
     cmd: ["npx", ["tsc", "--noEmit"]],
@@ -111,14 +81,15 @@ const CHECKS = [
     why: "webpack boundary errors that tsc cannot see",
     skipIfFailed: "typecheck",
   },
+
   ...(FULL
     ? [
-        {
-          name: "RLS coverage",
-          cmd: ["node", ["scripts/check-rls-coverage.mjs"]],
-          why: "a tenant table with no row-level security",
+        ...gatesInTier("database").map((gate) => ({
+          name: `check:${gate.id}`,
+          cmd: ["node", [gate.script]],
+          why: gate.why,
           needsDb: true,
-        },
+        })),
         {
           name: "security tests",
           cmd: ["npx", ["vitest", "run", "--project=security"]],

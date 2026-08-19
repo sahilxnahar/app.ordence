@@ -71,6 +71,37 @@ import {
   reopenReconciliation,
 } from "@/server/banking/reconciliation-service";
 import { postBankAdjustment } from "@/server/accounting/post-sales";
+import {
+  checkAllocation,
+  allocationsForLines,
+} from "@/server/banking/allocation-service";
+import { remainingOf, residueOf } from "@/lib/banking/allocation";
+import {
+  deferBankChargeCredit,
+  itcRegisterTotals,
+  itcTotalsForPeriod,
+  markNotClaimable,
+  postIdentifiedCredit,
+  recordTaxInvoice,
+  loadDeferrals,
+  ItcDeferralRefusal,
+} from "@/server/banking/bank-charge-itc-service";
+import {
+  emptyTotalsFor,
+  ITC_STATUS_META,
+  postingRefusal as itcPostingRefusal,
+  postingStateLabel,
+  unclaimedCreditNote,
+  type ItcDeferralStatus,
+} from "@/lib/banking/bank-charge-itc";
+/**
+ * ⭐ 0112. Batch 0108 built `mapAccountsSentence` and listed this file as
+ * one of three whose refusal named the posting-accounts screen WITHOUT
+ * its address, then said plainly that `server/actions/banking.ts` belonged
+ * to another stream and it would not reach across. Both streams have
+ * landed, so the one-line change is made here.
+ */
+import { mapAccountsSentence } from "@/lib/accounting/sales-posting";
 import type { ActionResult } from "@/lib/validators/crm";
 
 const MANAGE = "settings:update" as const;
@@ -593,6 +624,19 @@ export interface LineWithProposal {
     id: string;
     documentNo: string | null;
   } | null;
+  /**
+   * ⭐ EVERY ALLOCATION ON THIS LINE — 0110. `matched` is kept as the
+   * FIRST of them so the existing screen still renders, but a line may
+   * now carry several and the list is the truth.
+   */
+  readonly allocations: ReadonlyArray<{
+    kind: string;
+    id: string;
+    documentNo: string | null;
+    allocatedMinor: bigint;
+  }>;
+  /** 🔴 SIGNED. Zero means fully explained; anything else is outstanding. */
+  readonly residueMinor: bigint;
   readonly candidatesById: Readonly<Record<string, LedgerCandidate>>;
 }
 
@@ -683,48 +727,141 @@ export async function getStatementWorkspace(input: unknown): Promise<
             ),
           );
 
-        const matchByLine = new Map<string, { kind: string; id: string }>(
-          existingMatches.map((m: Record<string, unknown>) => [
-            m.statementLineId as string,
-            { kind: m.matchedKind as string, id: m.matchedId as string },
-          ]),
-        );
+        /**
+         * ⭐⭐⭐ ALLOCATION-AWARE FROM 0110.
+         *
+         * ══════════════════════════════════════════════════════════════
+         * 🔴 A LINE NOW HAS THREE STATES, NOT TWO
+         * ══════════════════════════════════════════════════════════════
+         * Untouched, partly explained, fully explained. The old code had
+         * a `matchByLine` map of one document per line and treated any
+         * entry in it as "Matched." — which, with allocation, would put
+         * the word "Matched." on a line that is still ₹4,000 short and
+         * offer the operator no way to finish it.
+         */
+        const allocationsByLine = new Map<string, typeof existingMatches>();
+        const allocatedPerDocument = new Map<string, bigint>();
+        for (const m of existingMatches as Record<string, unknown>[]) {
+          const lineId = m.statementLineId as string;
+          const forLine = allocationsByLine.get(lineId) ?? [];
+          forLine.push(m as never);
+          allocationsByLine.set(lineId, forLine);
 
-        // ⚠️ A DOCUMENT ALREADY MATCHED TO ANOTHER LINE IS NOT OFFERED
-        // AGAIN. 0070 enforces one document per line and one line per
-        // document; offering a taken candidate would produce a
-        // constraint violation instead of a sentence.
-        const taken = new Set(
-          existingMatches.map((m: Record<string, unknown>) => m.matchedId as string),
-        );
-        const available = candidates.filter((c) => !taken.has(c.id));
+          const docId = m.matchedId as string;
+          allocatedPerDocument.set(
+            docId,
+            (allocatedPerDocument.get(docId) ?? 0n) +
+              BigInt(m.allocatedMinor as string | bigint),
+          );
+        }
+
         const byId = Object.fromEntries(candidates.map((c) => [c.id, c]));
 
+        /**
+         * ⚠️ A DOCUMENT IS OFFERED WHILE IT STILL HAS ROOM.
+         *
+         * 🔴 BEFORE 0110 A DOCUMENT WAS HIDDEN THE MOMENT IT WAS TOUCHED,
+         *    because 0070's unique index would have turned a second use
+         *    into a constraint violation rather than a sentence. Now a
+         *    ₹10,000 receipt with ₹6,000 allocated has ₹4,000 left and is
+         *    a legitimate candidate for another line — which is the whole
+         *    point of the batch. Hiding it would make N:M representable
+         *    in the database and unreachable on the screen, which is this
+         *    codebase's most-repeated defect wearing a different hat.
+         */
+        const available = candidates.filter((c) => {
+          const used = allocatedPerDocument.get(c.id) ?? 0n;
+          return (
+            remainingOf({ id: c.id, amountMinor: c.amountMinor, label: c.kind }, [
+              {
+                id: null,
+                statementLineId: "",
+                matchedKind: c.kind,
+                matchedId: c.id,
+                allocatedMinor: used,
+              },
+            ]) !== 0n
+          );
+        });
+
         const withProposals: LineWithProposal[] = lines.map((line) => {
-          const already = matchByLine.get(line.id);
+          const rows = allocationsByLine.get(line.id) ?? [];
+          const residue = residueOf(
+            { id: line.id, amountMinor: line.amountMinor, label: "line" },
+            rows.map((m: Record<string, unknown>) => ({
+              id: m.id as string,
+              statementLineId: m.statementLineId as string,
+              matchedKind: m.matchedKind as string,
+              matchedId: m.matchedId as string,
+              allocatedMinor: BigInt(m.allocatedMinor as string | bigint),
+            })),
+          );
+          const first = rows[0] as Record<string, unknown> | undefined;
+
           return {
             line,
-            proposal: already
-              ? { statementLineId: line.id, ranked: [], ambiguous: false, headline: "Matched." }
-              : proposalsFor(line, available),
-            matched: already
-              ? {
-                  kind: already.kind,
-                  id: already.id,
-                  documentNo: byId[already.id]?.documentNo ?? null,
-                }
-              : null,
+            /**
+             * ⭐ PROPOSALS KEEP COMING WHILE ANYTHING IS LEFT. A partly
+             * explained line still needs candidates, and the residue —
+             * not the line — is what they have to fit.
+             */
+            proposal:
+              residue === 0n
+                ? {
+                    statementLineId: line.id,
+                    ranked: [],
+                    ambiguous: false,
+                    headline: "Fully explained.",
+                  }
+                : rows.length === 0
+                  ? proposalsFor(line, available)
+                  : {
+                      ...proposalsFor(
+                        { ...line, amountMinor: residue },
+                        available,
+                      ),
+                      statementLineId: line.id,
+                      headline: `${
+                        residue < 0n ? -residue : residue
+                      } paise of this line is still unexplained. Anything matched to it now has to account for that remainder, not for the whole line.`,
+                    },
+            matched:
+              first === undefined
+                ? null
+                : {
+                    kind: first.matchedKind as string,
+                    id: first.matchedId as string,
+                    documentNo: byId[first.matchedId as string]?.documentNo ?? null,
+                  },
+            allocations: rows.map((m: Record<string, unknown>) => ({
+              kind: m.matchedKind as string,
+              id: m.matchedId as string,
+              documentNo: byId[m.matchedId as string]?.documentNo ?? null,
+              allocatedMinor: BigInt(m.allocatedMinor as string | bigint),
+            })),
+            residueMinor: residue,
             candidatesById: byId,
           };
         });
 
+        /**
+         * 🔴 THE ARITHMETIC SUMMARY USES RESIDUES, NOT WHOLE AMOUNTS.
+         *    A partly explained line contributes only what is left of it,
+         *    or `reconcile()` would count the allocated part twice — once
+         *    inside the matched document and once again in the "in the
+         *    bank, not in the books" total.
+         */
         const unmatchedInBank = withProposals
-          .filter((w) => w.matched === null)
-          .map((w) => w.line);
+          .filter((w) => w.residueMinor !== 0n)
+          .map((w) => ({ ...w.line, amountMinor: w.residueMinor }));
 
-        const unmatchedInLedger = available.filter(
-          (c) => !withProposals.some((w) => w.matched?.id === c.id),
-        );
+        const unmatchedInLedger = candidates
+          .map((c) => ({
+            ...c,
+            amountMinor:
+              c.amountMinor - (allocatedPerDocument.get(c.id) ?? 0n),
+          }))
+          .filter((c) => c.amountMinor !== 0n);
 
         const ledgerClosing = await ledgerBalanceAt(
           tx,
@@ -767,6 +904,24 @@ const confirmSchema = z.object({
   statementLineId: z.string().uuid(),
   matchedKind: z.enum(["customer_receipt", "vendor_payment", "journal_entry"]),
   matchedId: z.string().uuid(),
+  /**
+   * ⭐⭐ HOW MUCH OF THE LINE THIS DOCUMENT EXPLAINS — 0110.
+   *
+   * ⚠️ A SIGNED INTEGER STRING IN PAISE, NOT A NUMBER. `z.number()` on
+   * money is how a paisa gets lost above 2^53, and every other money
+   * field that crosses this boundary in Ordence is already a string.
+   *
+   * 🔴 OPTIONAL, AND OMITTING IT MEANS "ALL OF WHAT IS LEFT ON THIS
+   *    LINE" — not "all of the line". The ordinary case is one line and
+   *    one document for the whole amount, and that must stay one click;
+   *    but once part of a line is allocated, the default has to be the
+   *    remainder or the second click would over-explain it and be
+   *    refused for reasons the operator did not cause.
+   */
+  allocatedMinor: z
+    .string()
+    .regex(/^-?\d+$/, "Paise, as a whole number, positive for money in.")
+    .optional(),
   proposedScore: z.number().int().min(0).max(100).optional(),
   wasAmbiguous: z.boolean().optional(),
   note: z.string().max(1000).optional(),
@@ -781,7 +936,14 @@ const confirmSchema = z.object({
  */
 export async function confirmMatch(
   input: unknown,
-): Promise<ActionResult<{ matched: true }>> {
+): Promise<
+  ActionResult<{
+    matched: true;
+    allocatedMinor: string;
+    residueMinor: string;
+    note: string;
+  }>
+> {
   try {
     const data = confirmSchema.parse(input);
     const ctx = await requirePermission(MANAGE);
@@ -811,11 +973,64 @@ export async function confirmMatch(
           );
         }
 
+        /**
+         * ⭐⭐⭐ THE ALLOCATION — 0110.
+         *
+         * ══════════════════════════════════════════════════════════════
+         * 🔴 THE DEFAULT IS WHAT IS LEFT, NOT THE WHOLE LINE
+         * ══════════════════════════════════════════════════════════════
+         * A customer paying three invoices with one NEFT is three
+         * confirmations. The first takes the first invoice's amount and
+         * leaves a residue; if the default were the whole line, the
+         * second confirmation would try to explain money that is already
+         * accounted for and be refused for something the operator did
+         * not do.
+         */
+        const already = await allocationsForLines(tx, ctx.tenant.id, [
+          data.statementLineId,
+        ]);
+        const remaining = remainingOf(
+          {
+            id: data.statementLineId,
+            amountMinor: state.amountMinor,
+            label: "this bank line",
+          },
+          already.filter((a) => a.statementLineId === data.statementLineId),
+        );
+
+        const allocated =
+          data.allocatedMinor === undefined
+            ? remaining
+            : BigInt(data.allocatedMinor);
+
+        /**
+         * 🔴🔴 BOTH SUM BOUNDS, READ BEFORE THE WRITE, IN THE SAME
+         *    TRANSACTION AS THE WRITE.
+         *
+         * ⚠️ `ordence_guard_summed_bank_allocation` in 0110 enforces the
+         *    same rule and is not redundant: this produces a sentence
+         *    naming how much is left, and the trigger makes the rule true
+         *    for the import and the API route nobody has written yet.
+         *    Same doctrine as the reconciliation lock.
+         */
+        const fit = await checkAllocation(tx, {
+          tenantId: ctx.tenant.id,
+          statementLineId: data.statementLineId,
+          matchedKind: data.matchedKind,
+          matchedId: data.matchedId,
+          allocatedMinor: allocated,
+        });
+
+        if (fit.refusal !== null) {
+          throw new BankAccountRefusal(fit.refusal, "");
+        }
+
         await tx.insert(bankLineMatches).values({
           tenantId: ctx.tenant.id,
           statementLineId: data.statementLineId,
           matchedKind: data.matchedKind,
           matchedId: data.matchedId,
+          allocatedMinor: allocated,
           proposedScore: data.proposedScore ?? null,
           wasAmbiguous: data.wasAmbiguous ?? false,
           confirmedBy: ctx.user.id,
@@ -829,13 +1044,37 @@ export async function confirmMatch(
           newValue: {
             kind: data.matchedKind,
             id: data.matchedId,
+            allocatedMinor: allocated.toString(),
+            residueAfterMinor: fit.lineResidueAfterMinor.toString(),
             score: data.proposedScore ?? null,
             ambiguous: data.wasAmbiguous ?? false,
           },
           severity: "notice",
         });
 
-        return { matched: true as const };
+        return {
+          matched: true as const,
+          allocatedMinor: allocated.toString(),
+          residueMinor: fit.lineResidueAfterMinor.toString(),
+          /**
+           * ⭐ THE SENTENCE IS BUILT FROM THE RESIDUE, so a partial match
+           * cannot look like a whole one. "Matched." on a line that is
+           * still ₹4,000 short is the screen telling a comfortable lie.
+           */
+          /**
+           * ⭐ READS `fullyExplainedAfter` RATHER THAN COMPARING THE
+           * RESIDUE ITSELF. One predicate, one implementation — the same
+           * reason `isLockedByReconciliation` exists.
+           */
+          note:
+            fit.fullyExplainedAfter
+              ? "Matched. This line is now fully explained."
+              : `Matched in part. ${
+                  fit.lineResidueAfterMinor < 0n
+                    ? -fit.lineResidueAfterMinor
+                    : fit.lineResidueAfterMinor
+                } paise of this line is still unexplained and stays on the reconciliation as an outstanding item until something accounts for it.`,
+        };
       },
       { impersonationId: ctx.impersonationId },
     );
@@ -858,10 +1097,29 @@ export async function confirmMatch(
  */
 export async function unmatch(
   input: unknown,
-): Promise<ActionResult<{ unmatched: true }>> {
+): Promise<ActionResult<{ unmatched: true; residueMinor: string; note: string }>> {
   try {
-    const { statementLineId } = z
-      .object({ statementLineId: z.string().uuid() })
+    /**
+     * ⭐⭐ ONE ALLOCATION, OR THE WHOLE LINE — 0110.
+     *
+     * ⚠️ BEFORE ALLOCATION, "unmatch this line" HAD ONE MEANING. Now a
+     * line can carry three allocations and the operator usually wants to
+     * remove the one that is wrong, not all three. Omitting the document
+     * still clears the line, because "start this line again" is a real
+     * request and making it three clicks would invite the wrong one.
+     */
+    const { statementLineId, matchedKind, matchedId } = z
+      .object({
+        statementLineId: z.string().uuid(),
+        matchedKind: z
+          .enum(["customer_receipt", "vendor_payment", "journal_entry"])
+          .optional(),
+        matchedId: z.string().uuid().optional(),
+      })
+      .refine(
+        (v) => (v.matchedKind === undefined) === (v.matchedId === undefined),
+        "Name both the kind and the id of the document to unmatch, or neither to clear the line.",
+      )
       .parse(input);
     const ctx = await requirePermission(MANAGE);
 
@@ -903,21 +1161,57 @@ export async function unmatch(
         await tx
           .delete(bankLineMatches)
           .where(
-            and(
-              eq(bankLineMatches.tenantId, ctx.tenant.id),
-              eq(bankLineMatches.statementLineId, statementLineId),
-            ),
+            matchedId === undefined || matchedKind === undefined
+              ? and(
+                  eq(bankLineMatches.tenantId, ctx.tenant.id),
+                  eq(bankLineMatches.statementLineId, statementLineId),
+                )
+              : and(
+                  eq(bankLineMatches.tenantId, ctx.tenant.id),
+                  eq(bankLineMatches.statementLineId, statementLineId),
+                  eq(bankLineMatches.matchedKind, matchedKind),
+                  eq(bankLineMatches.matchedId, matchedId),
+                ),
           );
+
+        /**
+         * ⭐ THE RESIDUE AFTER THE REMOVAL, READ AND REPORTED. Removing
+         * one of three allocations leaves the line partly explained, and
+         * an operator told only "Unmatched." would reasonably think the
+         * line was clear.
+         */
+        const left = await allocationsForLines(tx, ctx.tenant.id, [statementLineId]);
+        const residue = residueOf(
+          {
+            id: statementLineId,
+            amountMinor: state.amountMinor,
+            label: "this bank line",
+          },
+          left,
+        );
 
         await writeAudit(ctx, {
           action: "delete",
           resourceType: "bank_line_match",
           resourceId: statementLineId,
-          newValue: { unmatched: true },
+          newValue: {
+            unmatched: true,
+            document: matchedId ?? "all",
+            residueMinor: residue.toString(),
+          },
           severity: "notice",
         });
 
-        return { unmatched: true as const };
+        return {
+          unmatched: true as const,
+          residueMinor: residue.toString(),
+          note:
+            left.length === 0
+              ? "Unmatched. This line is outstanding again in full."
+              : `Unmatched. ${left.length} allocation${left.length === 1 ? "" : "s"} remain on this line and ${
+                  residue < 0n ? -residue : residue
+                } paise of it is unexplained.`,
+        };
       },
       { impersonationId: ctx.impersonationId },
     );
@@ -958,6 +1252,19 @@ export interface ReconciliationStatementView {
   readonly brs: Brs;
   /** ⭐ Ordered, signed lines. The renderer must not decide the order. */
   readonly printable: readonly BrsPrintLine[];
+  /**
+   * ⭐⭐ THE UNCLAIMED INPUT CREDIT ON THIS PERIOD'S BANK CHARGES — 0110.
+   *
+   * 🔴 ON THE RECONCILIATION SCREEN AND NOT ONLY ON ITS OWN REGISTER.
+   *    A worklist somebody has to remember to open is a worklist that is
+   *    not read. The reconciliation screen is where bank charges are
+   *    discovered and written up, so it is where the consequence of
+   *    writing them up gross belongs.
+   *
+   * ⚠️ NULL WHEN NOTHING IS AWAITING AN INVOICE. An always-present line
+   *    reading "0 charges" trains the eye to skip it.
+   */
+  readonly unclaimedCreditNote: string | null;
   readonly history: ReadonlyArray<{
     id: string;
     reconciledTo: string;
@@ -1022,6 +1329,18 @@ export async function getReconciliationStatement(
             reconciledTo: view.reconciledTo,
             brs: view.brs,
             printable: printableBrs(view.brs),
+            /**
+             * ⚠️ THE PERIOD IS THE STATEMENT'S OWN CLOSING MONTH, taken
+             * from `periodTo` and never from today. A March statement
+             * opened in June must show March's unclaimed credit.
+             */
+            unclaimedCreditNote: unclaimedCreditNote(
+              (await itcTotalsForPeriod(
+                tx,
+                ctx.tenant.id,
+                view.periodTo.slice(0, 7),
+              )) ?? emptyTotalsFor(view.periodTo.slice(0, 7)),
+            ),
             history: history.map((h: Record<string, unknown>) => ({
               id: h.id as string,
               reconciledTo: String(h.reconciledTo),
@@ -1499,7 +1818,7 @@ export async function postBankLineAdjustment(
            */
           const explanation =
             outcome.reason === "unmapped_roles"
-              ? `Your chart of accounts has no ledger mapped for: ${outcome.missing.join(", ")}. Map them on the posting accounts screen — guessing which of your accounts is "bank charges" would post a real expense to an account nobody chose.`
+              ? `Your chart of accounts has no ledger mapped for: ${outcome.missing.join(", ")}. ${mapAccountsSentence("sales")} Guessing which of your accounts is "bank charges" would post a real expense to an account nobody chose.`
               : outcome.reason === "period_closed"
                 ? `${outcome.period} is closed, and this charge is dated ${state.valueDate}, which falls inside it. Reopen that period deliberately if the charge genuinely belongs there. Do not date it into an open month: it would then be missing from the month it happened in, which is the month whose reconciliation found it.`
                 : outcome.reason === "already_posted"
@@ -1521,12 +1840,53 @@ export async function postBankLineAdjustment(
           statementLineId: data.statementLineId,
           matchedKind: "journal_entry",
           matchedId: outcome.transactionId,
+          /**
+           * 🔴 THE WHOLE LINE, ALWAYS — 0110. The journal was built FROM
+           * this line for this line's amount, so a partial allocation
+           * here would leave a residue on the BRS that no document can
+           * ever close: a journal cannot be topped up, only reversed.
+           * `journalAllocationRefusal` says the same thing on the way in
+           * and the 0110 trigger says it in the database.
+           */
+          allocatedMinor: state.amountMinor,
           // ⚠️ NO SCORE. Nothing was proposed; this line was explained.
           proposedScore: null,
           wasAmbiguous: false,
           confirmedBy: ctx.user.id,
           note: data.note ?? null,
         });
+
+        /**
+         * ⭐⭐⭐ THE DEFERRED INPUT CREDIT — 0110.
+         *
+         * ══════════════════════════════════════════════════════════════
+         * 🔴 0102 POSTED THE GROSS AND SAID "CLAIM THE CREDIT BY HAND"
+         * ══════════════════════════════════════════════════════════════
+         * Nothing recorded that it was owed and nothing ever asked, so
+         * the credit on every bank charge went silently unclaimed.
+         *
+         * ⚠️ THE POSTING STAYS GROSS AND THAT IS CORRECT. Gross is what
+         * left the account, and s.16(2)(a) CGST Act gives no credit
+         * without the tax invoice in hand — which arrives separately,
+         * usually consolidated for the month. What changes is that the
+         * unclaimed credit is now a ROW with a period and a state
+         * instead of a sentence in a help string.
+         *
+         * 🔴 IN THIS TRANSACTION, NOT AFTER IT. A charge posted without
+         * its deferral is a credit nobody will ever be told about, which
+         * is the exact defect being fixed.
+         */
+        const deferral =
+          data.kind === "bank_charge"
+            ? await deferBankChargeCredit(tx, {
+                tenantId: ctx.tenant.id,
+                bankAccountId: state.bankAccountId,
+                statementLineId: data.statementLineId,
+                transactionId: outcome.transactionId,
+                grossMinor: magnitude,
+                valueDate: state.valueDate,
+              })
+            : null;
 
         await writeAudit(ctx, {
           action: "create",
@@ -1537,13 +1897,18 @@ export async function postBankLineAdjustment(
             amountMinor: magnitude.toString(),
             valueDate: state.valueDate,
             transactionId: outcome.transactionId,
+            itcDeferralId: deferral?.deferralId ?? null,
           },
           severity: "notice",
         });
 
         return {
           transactionId: outcome.transactionId,
-          note: `Posted and matched. The ${data.kind === "bank_charge" ? "charge" : "interest"} is dated ${state.valueDate}, the day the bank has it, and it is now off the outstanding list.`,
+          note:
+            `Posted and matched. The ${data.kind === "bank_charge" ? "charge" : "interest"} is dated ${state.valueDate}, the day the bank has it, and it is now off the outstanding list.` +
+            (deferral === null
+              ? ""
+              : ` The input credit on it is recorded as unclaimed for ${deferral.taxPeriod}: the statement line is one gross figure with no rate, no invoice number and no GSTIN, so the credit cannot be worked out from it. Record the bank's tax invoice on the input credit register to claim it.`),
         };
       },
       { impersonationId: ctx.impersonationId },
@@ -1557,6 +1922,411 @@ export async function postBankLineAdjustment(
       return { ok: false, error: `${err.message} ${err.remedy}`.trim() };
     }
     return toSalesActionError(err, "postBankLineAdjustment");
+  }
+}
+
+/* ================================================================== */
+/* ⭐⭐⭐ THE INPUT CREDIT REGISTER FOR BANK CHARGES — 0110              */
+/* ================================================================== */
+
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 F2: "THE ITC ON EVERY BANK CHARGE IS SILENTLY UNCLAIMED"
+ * ══════════════════════════════════════════════════════════════════════
+ * 0102 posts the gross charge and its role help says to claim the credit
+ * from the bank's own tax invoice by hand. Nothing recorded that it was
+ * owed, nothing totalled it and nothing ever asked.
+ *
+ * ⭐⭐ THE DECISION, ARGUED IN FULL IN `lib/banking/bank-charge-itc.ts`:
+ * the rate is NEVER derived from the amount, NEVER read from a
+ * configured default, and NEVER typed at write-up time. It is
+ * transcribed from the bank's invoice, later, and must foot to the money
+ * that actually left the account.
+ *
+ * 🔴 THE THREE STATUTES THAT DECIDE IT:
+ *   • s.16(2)(a) CGST Act — credit needs the tax invoice IN HAND.
+ *   • s.16(2)(aa) with Rule 36(4) — and it must have reached GSTR-2B,
+ *     which a figure with no supplier invoice number never can.
+ *   • s.12(12) IGST Act — place of supply for banking services is the
+ *     recipient's location on the bank's records, so a charge may be
+ *     IGST rather than CGST+SGST and a computed split would file it in
+ *     the wrong box of the wrong return.
+ */
+
+export interface ItcRegisterView {
+  readonly periods: ReadonlyArray<{
+    taxPeriod: string;
+    chargeCount: number;
+    grossMinor: string;
+    awaitingInvoiceGrossMinor: string;
+    awaitingInvoiceCount: number;
+    identifiedCreditMinor: string;
+    identifiedCount: number;
+    notClaimableGrossMinor: string;
+    notClaimableCount: number;
+    /**
+     * ⭐⭐ 0112. THE SPLIT INSIDE `identified`. Before this, "identified"
+     * and "in the books" were the same number on this screen, and one of
+     * them was a job nobody knew was outstanding.
+     */
+    postedCreditMinor: string;
+    postedCount: number;
+    unpostedCreditMinor: string;
+    unpostedCount: number;
+    /** ⭐ Built from the totals, next to them, so the two cannot drift. */
+    note: string | null;
+  }>;
+  readonly charges: ReadonlyArray<{
+    id: string;
+    valueDate: string;
+    taxPeriod: string;
+    grossMinor: string;
+    status: ItcDeferralStatus;
+    statusLabel: string;
+    statusHelp: string;
+    creditMinor: string;
+    invoiceNo: string | null;
+    /** ⭐ 0112. NULL means identified and still inside Bank Charges. */
+    creditPostedAt: string | null;
+    creditTransactionId: string | null;
+    /**
+     * ⭐ The sentence, computed server-side from the same pure function
+     * the refusal uses, so the label and the button cannot disagree.
+     */
+    postingLabel: string;
+    /** ⚠️ NULL means the button is enabled. A sentence means it is not. */
+    postingRefusal: string | null;
+  }>;
+}
+
+/**
+ * ⭐⭐⭐ THE REGISTER. `status` DECIDES WHICH TOTAL EACH ROW LANDS IN,
+ * and the three totals are three different instructions to the person
+ * reading them: chase the bank, claim this, or nothing to do and here is
+ * why. That is the read that makes the column mean something.
+ */
+export async function getBankChargeItcRegister(): Promise<
+  ActionResult<ItcRegisterView>
+> {
+  try {
+    const ctx = await requirePermission(MANAGE);
+
+    return await withTenant(
+      ctx.tenant.id,
+      async (tx) => {
+        const periods = await itcRegisterTotals(tx, ctx.tenant.id);
+        const charges = await loadDeferrals(tx, ctx.tenant.id);
+
+        return {
+          ok: true as const,
+          data: {
+            periods: periods.map((p) => ({
+              taxPeriod: p.taxPeriod,
+              chargeCount: p.chargeCount,
+              grossMinor: p.grossMinor.toString(),
+              awaitingInvoiceGrossMinor: p.awaitingInvoiceGrossMinor.toString(),
+              awaitingInvoiceCount: p.awaitingInvoiceCount,
+              identifiedCreditMinor: p.identifiedCreditMinor.toString(),
+              identifiedCount: p.identifiedCount,
+              notClaimableGrossMinor: p.notClaimableGrossMinor.toString(),
+              notClaimableCount: p.notClaimableCount,
+              postedCreditMinor: p.postedCreditMinor.toString(),
+              postedCount: p.postedCount,
+              unpostedCreditMinor: p.unpostedCreditMinor.toString(),
+              unpostedCount: p.unpostedCount,
+              note: unclaimedCreditNote(p),
+            })),
+            charges: charges.map((c) => ({
+              id: c.id,
+              valueDate: c.valueDate,
+              taxPeriod: c.taxPeriod,
+              grossMinor: c.grossMinor.toString(),
+              status: c.status,
+              statusLabel: ITC_STATUS_META[c.status].label,
+              statusHelp: ITC_STATUS_META[c.status].help,
+              creditMinor: c.creditMinor.toString(),
+              invoiceNo: c.invoiceNo,
+              creditPostedAt: c.creditPostedAt,
+              creditTransactionId: c.creditTransactionId,
+              postingLabel: postingStateLabel(c),
+              postingRefusal: itcPostingRefusal(c),
+            })),
+          },
+        };
+      },
+      { impersonationId: ctx.impersonationId },
+    );
+  } catch (err) {
+    return toSalesActionError(err, "getBankChargeItcRegister");
+  }
+}
+
+/**
+ * ⚠️ EVERY FIGURE IS A PAISE STRING, NOT A NUMBER. `z.number()` on money
+ * loses a paisa above 2^53 and every other money field crossing this
+ * boundary in Ordence is already a string.
+ */
+const taxInvoiceSchema = z.object({
+  deferralId: z.string().uuid(),
+  invoiceNo: z.string().trim().min(1).max(100),
+  invoiceDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+  supplierGstin: z.string().trim().length(15),
+  taxableValueMinor: z.string().regex(/^\d+$/),
+  cgstMinor: z.string().regex(/^\d+$/),
+  sgstMinor: z.string().regex(/^\d+$/),
+  igstMinor: z.string().regex(/^\d+$/),
+  cessMinor: z.string().regex(/^\d+$/),
+});
+
+/**
+ * ⭐⭐ TRANSCRIBE THE BANK'S TAX INVOICE ONTO ONE CHARGE.
+ *
+ * 🔴 THE GROSS IS READ FROM THE STORED ROW AND NEVER TAKEN FROM THIS
+ *    FORM. A form supplying both the gross and the split can be made to
+ *    foot against itself, and a check that always passes is not a check.
+ *
+ * ⚠️ THE REFUSAL IS THE FEATURE. `taxable + CGST + SGST + IGST + cess`
+ *    must equal the paise that actually left the account. An assumed 18%
+ *    on a charge that was partly exempt does not foot, and this is where
+ *    it is stopped.
+ */
+export async function recordBankChargeTaxInvoice(
+  input: unknown,
+): Promise<ActionResult<{ creditMinor: string; note: string }>> {
+  try {
+    const data = taxInvoiceSchema.parse(input);
+    const ctx = await requirePermission(MANAGE);
+
+    const result = await withTenant(
+      ctx.tenant.id,
+      async (tx) => {
+        const outcome = await recordTaxInvoice(tx, {
+          tenantId: ctx.tenant.id,
+          userId: ctx.user.id,
+          deferralId: data.deferralId,
+          invoice: {
+            invoiceNo: data.invoiceNo,
+            invoiceDate: data.invoiceDate,
+            supplierGstin: data.supplierGstin,
+            taxableValueMinor: BigInt(data.taxableValueMinor),
+            cgstMinor: BigInt(data.cgstMinor),
+            sgstMinor: BigInt(data.sgstMinor),
+            igstMinor: BigInt(data.igstMinor),
+            cessMinor: BigInt(data.cessMinor),
+          },
+        });
+
+        await writeAudit(ctx, {
+          action: "update",
+          resourceType: "bank_charge_itc_deferral",
+          resourceId: data.deferralId,
+          newValue: {
+            invoiceNo: data.invoiceNo,
+            supplierGstin: data.supplierGstin,
+            creditMinor: outcome.creditMinor.toString(),
+          },
+          severity: "notice",
+        });
+
+        return outcome;
+      },
+      { impersonationId: ctx.impersonationId },
+    );
+
+    revalidatePath("/banking");
+    revalidatePath("/banking/input-credit");
+    return {
+      ok: true,
+      data: {
+        creditMinor: result.creditMinor.toString(),
+        /**
+         * ⚠️ THIS SENTENCE CHANGED IN 0112 AND THE OLD ONE IS WORTH
+         * KEEPING IN VIEW. It read: "The journal that moves it out of
+         * Bank Charges into input credit is a separate posting and has
+         * not been made by this screen." That was true and honest, and
+         * it described a job the product could not do. It can now, so
+         * the sentence says where the button is instead of apologising.
+         */
+        note: `Recorded. ${result.creditMinor} paise of input credit on this charge is now identified against invoice ${data.invoiceNo}, in ${result.taxPeriod}. It is not in the ledger yet — post it from the register to move it out of Bank Charges and into the input credit heads.`,
+      },
+    };
+  } catch (err) {
+    if (err instanceof ItcDeferralRefusal) {
+      return { ok: false, error: err.message };
+    }
+    return toSalesActionError(err, "recordBankChargeTaxInvoice");
+  }
+}
+
+/**
+ * ⭐⭐⭐ POST THE IDENTIFIED CREDIT — 0112.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 THE BUTTON THAT DID NOT EXIST, AND THE SENTENCE THAT SAID SO
+ * ══════════════════════════════════════════════════════════════════════
+ * Until this shipped, the screen told the operator in as many words that
+ * the journal "is a separate posting and has not been made by this
+ * screen", and there was no screen that made it. `invoice_recorded` was a
+ * worklist state, and the credit stayed inside Bank Charges in the trial
+ * balance while the register showed it as identified.
+ *
+ * ⚠️ IT IS A SEPARATE ACT FROM RECORDING THE INVOICE, DELIBERATELY.
+ * Merging the two would post a journal as a side effect of transcription,
+ * and transcription is exactly where the typo happens. `0110`'s footing
+ * CHECK catches a split that does not add up; it cannot catch a correct
+ * split entered against the wrong charge. A second, explicit act gives
+ * the person one look at a figure before it is in the books, and once it
+ * is, `ordence_guard_posted_itc_deferral` refuses to let it move.
+ *
+ * ⭐ `MANAGE` AND NOT A NEW PERMISSION. Recording the invoice already
+ * needs it and already decides the figure; the posting adds no judgement
+ * the recorder did not already make, and inventing a key would suggest
+ * this step involves a decision it does not.
+ */
+export async function postBankChargeInputCredit(
+  input: unknown,
+): Promise<ActionResult<{ note: string; transactionId: string }>> {
+  try {
+    const data = z.object({ deferralId: z.string().uuid() }).parse(input);
+    const ctx = await requirePermission(MANAGE);
+
+    const result = await withTenant(
+      ctx.tenant.id,
+      async (tx) => {
+        const outcome = await postIdentifiedCredit(tx, {
+          tenantId: ctx.tenant.id,
+          userId: ctx.user.id,
+          deferralId: data.deferralId,
+        });
+
+        /**
+         * ⚠️ AUDITED ONLY WHEN IT ACTUALLY POSTED. An audit row for a
+         * refused attempt would read, six months later, as though the
+         * credit had been taken.
+         */
+        if (outcome.posted) {
+          await writeAudit(ctx, {
+            action: "update",
+            resourceType: "bank_charge_itc_deferral",
+            resourceId: data.deferralId,
+            newValue: {
+              creditTransactionId: outcome.transactionId,
+              creditMinor: outcome.creditMinor.toString(),
+              taxPeriod: outcome.taxPeriod,
+            },
+            severity: "notice",
+          });
+        }
+
+        return outcome;
+      },
+      { impersonationId: ctx.impersonationId },
+    );
+
+    if (!result.posted) {
+      /**
+       * 🔴 EACH REFUSAL NAMES ITS OWN REMEDY. "Could not post" with no
+       * reason is the shape that makes an operator try the same button
+       * four times and then stop using the screen.
+       */
+      if (result.reason === "period_closed") {
+        return {
+          ok: false,
+          error: `The bank's invoice is dated inside ${result.period}, and that period is closed. The credit belongs in the period the invoice was issued in — dating it forward would claim it in a return the taxpayer was not entitled to claim it in. Reopen ${result.period}, post, and close it again.`,
+        };
+      }
+      if (result.reason === "unmapped_roles") {
+        return {
+          ok: false,
+          error: `This posting needs ledgers mapped for ${result.missing.join(", ")} and they are not. ${mapAccountsSentence("purchase")}`,
+        };
+      }
+      return {
+        ok: false,
+        error:
+          "A journal already exists under this charge's posting key, but the register does not have it recorded. That is the two halves having come apart, which should not be possible — do not retry. The transaction is in the ledger; the register row needs its reference restored by hand.",
+      };
+    }
+
+    revalidatePath("/banking");
+    revalidatePath("/banking/input-credit");
+    return {
+      ok: true,
+      data: {
+        transactionId: result.transactionId,
+        note: `Posted. ${result.creditMinor} paise moved out of Bank Charges and into the input credit heads, dated on the bank's invoice, in ${result.taxPeriod}.`,
+      },
+    };
+  } catch (err) {
+    if (err instanceof ItcDeferralRefusal) {
+      return { ok: false, error: err.message };
+    }
+    return toSalesActionError(err, "postBankChargeInputCredit");
+  }
+}
+
+/**
+ * ⭐ THE OTHER WAY OUT, AND IT NEEDS A REASON.
+ *
+ * ⚠️ A charge that will never carry a claimable credit has to leave the
+ * "chase the bank" list or the list stops being read. It must not leave
+ * silently: an exempt supply and a credit blocked by s.17(5) are
+ * different facts, and both differ from an oversight.
+ */
+export async function markBankChargeNotClaimable(
+  input: unknown,
+): Promise<ActionResult<{ note: string }>> {
+  try {
+    const data = z
+      .object({
+        deferralId: z.string().uuid(),
+        reason: z
+          .string()
+          .trim()
+          .min(
+            15,
+            "Say why this credit will not be taken. An exempt supply and a credit blocked under s.17(5) are different facts, and a blank reason is indistinguishable from having forgotten.",
+          )
+          .max(2000),
+      })
+      .parse(input);
+    const ctx = await requirePermission(MANAGE);
+
+    const result = await withTenant(
+      ctx.tenant.id,
+      async (tx) => {
+        const outcome = await markNotClaimable(tx, {
+          tenantId: ctx.tenant.id,
+          userId: ctx.user.id,
+          deferralId: data.deferralId,
+          reason: data.reason,
+        });
+
+        await writeAudit(ctx, {
+          action: "update",
+          resourceType: "bank_charge_itc_deferral",
+          resourceId: data.deferralId,
+          newValue: { status: "not_claimable", reason: data.reason },
+          severity: "notice",
+        });
+
+        return outcome;
+      },
+      { impersonationId: ctx.impersonationId },
+    );
+
+    revalidatePath("/banking/input-credit");
+    return {
+      ok: true,
+      data: {
+        note: `Recorded as not claimable for ${result.taxPeriod}, with your reason. It stays on the register — a credit deliberately given up and one nobody noticed look identical on a total, and only one of them is a decision.`,
+      },
+    };
+  } catch (err) {
+    if (err instanceof ItcDeferralRefusal) {
+      return { ok: false, error: err.message };
+    }
+    return toSalesActionError(err, "markBankChargeNotClaimable");
   }
 }
 

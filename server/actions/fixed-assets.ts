@@ -66,7 +66,7 @@ import {
   type ScheduleIIClass,
   type ShiftUsage,
 } from "@/lib/fixed-assets/depreciation";
-import { FIXED_ASSET_ROLE_META } from "@/lib/accounting/sales-posting";
+import { FIXED_ASSET_ROLE_META, mapAccountsSentence } from "@/lib/accounting/sales-posting";
 import { formatIso, fyEndFor, fyStartFor } from "@/lib/accounting/periods";
 import type { ActionResult } from "@/lib/validators/crm";
 
@@ -643,7 +643,20 @@ export async function postDepreciation(input: unknown): Promise<ActionResult<{ n
                   (r) =>
                     FIXED_ASSET_ROLE_META[r as keyof typeof FIXED_ASSET_ROLE_META]?.label ?? r,
                 )
-                .join(", ")}. Nothing has been posted — a journal missing a leg does not balance.`,
+                .join(", ")}. Nothing has been posted — a journal missing a leg does not balance. ` +
+              /**
+               * ⭐ AND NOW IT SAYS WHERE. Batch 0108.
+               *
+               * 🔴 THIS MESSAGE NAMED THE PROBLEM PERFECTLY AND SENT THE
+               * READER NOWHERE — and until this batch there was nowhere to
+               * send them: `depreciation_expense` and the other five
+               * fixed-asset roles were absent from the posting-accounts
+               * screen's list AND refused by `setSalesPostingAccount`'s
+               * validator. 0100 shipped a depreciation engine no navigation
+               * reached for four batches; this was the same defect one
+               * level down, and it outlived the fix to the first one.
+               */
+              mapAccountsSentence("fixed_assets"),
           };
         }
         if (posted.reason === "period_closed") {

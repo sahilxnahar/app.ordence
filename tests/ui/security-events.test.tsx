@@ -343,34 +343,95 @@ describe("anomaly rules — off-hours bulk export", () => {
     expect(istHour(new Date("2026-07-31T06:00:00Z"))).toBe(11);
   });
 
-  it("fires only when the export is BOTH large and off-hours", () => {
-    const offHoursSmall = observation({
+  /**
+   * ══════════════════════════════════════════════════════════════════
+   * 🔴 WAVE 9 — THIS TEST USED TO PASS AND THE RULE WAS DEAD
+   * ══════════════════════════════════════════════════════════════════
+   * The previous version built an observation with
+   * `eventType: "export.bulk"` and `occurrenceCount: 500` and asserted a
+   * finding. Both halves were wrong in a way the test could not see:
+   *
+   *   • NOTHING IN THE PRODUCT EVER EMITTED AN `export.*` EVENT, so the
+   *     rule examined zero rows on every real sweep. The test
+   *     manufactured the one input that made it look alive.
+   *
+   *   • `occurrenceCount` IS THE RECORDER'S COALESCING COUNTER, not a
+   *     record count. Setting it to 500 in a fixture is trivial; getting
+   *     it to 500 in production would have required five hundred exports
+   *     inside a ten-second window, while ONE export of fifty thousand
+   *     rows would have scored 1 and never fired.
+   *
+   * The size threshold now lives at the emitter
+   * (`server/export/log.ts`, via `lib/security/hours.ts`), where the real
+   * row count is in hand. An `export.bulk` event means "this export was
+   * large" as a fact rather than as an inference, and this rule's only
+   * remaining job is to correlate that fact with the clock.
+   */
+  it("fires on a bulk export that landed out of hours", () => {
+    const now = new Date("2026-07-31T22:00:00Z").getTime();
+
+    const offHours = observation({
       eventType: "export.bulk",
-      occurrenceCount: 10,
+      // ⚠️ ONE export, not five hundred. The old rule could not have fired
+      // on this and it is the exact case that matters most.
+      occurrenceCount: 1,
       occurredAt: new Date("2026-07-31T20:00:00Z"),
     });
-    const workingHoursLarge = observation({
+
+    const findings = detectOffHoursBulkExport([offHours], now);
+    expect(findings).toHaveLength(1);
+    expect(findings[0]!.ruleId).toBe("export.off_hours_bulk");
+  });
+
+  it("does not fire on a bulk export during working hours", () => {
+    const now = new Date("2026-07-31T22:00:00Z").getTime();
+    const working = observation({
       eventType: "export.bulk",
       occurrenceCount: 5_000,
       occurredAt: new Date("2026-07-31T06:00:00Z"),
     });
+    expect(detectOffHoursBulkExport([working], now)).toHaveLength(0);
+  });
 
+  /**
+   * ⚠️ `export.off_hours` IS EMITTED FOR EVERY OUT-OF-HOURS EXPORT
+   * INCLUDING SMALL ONES, and this rule must ignore it. Correlating on
+   * both types would report the same export twice — once as itself and
+   * once as its own corroboration — and inflate a two-row incident into
+   * a four-row one.
+   */
+  it("ignores the off-hours event itself, so one export is not counted twice", () => {
     const now = new Date("2026-07-31T22:00:00Z").getTime();
-    expect(detectOffHoursBulkExport([offHoursSmall, workingHoursLarge], now)).toHaveLength(0);
-
-    const both = observation({
-      eventType: "export.bulk",
-      occurrenceCount: ANOMALY_THRESHOLDS.bulkExportRecords,
+    const marker = observation({
+      eventType: "export.off_hours",
+      occurrenceCount: 1,
       occurredAt: new Date("2026-07-31T20:00:00Z"),
     });
-    const findings = detectOffHoursBulkExport([both], now);
-    expect(findings).toHaveLength(1);
+    expect(detectOffHoursBulkExport([marker], now)).toHaveLength(0);
+  });
 
-    // ⚠️ NOTICE, never critical. This rule describes a PERSON, and "employee
-    // downloaded the client list at 2am" is also a perfectly normal thing for
-    // an operations lead in another timezone to do. It prompts a question; it
-    // does not deliver a verdict, and it never triggers an automatic block.
-    expect(findings[0]!.severity).toBe("notice");
+  /**
+   * ⚠️ `warning`, AND IT ALWAYS WAS. The rule declared `notice` and
+   * explained at length why it must never be more. `resolveSeverity`
+   * takes the HIGHER of the finding's value and the event type's default,
+   * and both `anomaly.detected` and `export.off_hours` default to
+   * `warning` — so the declared `notice` had never once reached the
+   * database. A caller may escalate and may not demote; that rule is
+   * correct. The comment claiming otherwise was the false part.
+   */
+  it("carries the severity that will actually be written", () => {
+    const now = new Date("2026-07-31T22:00:00Z").getTime();
+    const findings = detectOffHoursBulkExport(
+      [
+        observation({
+          eventType: "export.bulk",
+          occurredAt: new Date("2026-07-31T20:00:00Z"),
+        }),
+      ],
+      now,
+    );
+    expect(findings[0]!.severity).toBe("warning");
+    expect(resolveSeverity("export.off_hours", findings[0]!.severity)).toBe("warning");
   });
 });
 

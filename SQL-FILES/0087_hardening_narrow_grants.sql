@@ -279,7 +279,43 @@ BEGIN
     GRANT EXECUTE ON FUNCTION dynamic_ddl_name(text, text, text)                TO ordence_app;
     GRANT EXECUTE ON FUNCTION dynamic_is_reserved_word(text)                    TO ordence_app;
     GRANT EXECUTE ON FUNCTION dynamic_pg_type(text)                             TO ordence_app;
-    GRANT EXECUTE ON FUNCTION prune_security_events(integer, boolean)           TO ordence_app;
+    -- ------------------------------------------------------------------
+    -- 🔴 prune_security_events(integer, boolean) IS DELIBERATELY ABSENT
+    -- ------------------------------------------------------------------
+    -- This line used to read:
+    --
+    --     GRANT EXECUTE ON FUNCTION prune_security_events(integer, boolean) TO ordence_app;
+    --
+    -- It was wrong, and it was wrong for four waves. The method above,
+    -- "signatures copied verbatim from the modules that GRANT them", is
+    -- correct for the twenty-nine other entries on this list, because
+    -- their modules grant them to ordence_app. 0012_phase20_secops.sql
+    -- grants THIS one to ordence_maintenance, directly under a comment
+    -- that says the web application must never hold it:
+    --
+    --     -- Explicitly NOT granted: EXECUTE on prune_security_events().
+    --     -- The web application must not be able to delete security
+    --     -- history under any circumstances, including via a function
+    --     -- that is allowed to.
+    --
+    -- The signature was copied; the role was not read. The function is
+    -- SECURITY DEFINER and is the one sanctioned way past the
+    -- append-only trigger, so EXECUTE on it defeats the append-only
+    -- table privileges granted eighty lines above, entirely.
+    --
+    -- The REVOKE at the top of this block already removes it from
+    -- ordence_app on any database that ran the old version of this file,
+    -- but that only holds for a database that re-runs 0087. For a
+    -- database that ran 0087 once and moved on,
+    -- 0121_revoke_prune_from_app_role.sql is the repair.
+    --
+    -- The permanent control is `npm run check:sealed-grants` (gate 25),
+    -- which fails the build if this line , or anything like it , comes
+    -- back in any .sql file in the repository.
+    --
+    -- ordence_maintenance's grant from 0012 survives: the REVOKE above
+    -- names PUBLIC and ordence_app only.
+    -- ------------------------------------------------------------------
 
   END IF;
 END

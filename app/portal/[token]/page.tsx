@@ -52,6 +52,7 @@ import {
   portalSourceRateLimitKey,
 } from "@/lib/security/rate-limit";
 import { recordSecurityEvent } from "@/server/security/record";
+import { portalTokenRef } from "@/lib/portal/tokens";
 
 // Never statically rendered or cached. A cached portal page would serve
 // one client's contract to whoever asked next, and a revoked link would
@@ -131,10 +132,16 @@ export default async function PortalPage({
       source: "portal",
       ipAddress: visitorFacts.ipAddress,
       subjectType: "portal_token_ref",
-      // ⚠️ PREFIX ONLY, NEVER THE TOKEN. This row is readable by support
-      // staff and exportable to a SIEM; a full token in it would be a
-      // live credential sitting in a log aggregator.
-      subjectId: token.slice(0, 8),
+      // ⚠️ THE HASH REFERENCE, NEVER THE TOKEN. This row is readable by
+      // support staff and exportable to a SIEM; a full token in it would
+      // be a live credential sitting in a log aggregator.
+      //
+      // ⭐ WAVE 9 — this was `token.slice(0, 8)`, which is a fragment of
+      // the live credential AND a different grouping key from the one
+      // `detectPortalTokenSharing` needs. `portalTokenRef` is the one
+      // function both sides now use, so a token cannot appear in this
+      // table under two identities and split its own sharing count.
+      subjectId: portalTokenRef(token),
       detail: { policy: "portal", scope: byToken.allowed ? "source" : "token" },
       reason: "Portal rate limit exceeded.",
     });

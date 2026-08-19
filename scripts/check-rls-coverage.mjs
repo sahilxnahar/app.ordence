@@ -74,8 +74,13 @@ const NOT_TENANT_SCOPED = new Set(["tenants", "plans"]);
  * write platform evidence silently (a worker, a cron, a forgotten
  * `withTenant`).
  *
- * The read boundary is UNTOUCHED: every table here still has a USING
- * clause that denies cross-tenant reads. This list only permits the
+ * The read boundary is checked SEPARATELY, by PLATFORM_READ_REFUSED
+ * below. This paragraph used to assert that every table here still had
+ * a USING clause denying cross-tenant reads. That was false for three of
+ * them and had been since 0079, and the old read test could not have
+ * caught it: it asked whether the USING clause still mentioned
+ * `app_current_tenant_id`, which `... OR app_platform_scope()` still
+ * satisfies. This list only permits the
  * marker on the WRITE side. Name the tables explicitly so that adding
  * to this list is a visible decision.
  */
@@ -105,7 +110,126 @@ const OPT_IN_PLATFORM_WRITE = new Set([
   "security_events",
   "tenant_health_events",
   "web_vital_events",
+  /**
+   * ⚠️ `email_suppressions` IS NOT HERE, AND IT USED TO FAIL THIS GATE.
+   * Its WITH CHECK is
+   *
+   *     tenant_id = app_current_tenant_id()
+   *     OR (tenant_id IS NULL AND app_platform_scope())
+   *
+   * The marker is CONJOINED with `tenant_id IS NULL`, so platform scope
+   * can write only a GLOBAL suppression row , never another tenant's.
+   * That is a different act from a cross-tenant write and it needs no
+   * opt-in. `isGlobalWriteOnly()` below recognises the idiom, so the safe
+   * shape stops being reported and the unsafe shape stays reported.
+   */
 ]);
+
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * ⭐⭐ THE READ SIDE, WHICH THIS GATE DID NOT USED TO CHECK AT ALL
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 The docstring above `OPT_IN_PLATFORM_WRITE` claimed "The read
+ * boundary is UNTOUCHED: every table here still has a USING clause that
+ * denies cross-tenant reads." That was false, and the old read test could
+ * not have seen it: it asked whether the USING clause still mentioned
+ * `app_current_tenant_id`, which `... OR app_platform_scope()` still
+ * satisfies.
+ *
+ * ⚠️ AND AN ALLOWLIST IS THE WRONG SHAPE HERE. 114 of 303 tenant tables
+ * carry the read marker. That is not a leak , it is the deliberate
+ * "platform read scope" 0014 Section 6 introduces for the tables holding
+ * the COMMERCIAL RELATIONSHIP, and roughly a dozen module files have
+ * extended it since. Requiring 114 written justifications would produce
+ * 114 copied sentences and one gate nobody can adopt.
+ *
+ * ⭐ SO THIS ENCODES THE REFUSALS INSTEAD. Two files state, in prose,
+ * that specific tables must NEVER acquire the read marker. Those
+ * sentences are the decision. Everything below turns them into a
+ * predicate that runs on every push, which is the only property they were
+ * missing , 0022 shipped a check for its own four tables and it lives in
+ * 0022, and nobody re-runs an old file's verification section.
+ */
+const PLATFORM_READ_REFUSED = new Map([
+  /* ── 0022_phase29_admin_console.sql, header and Check 12 ───────────
+   * "IT DOES NOT WIDEN `app_platform_scope()`. Not by one table."
+   * "WITH the marker: one query reads every customer's security events."
+   * "Check 12 below FAILS LOUDLY if any of the three ever acquires the
+   *  marker."
+   *
+   * 🔴 `security_events` IS THE ONE THAT DID. 0079_rls_opt_in_and_
+   * telemetry.sql added `OR app_platform_scope()` to its USING clause,
+   * 57 files later, while fixing a genuine and unrelated WRITE bug , the
+   * policy had been DISCARDING every attributed row, so security events
+   * naming a workspace went on the floor. That fix needed the WITH CHECK
+   * branch. It took the USING branch in the same statement, never
+   * mentions 0022, and `usage_counters`, `usage_levels` and `audit_logs`
+   * came through clean, so the refusal held for three tables out of four.
+   *
+   * ⚠️ IT IS DELIBERATELY LEFT IN PLACE RATHER THAN REVERTED, because
+   * `server/security/anomalies.ts` now depends on it: its platform-wide
+   * sweep is the only thing that ever looks at the unattributed perimeter
+   * rows, and its own comment says an anomaly detector that silently sees
+   * zero events is the most dangerous shape of broken there is. Reverting
+   * it here, in a gate, would trade a recorded widening for a silent
+   * blindness. It is recorded as `ACCEPTED` so the next reader finds the
+   * decision instead of rediscovering the contradiction.
+   */
+  ["usage_counters",  { by: "0022", why: "one query would read every customer's metered usage" }],
+  ["usage_levels",    { by: "0022", why: "one query would read every customer's metered usage" }],
+  ["audit_logs",      { by: "0022", why: "one query would read every customer's audit trail" }],
+  ["security_events", {
+    by: "0022",
+    why: "one query would read every customer's security events",
+    accepted: "0079 widened it to fix a write bug that was discarding every attributed row. server/security/anomalies.ts now depends on the cross-tenant read for its perimeter sweep. Recorded rather than reverted; see the note above.",
+  }],
+
+  /* ── 0014_phase17_platform.sql, Section 6 ──────────────────────────
+   * "DELIBERATELY NOT ADDED to the tables holding CUSTOMER CONTENT …
+   *  These hold data about the customer's OWN customers , third parties
+   *  who never had a relationship with us and whose data we hold as a
+   *  PROCESSOR. Reading it for our own convenience is processing with no
+   *  lawful basis; 'it made the ticket faster' is not a purpose."
+   *
+   * "If a future phase adds a platform clause to any of them, that is a
+   *  change to the data-protection posture of the product and it belongs
+   *  in a review."
+   *
+   * ⭐ THIS GATE IS THAT REVIEW. All ten are still clean today.
+   */
+  ["contacts",              { by: "0014", why: "customer content, held as a processor" }],
+  ["companies",             { by: "0014", why: "customer content, held as a processor" }],
+  ["deals",                 { by: "0014", why: "customer content, held as a processor" }],
+  ["custom_object_records", { by: "0014", why: "customer content, held as a processor" }],
+  ["assets",                { by: "0014", why: "customer content, held as a processor" }],
+  ["contracts",             { by: "0014", why: "customer content, held as a processor" }],
+  ["contract_versions",     { by: "0014", why: "customer content, held as a processor" }],
+  ["journal_entries",       { by: "0014", why: "the customer's general ledger" }],
+  ["transactions",          { by: "0014", why: "the customer's general ledger" }],
+  ["ledgers",               { by: "0014", why: "the customer's general ledger" }],
+]);
+
+/**
+ * Is the platform marker in this WITH CHECK confined to writing GLOBAL
+ * (null-tenant) rows?
+ *
+ * ⚠️ TEXT MATCHING, AND IT IS DELIBERATELY STRICT. It recognises exactly
+ * the one idiom the codebase uses, normalised for whitespace and for the
+ * parentheses PostgreSQL adds when it prints a policy back:
+ *
+ *     (tenant_id IS NULL AND app_platform_scope())
+ *
+ * Anything else , a bare `OR app_platform_scope()`, a disjunction, a
+ * rewritten predicate , is NOT recognised and is reported. A matcher that
+ * tried to be clever here would eventually accept a cross-tenant write.
+ */
+function isGlobalWriteOnly(withCheck) {
+  if (!withCheck) return false;
+  const flat = withCheck.replace(/[()\s]+/g, " ").toLowerCase().trim();
+  const occurrences = (flat.match(/app_platform_scope/g) ?? []).length;
+  if (occurrences !== 1) return false;
+  return flat.includes("tenant_id is null and app_platform_scope");
+}
 
 const pool = new Pool({ connectionString: URL });
 let failures = 0;
@@ -124,6 +248,10 @@ try {
                                                        AS has_tenant_policy,
       COALESCE(bool_or(p.with_check::text LIKE '%app_platform_scope%'), false)
                                                        AS marker_write,
+      COALESCE(bool_or(p.qual::text LIKE '%app_platform_scope%'), false)
+                                                       AS marker_read,
+      string_agg(COALESCE(p.with_check::text, ''), ' | ')
+                                                       AS with_check_text,
       COALESCE(
         bool_or(
           (p.qual::text LIKE '%app_current_tenant_id%')
@@ -166,26 +294,60 @@ try {
     if (!t.has_tenant_policy) {
       fail(`${t.table_name} has RLS enabled but no policy referencing app_current_tenant_id() — RLS with no policy denies everything, which fails closed but breaks the table.`);
     }
-    if (t.marker_write && !OPT_IN_PLATFORM_WRITE.has(t.table_name)) {
-      fail(`${t.table_name} allows app_platform_scope() in WITH CHECK — that permits a cross-tenant WRITE. Platform scope belongs in USING only.`);
+    if (
+      t.marker_write &&
+      !OPT_IN_PLATFORM_WRITE.has(t.table_name) &&
+      !isGlobalWriteOnly(t.with_check_text)
+    ) {
+      fail(`${t.table_name} allows app_platform_scope() in WITH CHECK — that permits a cross-tenant WRITE. Platform scope belongs in USING only, unless it is conjoined with tenant_id IS NULL (a global row), in which case say so in the policy.`);
     }
-    if (OPT_IN_PLATFORM_WRITE.has(t.table_name)) {
-      // The opt-in marker is only legitimate while the READ boundary
-      // still holds. If the USING clause lost its tenant reference,
-      // the table silently became a cross-tenant window in both
-      // directions.
-      if (!t.has_tenant_read_policy) {
-        fail(`${t.table_name} is an opt-in platform-write table but its USING clause no longer references the tenant — a cross-tenant READ hole.`);
-      }
-      if (!t.marker_write) {
-        fail(
-          `${t.table_name} is a documented opt-in platform-write table, but its WITH CHECK no longer requires the platform-scope marker — the marker can be removed by accident just as easily as a policy. If the marker was deliberately removed, remove the table from OPT_IN_PLATFORM_WRITE and say why.`,
-        );
-      }
+
+    /**
+     * ⭐ THE READ SIDE. See PLATFORM_READ_REFUSED.
+     *
+     * A platform-scope read is not automatically wrong , 114 tables have
+     * one by design. It is wrong on a table somebody wrote down that it
+     * must never have one, and that is all this refuses.
+     */
+    const refusal = PLATFORM_READ_REFUSED.get(t.table_name);
+    if (t.marker_read && refusal && !refusal.accepted) {
+      fail(
+        `${t.table_name} allows app_platform_scope() in its USING clause, and ${refusal.by} refused exactly that: ${refusal.why}. ` +
+          `One query on a platform-scoped connection now reads every tenant's rows from this table. ` +
+          `If this widening is deliberate, record it in PLATFORM_READ_REFUSED with an \`accepted\` note saying who depends on it; do not delete the entry.`,
+      );
+    }
+
+    /**
+     * ⚠️ AND THE OTHER DIRECTION. An `accepted` widening is a recorded
+     * dependency. `security_events` losing the marker again would leave
+     * the anomaly detector's perimeter sweep reading zero rows on a
+     * platform-scoped connection , silently, and quiet reads as safe.
+     */
+    if (refusal && refusal.accepted && !t.marker_read) {
+      fail(
+        `${t.table_name} carries an ACCEPTED platform-read widening in PLATFORM_READ_REFUSED, but its USING clause no longer has app_platform_scope(). ` +
+          `Whatever depended on the cross-tenant read now sees zero rows without erroring. If the widening was deliberately reverted, remove the accepted note and say why.`,
+      );
     }
   }
 
   const checked = rows.filter((t) => !NOT_TENANT_SCOPED.has(t.table_name)).length;
+  const readMarker = rows.filter(
+    (t) => !NOT_TENANT_SCOPED.has(t.table_name) && t.marker_read,
+  ).length;
+
+  /**
+   * ⚠️ REPORTED EVERY RUN, PASS OR FAIL. This number is the size of the
+   * platform read scope, and it should be looked at occasionally rather
+   * than only when something fails. It grew from 0014's handful to 114
+   * without anybody stating a total.
+   */
+  console.log(
+    `   platform read scope: ${readMarker}/${checked} tenant tables carry ` +
+      `app_platform_scope() in USING · ${PLATFORM_READ_REFUSED.size} tables are ` +
+      `on the refusal list`,
+  );
 
   if (failures > 0) {
     console.error(`\n❌ RLS coverage FAILED — ${failures} problem(s) across ${checked} tenant tables.\n`);

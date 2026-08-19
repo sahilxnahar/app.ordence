@@ -128,8 +128,27 @@ describe("all three statements take a period", () => {
    */
   it("excludes out-of-period amounts inside the aggregate, not just in the join", () => {
     const code = codeOnly(ACTIONS);
-    const guards = code.match(/\$\{transactions\.id\} IS NOT NULL/g) ?? [];
-    expect(guards.length).toBe(2); // once for the debit sum, once for the credit
+    /**
+     * ⚠️ THIS USED TO BE `expect(guards.length).toBe(2)` AND BATCH 0108
+     * BROKE IT BY ADDING A THIRD CORRECT AGGREGATE — the count of legs
+     * that have no `amount_minor`, which must carry the same period guard
+     * as the two sums or it would report legs from outside the period.
+     *
+     * A pinned count is a SHAPE. It cannot tell "somebody added a guarded
+     * aggregate" from "somebody added an unguarded one", so it failed the
+     * safe change and would have passed the dangerous one had the new
+     * expression been number three of three with the guard on a different
+     * line. The invariant is that EVERY aggregate over the left-joined
+     * journal carries the guard, which is what is checked now.
+     */
+    const block = code.slice(
+      code.indexOf("totalDebitMinor:"),
+      code.indexOf("unscaledLegs:") + 400,
+    );
+    const aggregates = block.match(/(COALESCE\(SUM\(CASE WHEN|COUNT\(\*\) FILTER \(WHERE)/g) ?? [];
+    const guards = block.match(/\$\{transactions\.id\} IS NOT NULL/g) ?? [];
+    expect(aggregates.length).toBeGreaterThanOrEqual(3);
+    expect(guards.length).toBe(aggregates.length);
   });
 
   it("is tenant-scoped on every join in the statement query", () => {
@@ -143,13 +162,21 @@ describe("all three statements take a period", () => {
    * An unguarded statement reader returns a company's complete financial
    * position to anyone who knows the action id.
    */
-  it("guards each new statement export", () => {
+  /**
+   * ⭐ WAVE 9 — see the same change in `tests/ui/cash-flow.test.ts`. A
+   * session proves the caller is somebody; `ledgers:read` proves they are
+   * somebody this workspace has decided may read its books.
+   */
+  it("guards each new statement export on the permission, not merely on a session", () => {
     const code = codeOnly(ACTIONS);
     const bodies = code.split(/export async function /).slice(1);
     for (const name of ["getTrialBalance", "getProfitAndLoss", "getBalanceSheet"]) {
       const body = bodies.find((b) => b.startsWith(name));
       expect(body, `${name} is exported`).toBeDefined();
-      expect(body, `${name} is guarded`).toContain("await requireTenantContext()");
+      expect(body, `${name} is guarded`).toContain('await requirePermission("ledgers:read")');
+      expect(body, `${name} no longer relies on a session alone`).not.toContain(
+        "await requireTenantContext()",
+      );
     }
   });
 
@@ -397,8 +424,19 @@ describe("money on the statement path", () => {
   /** No float ever stands between the database and a rupee figure. */
   it("keeps the aggregate out of IEEE-754", () => {
     const code = codeOnly(ACTIONS);
-    expect(code).toContain("toMinorUnits(r.totalDebit)");
-    expect(code).toContain("toMinorUnits(r.totalCredit)");
+    /**
+     * ⚠️ THIS USED TO ASSERT `toMinorUnits(r.totalDebit)`. Batch 0108
+     * removed that call: the aggregate now comes out of Postgres already
+     * in minor units, so there is nothing to convert — which is a stronger
+     * form of "out of IEEE-754" than the one the old assertion pinned.
+     *
+     * 🔴 AND `toMinorUnits` WAS ITSELF A HARDCODED HUNDRED whose regex
+     * refused a third decimal, so a Kuwaiti trial balance did not merely
+     * come out wrong: it threw. The old test protected the float property
+     * and was blind to the currency one.
+     */
+    expect(code).toContain("BigInt(r.totalDebitMinor)");
+    expect(code).toContain("BigInt(r.totalCreditMinor)");
     expect(code).not.toContain("Number(r.totalDebit)");
     expect(code).not.toContain("Number(r.totalCredit)");
     expect(code).not.toContain("parseFloat");

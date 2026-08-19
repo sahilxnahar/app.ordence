@@ -65,28 +65,23 @@ import {
   EXPOSURE_SCOPE_NOTE,
 } from "@/lib/credit/headroom";
 import { assessAutoHold } from "@/lib/credit/hold";
-import { describeSweep, planDunning } from "@/lib/credit/dunning";
 import { loadActiveHold } from "@/lib/credit/enforce";
 import {
-  loadChaseableInvoices,
   loadCreditSubjects,
-  loadDunningLadder,
   loadInvoiceFacts,
   loadOrderCommitments,
-  loadRecordedDunning,
 } from "@/lib/credit/queries";
 import {
   serializeReconciliation,
   type SerializedReconciliation,
 } from "@/lib/reconciliation/gate";
-import { todayInIndia } from "@/lib/accounting/periods";
 import { formatMoney, serializeAmount, toBigIntAmount } from "@/lib/billing/money";
 /**
- * ⭐⭐ THE DRAIN THAT DID NOT EXIST. See the header of `runDunningSweep`
- * below: this file wrote letters into a queue and nothing emptied it.
+ * ⭐⭐ THE SWEEP ITSELF, WHICH IS NO LONGER IN THIS FILE. Brief C moved it
+ * so that something with no browser session could call it — see the
+ * header on `runDunningSweep` below, and the one on the module itself.
  */
-import { enqueueEmail } from "@/server/email/outbox";
-import { renderDunningLetterEmail } from "@/lib/email/templates";
+import { sweepDunningForTenant } from "@/server/credit/dunning-sweep";
 import type { ActionResult } from "@/lib/validators/crm";
 
 const FEATURE_ORDERS = "sales.orders" as const;
@@ -850,39 +845,35 @@ export async function recordCreditHoldOverride(
 /* ================================================================== */
 
 /**
- * ⭐⭐ WORK OUT WHICH REMINDERS ARE DUE AND RECORD THEM.
+ * ⭐⭐ THE DUNNING SWEEP — THE INTERACTIVE DOOR ONTO IT.
  *
- * 🔴 IT STILL QUEUES. IT STILL DOES NOT SEND — AND NOW SOMETHING EMPTIES
- * THE QUEUE. This header used to read "there is no SMTP call, no Resend
- * call and no webhook anywhere below", and that was true of the whole
- * product, not only of this function. The letters were written with
- * `delivery: "queued"` and stayed there forever. The screen said a
- * reminder had been recorded; the customer received nothing; the invoice
- * aged; the owner believed they were chasing money they were not
- * chasing.
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 THE BODY MOVED TO `server/credit/dunning-sweep.ts` — Brief C
+ * ══════════════════════════════════════════════════════════════════════
+ * Not for tidiness. This function was CALLED BY NOTHING: no route, no
+ * button, no cron. The collections ladder never advanced, so no
+ * `credit_dunning_log` row was ever written, so the outbox drain the
+ * previous batch built had nothing to drain. A statutory demand notice
+ * that was never swept is a notice that was never sent, and the provider
+ * message id that constitutes proof of service was never obtained.
  *
- * ⚠️ THE FIX IS NOT A `send()` IN THIS FUNCTION, AND THAT IS THE POINT.
- * A sweep that mails inline is a sweep that dies on invoice 40 of 300
- * with 39 letters gone and no record of which, then reruns from the top.
- * The queue was always right. What was missing was the drain.
+ * The thing that had to change was the CALLER, and the only caller that
+ * can run nightly has no Clerk session and no user. It therefore cannot
+ * come through this file: every export of a `"use server"` module is a
+ * browser-reachable RPC endpoint, and one that accepted a `tenantId`
+ * would be the Phase 47 defect again — see this file's own header.
  *
- * ⭐ SO EACH ACTIONED EMAIL RUNG ALSO GETS AN `email_outbox` ROW, in THIS
- * transaction, and `server/email/outbox.ts` sends it and writes `sent`
- * or `failed` back onto the dunning row. Recording `sent` here because
- * the row is "about to" go out would produce a collections call opening
- * with "we have written to you three times" against a customer who can
- * prove otherwise.
+ * ⚠️ SO THE GATE STAYED HERE AND THE WORK MOVED. What is below is the
+ * whole of what an interactive request adds: validate the input, prove
+ * the workspace has paid for orders, prove this person may manage credit,
+ * write a CHAINED audit row against their name, and revalidate the screen
+ * they are looking at. The scheduler does none of those things, because
+ * none of them are true of it — it checks the entitlement per workspace
+ * itself and writes a SYSTEM audit row into the same chain.
  *
- * 🔴 ONLY THE ROWS THIS RUN ACTUALLY INSERTED ARE MAILED. The insert is
- * `ON CONFLICT DO NOTHING ... RETURNING`, so a row another container
- * already recorded comes back absent and earns no letter. Enqueueing
- * from `plan.actions` instead would mail a second copy of every reminder
- * every time two sweeps overlapped.
- *
- * 🔴 AND IT IS SAFE TO RUN TWICE. `ON CONFLICT DO NOTHING` against
- * `credit_dunning_log_once_per_stage_key` is the guarantee — not the
- * `alreadyRecorded` set, which is a read-then-write two containers can
- * both pass in the same millisecond.
+ * ⚠️ AND `runDunningSweep` IS STILL EXPORTED, still gated, still the way
+ * a human presses the button. Deleting it in favour of the cron would
+ * remove the only way to chase a customer today rather than tomorrow.
  */
 export async function runDunningSweep(input: unknown): Promise<
   ActionResult<{
@@ -903,232 +894,37 @@ export async function runDunningSweep(input: unknown): Promise<
       permission: "sales.credit.manage",
     });
 
-    /**
-     * 🔴 CLAMPED TO TODAY IN INDIA, NEVER `toISOString()`. India is
-     * UTC+5:30, so between midnight and 05:30 IST a UTC date is
-     * YESTERDAY — and a sweep that thinks it is yesterday silently fails
-     * to fire the stage that came due at midnight.
-     *
-     * ⚠️ AND A FUTURE `asOf` IS CLAMPED, NOT REJECTED. Rejecting sends
-     * somebody to edit an invoice's due date to make the ladder fire,
-     * which corrupts the document to fix the job.
-     */
-    const today = todayInIndia();
-    const asOf = data.asOf && data.asOf <= today ? data.asOf : today;
-    const preview = data.preview === true;
+    const result = await sweepDunningForTenant({
+      tenantId: ctx.tenant.id,
+      organizationName: ctx.tenant.name,
+      asOf: data.asOf,
+      ladderId: data.ladderId,
+      preview: data.preview === true,
+      /**
+       * ⭐ THE PERSON WHO PRESSED IT. The scheduled path passes null
+       * instead, so "who chased this customer" has an honest answer in
+       * both directions rather than a plausible one in both.
+       */
+      actorUserId: ctx.user.id,
+      impersonationId: ctx.impersonationId,
+      audit: (entry) =>
+        writeAudit(ctx, {
+          action: "create",
+          resourceType: "dunning_sweep",
+          resourceId: entry.ladderId,
+          newValue: {
+            ladder: entry.ladderName,
+            asOf: entry.asOf,
+            queued: entry.queued,
+            suppressed: entry.suppressed,
+            holdsPlaced: entry.holdsPlaced,
+            skipped: entry.skipped,
+          },
+          severity: "warning",
+        }),
+    });
 
-    const result = await withTenant(
-      ctx.tenant.id,
-      async (tx) => {
-        const ladder = await loadDunningLadder(tx, ctx.tenant.id, data.ladderId);
-        if (!ladder) {
-          return {
-            asOf,
-            queued: 0,
-            suppressed: 0,
-            holdsPlaced: 0,
-            skipped: [] as { invoiceNumber: string; why: string }[],
-            summary:
-              "No active dunning ladder is configured, so nobody has been chased. A default ladder shipped by us would be the schedule most workspaces chase on, chosen by nobody — set the ages that suit this business.",
-            preview,
-          };
-        }
-
-        const [invoices, alreadyRecorded] = await Promise.all([
-          loadChaseableInvoices(tx, ctx.tenant.id),
-          loadRecordedDunning(tx, ctx.tenant.id),
-        ]);
-
-        const plan = planDunning({
-          asOf,
-          invoices,
-          stages: ladder.stages,
-          alreadyRecorded,
-        });
-
-        const queued = plan.actions.filter((a) => a.delivery === "queued").length;
-        const suppressed = plan.actions.length - queued;
-        let holdsPlaced = 0;
-
-        if (!preview && plan.actions.length > 0) {
-          const recorded = await tx
-            .insert(creditDunningLog)
-            .values(
-              plan.actions.map((a) => ({
-                tenantId: ctx.tenant.id,
-                companyId: a.companyId,
-                invoiceId: a.invoiceId,
-                ladderId: ladder.id,
-                stageId: a.stageId,
-                stageNo: a.stageNo,
-                daysPastDue: a.daysPastDue,
-                channel: a.channel,
-                templateKey: a.templateKey,
-                recipientName: a.recipientName,
-                recipientEmail: a.recipientEmail,
-                recipientPhone: a.recipientPhone,
-                amountDueMinor: a.amountDueMinor,
-                delivery: a.delivery,
-                failureReason: a.suppressionReason,
-                nextActionOn: a.nextActionOn,
-                createdBy: ctx.user.id,
-              })),
-            )
-            /**
-             * 🔴 THE IDEMPOTENCY GUARANTEE. A quiet no-op on the second
-             * run rather than an exception — a sweep that dies on invoice
-             * 40 of 300 because another container got there first is a
-             * sweep that never finishes.
-             *
-             * ⭐ AND `RETURNING` TURNS IT INTO A CLAIM. What comes back is
-             * exactly the set of rungs THIS run recorded; a rung another
-             * container got to first is absent. That set, and only that
-             * set, earns a letter below.
-             */
-            .onConflictDoNothing()
-            .returning({
-              id: creditDunningLog.id,
-              invoiceId: creditDunningLog.invoiceId,
-              stageId: creditDunningLog.stageId,
-            });
-
-          /*
-           * ══════════════════════════════════════════════════════════
-           * ⭐⭐ THE LETTERS. THIS IS THE PART THAT DID NOT EXIST.
-           * ══════════════════════════════════════════════════════════
-           * 🔴 `delivery` STAYS `queued` HERE. The outbox row is the
-           * instruction to send; `server/email/outbox.ts` is the only
-           * thing that may write `sent`, and only when Resend hands back
-           * a message id. Marking it here would be the same lie in a
-           * different table.
-           *
-           * ⚠️ ONLY `channel = "email"` RUNGS. A rung whose channel is
-           * `call` or `visit` is a diary entry for a person; queueing an
-           * email for it would silently replace the phone call somebody
-           * was supposed to make with a letter nobody chose to send.
-           *
-           * ⚠️ AND ONLY WHERE THERE IS AN ADDRESS. A rung with no
-           * recipient email keeps its `queued` row — it is still a
-           * chase that is owed — but there is nothing to send it to, and
-           * inventing one is worse than the gap.
-           */
-          const actionByKey = new Map(
-            plan.actions.map((a) => [`${a.invoiceId}:${a.stageId}`, a]),
-          );
-
-          for (const written of recorded) {
-            const action = actionByKey.get(`${written.invoiceId}:${written.stageId}`);
-            if (!action) continue;
-            if (action.delivery !== "queued") continue;
-            if (action.channel !== "email") continue;
-            if (!action.recipientEmail) continue;
-
-            const letter = renderDunningLetterEmail({
-              recipientName: action.recipientName,
-              organizationName: ctx.tenant.name,
-              customerName: action.companyName,
-              invoiceNumber: action.invoiceNumber,
-              amountDue: formatMoney(action.amountDueMinor),
-              dueDate: null,
-              daysPastDue: action.daysPastDue,
-              stageLabel: action.stageLabel,
-            });
-
-            await enqueueEmail(tx, {
-              tenantId: ctx.tenant.id,
-              purpose: "dunning",
-              /**
-               * ⭐ THE THREAD BACK. The dispatcher writes the outcome
-               * onto this exact dunning row, so the collections board
-               * stops saying "queued" the moment the letter actually
-               * goes — and says "failed", with the reason, when it does
-               * not.
-               */
-              subjectType: "credit_dunning_log",
-              subjectId: written.id,
-              toEmail: action.recipientEmail,
-              subject: letter.subject,
-              html: letter.html,
-              text: letter.text,
-              category: "receivables",
-              severity: "warning",
-              /**
-               * 🔴 DERIVED FROM THE DUNNING ROW, NOT FROM THE CLOCK. It
-               * is the same value on a re-run, which is what lets the
-               * unique index refuse a second letter for a rung that has
-               * already been chased.
-               */
-              idempotencyKey: `dunning:${written.id}`,
-              createdBy: ctx.user.id,
-            });
-          }
-
-          /**
-           * ⭐ THE RUNGS THAT PLACE A HOLD. `ON CONFLICT DO NOTHING`
-           * again, against the one-active-hold index: a customer with
-           * four invoices reaching the final stage on the same night gets
-           * one hold, not four.
-           */
-          const holdRungs = plan.actions.filter(
-            (a) => a.delivery === "queued" && a.placesHold,
-          );
-          for (const rung of holdRungs) {
-            const placed = await tx
-              .insert(creditHoldEvents)
-              .values({
-                tenantId: ctx.tenant.id,
-                companyId: rung.companyId,
-                source: "automatic",
-                reason: `${rung.invoiceNumber} is ${rung.daysPastDue} days past due and reached "${rung.stageLabel}". Placed by the dunning ladder; it will not lift itself.`,
-                /**
-                 * ⚠️ `placedBy` IS NULL AND THE CHECK CONSTRAINT ALLOWS
-                 * IT ONLY FOR `automatic`. The sweep has no user, and
-                 * naming the person who pressed the button would put
-                 * their signature on a decision the ladder made.
-                 */
-                exposureAtHoldMinor: null,
-                limitAtHoldMinor: null,
-              })
-              .onConflictDoNothing()
-              .returning({ id: creditHoldEvents.id });
-            if (placed.length > 0) holdsPlaced += 1;
-          }
-
-          await writeAudit(ctx, {
-            action: "create",
-            resourceType: "dunning_sweep",
-            resourceId: ladder.id,
-            newValue: {
-              ladder: ladder.name,
-              asOf,
-              queued,
-              suppressed,
-              holdsPlaced,
-              skipped: plan.skipped.length,
-            },
-            severity: "warning",
-          });
-        }
-
-        return {
-          asOf,
-          queued,
-          suppressed,
-          holdsPlaced,
-          skipped: plan.skipped.map((s) => ({
-            invoiceNumber: s.invoiceNumber,
-            why: s.why,
-          })),
-          summary: preview
-            ? `Preview only — nothing has been written. ${describeSweep(plan)}`
-            : describeSweep(plan),
-          preview,
-        };
-      },
-      { impersonationId: ctx.impersonationId },
-    );
-
-    if (!preview) revalidatePath("/receivables/credit");
+    if (!result.preview) revalidatePath("/receivables/credit");
     return { ok: true, data: result };
   } catch (err) {
     return toSalesActionError(err, "runDunningSweep");

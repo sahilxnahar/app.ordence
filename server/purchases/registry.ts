@@ -313,6 +313,19 @@ export async function loadVendorLedger(
  * — and on a construction site the contractor's March invoice arrives in
  * May, every month — makes every stored balance after that date wrong,
  * with no error and no screen that looks different.
+ *
+ * ⚠️ BATCH 0104 — THE SUM IS SINGLE-CURRENCY BY CONSTRUCTION AND RETURNS
+ * NO LABEL. `vendor_ledger_entries` has no `currency` column, so this
+ * `sum(credit_minor - debit_minor)` cannot be adding two currencies
+ * together — unlike the analytics views, there is nothing to group by.
+ *
+ * 🔴 IT IS STILL A BARE `bigint` AND THAT IS DELIBERATE AT THIS LAYER. A
+ * registry function has no tenant settings to read, so the functional
+ * currency is not knowable here without a second query. The label is
+ * applied one layer up, in `server/actions/purchases.ts#getVendorBalances`,
+ * where `ctx.tenant.settings` is already in hand — and it is applied with
+ * `currencyAssumed: true`, because it is an assumption the schema forces
+ * rather than a fact any row carries.
  */
 export async function vendorBalances(
   tenantId: string,

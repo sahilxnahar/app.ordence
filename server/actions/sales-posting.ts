@@ -38,30 +38,38 @@ import {
   salesTransactionKey,
 } from "@/server/accounting/post-sales";
 import {
-  POSTING_ROLE_META,
-  PURCHASE_ROLE_META,
-  CONSTRUCTION_ROLE_META,
-  PROPERTY_ROLE_META,
-  type PostingRole,
-  type PurchasePostingRole,
+  POSTING_ROLE_REGISTRY,
+  POSTING_ROLE_KEYS,
+  POSTING_MODULES,
+  modulesNeeding,
+  type PostingModuleKey,
 } from "@/lib/accounting/sales-posting";
 
 /**
- * ⚠️ ONE MAP TABLE, TWO ROLE SETS. `sales_posting_accounts` is keyed by an
- * opaque `role` varchar precisely so the purchase roles are rows rather
- * than a second table carrying a second RLS policy to keep in step.
+ * ⚠️ ONE MAP TABLE, NINE ROLE SETS. `sales_posting_accounts` is keyed by an
+ * opaque `role` varchar precisely so every family is a row rather than a
+ * second table carrying a second RLS policy to keep in step.
+ *
+ * 🔴 THIS WAS A FOUR-FAMILY SPREAD UNTIL BATCH 0108 and it was the whole
+ * defect: `{...POSTING, ...PURCHASE, ...CONSTRUCTION, ...PROPERTY}` left
+ * metering, payroll, the GST return, fixed assets and FX out of BOTH the
+ * form and `setAccountSchema` below — so twenty-seven roles that every
+ * posting path checks could not be set by anybody, and the FX refusal
+ * telling the operator to "map them on the posting-accounts screen" sent
+ * them to a screen that would have refused the write. The list now comes
+ * from `POSTING_ROLE_REGISTRY`, which is built from the builders' own meta
+ * objects and cannot fall behind them.
  */
-const ALL_ROLE_META: Record<
-  string,
-  { label: string; tallyGroup: string; accountType: string; help: string }
-> = { ...POSTING_ROLE_META, ...PURCHASE_ROLE_META, ...CONSTRUCTION_ROLE_META, ...PROPERTY_ROLE_META };
 import { serializeAmount, toBigIntAmount } from "@/lib/billing/money";
 import type { ActionResult } from "@/lib/validators/crm";
 
 const setAccountSchema = z.object({
-  role: z.enum(
-    Object.keys(ALL_ROLE_META) as [string, ...string[]],
-  ),
+  /**
+   * ⭐ THE REGISTRY, NOT A HAND-PICKED SUBSET. A role a builder can emit
+   * is a role somebody must be able to map, and this enum is what used to
+   * decide otherwise.
+   */
+  role: z.enum(POSTING_ROLE_KEYS as [string, ...string[]]),
   ledgerId: z.string().uuid(),
 });
 
@@ -76,8 +84,14 @@ const SETTINGS_PERMISSION = "settings:update" as const;
 export async function getSalesPostingSetup(): Promise<
   ActionResult<{
     roles: {
-      role: PostingRole | PurchasePostingRole;
-      side: "sales" | "purchase" | "construction" | "property";
+      role: string;
+      /**
+       * ⭐ EVERY module that needs this role, not one guessed from a
+       * precedence chain. `bank` is needed by sales receipts AND vendor
+       * payments; telling somebody it is "a sales role" is why nobody maps
+       * it before running payroll.
+       */
+      modules: readonly PostingModuleKey[];
       label: string;
       tallyGroup: string;
       accountType: string;
@@ -87,6 +101,18 @@ export async function getSalesPostingSetup(): Promise<
     }[];
     ledgers: { id: string; code: string; name: string; accountType: string }[];
     unmappedCount: number;
+    /**
+     * ⭐ Per module: how many of its roles are still unmapped, so the
+     * screen can say "the depreciation run cannot post" rather than
+     * "6 roles unmapped".
+     */
+    moduleStatus: {
+      key: PostingModuleKey;
+      label: string;
+      needs: string;
+      total: number;
+      unmapped: number;
+    }[];
   }>
 > {
   try {
@@ -116,28 +142,34 @@ export async function getSalesPostingSetup(): Promise<
       const byRole = new Map(mapped.map((m) => [m.role, m.ledgerId]));
       const byId = new Map(available.map((l) => [l.id, `${l.code} — ${l.name}`]));
 
-      const roles = Object.keys(ALL_ROLE_META).map((role) => {
-        const ledgerId = byRole.get(role) ?? null;
-        const meta = ALL_ROLE_META[role] as {
-          label: string;
-          tallyGroup: string;
-          accountType: string;
-          help: string;
-        };
+      const roles = POSTING_ROLE_REGISTRY.map((entry) => {
+        const ledgerId = byRole.get(entry.role) ?? null;
         return {
-          role: role as PostingRole | PurchasePostingRole,
-          /** ⚠️ Grouped on screen — nine sales roles and nine purchase
-           *  roles in one undifferentiated list is a form nobody finishes. */
-          side: (role in PROPERTY_ROLE_META
-            ? "property"
-            : role in CONSTRUCTION_ROLE_META
-              ? "construction"
-              : role in PURCHASE_ROLE_META
-                ? "purchase"
-                : "sales") as "sales" | "purchase" | "construction" | "property",
-          ...meta,
+          role: entry.role,
+          modules: entry.modules,
+          label: entry.label,
+          tallyGroup: entry.tallyGroup,
+          accountType: entry.accountType,
+          help: entry.help,
           ledgerId,
           ledgerLabel: ledgerId ? (byId.get(ledgerId) ?? null) : null,
+        };
+      });
+
+      /**
+       * ⚠️ A ROLE NEEDED BY TWO MODULES COUNTS AS UNMAPPED IN BOTH. It is
+       * one row in the table and two refusals in the product, and the
+       * operator is trying to answer "why will payroll not post", not
+       * "how many rows are missing".
+       */
+      const moduleStatus = (Object.keys(POSTING_MODULES) as PostingModuleKey[]).map((key) => {
+        const mine = roles.filter((r) => r.modules.includes(key));
+        return {
+          key,
+          label: POSTING_MODULES[key].label,
+          needs: POSTING_MODULES[key].needs,
+          total: mine.length,
+          unmapped: mine.filter((r) => r.ledgerId === null).length,
         };
       });
 
@@ -145,6 +177,7 @@ export async function getSalesPostingSetup(): Promise<
         roles,
         ledgers: available,
         unmappedCount: roles.filter((r) => r.ledgerId === null).length,
+        moduleStatus,
       };
     });
 
@@ -441,7 +474,22 @@ export async function getSalesPostingBacklog(): Promise<
  * per-document safe: a re-run skips what already landed.
  */
 export async function postSalesBacklog(): Promise<
-  ActionResult<{ posted: number; skipped: number; missingRoles: string[] }>
+  ActionResult<{
+    posted: number;
+    skipped: number;
+    missingRoles: string[];
+    /**
+     * ⭐ WHICH MODULES ARE BLOCKED, not just which rows are missing.
+     * Batch 0108.
+     *
+     * ⚠️ "Still unmapped: bank, tds_payable" is a list of database keys.
+     * The operator is trying to answer "what can I not do until I fix
+     * this", and the honest answer is "vendor payments and RA bills" —
+     * derivable from the registry, and previously derivable by nobody
+     * because a role knew only one `side`.
+     */
+    blockedModules: string[];
+  }>
 > {
   try {
     const ctx = await requirePermission(SETTINGS_PERMISSION);
@@ -711,7 +759,15 @@ export async function postSalesBacklog(): Promise<
 
     revalidatePath("/accounting/posting");
     revalidatePath("/accounting");
-    return { ok: true, data: { posted, skipped, missingRoles: [...missing] } };
+    const blocked = new Set<string>();
+    for (const role of missing) {
+      for (const key of modulesNeeding(role)) blocked.add(POSTING_MODULES[key].label);
+    }
+
+    return {
+      ok: true,
+      data: { posted, skipped, missingRoles: [...missing], blockedModules: [...blocked] },
+    };
   } catch (err) {
     return toSalesActionError(err, "postSalesBacklog");
   }

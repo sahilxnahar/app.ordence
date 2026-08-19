@@ -337,6 +337,15 @@ const REAL_ESTATE_TEMPLATE: IndustryTemplate = {
          * cost. A menu sorted any other way asks a site team to hold the
          * sequence in their head every time they use it.
          */
+        /*
+         * ⭐⭐ WAVE 7 — DRAWINGS COME BEFORE THE BOQ, because that is the
+         * order the work happens in. The bill of quantities is TAKEN OFF
+         * the drawings, and until wave 7 this product had the whole
+         * billing chain — BOQ, rate analyses, measurement books, RA bills
+         * — and nothing anywhere that held a drawing. Every quantity in
+         * it was typed in by somebody reading a printed sheet.
+         */
+        { id: "drawings", label: "Drawings", href: "/drawings", icon: "ruler" },
         { id: "boq", label: "BOQ", href: "/boq", icon: "file-text" },
         // ⚠️ Variations sits BETWEEN the BOQ and the bills, deliberately.
         // That is the order the work happens in: scope is agreed, scope
@@ -366,8 +375,68 @@ const REAL_ESTATE_TEMPLATE: IndustryTemplate = {
         { id: "gst", label: "GST", href: "/gst", icon: "receipt" },
         { id: "gstr2b", label: "GSTR-2B", href: "/gstr2b", icon: "file-check" },
         { id: "tds", label: "TDS", href: "/tds", icon: "receipt" },
+        /**
+         * ⭐⭐⭐ AND THE SCREEN THAT WRITES INTO IT — wave one. `/tds` was
+         * four read-only screens over a table nothing in the product could
+         * insert a row into; every one of them rendered correctly and empty.
+         */
+        { id: "tds-deduct", label: "Record a deduction", href: "/tds/deduct", icon: "receipt" },
+        /**
+         * ⭐⭐⭐ BANK RECONCILIATION — ADDED IN 0110, AND IT SHOULD HAVE
+         *    BEEN ADDED IN 0070.
+         *
+         * ══════════════════════════════════════════════════════════════
+         * 🔴 `/banking` HAS EXISTED SINCE v1.18.0 AND APPEARED IN NO NAV
+         *    SECTION, NO COMMAND BAR ENTRY, AND NO LINK FROM ANY OTHER
+         *    SCREEN
+         * ══════════════════════════════════════════════════════════════
+         * 0070 built statement import and matching. 0102 built the
+         * reconciliation statement, the sign-off, the guard trigger and
+         * the artefact an auditor asks for. Every gate stayed green
+         * across both, because no gate asks whether a page can be
+         * REACHED — and the only routes to it were the URL bar and a
+         * back-link from a page nobody could get to either.
+         *
+         * ⚠️ THIS IS THE SAME DEFECT AS `0100`'s DEPRECIATION ENGINE,
+         *    WHICH NOTHING RENDERED FOR FOUR BATCHES, and the same shape
+         *    as the eleven columns declared and enforced by nothing. It
+         *    is the twelfth. Built-and-unreachable and
+         *    declared-and-unread are one defect wearing two hats.
+         */
+        { id: "banking", label: "Bank Reconciliation", href: "/banking", icon: "landmark" },
+        /**
+         * ⭐ AND THE REGISTER THE RECONCILIATION SCREEN FEEDS — 0110.
+         * A bank charge is posted gross because the bank's tax invoice
+         * arrives separately, so the input credit on it sits unclaimed.
+         * Before this it sat unclaimed AND unrecorded.
+         */
+        { id: "bank-charge-itc", label: "Bank Charge Credit", href: "/banking/input-credit", icon: "receipt" },
         { id: "accounting", label: "Ledger", href: "/accounting", icon: "book-open" },
+        /**
+         * ⚠️ Added in the same change as the screen itself. `0100` shipped a
+         * complete depreciation engine and NOTHING rendered it for four
+         * batches, which is this codebase's recurring defect wearing a
+         * different hat: built, correct, and reachable by nobody.
+         */
+        { id: "fixed-assets", label: "Fixed Assets", href: "/fixed-assets", icon: "building-2" },
+        { id: "fx", label: "Currency & FX", href: "/fx", icon: "arrow-left-right" },
         { id: "receivables", label: "Payments Due", href: "/receivables", icon: "indian-rupee" },
+        /**
+         * ⭐⭐ ADDED IN THE SAME CHANGE AS THE SCREEN, AND ONLY ON THIS
+         * TEMPLATE. `sendDunningNotice` has had a permission model, an
+         * escalation gate and four database constraints since Phase 38
+         * and NO IMPORTER ANYWHERE in `app/` or `components/` — the
+         * fixed-assets note two lines above is the same defect, and this
+         * is the second time it has been the reason for a nav entry.
+         *
+         * ⚠️ REAL ESTATE ONLY. The ladder is the RERA one: reminder →
+         * first notice → final notice → cancellation warning, ending in
+         * a letter that precedes forfeiting a home deposit. A trading
+         * company chasing an invoice has a different escalation with
+         * different consequences, and putting this in their sidebar
+         * would offer them a statutory process they are not in.
+         */
+        { id: "dunning-ladder", label: "Statutory Ladder", href: "/receivables/ladder", icon: "gavel" },
         { id: "purchases", label: "Purchases", href: "/purchases", icon: "shopping-cart" },
         { id: "statements", label: "Statements", href: "/statements", icon: "file-text" },
         { id: "tally", label: "Tally Export", href: "/tally", icon: "download" },
@@ -592,7 +661,54 @@ const FINANCE_NAV_SECTION: NavSection = {
     { id: "gst", label: "GST", href: "/gst", icon: "receipt" },
     { id: "gstr2b", label: "GSTR-2B", href: "/gstr2b", icon: "file-check" },
     { id: "tds", label: "TDS", href: "/tds", icon: "receipt" },
+    /**
+     * ⭐⭐⭐ AND THE SCREEN THAT WRITES INTO IT — wave one. `/tds` was
+     * four read-only screens over a table nothing in the product could
+     * insert a row into; every one of them rendered correctly and empty.
+     */
+    { id: "tds-deduct", label: "Record a deduction", href: "/tds/deduct", icon: "receipt" },
+        /**
+     * ⭐⭐⭐ BANK RECONCILIATION — ADDED IN 0110, AND IT SHOULD HAVE
+     *    BEEN ADDED IN 0070.
+     *
+     * ══════════════════════════════════════════════════════════════
+     * 🔴 `/banking` HAS EXISTED SINCE v1.18.0 AND APPEARED IN NO NAV
+     *    SECTION, NO COMMAND BAR ENTRY, AND NO LINK FROM ANY OTHER
+     *    SCREEN
+     * ══════════════════════════════════════════════════════════════
+     * 0070 built statement import and matching. 0102 built the
+     * reconciliation statement, the sign-off, the guard trigger and
+     * the artefact an auditor asks for. Every gate stayed green
+     * across both, because no gate asks whether a page can be
+     * REACHED — and the only routes to it were the URL bar and a
+     * back-link from a page nobody could get to either.
+     *
+     * ⚠️ THIS IS THE SAME DEFECT AS `0100`'s DEPRECIATION ENGINE,
+     *    WHICH NOTHING RENDERED FOR FOUR BATCHES, and the same shape
+     *    as the eleven columns declared and enforced by nothing. It
+     *    is the twelfth. Built-and-unreachable and
+     *    declared-and-unread are one defect wearing two hats.
+     */
+    { id: "banking", label: "Bank Reconciliation", href: "/banking", icon: "landmark" },
+    /**
+     * ⭐ AND THE REGISTER THE RECONCILIATION SCREEN FEEDS — 0110.
+     * A bank charge is posted gross because the bank's tax invoice
+     * arrives separately, so the input credit on it sits unclaimed.
+     * Before this it sat unclaimed AND unrecorded.
+     */
+    { id: "bank-charge-itc", label: "Bank Charge Credit", href: "/banking/input-credit", icon: "receipt" },
     { id: "accounting", label: "Ledger", href: "/accounting", icon: "book-open" },
+    /**
+     * ⭐ CURRENCY & FX — v1.65.0-alpha.
+     *
+     * 🔴 IT SITS UNDER FINANCE AND NOT UNDER SETTINGS. A rate is not a
+     * preference: it is an input to the profit and loss account, and the
+     * reporting-date restatement it drives moves the reported profit.
+     * Filing it beside the ledger is where the person who has to defend
+     * the figure will look for it.
+     */
+    { id: "fixed-assets", label: "Fixed Assets", href: "/fixed-assets", icon: "building-2" },
+    { id: "fx", label: "Currency & FX", href: "/fx", icon: "arrow-left-right" },
     { id: "tally", label: "Tally Export", href: "/tally", icon: "download" },
   ],
 };
@@ -805,7 +921,43 @@ const TRADING_TEMPLATE = makeVertical({
         { id: "gst", label: "GST", href: "/gst", icon: "landmark" },
         { id: "gstr2b", label: "GSTR-2B", href: "/gstr2b", icon: "file-check" },
         { id: "tds", label: "TDS", href: "/tds", icon: "scissors" },
+        /**
+         * ⭐⭐⭐ AND THE SCREEN THAT WRITES INTO IT — wave one. `/tds` was
+         * four read-only screens over a table nothing in the product could
+         * insert a row into; every one of them rendered correctly and empty.
+         */
+        { id: "tds-deduct", label: "Record a deduction", href: "/tds/deduct", icon: "scissors" },
         { id: "accounting", label: "Ledger", href: "/accounting", icon: "book-open" },
+        /**
+         * ⭐⭐⭐ BANK RECONCILIATION — ADDED IN 0110, AND IT SHOULD HAVE
+         *    BEEN ADDED IN 0070.
+         *
+         * ══════════════════════════════════════════════════════════════
+         * 🔴 `/banking` HAS EXISTED SINCE v1.18.0 AND APPEARED IN NO NAV
+         *    SECTION, NO COMMAND BAR ENTRY, AND NO LINK FROM ANY OTHER
+         *    SCREEN
+         * ══════════════════════════════════════════════════════════════
+         * 0070 built statement import and matching. 0102 built the
+         * reconciliation statement, the sign-off, the guard trigger and
+         * the artefact an auditor asks for. Every gate stayed green
+         * across both, because no gate asks whether a page can be
+         * REACHED — and the only routes to it were the URL bar and a
+         * back-link from a page nobody could get to either.
+         *
+         * ⚠️ THIS IS THE SAME DEFECT AS `0100`'s DEPRECIATION ENGINE,
+         *    WHICH NOTHING RENDERED FOR FOUR BATCHES, and the same shape
+         *    as the eleven columns declared and enforced by nothing. It
+         *    is the twelfth. Built-and-unreachable and
+         *    declared-and-unread are one defect wearing two hats.
+         */
+        { id: "banking", label: "Bank Reconciliation", href: "/banking", icon: "landmark" },
+        /**
+         * ⭐ AND THE REGISTER THE RECONCILIATION SCREEN FEEDS — 0110.
+         * A bank charge is posted gross because the bank's tax invoice
+         * arrives separately, so the input credit on it sits unclaimed.
+         * Before this it sat unclaimed AND unrecorded.
+         */
+        { id: "bank-charge-itc", label: "Bank Charge Credit", href: "/banking/input-credit", icon: "receipt" },
         { id: "tally", label: "Tally Export", href: "/tally", icon: "download" },
       ],
     },
@@ -1084,7 +1236,43 @@ const FINANCE_TEMPLATE = makeVertical({
         { id: "gst", label: "GST", href: "/gst", icon: "receipt" },
         { id: "gstr2b", label: "GSTR-2B", href: "/gstr2b", icon: "file-check" },
         { id: "tds", label: "TDS", href: "/tds", icon: "scissors" },
+        /**
+         * ⭐⭐⭐ AND THE SCREEN THAT WRITES INTO IT — wave one. `/tds` was
+         * four read-only screens over a table nothing in the product could
+         * insert a row into; every one of them rendered correctly and empty.
+         */
+        { id: "tds-deduct", label: "Record a deduction", href: "/tds/deduct", icon: "scissors" },
         { id: "accounting", label: "Ledger", href: "/accounting", icon: "book-open" },
+        /**
+         * ⭐⭐⭐ BANK RECONCILIATION — ADDED IN 0110, AND IT SHOULD HAVE
+         *    BEEN ADDED IN 0070.
+         *
+         * ══════════════════════════════════════════════════════════════
+         * 🔴 `/banking` HAS EXISTED SINCE v1.18.0 AND APPEARED IN NO NAV
+         *    SECTION, NO COMMAND BAR ENTRY, AND NO LINK FROM ANY OTHER
+         *    SCREEN
+         * ══════════════════════════════════════════════════════════════
+         * 0070 built statement import and matching. 0102 built the
+         * reconciliation statement, the sign-off, the guard trigger and
+         * the artefact an auditor asks for. Every gate stayed green
+         * across both, because no gate asks whether a page can be
+         * REACHED — and the only routes to it were the URL bar and a
+         * back-link from a page nobody could get to either.
+         *
+         * ⚠️ THIS IS THE SAME DEFECT AS `0100`'s DEPRECIATION ENGINE,
+         *    WHICH NOTHING RENDERED FOR FOUR BATCHES, and the same shape
+         *    as the eleven columns declared and enforced by nothing. It
+         *    is the twelfth. Built-and-unreachable and
+         *    declared-and-unread are one defect wearing two hats.
+         */
+        { id: "banking", label: "Bank Reconciliation", href: "/banking", icon: "landmark" },
+        /**
+         * ⭐ AND THE REGISTER THE RECONCILIATION SCREEN FEEDS — 0110.
+         * A bank charge is posted gross because the bank's tax invoice
+         * arrives separately, so the input credit on it sits unclaimed.
+         * Before this it sat unclaimed AND unrecorded.
+         */
+        { id: "bank-charge-itc", label: "Bank Charge Credit", href: "/banking/input-credit", icon: "receipt" },
         { id: "tally", label: "Tally Export", href: "/tally", icon: "download" },
       ],
     },

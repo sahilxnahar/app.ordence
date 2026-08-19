@@ -359,7 +359,19 @@ async function firstRefusal(tx: Tx, slug: string, fold: string): Promise<SlugRej
  * Capped at 3: a list of eight near-identical names is a decision, not a
  * help.
  */
-async function verifiedSuggestions(tx: Tx, raw: string): Promise<string[]> {
+/**
+ * ⚠️ EXPORTED, NOT COPIED — Brief A. `server/actions/claim.ts` refuses a
+ *    claim too and needs the same answer. A second implementation would be
+ *    the two-reserved-word-lists incident in a new shape: one copy gets the
+ *    fold-deduplication fix and the other keeps offering a name that is
+ *    already spoken for.
+ *
+ * ⚠️ THIS FILE IS `_availability.ts`, NOT `route.ts`. The Next.js rule that
+ *    a route module may export only HTTP verbs does not apply here, which is
+ *    precisely why the logic was put in this file in the first place, and
+ *    `scripts/check-route-exports.mjs` is the gate that keeps it that way.
+ */
+export async function verifiedSuggestions(tx: Tx, raw: string): Promise<string[]> {
   const candidates = suggestSlugs(raw, 6);
   if (candidates.length === 0) return [];
 

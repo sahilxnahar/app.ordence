@@ -42,22 +42,54 @@ const ROOT = process.cwd();
  * Raising it to make a build pass converts the gate into a formality.
  * If a change genuinely needs a new destination, build the destination.
  */
-const KNOWN_DEAD_MAX = 8;
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * ⭐⭐⭐ WAVE 10 — THIS IS NOW ZERO. THE BACKLOG IS PAID OFF.
+ * ══════════════════════════════════════════════════════════════════════
+ * It was 8. The header above says: "THE LIST IS THE BACKLOG. When it
+ * reaches zero, delete the mechanism." It has reached zero, and the
+ * allowance is what is deleted , not the check.
+ *
+ * The eight, and what each cost:
+ *
+ *   /sales/bookings/:id        every row of the bookings list. BUILT, and
+ *   /sales/bookings/new        it made 21 orphaned server actions
+ *                              reachable , the whole demand, receipt and
+ *                              payment-plan lifecycle.
+ *   /sales/inventory/:id       every unit code in the grid. BUILT, with
+ *                              hold, release, block and correct.
+ *   /sales/inventory/new       REMOVED, not built: the create form was
+ *                              already on the list page and a second
+ *                              surface for the same eleven fields is the
+ *                              duplication this codebase has paid for
+ *                              before.
+ *   /settings/recovery/:id/:id every Restore link. Its own entry said
+ *                              "Soft delete works; undelete does not."
+ *                              BUILT.
+ *   /land/:id                  every parcel. BUILT, including the title
+ *                              chain audit, which had no screen that
+ *                              could ask it a question.
+ *   /leads/:id                 every enquiry reference. REPOINTED: the
+ *                              lead screen has always been at
+ *                              `/sales/leads/:id`.
+ *   /companies/:id             the statement's breadcrumb. REPOINTED to
+ *                              the edit screen, which is the only screen
+ *                              about a company there is.
+ *
+ * ⚠️ AT ZERO, ANY DEAD LINK FAILS THE BUILD. That is the whole point of
+ * the number reaching zero, and it is why the entry list below is empty
+ * rather than the file being deleted: a gate that only refuses NEW dead
+ * links is exactly what is wanted once the old ones are gone.
+ */
+const KNOWN_DEAD_MAX = 0;
 
 /**
- * The twelve, each with the screen that links to it and what it costs a
- * customer who clicks it. Ordered by how early in a trial they hit it.
+ * ⭐ EMPTY SINCE WAVE 10. Every entry that was here has been built,
+ * removed or repointed , see the note on `KNOWN_DEAD_MAX`. An entry
+ * added here from now on is a deliberate, reviewable decision to ship a
+ * 404, and it has to raise the budget above zero to do it.
  */
-const KNOWN_DEAD = new Map([
-  ["/sales/inventory/new", "Inventory list · New unit"],
-  ["/sales/inventory/:id", "Inventory grid · every unit code"],
-  ["/sales/bookings/new", "Bookings list · New booking"],
-  ["/sales/bookings/:id", "Bookings list · every row"],
-  ["/companies/:id", "Company statement · the breadcrumb back to the company"],
-  ["/leads/:id", "Enquiries list · every row"],
-  ["/land/:id", "Land register · every parcel"],
-  ["/settings/recovery/:id/:id", "Recycle bin · every Restore link. Soft delete works; undelete does not."],
-]);
+const KNOWN_DEAD = new Map([]);
 
 /* ------------------------------------------------------------------ */
 /* THE ROUTE TABLE                                                     */

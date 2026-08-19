@@ -31,7 +31,14 @@ import "server-only";
  */
 
 import { withTenant } from "@/db";
-import { chatCompletion, type ChatMessage } from "@/lib/ai/client";
+import { type ChatMessage } from "@/lib/ai/client";
+// ⭐ 0105 · THE ONLY CHANGE OF SUBSTANCE IN THIS FILE. These six monitors
+// used to call `chatCompletion` directly, which read the key from
+// `process.env` and had no tenant dimension at all. They now go through
+// the wrapper that asks THIS workspace first and falls back to Ordence's
+// key. Nothing else about them moves — same prompts, same data, same
+// `sensitivity: "tenant"`, same refusal when the confidential lane is empty.
+import { tenantChatCompletion } from "@/server/ai/chat";
 import { recordPattern } from "@/lib/ai/patterns";
 import { createNotification } from "@/server/notifications/create";
 import {
@@ -84,7 +91,24 @@ function daysBetween(from: string, to: string): number {
   );
 }
 
+/**
+ * ⚠️ `tenantId` IS NOW REQUIRED, AND IT IS THE WHOLE CHANGE.
+ *
+ * 🔴 `sensitivity: "tenant"` IS UNCHANGED AND MUST STAY UNCHANGED. Every
+ * one of these six monitors reads the workspace's own compliance,
+ * receivables, ITC, stock and site data. A tenant supplying their own
+ * Groq key does not make Groq eligible for it — the lane is a property
+ * of the provider, not of the payer. See `laneForCredential()` in
+ * `lib/ai/credentials.ts`.
+ *
+ * ⭐ SO ON A DEPLOYMENT WITH NO CONFIDENTIAL-LANE KEY THIS RETURNS null
+ * ON EVERY RUN, and each worker falls through to its own arithmetic
+ * summary below. That is correct behaviour and it is also the state of
+ * the live deployment today, which has an OpenRouter key and nothing
+ * else. It was silent before; `getAiProviderStatus()` now counts it.
+ */
 async function analyzeWithAI(
+  tenantId: string,
   systemPrompt: string,
   dataSummary: string,
 ): Promise<string | null> {
@@ -93,7 +117,8 @@ async function analyzeWithAI(
     { role: "user", content: dataSummary },
   ];
 
-  const response = await chatCompletion({
+  const response = await tenantChatCompletion({
+    tenantId,
     messages,
     temperature: 0.2,
     sensitivity: "tenant",
@@ -162,6 +187,7 @@ async function gstDeadlineWatcher(tenantId: string): Promise<WorkerResult> {
     });
 
     const summary = (await analyzeWithAI(
+      tenantId,
       "You are a GST compliance monitor for an Indian business. Analyze the upcoming GST deadlines and highlight risks. Be concise — 3-5 bullet points max.",
       dataSummary,
     )) ?? `${overdue.length} overdue, ${dueSoon.length} due within 7 days, ${upcoming.tasks.length} total pending.`;
@@ -263,6 +289,7 @@ async function receivablesAging(tenantId: string): Promise<WorkerResult> {
     });
 
     const summary = (await analyzeWithAI(
+      tenantId,
       "You are a receivables monitor for an Indian business. Analyze the overdue receivables and recommend collection actions. Be concise — 3-5 bullet points. Amounts are in rupees.",
       dataSummary,
     )) ?? `${data.overdue.length} overdue receivables totaling ₹${Math.floor(totalRs).toLocaleString("en-IN")}.`;
@@ -358,6 +385,7 @@ async function reconciliationDrift(tenantId: string): Promise<WorkerResult> {
     });
 
     const summary = (await analyzeWithAI(
+      tenantId,
       "You are a GSTR-2B reconciliation monitor. Analyze the reconciliation status and highlight ITC at risk. Be concise — 3-5 bullet points. Amounts are in rupees.",
       dataSummary,
     )) ?? `${data.unreconciled.length} unreconciled invoices worth ₹${Math.floor(Number(totalUnreconciledMinor) / 100).toLocaleString("en-IN")}.`;
@@ -449,6 +477,7 @@ async function inventoryReorder(tenantId: string): Promise<WorkerResult> {
     });
 
     const summary = (await analyzeWithAI(
+      tenantId,
       "You are an inventory monitor for an Indian business. Analyze stock levels and recommend reorders. Be concise — 3-5 bullet points.",
       dataSummary,
     )) ?? `${critical.length} out of stock, ${low.length} below reorder level, ${data.items.length} total items needing attention.`;
@@ -548,6 +577,7 @@ async function complianceGap(tenantId: string): Promise<WorkerResult> {
     });
 
     const summary = (await analyzeWithAI(
+      tenantId,
       "You are a compliance monitor for an Indian business. Analyze expiring licences and overdue compliance tasks. Recommend actions. Be concise — 3-5 bullet points.",
       dataSummary,
     )) ?? `${data.expiring.length} licences expiring within 60 days, ${data.overdue.length} overdue compliance tasks.`;
@@ -666,6 +696,7 @@ async function siteLabourAnomaly(tenantId: string): Promise<WorkerResult> {
     });
 
     const summary = (await analyzeWithAI(
+      tenantId,
       "You are a construction site monitor. Analyze daily site logs for anomalies — missing logs, worker count drops, or unusual patterns. Be concise — 3-5 bullet points.",
       dataSummary,
     )) ?? `${data.missingLogs.length} projects with missing logs, ${drops.length} worker count drops detected.`;

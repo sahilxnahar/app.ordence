@@ -54,6 +54,7 @@ import {
 import { verifyUploadTicket, getTicketSecret } from "@/lib/storage/upload-ticket";
 import { pathnameBelongsToTenant, isAllowedMimeType } from "@/lib/validators/storage";
 import { peekAndSniff } from "@/lib/validators/peek-stream";
+import { recordSecurityEvent } from "@/server/security/record";
 
 // Node runtime: `requireTenantContext` queries PostgreSQL.
 export const runtime = "nodejs";
@@ -115,6 +116,40 @@ export async function PUT(request: NextRequest): Promise<NextResponse> {
         sessionTenantId: ctx.tenant.id,
         ticketTenantId: ticket.t,
       });
+
+      /**
+       * ⭐⭐⭐ WAVE 9 — THIS IS THE EVENT `tenant.cross_access_attempt`
+       * WAS DECLARED FOR, AND THIS SURFACE ONLY WROTE A CONSOLE LINE.
+       *
+       * The catalogue says of this type: *"If this ever fires in
+       * production it is either an attack or a bug in our scoping, and
+       * both are page-someone events."* A `console.error` is not a page.
+       * It is a line in Railway's log stream that nobody reads unless
+       * they are already looking, which means the one condition the file
+       * header calls the reason this check exists produced no alert.
+       *
+       * ⚠️ AWAITED, NOT FIRE-AND-FORGET. The refusal is cheap and the
+       * event is `critical`; returning before the write means an attacker
+       * who can make the process exit mid-request also decides whether
+       * the attempt was recorded.
+       */
+      await recordSecurityEvent({
+        type: "tenant.cross_access_attempt",
+        tenantId: ctx.tenant.id,
+        source: "api/upload/put",
+        subjectType: "upload_ticket",
+        /** The PATH the ticket authorised. Never the ticket itself. */
+        subjectId: ticket.p.slice(0, 200),
+        actorUserId: ctx.user.id,
+        route: "/api/upload/put",
+        detail: {
+          sessionTenantId: ctx.tenant.id,
+          ticketTenantId: ticket.t,
+          contentType: ticket.ct,
+        },
+        reason: "An upload ticket issued to one workspace was presented by another.",
+      });
+
       return refuseTicket();
     }
 
@@ -209,6 +244,37 @@ export async function PUT(request: NextRequest): Promise<NextResponse> {
         declared: ticket.ct,
         reason: verdict.reason,
       });
+
+      /**
+       * ⭐⭐ WAVE 9 — `upload.rejected` HAD NEVER BEEN EMITTED EITHER.
+       *
+       * ⚠️ EMITTED HERE AND NOT AT THE ALLOWLIST CHECKS ABOVE, WHICH IS
+       * THE WHOLE POINT OF THE DISTINCTION. Every refusal before this one
+       * caught a client that ASKED for something not permitted — a
+       * mistake, a stale page, an unsupported file. This one caught a
+       * client whose bytes do not match what it declared them to be,
+       * twice, in two places it had to keep consistent. That is not a
+       * mistake; the only way to produce it is to try.
+       *
+       * A row for every 415 would bury that signal under ordinary
+       * user error, which is how a security table stops being read.
+       */
+      await recordSecurityEvent({
+        type: "upload.rejected",
+        tenantId: ctx.tenant.id,
+        source: "api/upload/put",
+        subjectType: "upload",
+        subjectId: ticket.p.slice(0, 200),
+        actorUserId: ctx.user.id,
+        route: "/api/upload/put",
+        detail: {
+          declaredContentType: ticket.ct,
+          verdict: verdict.reason,
+          declaredBytes: declaredLength,
+        },
+        reason: "Upload contents did not match the declared file type.",
+      });
+
       return NextResponse.json({ error: verdict.detail }, { status: 415 });
     }
 

@@ -39,7 +39,12 @@
  * checkable at all.
  */
 
-import { alignToHeader, parseCsv, unguardFormulaPrefix } from "./csv";
+import {
+  alignToHeader,
+  parseCsv,
+  unguardFormulaPrefix,
+  type CsvRecord,
+} from "./csv";
 import { describeMissingHeaders, mapHeaders } from "./mapping";
 import { coerceQuantityThousandths, describeAtomicRefusal } from "./opening";
 import {
@@ -140,7 +145,38 @@ export function planImport(
   const parsed = parseCsv(csvText);
   if (!parsed.ok) return fatalPlan(entity.key, parsed.error);
 
-  const [header, ...dataRecords] = parsed.records;
+  return planImportRecords(entity, parsed.records);
+}
+
+/**
+ * ⭐⭐⭐ WAVE 6 — THE SAME PLANNER, FROM A RECORD STREAM RATHER THAN TEXT.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * ⚠️ THIS IS THE ENTIRE COST OF SUPPORTING EVERY INPUT FORMAT
+ * ══════════════════════════════════════════════════════════════════════
+ * `planImport` above used to do two jobs: turn CSV text into records, and
+ * turn records into a plan. Only the first is format-specific.
+ * `lib/import/sources/` produces `CsvRecord[]` from Excel, JSON and Tally
+ * XML, and they all arrive HERE — so mapping, coercion, validation,
+ * de-duplication, the dry run, the partial-success report and the
+ * re-run safety are shared, not reimplemented per format.
+ *
+ * 🔴 THE ALTERNATIVE — an `importFromExcel` beside `importFromCsv` — is
+ * exactly what `lib/import/types.ts` was written in Batch 57 to prevent,
+ * one level up: *"the parser is duplicated, the error messages have
+ * drifted, the dry run of one has a bug the other does not"*. A second
+ * planner would have all of those properties and would also disagree
+ * about de-duplication, which is the one that doubles a customer's data.
+ *
+ * ⚠️ `planImport` IS KEPT AND NOT REPLACED. Every existing caller passes
+ * CSV text and none of them change; the new one is a second door onto the
+ * same room, not a migration.
+ */
+export function planImportRecords(
+  entity: ImportEntityDefinition,
+  records: readonly CsvRecord[],
+): ImportPlan {
+  const [header, ...dataRecords] = records;
   if (!header) return fatalPlan(entity.key, "That file has no rows in it.");
 
   const headers = header.cells;

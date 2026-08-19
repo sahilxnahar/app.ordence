@@ -53,6 +53,22 @@ export const userStatusEnum = pgEnum("user_status", [
   "active",
   "suspended",
   "offboarded",
+  /**
+   * ⭐⭐⭐ 0114. THE PERSON EXISTS BECAUSE THE IDENTITY PROVIDER CREATED
+   * THEM, AND THE WORKSPACE HAD NO SEAT FREE.
+   *
+   * 🔴 IT DOES NOT CONSUME A SEAT. `SEAT_CONSUMING_STATUSES` in
+   * `lib/billing/seats.ts` deliberately excludes it, so a workspace at
+   * 10 of 10 with three people parked is still at 10 of 10 and its owner
+   * is asked to buy three seats rather than discovering they are at 13.
+   *
+   * ⚠️ THIS EXISTS BECAUSE REFUSING THE CLERK WEBHOOK IS WORSE. A non-2xx
+   * makes Clerk retry the membership event for ever and the person exists
+   * in the identity provider while never existing here — able to sign in,
+   * landing on a broken workspace, with no way for their admin to find
+   * out why. Parking them gives Clerk its 200 AND withholds the seat.
+   */
+  "pending_seat",
 ]);
 
 export const systemRoleEnum = pgEnum("system_role", [
@@ -234,6 +250,45 @@ export const tenants = pgTable(
 
     /** Hard capacity limits enforced by middleware before any write. */
     seatLimit: integer("seat_limit").default(5).notNull(),
+
+    /**
+     * ⭐⭐⭐ WHOSE AI KEYS THIS WORKSPACE MAY SPEND — 0115.
+     *
+     * 🔴 `byo_required` MEANS ORDENCE'S KEYS ARE NOT IN THIS WORKSPACE'S
+     * CREDENTIAL SET AT ALL. A provider it has not configured is simply
+     * unavailable, and the refusal names the fix rather than saying
+     * "unavailable" — which is indistinguishable from an outage on our
+     * side and produces a ticket about our product for a key only they
+     * can add.
+     *
+     * ⚠️ NEW WORKSPACES DEFAULT TO `byo_required`; every workspace that
+     * existed when 0115 ran was grandfathered to `platform_allowed`, so
+     * that a deploy did not cut anybody off mid-sentence. 0115's verdict
+     * reports how many, because moving them is a decision somebody makes
+     * with the number in front of them.
+     *
+     * ⚠️ A COLUMN AND NOT A KEY IN `settings`, because a CHECK can police
+     * a column and cannot police a key inside a jsonb document — and a
+     * policy the database cannot spell-check eventually reads
+     * "byo-required" and silently means `platform_allowed`.
+     */
+    aiCredentialPolicy: varchar("ai_credential_policy", { length: 20 })
+      .default("byo_required")
+      .notNull(),
+
+    /**
+     * ⭐⭐ 0117 — WHETHER A HIGH-CONFIDENCE IMPORT MAY COMMIT WITHOUT A
+     * PERSON. `propose_only` (the default) or `auto_above_threshold`.
+     *
+     * 🔴 AN OPENING TRIAL BALANCE IS NEVER AUTO-COMMITTED WHATEVER THIS
+     * SAYS. See `lib/import/proposal.ts#neverAutoCommit`: it sets the
+     * starting position of the customer's books and every figure after it
+     * derives from it, so a mapping that is 99% right here is wrong about
+     * somebody's books one time in a hundred, permanently.
+     */
+    importAutoCommitPolicy: varchar("import_auto_commit_policy", { length: 24 })
+      .default("propose_only")
+      .notNull(),
     storageLimitMb: integer("storage_limit_mb").default(512).notNull(),
 
     trialEndsAt: timestamp("trial_ends_at", { withTimezone: true }),

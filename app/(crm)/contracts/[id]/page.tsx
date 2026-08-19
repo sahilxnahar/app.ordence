@@ -32,6 +32,8 @@ import { isEmailEnabled } from "@/lib/email/resend";
 import { DocumentVault } from "@/components/crm/document-vault";
 import { PortalManager } from "@/components/crm/portal-manager";
 import { SendToClientButton } from "../send-to-client";
+import { LegalHoldControl } from "./legal-hold-control";
+import { placeLegalHold, liftLegalHold } from "@/server/actions/legal-hold";
 import { Badge } from "@/components/ui/badge";
 
 export const dynamic = "force-dynamic";
@@ -119,6 +121,23 @@ export default async function ContractDetailPage({
   // The server re-checks both; this only decides what the UI offers.
   const canCreatePortalLink = canUpdate && !underLegalHold;
   const canCreateSigningLink = can(subject, "contracts:approve") && !underLegalHold;
+
+  /**
+   * ⭐⭐⭐ WAVE 9 — `contracts:legal_hold` WAS DECLARED, GRANTED TO
+   * `manager`, HONOURED IN FIVE PLACES AND SETTABLE FROM NOWHERE.
+   *
+   * This page has read `contract.legalHold` since v0.8.0 and refused four
+   * operations on it. Nothing in the product could turn it on or off —
+   * the only route was an UPDATE typed into a database console, with no
+   * audit row, no attributable actor and no recorded reason. See
+   * `server/actions/legal-hold.ts`.
+   *
+   * ⚠️ THE CONTROL IS HIDDEN, NOT DISABLED, FOR SOMEBODY WITHOUT THE
+   * PERMISSION. A greyed-out "Lift the hold" button on a contract in a
+   * live dispute is an invitation to go and ask for the permission; the
+   * decision is not theirs to prompt.
+   */
+  const canChangeLegalHold = can(subject, "contracts:legal_hold");
 
   return (
     <main className="mx-auto max-w-5xl space-y-8 p-6">
@@ -415,6 +434,21 @@ export default async function ContractDetailPage({
           than merely discouraged.
         </p>
       </section>
+
+      {/*
+        ⭐ WAVE 9 — LAST ON THE PAGE, DELIBERATELY. It is rare, it is
+        heavy, and putting it near the header would place a control that
+        freezes a record next to the buttons people use every day.
+      */}
+      {canChangeLegalHold && (
+        <LegalHoldControl
+          contractId={contract.id}
+          legalHold={underLegalHold}
+          legalHoldReason={contract.legalHoldReason ?? null}
+          place={placeLegalHold}
+          lift={liftLegalHold}
+        />
+      )}
     </main>
   );
 }

@@ -96,6 +96,70 @@ vi.mock("@/db", () => ({
   withTenant: vi.fn(),
 }));
 
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * ⭐ CLERK, MOCKED AS A STORE RATHER THAN AS A NO-OP — v1.65.0-alpha
+ * ══════════════════════════════════════════════════════════════════════
+ * The webhook now writes the GRANTED address back to the Clerk
+ * organisation, and it has to: `middleware.ts:1031` compares the hostname
+ * label against the session's CLERK `orgSlug`, not against
+ * `tenants.slug`. A workspace whose two values differ is answered
+ * `/access-denied` on its own address, by `/api/internal/host-moved`,
+ * because a LIVE tenant holds the label and the live check deliberately
+ * does not redirect.
+ *
+ * ⚠️ A `vi.fn()` THAT RETURNS UNDEFINED WOULD NOT HAVE CAUGHT THAT. The
+ *    fake keeps the slug it was given, so the tests below can assert what
+ *    Clerk ends up holding — which is the value the routing gate reads.
+ */
+const clerkWorld = vi.hoisted(() => ({
+  orgs: new Map<string, { slug: string | null }>(),
+  updates: [] as Array<{ organizationId: string; slug: string }>,
+  /** Set to make the next update refuse, the way a taken slug would. */
+  refuseUpdateWith: null as Error | null,
+  /** Set to make Clerk unreachable, the way an outage would. */
+  unreachable: false,
+}));
+
+vi.mock("@clerk/nextjs/server", () => ({
+  clerkClient: async () => {
+    if (clerkWorld.unreachable) throw new Error("simulated Clerk outage");
+    return {
+      organizations: {
+        async getOrganization({ organizationId }: { organizationId: string }) {
+          const org = clerkWorld.orgs.get(organizationId);
+          if (!org) throw new Error(`no such organization ${organizationId}`);
+          return org;
+        },
+        async updateOrganization(organizationId: string, params: { slug: string }) {
+          if (clerkWorld.refuseUpdateWith) throw clerkWorld.refuseUpdateWith;
+          clerkWorld.orgs.set(organizationId, { slug: params.slug });
+          clerkWorld.updates.push({ organizationId, slug: params.slug });
+          return { id: organizationId, slug: params.slug };
+        },
+      },
+    };
+  },
+}));
+
+/**
+ * ⚠️ SPIED, NOT EXERCISED. `createNotification` opens its own tenant
+ *    transaction, reads the recipient list and may send email — all of
+ *    which have their own coverage. What THIS file is entitled to assert
+ *    is that the webhook tells somebody when a live address moves, and
+ *    tells nobody when it does not.
+ */
+const notified = vi.hoisted(() => ({
+  calls: [] as Array<Record<string, unknown>>,
+}));
+
+vi.mock("@/server/notifications/create", () => ({
+  createNotification: async (input: Record<string, unknown>) => {
+    notified.calls.push(input);
+    return { ok: true as const, id: "ntf_test" };
+  },
+}));
+
 import { withPlatformScope, withTenant } from "@/db";
 import { tenants, auditLogs } from "@/db/schema";
 import { tenantSlugHistory } from "@/db/schema/slugs";
@@ -454,6 +518,12 @@ beforeEach(() => {
   world = newWorld();
   process.env.CLERK_WEBHOOK_SIGNING_SECRET = "whsec_test";
 
+  clerkWorld.orgs.clear();
+  clerkWorld.updates.length = 0;
+  clerkWorld.refuseUpdateWith = null;
+  clerkWorld.unreachable = false;
+  notified.calls.length = 0;
+
   vi.mocked(withPlatformScope).mockImplementation(
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (async (_reason: string, cb: (tx: any) => Promise<unknown>) => cb(makeTx(world))) as any,
@@ -471,6 +541,13 @@ function deliver(
   type: "organization.created" | "organization.updated",
   org: OrgPayload,
 ): Promise<Response> {
+  /*
+   * ⚠️ THE FAKE CLERK IS SEEDED FROM THE PAYLOAD. A delivery describes an
+   *    organisation that exists in Clerk with that slug; without this the
+   *    reconciliation would read an organisation that is not there and the
+   *    tests would be measuring the mock rather than the code.
+   */
+  clerkWorld.orgs.set(org.id, { slug: org.slug });
   return POST(
     new Request("https://app.ordence.com/api/webhooks/clerk", {
       method: "POST",
@@ -942,5 +1019,213 @@ describe("the candidate list is a pure function of the ask and the org id", () =
     for (const candidate of planSlugCandidates(long, ORG).candidates) {
       expect(candidate.length).toBeLessThanOrEqual(63);
     }
+  });
+});
+
+/* ================================================================== */
+/* ⭐⭐⭐ THE MIRROR — CLERK MUST HOLD THE ADDRESS WE GRANTED          */
+/* ================================================================== */
+
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 THE DEFECT THIS BLOCK EXISTS FOR — v1.65.0-alpha, Brief A
+ * ══════════════════════════════════════════════════════════════════════
+ * The fallback ladder above works: a company called Support gets a
+ * workspace on `support-india`, and the tests above prove it. What none of
+ * them asked is whether anybody can REACH it.
+ *
+ * `middleware.ts:1031` refuses a request whose hostname label differs from
+ * the session's CLERK `orgSlug`. Clerk still held `support`. So every
+ * member of that workspace, opening the address the product had just
+ * granted them, was rewritten to `/api/internal/host-moved`, which found a
+ * LIVE tenant on the label — their own — and therefore did NOT redirect,
+ * and answered `/access-denied`.
+ *
+ * ⚠️ SO THE LADDER PRODUCED A WORKSPACE NOBODY COULD ENTER, and every
+ *    assertion in this file passed while it did. `settings.clerkSlug` was
+ *    written, was displayed in the console, and was enforced by nothing.
+ *
+ * ⭐ THE PROPERTY, STATED ONCE: after any delivery, the slug Clerk holds
+ *    and `tenants.slug` are the same string. Everything below is that
+ *    sentence in different circumstances.
+ */
+describe("🔴 Clerk is made to hold the address the database granted", () => {
+  const clerkSlugOf = (orgId: string) => clerkWorld.orgs.get(orgId)?.slug ?? null;
+
+  it("⭐⭐⭐ a DIVERTED provision leaves Clerk holding the granted address", async () => {
+    const response = await deliver("organization.created", {
+      id: "org_mirror_1",
+      name: "Support",
+      slug: "support",
+    });
+
+    expect(response.status).toBe(200);
+    const workspace = workspaceFor("org_mirror_1")!;
+
+    /* The ladder walked — this test is meaningless otherwise. */
+    expect(workspace.slug).not.toBe("support");
+
+    expect(
+      clerkSlugOf("org_mirror_1"),
+      "middleware compares the hostname against THIS value; if it is stale the workspace answers access-denied to its own staff",
+    ).toBe(workspace.slug);
+  });
+
+  it("⭐ a provision that got the address it asked for writes NOTHING to Clerk", async () => {
+    /** The common case must cost no round trip and must fire no second
+     *  webhook. A Clerk write per delivery is a loop with a network in it. */
+    await deliver("organization.created", {
+      id: "org_mirror_2",
+      name: "Harbour Works",
+      slug: "harbour-works",
+    });
+
+    expect(workspaceFor("org_mirror_2")!.slug).toBe("harbour-works");
+    expect(clerkWorld.updates).toHaveLength(0);
+  });
+
+  it("⭐ a REFUSED rename restores Clerk to the address the workspace kept", async () => {
+    await deliver("organization.created", { id: "org_mirror_3", name: "Harbour", slug: "harbour" });
+    clerkWorld.updates.length = 0;
+
+    /* Somebody edits the slug in Clerk to a reserved word. */
+    const response = await deliver("organization.updated", {
+      id: "org_mirror_3",
+      name: "Harbour",
+      slug: "billing",
+    });
+
+    expect(response.status).toBe(200);
+    expect(workspaceFor("org_mirror_3")!.slug, "the live address must not move").toBe("harbour");
+    expect(
+      clerkSlugOf("org_mirror_3"),
+      "Clerk kept the refused name, so every member of this workspace is locked out",
+    ).toBe("harbour");
+  });
+
+  it("⭐ an APPLIED rename needs no Clerk write — the two already agree", async () => {
+    await deliver("organization.created", { id: "org_mirror_4", name: "Harbour", slug: "harbour" });
+    clerkWorld.updates.length = 0;
+
+    await deliver("organization.updated", {
+      id: "org_mirror_4",
+      name: "Harbour",
+      slug: "harbour-projects",
+    });
+
+    expect(workspaceFor("org_mirror_4")!.slug).toBe("harbour-projects");
+    expect(clerkWorld.updates).toHaveLength(0);
+  });
+
+  it("🔴 Clerk being UNREACHABLE fails the delivery, so Svix retries", async () => {
+    /** A transient outage must not leave a permanently unreachable
+     *  workspace behind a 200 that says everything is fine. */
+    clerkWorld.unreachable = true;
+
+    const response = await deliver("organization.created", {
+      id: "org_mirror_5",
+      name: "Support",
+      slug: "support",
+    });
+
+    expect(response.status).toBe(500);
+    /* ⭐ AND THE WORKSPACE IS STILL THERE. The row committed; only the
+     *    reconciliation failed, and the retry re-attempts exactly that. */
+    expect(workspaceFor("org_mirror_5")).toBeDefined();
+  });
+
+  it("⚠️ Clerk REFUSING the name does not fail the delivery — a retry cannot succeed", async () => {
+    /** Replaying the delivery asks Clerk the same question and gets the
+     *  same answer, forever, on Svix's retry schedule. The honest outcome
+     *  is a loud log and a 200, not an infinite loop. */
+    clerkWorld.refuseUpdateWith = Object.assign(new Error("refused"), {
+      errors: [{ code: "duplicate_record", meta: { paramName: "slug" } }],
+    });
+
+    const response = await deliver("organization.created", {
+      id: "org_mirror_6",
+      name: "Support",
+      slug: "support",
+    });
+
+    expect(response.status).toBe(200);
+    expect(workspaceFor("org_mirror_6")).toBeDefined();
+  });
+});
+
+/* ================================================================== */
+/* ⭐⭐ A3 — SOMEBODY IS TOLD WHEN A LIVE ADDRESS MOVES                */
+/* ================================================================== */
+
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * ⭐ THE DECISION THIS PINS — Brief A, question A3
+ * ══════════════════════════════════════════════════════════════════════
+ * `server/platform/rename-slug.ts` argues that a rename must stay an
+ * operator act until TWO things exist: ① a 301 from the released host, and
+ * ② somebody telling the workspace it happened. ① shipped in v1.57.0.
+ * ② is asserted here.
+ *
+ * ⚠️ THE INTERESTING HALF IS THE SILENCE. `organization.updated` fires for
+ *    a logo change and a display-name change, which is most of them.
+ *    Notifying on "the update succeeded" rather than on "the address
+ *    moved" would email every user in every workspace every time somebody
+ *    uploaded a logo — and that is the version a reasonable person writes
+ *    first, because `rename.ok` is true in both cases.
+ */
+describe("⭐⭐ a workspace is told when its address moves, and only then", () => {
+  it("⭐ an applied rename notifies EVERY user in the workspace", async () => {
+    await deliver("organization.created", { id: "org_note_1", name: "Harbour", slug: "harbour" });
+    notified.calls.length = 0;
+
+    await deliver("organization.updated", {
+      id: "org_note_1",
+      name: "Harbour",
+      slug: "harbour-projects",
+    });
+
+    expect(notified.calls).toHaveLength(1);
+    const notice = notified.calls[0];
+    expect(notice.tenantId).toBe(workspaceFor("org_note_1")!.id);
+    /* ⚠️ BROADCAST. `userId` absent means every member — the thing that
+     *    changed is in every colleague's bookmark bar. */
+    expect(notice.userId).toBeUndefined();
+    /* ⚠️ The severity is the delivery channel: only critical and warning
+     *    are emailed, and an in-app bell is no use to somebody whose
+     *    problem is that they cannot reach the app. */
+    expect(notice.severity).toBe("critical");
+    expect(String(notice.body)).toContain("harbour-projects");
+    expect(String(notice.body)).toContain("harbour");
+  });
+
+  it("🔴 a logo-only update notifies NOBODY", async () => {
+    await deliver("organization.created", { id: "org_note_2", name: "Harbour", slug: "harbour" });
+    notified.calls.length = 0;
+
+    await deliver("organization.updated", {
+      id: "org_note_2",
+      name: "Harbour Works",
+      slug: "harbour",
+      image_url: "https://img.example/new.png",
+    });
+
+    expect(notified.calls).toHaveLength(0);
+  });
+
+  it("🔴 a REFUSED rename notifies nobody — nothing moved", async () => {
+    await deliver("organization.created", { id: "org_note_3", name: "Harbour", slug: "harbour" });
+    notified.calls.length = 0;
+
+    await deliver("organization.updated", { id: "org_note_3", name: "Harbour", slug: "admin" });
+
+    expect(workspaceFor("org_note_3")!.slug).toBe("harbour");
+    expect(notified.calls).toHaveLength(0);
+  });
+
+  it("⚠️ a brand-new workspace notifies nobody — it did not MOVE", async () => {
+    /** "Your address changed" on the first screen a customer ever sees is
+     *  alarming and untrue. */
+    await deliver("organization.created", { id: "org_note_4", name: "Support", slug: "support" });
+    expect(notified.calls).toHaveLength(0);
   });
 });

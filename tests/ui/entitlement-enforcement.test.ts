@@ -60,27 +60,58 @@ function walk(dir: string, out: string[] = []): string[] {
   return out;
 }
 
-/** Every server-side file that could hold a gate. Read once. */
-const SERVER_SOURCE: string = (() => {
+/** Every server-side file that could hold a gate, read once, kept apart. */
+const SERVER_FILES: string[] = (() => {
   const files = [...walk(join(ROOT, "server")), ...walk(join(ROOT, "app"))];
-  return files
-    .map((f) => {
-      try {
-        return readFileSync(f, "utf8");
-      } catch {
-        return "";
-      }
-    })
-    .join("\n");
+  return files.map((f) => {
+    try {
+      return readFileSync(f, "utf8");
+    } catch {
+      return "";
+    }
+  });
 })();
 
+const SERVER_SOURCE: string = SERVER_FILES.join("\n");
+
+/** Regex-safe form of a feature key, which contains dots. */
+function esc(key: string): string {
+  return key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 /**
- * Is there a server-side decision point that mentions this key?
+ * Is there a server-side decision point that reads this key?
  *
- * Deliberately loose: `requireFeature("x")`, a guard descriptor
- * `feature: "x"`, or a module constant. A stricter matcher would fail on
- * the next legitimate way somebody spells a gate, and the property under
- * test is "some server code reads this key", not "it is spelled thus".
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 BATCH 0109 — THIS FUNCTION WAS THE DEFECT.
+ * ══════════════════════════════════════════════════════════════════════
+ * It used to test six literal spellings against one big joined string,
+ * and five keys were refused by live server code while this reported
+ * that nothing read them: `sales.orders`, `sales.fulfilment`,
+ * `workflows.scheduled`, `workflows.http_request`, `email.transactional`.
+ *
+ * Two shapes defeated it, and both are ordinary good code:
+ *
+ *   1. a module constant not called exactly `FEATURE` —
+ *        const FEATURE_ORDERS = "sales.orders" as const;
+ *        ... guardSalesWrite({ feature: FEATURE_ORDERS, ... })
+ *
+ *   2. a key collected and passed to the gate in a loop —
+ *        features.add("workflows.scheduled");
+ *        for (const feature of featuresFor(...)) await requireFeature(feature, ctx);
+ *
+ * ⚠️ SO IT NOW RESOLVES THE BINDING, PER FILE, and the per-file part is
+ * load-bearing: against the joined string a constant declared in one
+ * file would match a same-named variable used in another, and the
+ * matcher would start reporting gates that do not exist. A false
+ * negative here is a missed limit; a false positive is a ledger that
+ * lies in the more comfortable direction, which is worse.
+ *
+ * ⚠️ IT IS STILL A HEURISTIC, and it always will be. That is why the
+ * companion check in `tests/ui/entitlement-gates-0109.test.ts` needs no
+ * knowledge of spelling at all: a `declared_only` key may not appear in
+ * server code AS A STRING, full stop. Whatever the next spelling is,
+ * that one catches it.
  */
 function hasServerGate(key: FeatureKey): boolean {
   // ⚠️ Matched against the SPELLINGS OF A GATE, not against any mention.
@@ -88,14 +119,52 @@ function hasServerGate(key: FeatureKey): boolean {
   // label or a nav entry — all of which DISPLAY it and refuse nothing.
   // Counting those as enforcement would make this test report exactly the
   // false comfort the ledger exists to remove.
-  return [
+  const literal = [
     `requireFeature("${key}"`,
     `requireFeatureAndPermission("${key}"`,
+    `checkFeature("${key}"`,
     `hasFeature("${key}"`,
     `evaluateFeature("${key}"`,
     `feature: "${key}"`,
     `FEATURE = "${key}"`,
-  ].some((spelling) => SERVER_SOURCE.includes(spelling));
+  ];
+  if (literal.some((spelling) => SERVER_SOURCE.includes(spelling))) return true;
+
+  /** `checkFeatureForTenant(session.tenantId, "ai.rag")` and friends. */
+  const byTenant = new RegExp(
+    `(?:check|require)FeatureForTenant\\([^)]*"${esc(key)}"`,
+  );
+
+  /** The key held in a module constant, then that constant used as a gate. */
+  const binding = new RegExp(
+    `const\\s+([A-Za-z0-9_$]+)\\s*(?::[^=\\n]+)?=\\s*"${esc(key)}"`,
+    "g",
+  );
+
+  /** The key collected into a set or array that a loop hands to the gate. */
+  const collected = new RegExp(`(?:add|push)\\(\\s*"${esc(key)}"\\s*\\)`);
+
+  for (const src of SERVER_FILES) {
+    if (!src.includes(`"${key}"`)) continue;
+
+    if (byTenant.test(src)) return true;
+
+    if (collected.test(src) && /requireFeature\(|checkFeature\(/.test(src)) {
+      return true;
+    }
+
+    binding.lastIndex = 0;
+    for (let m = binding.exec(src); m !== null; m = binding.exec(src)) {
+      const name = m[1];
+      const used = new RegExp(
+        `(?:feature:\\s*|requireFeature\\(\\s*|checkFeature\\(\\s*|` +
+          `requireFeatureAndPermission\\(\\s*|can\\(\\s*)${name}\\b`,
+      );
+      if (used.test(src)) return true;
+    }
+  }
+
+  return false;
 }
 
 /* ------------------------------------------------------------------ */

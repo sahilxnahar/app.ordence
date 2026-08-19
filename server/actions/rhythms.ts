@@ -25,40 +25,46 @@ import { revalidatePath } from "next/cache";
 import { z } from "zod";
 import { withTenant } from "@/db";
 import { customerRhythms, rhythmSignals } from "@/db/schema/patterns";
-import { tasks } from "@/db/schema/work";
 import { requirePermission, writeAudit } from "@/server/audit";
 import { toSalesActionError } from "@/server/sales/guards";
 import type { ActionResult } from "@/lib/validators/crm";
 import {
   compareSignals,
-  detectRhythm,
-  signalFrom,
   type Signal,
 } from "@/lib/patterns/rhythm";
+/**
+ * ⭐ THE RECOMPUTE ITSELF, WHICH IS NO LONGER IN THIS FILE. Brief C moved
+ * it so that a nightly schedule — which has no browser session — could
+ * call it. See the header on the module.
+ */
+import { recomputeRhythmsForTenant } from "@/server/patterns/rhythm-recompute";
 
 const READ = "contacts:read" as const;
 const WRITE = "contacts:update" as const;
-
-/** ⚠️ IST, because a business day is a business day. */
-function istToday(now: Date): string {
-  return new Intl.DateTimeFormat("en-CA", {
-    timeZone: "Asia/Kolkata",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  }).format(now);
-}
 
 /* ------------------------------------------------------------------ */
 /* THE RECOMPUTE                                                       */
 /* ------------------------------------------------------------------ */
 
 /**
- * ⭐ Reads every customer's order dates and replaces their rhythm row.
+ * ⭐ THE RECOMPUTE — THE INTERACTIVE DOOR ONTO IT.
  *
- * 🔴 REPLACES, NEVER PATCHES. A derived row that can be partially
- * updated is a derived row that will disagree with the data it came
- * from, and 0068 refuses any update that does not move `computed_at`.
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 THE BODY MOVED TO `server/patterns/rhythm-recompute.ts` — Brief C
+ * ══════════════════════════════════════════════════════════════════════
+ * This function was the ONLY writer of `customer_rhythms` and
+ * `rhythm_signals`, and nothing called it. The `/rhythms` board read what
+ * was computed; nothing computed. The half of the feature the owner
+ * valued most — the customer who has gone quiet — cannot be noticed by a
+ * function that never runs.
+ *
+ * The caller that has to exist runs nightly and has no Clerk session, so
+ * it cannot come through this file: every export here is a
+ * browser-reachable RPC endpoint and one taking a `tenantId` would be a
+ * way past row-level security.
+ *
+ * ⚠️ THE BUTTON STAYS. "Recompute now" after a bulk import is a real
+ * request, and it is the only way to see today's answer today.
  */
 export async function recomputeRhythms(): Promise<
   ActionResult<{
@@ -71,180 +77,24 @@ export async function recomputeRhythms(): Promise<
 > {
   try {
     const ctx = await requirePermission(WRITE);
-    const now = new Date();
-    const today = istToday(now);
 
-    const result = await withTenant(
-      ctx.tenant.id,
-      async (tx) => {
-        /**
-         * ⭐ ORDER DATES PER CUSTOMER, FROM THE INVOICES THAT WERE
-         * ACTUALLY RAISED.
-         *
-         * ⚠️ Not from quotations, and not from cancelled or void
-         * invoices. A pattern built on things that did not happen
-         * predicts things that will not happen.
-         */
-        const rows = await tx.execute(sql`
-          SELECT c.id AS subject_id,
-                 btrim(concat_ws(' ', c.first_name, c.last_name)) AS subject_label,
-                 array_agg(DISTINCT i.invoice_date::text
-                           ORDER BY i.invoice_date::text) AS order_dates
-            FROM contacts c
-            JOIN sales_invoices i ON i.contact_id = c.id
-           WHERE c.tenant_id = ${ctx.tenant.id}::uuid
-             AND i.tenant_id = ${ctx.tenant.id}::uuid
-             -- 🔴 ISSUED AND BEYOND ONLY. A pattern built on drafts and
-             -- cancellations predicts things that will not happen.
-             AND i.status IN ('issued', 'part_paid', 'paid')
-           GROUP BY c.id, c.first_name, c.last_name
-        `);
-
-        let regular = 0;
-        let lapsed = 0;
-        let signalsRaised = 0;
-        let tasksRaised = 0;
-        const examined = rowsOf(rows).length;
-
-        for (const row of rowsOf<Record<string, unknown>>(rows)) {
-          const dates = (row.order_dates as string[] | null) ?? [];
-          const subjectId = String(row.subject_id);
-          const label = String(row.subject_label ?? "This customer");
-
-          const rhythm = detectRhythm(dates, today);
-          if (rhythm.verdict === "regular") regular += 1;
-          if (rhythm.verdict === "lapsed") lapsed += 1;
-
-          /**
-           * 🔴 THE REFUSALS ARE STORED TOO. "We looked and there is no
-           * pattern" is an answer, and a screen showing only the
-           * confident rows makes a business look like it has forty
-           * customers when it has four hundred.
-           */
-          await tx
-            .insert(customerRhythms)
-            .values({
-              tenantId: ctx.tenant.id,
-              subjectType: "contact",
-              subjectId,
-              subjectLabel: label,
-              verdict: rhythm.verdict,
-              orderCount: rhythm.orderCount,
-              firstOrderOn: rhythm.firstOrderOn,
-              lastOrderOn: rhythm.lastOrderOn,
-              medianGapDays: rhythm.medianGapDays,
-              madDays: rhythm.madDays,
-              expectedNextOn: rhythm.expectedNextOn,
-              windowDays: rhythm.windowDays,
-              confidence: rhythm.confidence,
-              drift: rhythm.drift,
-              explanation: rhythm.explanation.slice(0, 1000),
-              computedAt: now,
-              computedThroughOn: today,
-            })
-            .onConflictDoUpdate({
-              target: [
-                customerRhythms.tenantId,
-                customerRhythms.subjectType,
-                customerRhythms.subjectId,
-              ],
-              set: {
-                subjectLabel: label,
-                verdict: rhythm.verdict,
-                orderCount: rhythm.orderCount,
-                firstOrderOn: rhythm.firstOrderOn,
-                lastOrderOn: rhythm.lastOrderOn,
-                medianGapDays: rhythm.medianGapDays,
-                madDays: rhythm.madDays,
-                expectedNextOn: rhythm.expectedNextOn,
-                windowDays: rhythm.windowDays,
-                confidence: rhythm.confidence,
-                drift: rhythm.drift,
-                explanation: rhythm.explanation.slice(0, 1000),
-                computedAt: now,
-                computedThroughOn: today,
-              },
-            });
-
-          const signal = signalFrom(rhythm, today, label);
-          if (!signal) continue;
-
-          /**
-           * ⭐ THE OCCURRENCE IS WHAT MAKES A NIGHTLY JOB SURVIVABLE.
-           *
-           * 🔴 For a due signal it is the expected date; for a lapse it
-           * is the month. So running this every night re-raises nothing,
-           * and the salesman still trusts the list on the third day.
-           */
-          const occurrence =
-            signal.kind === "lapsed" ? today.slice(0, 7) : signal.dueOn;
-
-          const inserted = await tx
-            .insert(rhythmSignals)
-            .values({
-              tenantId: ctx.tenant.id,
-              subjectType: "contact",
-              subjectId,
-              subjectLabel: label,
-              kind: signal.kind,
-              occurrence,
-              dueOn: signal.dueOn,
-              confidence: signal.confidence,
-              headline: signal.headline.slice(0, 300),
-              detail: signal.detail.slice(0, 1000),
-              raisedAt: now,
-            })
-            .onConflictDoNothing()
-            .returning({ id: rhythmSignals.id });
-
-          const signalId = inserted[0]?.id as string | undefined;
-          if (!signalId) continue;
-          signalsRaised += 1;
-
-          /**
-           * 🔴🔴 AND THIS IS THE LINE THAT MAKES ANY OF IT MATTER.
-           *
-           * ⚠️ A prediction on a screen is a prediction nobody acts on.
-           * 0060 built tasks; a signal that does not become one is a
-           * report, and this business already has reports.
-           */
-          const task = await tx
-            .insert(tasks)
-            .values({
-              tenantId: ctx.tenant.id,
-              title: signal.headline.slice(0, 300),
-              detail: signal.detail,
-              subjectType: "contact",
-              subjectId,
-              subjectLabel: label,
-              dueOn: today,
-              priority: signal.priority,
-              status: "open",
-            })
-            .returning({ id: tasks.id });
-
-          const taskId = task[0]?.id as string | undefined;
-          if (taskId) {
-            tasksRaised += 1;
-            await tx
-              .update(rhythmSignals)
-              .set({ taskId })
-              .where(eq(rhythmSignals.id, signalId));
-          }
-        }
-
-        await writeAudit(ctx, {
+    const result = await recomputeRhythmsForTenant({
+      tenantId: ctx.tenant.id,
+      impersonationId: ctx.impersonationId,
+      audit: (entry) =>
+        writeAudit(ctx, {
           action: "update",
           resourceType: "customer_rhythms",
           resourceId: ctx.tenant.id,
-          newValue: { examined, regular, lapsed, signalsRaised },
+          newValue: {
+            examined: entry.examined,
+            regular: entry.regular,
+            lapsed: entry.lapsed,
+            signalsRaised: entry.signalsRaised,
+          },
           severity: "info",
-        });
-
-        return { examined, regular, lapsed, signalsRaised, tasksRaised };
-      },
-      { impersonationId: ctx.impersonationId },
-    );
+        }),
+    });
 
     revalidatePath("/rhythms");
     return { ok: true, data: result };

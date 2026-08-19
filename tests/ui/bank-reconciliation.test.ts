@@ -127,6 +127,7 @@ describe("the bank reconciliation statement", () => {
         bookItem("l1", "2026-03-28", -85_000_00n),
         bookItem("l2", "2026-03-29", 40_000_00n),
       ],
+      partlyExplained: [],
       toleranceMinor: 0n,
     },
     // Nothing outstanding at all.
@@ -135,6 +136,7 @@ describe("the bank reconciliation statement", () => {
       bookBalanceMinor: 500_00n,
       unmatchedInBank: [],
       unmatchedInLedger: [],
+      partlyExplained: [],
       toleranceMinor: 0n,
     },
     // An overdrawn account: every balance negative.
@@ -143,6 +145,7 @@ describe("the bank reconciliation statement", () => {
       bookBalanceMinor: -812_345_67n,
       unmatchedInBank: [bankLine("b1", "2026-01-05", -99_99n)],
       unmatchedInLedger: [bookItem("l1", "2026-01-04", -12_345_68n)],
+      partlyExplained: [],
       toleranceMinor: 0n,
     },
     // A large, deliberately unexplained residue.
@@ -151,6 +154,7 @@ describe("the bank reconciliation statement", () => {
       bookBalanceMinor: 999_999_999n,
       unmatchedInBank: [bankLine("b1", "2026-06-01", 7n)],
       unmatchedInLedger: [],
+      partlyExplained: [],
       toleranceMinor: 0n,
     },
   ];
@@ -207,6 +211,7 @@ describe("the bank reconciliation statement", () => {
       bookBalanceMinor: 150_00n,
       unmatchedInBank: [],
       unmatchedInLedger: [],
+      partlyExplained: [],
       toleranceMinor: 0n,
     });
     expect(brs.differenceMinor).not.toBe(0n);
@@ -255,6 +260,7 @@ describe("categorisation", () => {
       const brs = buildBrs({
         bankBalanceMinor: 0n,
         bookBalanceMinor: 0n,
+        partlyExplained: [],
         toleranceMinor: 0n,
         ...item,
       });
@@ -282,6 +288,7 @@ describe("the rounding tolerance", () => {
       bookBalanceMinor: 100_40n,
       unmatchedInBank: [],
       unmatchedInLedger: [],
+      partlyExplained: [],
       toleranceMinor,
     });
 
@@ -318,6 +325,7 @@ describe("the rounding tolerance", () => {
       bookBalanceMinor: 100_00n,
       unmatchedInBank: [],
       unmatchedInLedger: [],
+      partlyExplained: [],
       toleranceMinor: 10_000n,
     });
     expect(clean.differenceAbsorbedMinor).toBe(0n);
@@ -598,9 +606,29 @@ describe("the matcher", () => {
     const inserts = [...code.matchAll(/\.insert\(bankLineMatches\)/g)];
     expect(inserts.length).toBeGreaterThan(0);
     for (const m of inserts) {
-      const around = code.slice(m.index!, m.index! + 800);
+      /**
+       * ⚠️ THE WINDOW IS THE `values({ ... })` OBJECT, NOT A FIXED NUMBER
+       * OF CHARACTERS. This assertion read the next 800 characters until
+       * 0110 added `allocated_minor` and its comment to the adjustment
+       * path, at which point `confirmedBy` fell outside the window and a
+       * correct change failed a correct test. That is the sixth time a
+       * shape has failed a correct change in this codebase; the property
+       * — every insert names the person who caused it — is unchanged.
+       */
+      const start = code.indexOf("{", code.indexOf(".values(", m.index!));
+      let depth = 0;
+      let end = start;
+      while (end < code.length) {
+        if (code[end] === "{") depth += 1;
+        if (code[end] === "}") {
+          depth -= 1;
+          if (depth === 0) break;
+        }
+        end += 1;
+      }
+      const values = code.slice(start, end + 1);
       // Every insert names the person who caused it.
-      expect(around).toContain("confirmedBy: ctx.user.id");
+      expect(values).toContain("confirmedBy: ctx.user.id");
     }
     expect(code).not.toMatch(/autoConfirm|confirmAll|matchAll\(/);
   });

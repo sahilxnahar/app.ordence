@@ -27,6 +27,8 @@
  * first filing needs.
  */
 
+import { creditNoteEffect, type CreditNoteEffect } from "./netting";
+
 /* ------------------------------------------------------------------ */
 /* INPUT                                                               */
 /* ------------------------------------------------------------------ */
@@ -209,6 +211,37 @@ export type Gstr1Return = {
     igst: string;
     cess: string;
   };
+  /**
+   * ⭐⭐ WHAT RULE 53 DID TO THE TOTALS ABOVE, DECLARED RATHER THAN
+   * IMPLIED. The totals are NET of every credit note that reduces output
+   * tax and GROSS of every one that does not, and an accountant
+   * reconciling this against the ledger needs to be told which was which
+   * without reading the warning list.
+   */
+  creditNotes: {
+    /** Notes whose tax was subtracted from `totals` and from `hsn`. */
+    nettedCount: number;
+    /**
+     * 🔴 SECTION 34(2) HAS RUN OUT ON THESE. They are still listed in
+     * CDNR/CDNUR — the documents exist and the customer holds them — but
+     * their tax is NOT subtracted from `totals`, because it is not
+     * subtractable. That is why the section tables can foot to more than
+     * the totals do.
+     */
+    timeBarred: {
+      number: string;
+      noteDate: string;
+      deadline: string | null;
+      againstInvoiceNumber: string | null;
+    }[];
+    /**
+     * ⚠️ NETTED, BUT UNVERIFIED. The original supply date was not
+     * supplied, so no s.34(2) window could be drawn. Reducing was the
+     * safer of the two wrong answers; the list exists so somebody can
+     * make it the right one.
+     */
+    windowUnverified: string[];
+  };
   warnings: string[];
 };
 
@@ -255,6 +288,14 @@ export function buildGstr1(args: {
   period: string;
   supplierGstin: string | null;
   documents: readonly Gstr1Document[];
+  /**
+   * ⚠️ THE EARLIER LIMB OF SECTION 34(2), AND IT IS NORMALLY ABSENT.
+   * The window closes on the date the annual return was furnished if
+   * that is before 30 November. Nothing in this codebase records a
+   * GSTR-9 filing, so no caller can pass it and the window applied is
+   * the latest lawful one. See `lib/gstr1/netting.ts`.
+   */
+  annualReturnFiledOn?: string | null;
 }): Gstr1Return {
   const warnings: string[] = [];
   const b2b: Gstr1InvoiceRow[] = [];
@@ -290,7 +331,61 @@ export function buildGstr1(args: {
   let igst = 0n;
   let cess = 0n;
 
+  let nettedCount = 0;
+  const timeBarred: Gstr1Return["creditNotes"]["timeBarred"] = [];
+  const windowUnverified: string[] = [];
+
   for (const doc of args.documents) {
+    /**
+     * ══════════════════════════════════════════════════════════════════
+     * 🔴 SECTION 34(2) — DECIDED BEFORE ANY ARITHMETIC
+     * ══════════════════════════════════════════════════════════════════
+     * A credit note issued after 30 November following the end of the
+     * financial year OF THE ORIGINAL SUPPLY reduces nothing. Ordence
+     * subtracted it anyway until this batch, which under-declares the
+     * return — the expensive direction, because the shortfall carries
+     * interest under s.50 and is found by a machine at reconciliation.
+     *
+     * ⚠️ THE TEST IS AGAINST THE SUPPLY'S DATE, NOT THE NOTE'S OWN
+     * FINANCIAL YEAR. A note raised in the following April against a
+     * March supply is in a different year from the supply and is well
+     * inside the window; a note raised on the same day against a supply
+     * two years old is not.
+     */
+    const effect: CreditNoteEffect | null =
+      doc.kind === "credit_note"
+        ? creditNoteEffect({
+            noteDate: doc.date,
+            supplyDate: doc.againstInvoiceDate ?? null,
+            annualReturnFiledOn: args.annualReturnFiledOn ?? null,
+          })
+        : null;
+
+    if (effect) {
+      if (!effect.reducesOutputTax) {
+        timeBarred.push({
+          number: doc.number,
+          noteDate: doc.date,
+          deadline: effect.deadline,
+          againstInvoiceNumber: doc.againstInvoiceNumber ?? null,
+        });
+        warnings.push(
+          `${doc.number} is dated ${doc.date}, after the section 34(2) deadline of ` +
+            `${effect.deadline} for a supply made on ${doc.againstInvoiceDate}. It is listed ` +
+            `as a document but its tax is NOT deducted — the credit note is commercial, the ` +
+            `output tax stays.`,
+        );
+      } else if (effect.reason === "supply_date_unknown") {
+        windowUnverified.push(doc.number);
+        warnings.push(
+          `${doc.number} names no original invoice date, so the section 34(2) window cannot ` +
+            `be checked. Its tax IS deducted; confirm the original supply date before filing.`,
+        );
+        nettedCount += 1;
+      } else {
+        nettedCount += 1;
+      }
+    }
     /**
      * ⚠️ A DOCUMENT WITH NO PLACE OF SUPPLY CANNOT BE CLASSIFIED and is
      * reported rather than silently dropped. Dropping it makes the return
@@ -353,9 +448,17 @@ export function buildGstr1(args: {
      * applied here. An HSN summary that added credit notes overstates
      * turnover by twice the value of every return.
      */
-    const sign = doc.kind === "credit_note" ? -1n : 1n;
+    const sign =
+      doc.kind === "credit_note" ? (effect?.reducesOutputTax === false ? 0n : -1n) : 1n;
 
-    for (const line of doc.lines) {
+    /**
+     * ⚠️ A TIME-BARRED NOTE CONTRIBUTES NOTHING TO TABLE 12 EITHER, and
+     * is skipped rather than added with a zero sign — otherwise it opens
+     * an HSN bucket of zeros for a code and rate that no supply in the
+     * period used, and an empty row in Table 12 is a question at an
+     * assessment with no answer behind it.
+     */
+    for (const line of sign === 0n ? [] : doc.lines) {
       const code = line.hsnSacCode?.trim() || "";
       if (code === "") {
         warnings.push(
@@ -453,6 +556,7 @@ export function buildGstr1(args: {
             },
           ]
         : [],
+    creditNotes: { nettedCount, timeBarred, windowUnverified },
     totals: {
       documentCount: args.documents.length,
       taxableValue: toRupees(taxable),

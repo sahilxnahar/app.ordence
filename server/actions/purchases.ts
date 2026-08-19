@@ -71,6 +71,8 @@ import {
   vendorBalances,
 } from "@/server/purchases/registry";
 import { pricePurchase } from "@/server/purchases/engine";
+import { functionalCurrencyFromSettings } from "@/lib/fx/currency";
+import { recognisePurchaseInvoice } from "@/server/fx/initial-recognition";
 import { determineItcEligibility } from "@/lib/purchases/itc";
 import {
   apportionRule42ByHead,
@@ -472,7 +474,7 @@ export async function recordPurchaseInvoice(
           notes: data.notes ?? null,
           createdBy: ctx.user.id,
         })
-        .returning({ id: purchaseInvoices.id });
+        .returning({ id: purchaseInvoices.id, currency: purchaseInvoices.currency });
 
       if (!header) throw new Error("Purchase invoice header was not written.");
 
@@ -558,6 +560,69 @@ export async function recordPurchaseInvoice(
           ),
         );
 
+      /**
+       * ══════════════════════════════════════════════════════════════
+       * ⭐⭐⭐ ① INITIAL RECOGNITION — AS 11 ¶9 / Ind AS 21 ¶21, over 0101.
+       * ══════════════════════════════════════════════════════════════
+       * 🔴 THE HALF 0101 LEFT OPEN AND SAID SO. It wired recognition for
+       * sales only, while `server/fx/revaluation-service.ts` already
+       * read `purchase_invoices.functional_total_minor` — which nothing
+       * wrote. Every payable therefore carried NULL, the reader fell
+       * back to `0n`, and the FIRST reporting-date restatement booked
+       * the WHOLE bill as an exchange difference in the P&L. This line
+       * is what stops that: the payable is carried from the moment it
+       * is recorded, so the first restatement can only be the movement
+       * in the rate.
+       *
+       * ⚠️ ONLY `blocked` IS COST. Rule 42 common credit enters the
+       * ledger in full and is reversed separately by
+       * `runRule42ForPeriod` — treating it as cost here would double the
+       * reversal. The same predicate decides the group split below and
+       * the `itcBlocked` flag it used to decide alone.
+       *
+       * ⚠️ FOR A BILL ALREADY IN THE BOOKS' OWN CURRENCY — every bill
+       * this product records today, because `currency` takes its INR
+       * default — this returns its input unchanged, resolves no rate and
+       * posts exactly the legs it posted before. It still fills the
+       * functional columns.
+       */
+      const blockedLines = postedLines.filter((l) => l.itcEligibility === "blocked");
+      const sumHead = (pick: (row: (typeof postedLines)[number]) => bigint): bigint =>
+        blockedLines.reduce((total, row) => total + pick(row), 0n);
+
+      const recognised = await recognisePurchaseInvoice(tx, {
+        tenantId: ctx.tenant.id,
+        invoiceId: header.id,
+        invoiceNumber: data.invoiceNumber,
+        invoiceDate: data.invoiceDate,
+        invoiceCurrency: header.currency,
+        functionalCurrency: functionalCurrencyFromSettings(ctx.tenant.settings).code,
+        /**
+         * ⚠️ THE HEADER FIGURES, NOT A RE-SUM OF THE LINES. The header is
+         * what `purchase_invoices_totals_balance` proves adds up, and the
+         * translation's whole method is anchored on the total — handing
+         * it components that do not foot would push the difference into
+         * round-off invisibly. The lines are proved against the header by
+         * the deferred trigger, so they are the same number twice.
+         */
+        totals: {
+          taxableValueMinor: p.taxableValueMinor,
+          cgstMinor: p.cgstMinor,
+          sgstMinor: p.sgstMinor,
+          igstMinor: p.igstMinor,
+          cessMinor: p.cessMinor,
+          roundOffMinor: p.roundOffMinor,
+          totalMinor: p.totalMinor,
+        },
+        blockedTax: {
+          cgstMinor: sumHead((l) => l.cgstMinor),
+          sgstMinor: sumHead((l) => l.sgstMinor),
+          igstMinor: sumHead((l) => l.igstMinor),
+          cessMinor: sumHead((l) => l.cessMinor),
+        },
+        rcmTaxMinor: p.rcmTaxMinor,
+      });
+
       await postPurchaseInvoice(tx, {
         tenantId: ctx.tenant.id,
         userId: ctx.user.id,
@@ -566,23 +631,12 @@ export async function recordPurchaseInvoice(
         invoiceDate: data.invoiceDate,
         vendorId: data.vendorId,
         vendorName: null,
-        lines: postedLines.map((l) => ({
-          taxableValueMinor: l.taxableValueMinor,
-          cgstMinor: l.cgstMinor,
-          sgstMinor: l.sgstMinor,
-          igstMinor: l.igstMinor,
-          cessMinor: l.cessMinor,
-          /**
-           * ⚠️ ONLY `blocked` IS COST. Rule 42 common credit enters the
-           * ledger in full and is reversed separately by
-           * `runRule42ForPeriod` — treating it as cost here would double
-           * the reversal.
-           */
-          itcBlocked: l.itcEligibility === "blocked",
-        })),
-        roundOffMinor: p.roundOffMinor,
-        totalMinor: p.totalMinor,
-        rcmTaxMinor: p.rcmTaxMinor,
+        // ⭐ THE READ. Translated at the bill-date rate, or the original
+        // figures when no translation was needed.
+        lines: recognised.functionalLines,
+        roundOffMinor: recognised.functionalTotals.roundOffMinor,
+        totalMinor: recognised.functionalTotals.totalMinor,
+        rcmTaxMinor: recognised.functionalRcmTaxMinor,
         rcmSection: data.rcmSection ?? null,
       });
 
@@ -1633,19 +1687,61 @@ export async function getVendorAgeing(input: unknown): Promise<
   }
 }
 
+/**
+ * ⚠️ BATCH 0104 — LABELLED, NOT GROUPED, AND THE LABEL SAYS IT IS AN
+ * ASSUMPTION.
+ *
+ * `vendor_ledger_entries` has NO `currency` column. `vendorBalances()` sums
+ * `credit_minor - debit_minor` across every entry for a vendor, and that
+ * arithmetic was, and remains, correct — the table cannot hold two
+ * currencies, so there are not two to add.
+ *
+ * 🔴 WHAT WAS WRONG IS THAT THE NUMBER LEFT THIS ACTION NAKED. A vendor
+ * balance is read by somebody deciding what to pay, and a bare "412000" is
+ * a figure they will read as rupees whatever the workspace's books are
+ * actually kept in.
+ *
+ * ⚠️ AND THE GAP IS WORTH NAMING RATHER THAN PAPERING OVER: a workspace
+ * that buys from an overseas supplier has nowhere to record that bill's
+ * currency in this ledger at all. `purchase_invoices` carries a currency;
+ * the vendor ledger built from it does not. `currencyAssumed: true` is the
+ * only place in the payload where that fact is visible. Fixing it properly
+ * means a column on the table plus every writer that fills it — a
+ * migration, not a label.
+ */
 export async function getVendorBalances(): Promise<
-  ActionResult<{ rows: { vendorId: string; legalName: string; balanceMinor: string }[] }>
+  ActionResult<{
+    currency: string;
+    currencyAssumed: boolean;
+    currencyNote: string;
+    rows: {
+      vendorId: string;
+      legalName: string;
+      balanceMinor: string;
+      currency: string;
+      currencyAssumed: boolean;
+    }[];
+  }>
 > {
   try {
     const ctx = await requirePermission("purchases:read");
+    const functional = functionalCurrencyFromSettings(ctx.tenant.settings);
     const rows = await vendorBalances(ctx.tenant.id);
     return {
       ok: true,
       data: {
+        currency: functional.code,
+        currencyAssumed: true,
+        currencyNote:
+          `vendor_ledger_entries has no currency column, so every balance here is ` +
+          `${functional.code} by construction rather than by measurement. A ` +
+          `foreign-currency vendor balance cannot be represented in this ledger at all.`,
         rows: rows.map((row) => ({
           vendorId: row.vendorId,
           legalName: row.legalName,
           balanceMinor: serializeAmount(row.balanceMinor),
+          currency: functional.code,
+          currencyAssumed: true,
         })),
       },
     };

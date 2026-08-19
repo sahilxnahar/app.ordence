@@ -424,10 +424,30 @@ describe("the dry run is the real run", () => {
     const code = codeOnly(ACTIONS);
     expect(code).toContain('return runImport(input, "preview")');
     expect(code).toContain('return runImport(input, "commit")');
-    // Exactly one call to the planner, and one place that reads `mode`
-    // to decide whether to write.
+    /*
+     * ⚠️ TWO PLANNERS SINCE WAVE 6 AND STILL ONE DECISION LAYER.
+     * `planImport` parses CSV text and then calls `planImportRecords`;
+     * a spreadsheet, a JSON export and a Tally day book arrive as records
+     * already. Both land in the same planner, so mapping, coercion,
+     * validation and de-duplication are shared — which is the property
+     * this test is actually protecting.
+     */
     expect(code.match(/planImport\(/g) ?? []).toHaveLength(1);
-    expect(code.match(/mode === "commit"/g) ?? []).toHaveLength(2);
+    expect(code.match(/planImportRecords\(/g) ?? []).toHaveLength(1);
+
+    /*
+     * ⭐ THREE READS OF `mode` SINCE WAVE 6, AND THE THIRD IS THE POINT
+     * OF THIS ASSERTION RATHER THAN A VIOLATION OF IT: the audit entry,
+     * the chunk record, and nothing else. Every one of them is on the
+     * WRITE side, below every decision — a fourth appearing above the
+     * planner is what this is watching for.
+     */
+    const modeReads = code.match(/mode === "commit"/g) ?? [];
+    expect(modeReads).toHaveLength(3);
+    const plannerAt = code.indexOf("planImportRecords(entity, params.records)");
+    for (const index of [...code.matchAll(/mode === "commit"/g)].map((m) => m.index ?? 0)) {
+      expect(index).toBeGreaterThan(plannerAt);
+    }
   });
 
   /**
@@ -780,9 +800,17 @@ describe("the server actions", () => {
     expect(code).toContain("requireAccess(");
     expect(code).toContain('requireFeature("crm.bulk_import"');
     expect(code).toContain("requirePermission(entity.createPermission)");
-    // One guard function, called from the one runner both exports use —
-    // so neither can be reached without it.
-    expect(code.match(/guardImport\(/g) ?? []).toHaveLength(2);
+    /*
+     * ⚠️ ONE GUARD FUNCTION, AND SINCE WAVE 6 TWO CALLERS: `runImport`,
+     * which both exports go through, and `beginImportRun`, which opens a
+     * migration. Three occurrences = the definition plus those two.
+     *
+     * 🔴 THE ASSERTION IS ON THE CALLERS, NOT THE COUNT, because a raw
+     * count is a number somebody bumps when it fails. This names them.
+     */
+    expect(code.match(/guardImport\(/g) ?? []).toHaveLength(3);
+    expect(code).toMatch(/const ctx = await guardImport\(entity, params\.duplicateMode\)/);
+    expect(code).toContain("async function guardImport(");
   });
 
   /**

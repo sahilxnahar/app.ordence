@@ -104,6 +104,46 @@ async function TdsBody() {
 
   return (
     <div className="space-y-6">
+      {/**
+       * ⭐⭐⭐ THE LINK THAT MAKES EVERY PANEL BELOW CAPABLE OF BEING
+       * NON-ZERO — wave one.
+       *
+       * 🔴 UNTIL THIS SHIPPED, THIS PAGE READ A TABLE NOTHING COULD
+       * WRITE. `recordDeduction` holds the only INSERT into
+       * `tds_deductions` and no screen, route or job called it. So
+       * "deducted, not deposited" was structurally zero, the interest
+       * exposure was structurally zero, and the quarterly return was
+       * structurally empty — and all three looked like good news.
+       */}
+      <div className="flex flex-wrap items-center justify-between gap-3 rounded-md border p-3 text-sm">
+        <p className="text-muted-foreground">
+          Deducting tax on a payment you are about to make? Ask what comes off
+          it before the money moves — once the annual threshold is crossed the
+          whole year&apos;s aggregate comes into charge at once, and the payee
+          receives materially less than they expect.
+        </p>
+        <div className="flex flex-wrap gap-2">
+          <Link
+            href="/tds/deduct"
+            className="rounded-md border px-3 py-1.5 font-medium underline"
+          >
+            Record a deduction
+          </Link>
+          {/*
+            ⭐⭐ WAVE 10 — THE REST OF THE QUARTER, WHICH HAD NO SCREEN.
+            Deducting was reachable; depositing, mapping, reconciling,
+            filing and certifying were nine server actions with no caller.
+            The deadlines and the penalties are all in that half.
+          */}
+          <Link
+            href="/tds/compliance"
+            className="rounded-md border px-3 py-1.5 font-medium underline"
+          >
+            Challans, returns and certificates
+          </Link>
+        </div>
+      </div>
+
       {/* ── The two that cost money, first. See the page header. ─────── */}
       <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
         <Card

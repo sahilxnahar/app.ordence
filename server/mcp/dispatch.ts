@@ -1536,6 +1536,43 @@ export async function dispatchTool(
     return { ok: false, refused: true, reason };
   }
 
+  /* --- 4a. ⭐ IS THE AI SURFACE IN THE PLAN AT ALL? — Batch 0109 --- */
+  //
+  // ══════════════════════════════════════════════════════════════════════
+  // 🔴 `ai.rag` WAS PRICED AT THE AI TIER AND REFUSED BY NOTHING
+  // ══════════════════════════════════════════════════════════════════════
+  // "Ask your data — natural-language questions answered from your
+  // records" is what this endpoint IS. It was reachable on every plan,
+  // including the free one, because the only gate that could have said
+  // otherwise — `requireFeature()` — needs a Clerk session and an MCP
+  // client has no cookie jar. The same shape as the standing gap closed
+  // at 4b below, and it stayed open for the same reason.
+  //
+  // ⚠️ EVERY TOOL, NOT JUST THE WRITES. 4b is about whether the account
+  // is PAID UP, so reads stay open — a lapsed customer must still see
+  // their own data. This is about whether the AI tier was ever BOUGHT,
+  // and a read tool on an unbought tier is the product being given away,
+  // not a customer being locked out of their records. Those records are
+  // reachable in full through the browser, which is where their own data
+  // lives.
+  //
+  // ⚠️ FAILS CLOSED — see `checkFeatureForTenant`. It refuses one
+  // surface, not the workspace, so the cost of a query failing is an
+  // agent pausing rather than a business stopping.
+  {
+    const { checkFeatureForTenant } = await import("@/server/entitlements");
+    const decision = await checkFeatureForTenant(session.tenantId, "ai.rag");
+    if (!decision.allowed) {
+      const { refusalFor } = await import("@/lib/entitlements/upgrade");
+      // ⚠️ The sentence names the plan. An agent told "not available"
+      // retries forever; an agent told which plan includes it can say so
+      // to the person who can buy it.
+      const reason = refusalFor(decision, null).sentence;
+      await logCall(session, toolName, "refused", Date.now() - started, argumentKeys, reason);
+      return { ok: false, refused: true, reason };
+    }
+  }
+
   /* --- 4b. is the WORKSPACE still in good standing? — S1, v0.83.2 --- */
   //
   // ══════════════════════════════════════════════════════════════════════

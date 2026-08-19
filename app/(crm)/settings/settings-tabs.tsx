@@ -37,6 +37,18 @@ const TABS = [
   // table entry in `lib/import/entities.ts` instead of a new page.
   { href: "/settings/import", label: "Import" },
   { href: "/settings/support-access", label: "Support access" },
+  // ⭐ Wave 5. Export in every format, and the log of what has been taken.
+  // ⚠️ THE TAB AND THE ENGINE LAND IN THE SAME COMMIT, for the reason
+  // stated two lines below about Batch H: an export service with no
+  // navigation to it is the fourteenth instance of built-and-unreachable
+  // in this codebase, and `scripts/check-action-reachability.mjs` exists
+  // because the thirteen before it were not noticed.
+  { href: "/settings/exports", label: "Export" },
+  // ⭐ Batch H. DPDPA 2023 data-principal rights. The tab lands in the SAME
+  // commit as the engine behind it, deliberately: 0100 shipped a complete
+  // depreciation engine that no navigation reached for four batches, and
+  // built-and-unreachable is the same defect as declared-and-unenforced.
+  { href: "/settings/privacy", label: "Data principal rights" },
   { href: "/settings/recovery", label: "Recycle bin" },
 ];
 

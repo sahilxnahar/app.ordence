@@ -233,11 +233,52 @@ export const POLICY_CONFIG: Record<RateLimitPolicy, PolicyConfig> = {
   /**
    * 300 per minute per tenant — the backstop for anything not named above.
    */
+  /**
+   * ⭐⭐ WAVE 9 — THE RATIONALE ON THIS POLICY WAS FALSE AND IS NOW TRUE.
+   *
+   * ══════════════════════════════════════════════════════════════════
+   * 🔴 IT USED TO SAY: "Default ceiling so a new route is never
+   *    completely unguarded." NOTHING CALLED IT.
+   * ══════════════════════════════════════════════════════════════════
+   * A grep for `checkRateLimit("api"` returned no call sites anywhere in
+   * the product. The sentence described a guarantee this policy did not
+   * provide and had never provided.
+   *
+   * The guarantee itself is real — it is just somewhere else.
+   * `lib/edge/budgets.ts` applies a per-plan, per-surface ceiling in
+   * MIDDLEWARE, on every request the matcher sees, which is every route
+   * including ones nobody has written yet. That is the thing that keeps a
+   * new route from being unguarded, and this policy was quietly taking
+   * credit for it.
+   *
+   * ⚠️ WHAT IS LEFT UNGUARDED IS WHAT THE EDGE DELIBERATELY EXEMPTS.
+   * `RATE_LIMIT_EXEMPT_PREFIXES` lists six, with reasons: health and
+   * readiness (a 429 makes a load balancer kill a healthy instance and
+   * the replacement is throttled too — a crash loop the limiter caused),
+   * webhooks and cron (which have their own limiters, or a shared
+   * secret). `/api/diag` is on that list and had NEITHER: no session, no
+   * secret, no limit, and a response that enumerates every configuration
+   * name this deployment knows about. That is where this policy now
+   * applies, and it is the only place it applies, because it is the only
+   * place that was actually unguarded.
+   *
+   * ⚠️ 300/MINUTE IS LOOSE ON PURPOSE. Diag exists to be reachable when
+   * everything else is broken, and a human refreshing it during an
+   * incident must never be the one who gets throttled. 300 is far above
+   * any human and far below a useful polling oracle.
+   *
+   * ⚠️ `rateLimitBackendName()` ALSO PROBES THIS POLICY to report which
+   * backend is live. That is a diagnostic use, not an enforcement one,
+   * and it is not what makes the sentence above true.
+   */
   api: {
     limit: 300,
     windowSeconds: 60,
     enforceWhenDegraded: true,
-    rationale: "Default ceiling so a new route is never completely unguarded.",
+    rationale:
+      "The ceiling for /api/diag, the one edge-exempt route with neither a session " +
+      "nor a shared secret. The general default is the per-plan edge budget in " +
+      "lib/edge/budgets.ts, not this.",
   },
 };
 
@@ -257,9 +298,23 @@ export type RateLimitDecision = {
   limit: number;
   /** Requests left in the window. Never disclosed to an anonymous caller. */
   remaining: number;
-  /** Which counter answered. `"none"` = the policy declined to enforce. */
-  backend: "redis" | "memory" | "none";
-  /** True when Redis was unavailable and this is the degraded path. */
+  /**
+   * Which counter answered. `"none"` = the policy declined to enforce.
+   *
+   * ⭐ `"postgres"` ADDED IN WAVE 8. It is not a degraded answer: a fixed
+   * window counted in the database is atomic across every instance, which
+   * is the property that makes a limit a limit. `"memory"` is the only
+   * value that means the number is unknown.
+   */
+  backend: "redis" | "postgres" | "memory" | "none";
+  /**
+   * True when the answer came from a per-instance counter, so the
+   * effective limit is (limit × instances).
+   *
+   * ⚠️ NOT "REDIS WAS UNAVAILABLE". After wave 8 Redis being absent is
+   * ordinary — the durable Postgres counter answers instead and this stays
+   * false, correctly.
+   */
   degraded: boolean;
 };
 
@@ -585,6 +640,71 @@ export function onRateLimitDegraded(listener: DegradationListener | null): void 
   degradationListener = listener;
 }
 
+/* ------------------------------------------------------------------ */
+/* ⭐⭐⭐ THE DURABLE BACKEND — WAVE 8                                  */
+/* ------------------------------------------------------------------ */
+
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 WHY THIS EXISTS
+ * ══════════════════════════════════════════════════════════════════════
+ * `notifyDegraded` above says it plainly: *"Per-instance memory counters
+ * are a speed bump, not a control: on a serverless deployment the
+ * effective limit is (limit × instances)."* That was true of this
+ * deployment, because `UPSTASH_REDIS_REST_*` is not set.
+ *
+ * ⭐ THE DATABASE IS ALREADY ON EVERY REQUEST. A fixed-window counter in
+ * Postgres — `ordence_rate_limit_hit`, SQL 0119 — is one statement and is
+ * atomic across every instance, which is the entire property the memory
+ * counter lacks.
+ *
+ * ⚠️ INJECTED, FOR THE SAME REASON `onRateLimitDegraded` IS. This module
+ * must stay importable from Edge middleware, and the database client is
+ * not. `server/security/rate-limit-durable.ts` registers the
+ * implementation from `instrumentation.ts`, which runs once per Node
+ * process.
+ */
+export type DurableCounter = (
+  policy: RateLimitPolicy,
+  key: string,
+  nowMs: number,
+) => Promise<number>;
+
+let durableCounter: DurableCounter | null = null;
+
+export function registerDurableCounter(counter: DurableCounter | null): void {
+  durableCounter = counter;
+}
+
+/** True when a cross-instance counter is available. Read by `/api/diag`. */
+export function hasDurableCounter(): boolean {
+  return durableCounter !== null;
+}
+
+/**
+ * ⚠️ THE ORDER IS REDIS, THEN POSTGRES, THEN MEMORY, and it is a
+ * preference rather than a fallback chain of equals:
+ *
+ *   redis     ~1ms, purpose-built, needs a service the operator buys
+ *   postgres  ⭐ correct, always present, one round trip on a connection
+ *             the request already holds
+ *   memory    🔴 per-instance. A speed bump. The last resort, and after
+ *             wave 8 it is reached only when the database itself is down
+ *             — at which point the request was going to fail anyway.
+ */
+export function rateLimitBackendName(): "redis" | "postgres" | "memory" {
+  /**
+   * ⚠️ `getLimiter` RATHER THAN READING THE ENVIRONMENT DIRECTLY. It is
+   * the same function `checkRateLimit` uses to decide, and a second
+   * reading of the same condition is a second thing to keep in step —
+   * which is how a diagnostic ends up reporting a backend the limiter is
+   * not actually using.
+   */
+  if (getLimiter("api")) return "redis";
+  if (durableCounter) return "postgres";
+  return "memory";
+}
+
 function notifyDegraded(
   policy: RateLimitPolicy,
   reason: "not_configured" | "redis_error",
@@ -698,6 +818,47 @@ export async function checkRateLimit(
         backend: "none",
         degraded: true,
       };
+    }
+
+    /* ---- ⭐⭐⭐ THE DURABLE PATH — WAVE 8 ------------------------ */
+
+    /**
+     * 🔴 TRIED BEFORE MEMORY, AND IT IS NOT A "DEGRADED" ANSWER.
+     * A Postgres fixed-window counter is atomic across every instance,
+     * which is the property that makes a limit a limit. `degraded: false`
+     * is therefore the honest flag — the control is working, on a
+     * different backend from the one the policy was written against.
+     */
+    if (durableCounter && !options.forceMemory) {
+      try {
+        const nowMs = options.nowMs ?? Date.now();
+        const hits = await durableCounter(policy, key, nowMs);
+        const windowMs = config.windowSeconds * 1000;
+        const windowEnd = (Math.floor(nowMs / windowMs) + 1) * windowMs;
+        const allowed = hits <= config.limit;
+
+        return {
+          ...base,
+          allowed,
+          /** ⚠️ Never 0 on a denial. A `Retry-After: 0` is a hot loop. */
+          retryAfterSeconds: allowed ? 0 : Math.max(1, Math.ceil((windowEnd - nowMs) / 1000)),
+          remaining: Math.max(0, config.limit - hits),
+          backend: "postgres",
+          degraded: false,
+        };
+      } catch (err) {
+        /**
+         * ⚠️ THE DATABASE BEING UNREACHABLE IS NOT A REASON TO 500 A
+         * ROUTE THAT WAS ONLY BEING COUNTED. Fall to memory and say so —
+         * and at that point the request's own work is about to fail for
+         * the same reason anyway.
+         */
+        notifyDegraded(
+          policy,
+          "redis_error",
+          `the durable counter failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
     }
 
     const memory = memoryCheck(

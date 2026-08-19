@@ -32,8 +32,32 @@
 
 import { Suspense } from "react";
 import Link from "next/link";
-import { getCreditControlBoard } from "@/server/actions/credit";
+import {
+  getCreditControlBoard,
+  /**
+   * ⭐⭐⭐ WAVE 10 — THE WRITE HALF, WHICH HAD NO CALLER.
+   *
+   * 🔴 This board showed every customer's exposure, headroom and hold
+   * state and could change none of it. Setting a limit, placing a hold,
+   * releasing one, overriding one for a single order, capping what each
+   * role may approve, and running the sweep were nine guarded, tested
+   * server actions reachable from nowhere.
+   */
+  getCreditPosition,
+  placeCreditHold,
+  recordCreditHoldOverride,
+  releaseCreditHold,
+  removeApprovalLimit,
+  runDunningSweep,
+  setApprovalLimit,
+  setCreditHold,
+  setCreditTerms,
+} from "@/server/actions/credit";
 import { CreditControlBoard } from "@/components/credit/credit-control-board";
+import { CreditControls } from "./credit-controls";
+import { requirePageContext } from "@/server/tenant-context";
+import { can } from "@/lib/permissions";
+import { SYSTEM_ROLE_VALUES } from "@/db/schema/core";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 
 export const dynamic = "force-dynamic";
@@ -56,8 +80,46 @@ async function BoardBody() {
     );
   }
 
+  const ctx = await requirePageContext();
+  const subject = { role: ctx.role, overrides: ctx.user.permissionOverrides };
+
   return (
-    <CreditControlBoard rows={result.data.rows} scopeNote={result.data.scopeNote} />
+    <>
+      <CreditControlBoard rows={result.data.rows} scopeNote={result.data.scopeNote} />
+
+      {/*
+        ⭐ WAVE 10 — the controls sit BELOW the board, because the board
+        is what somebody came here to read and the controls are what they
+        do about it.
+      */}
+      <CreditControls
+        rows={result.data.rows.map((row) => ({
+          companyId: row.companyId,
+          companyName: row.companyName,
+          onHold: row.onHold,
+          holdId: row.holdId,
+          holdSource: row.holdSource,
+        }))}
+        /*
+          ⚠️ `platform_super_admin` IS EXCLUDED. It is an Ordence staff
+          role, never assignable inside a workspace, and an approval
+          ceiling on it would be a control the customer cannot enforce.
+        */
+        roles={SYSTEM_ROLE_VALUES.filter((role) => role !== "platform_super_admin")}
+        canManageCredit={can(subject, "sales.credit.manage")}
+        canApproveOrderCredit={can(subject, "sales.orders.approve_credit")}
+        canManageRoles={can(subject, "roles:manage")}
+        getPosition={getCreditPosition}
+        setTerms={setCreditTerms}
+        setHold={setCreditHold}
+        placeHold={placeCreditHold}
+        releaseHold={releaseCreditHold}
+        recordOverride={recordCreditHoldOverride}
+        setApprovalLimit={setApprovalLimit}
+        removeApprovalLimit={removeApprovalLimit}
+        runSweep={runDunningSweep}
+      />
+    </>
   );
 }
 

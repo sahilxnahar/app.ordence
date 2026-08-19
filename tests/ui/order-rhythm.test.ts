@@ -48,6 +48,18 @@ const flat = (s: string) => s.replace(/\s+/g, " ");
 const SQL = read("SQL-FILES/0068_order_rhythm.sql");
 const SQL_CODE = sqlCode(SQL);
 const ACTION = read("server/actions/rhythms.ts");
+/**
+ * ⚠️ THE RECOMPUTE MOVED OUT OF THE ACTION FILE IN v1.66.0-alpha, AND
+ * THESE ASSERTIONS FOLLOWED IT.
+ *
+ * They were always assertions about the RECOMPUTE and were pinned to the
+ * file it happened to live in, which is the shape the house rule warns
+ * about. It moved because nothing ever called it: a `"use server"` export
+ * cannot take a tenant id, so a nightly schedule could not reach it, so
+ * `/rhythms` read what was computed and nothing computed. The properties
+ * below are unchanged; only the path is.
+ */
+const RECOMPUTE = read("server/patterns/rhythm-recompute.ts");
 const PAGE = read("app/(crm)/rhythms/page.tsx");
 
 const TODAY = "2026-08-13";
@@ -401,11 +413,11 @@ describe("⭐⭐ surviving a scheduler", () => {
    * MONTH FOR A LAPSE, so a nightly job re-raises nothing.
    */
   it("keys a lapse by month and a due signal by its date", () => {
-    expect(ACTION).toContain('signal.kind === "lapsed" ? today.slice(0, 7) : signal.dueOn');
+    expect(RECOMPUTE).toContain('signal.kind === "lapsed" ? today.slice(0, 7) : signal.dueOn');
   });
 
   it("inserts on conflict do nothing rather than checking first", () => {
-    expect(ACTION).toContain("onConflictDoNothing");
+    expect(RECOMPUTE).toContain("onConflictDoNothing");
   });
 
   /**
@@ -413,8 +425,8 @@ describe("⭐⭐ surviving a scheduler", () => {
    * prediction nobody acts on; this business already has reports.
    */
   it("turns a signal into a task with today's date", () => {
-    expect(ACTION).toContain(".insert(tasks)");
-    expect(ACTION).toContain("dueOn: today");
+    expect(RECOMPUTE).toContain(".insert(tasks)");
+    expect(RECOMPUTE).toContain("dueOn: today");
   });
 });
 
@@ -529,7 +541,7 @@ describe("⭐ 0068's own rules", () => {
 
   /** ⚠️ A pattern built on drafts predicts things that will not happen. */
   it("builds the pattern only from invoices that were actually raised", () => {
-    expect(ACTION).toContain("i.status IN ('issued', 'part_paid', 'paid')");
+    expect(RECOMPUTE).toContain("i.status IN ('issued', 'part_paid', 'paid')");
   });
 
   it("puts platform scope in USING and never in WITH CHECK", () => {

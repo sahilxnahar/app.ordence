@@ -31,9 +31,37 @@
 import Link from "next/link";
 import { UploadCloud } from "lucide-react";
 import { ImportWizard } from "@/components/settings/import-wizard";
-import { commitImport, previewImport } from "@/server/actions/import";
+import { ImportRunsPanel } from "./import-runs-panel";
+import {
+  beginImportRun,
+  commitImport,
+  endImportRun,
+  getImportRuns,
+  previewImport,
+  proposeImportMapping,
+  recordMappingDecision,
+} from "@/server/actions/import";
 
 export const dynamic = "force-dynamic";
+
+/**
+ * ⚠️ ITS OWN COMPONENT SO A FAILURE TO READ THE RUNS DOES NOT TAKE THE
+ * IMPORT SCREEN DOWN WITH IT. Somebody who cannot see their history can
+ * still run an import; somebody who cannot run an import because the
+ * history query failed has been given a worse product for no reason.
+ */
+async function PastRuns() {
+  const result = await getImportRuns();
+  if (!result.ok) return null;
+  if (result.data.length === 0) return null;
+
+  return (
+    <section className="space-y-3 rounded-lg border bg-card p-4">
+      <h2 className="text-sm font-semibold">Imports so far</h2>
+      <ImportRunsPanel runs={result.data} />
+    </section>
+  );
+}
 
 export default function ImportPage() {
   return (
@@ -112,7 +140,37 @@ export default function ImportPage() {
         that screen explains it.
       </p>
 
-      <ImportWizard preview={previewImport} commit={commitImport} />
+      {/*
+        ⭐⭐ WAVE 6 — WHICH OF MY UPLOADS DID NOT FINISH.
+        ⚠️ ABOVE THE WIZARD, not below it. Somebody coming back to this
+        page after a migration that stopped is not here to start a new
+        one, and a list at the bottom of a long form is a list nobody
+        scrolls to.
+      */}
+      <PastRuns />
+
+      <ImportWizard
+        preview={previewImport}
+        commit={commitImport}
+        /*
+          ⭐ WAVE 6 — the two actions that turn an upload into a
+          migration. Passed as props rather than imported inside the
+          wizard for the same reason `preview` and `commit` are: the
+          component stays a pure function of what it is given, and the
+          tests can drive it without a server.
+        */
+        beginRun={beginImportRun}
+        endRun={endImportRun}
+        /*
+          ⭐ WAVE 6 — the mapping proposal. `propose` reads the headers
+          and a sample of values and says what it thinks each column is,
+          with a reason; `decide` records what the person did with that,
+          including what they CHANGED, which is the only honest record of
+          where the matcher is wrong.
+        */
+        propose={proposeImportMapping}
+        decide={recordMappingDecision}
+      />
     </div>
   );
 }

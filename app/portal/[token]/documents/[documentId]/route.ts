@@ -54,6 +54,7 @@ import {
   portalSourceRateLimitKey,
 } from "@/lib/security/rate-limit";
 import { recordSecurityEvent } from "@/server/security/record";
+import { portalTokenRef } from "@/lib/portal/tokens";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -99,7 +100,10 @@ export async function GET(
         source: "portal_download",
         ipAddress: downloadIp,
         subjectType: "portal_token_ref",
-        subjectId: token.slice(0, 8), // prefix only — never the token
+        // ⭐ WAVE 9 — the hash reference, not a credential fragment, and
+        // the same key `detectPortalTokenSharing` groups on. See the note
+        // in `lib/portal/tokens.ts#portalTokenRef`.
+        subjectId: portalTokenRef(token),
         detail: { policy: "portal", scope: byToken.allowed ? "source" : "token" },
         reason: "Portal download rate limit exceeded.",
       });

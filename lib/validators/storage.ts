@@ -15,6 +15,19 @@ export const DOCUMENT_ENTITY_TYPES = [
   "deal",
   "contact",
   "company",
+  /**
+   * ⭐ WAVE 7. A drawing revision's file is stored through the same
+   * three-step upload as every other file in the product — one storage
+   * path, one set of magic-byte checks, one rate limit, one retention
+   * story. A second uploader for drawings would be a second place for a
+   * file to arrive without them.
+   *
+   * ⚠️ THE ENTITY IS THE DRAWING, NOT THE REVISION, and deliberately: the
+   * revision row is created AFTER the document row, so the document
+   * cannot reference it. The register's own `document_id` is what ties
+   * the two together, in the direction that can be enforced.
+   */
+  "drawing",
 ] as const;
 
 export type DocumentEntityTypeInput = (typeof DOCUMENT_ENTITY_TYPES)[number];
@@ -55,6 +68,29 @@ export const ALLOWED_MIME_TYPES = [
   "image/tiff",
   // Archives
   "application/zip",
+  /**
+   * ⭐⭐ WAVE 7 — CAD DRAWINGS.
+   *
+   * ⚠️ TWO TYPES FOR ONE FORMAT, AND BOTH ARE NEEDED. `image/vnd.dxf` is
+   * the IANA-registered type and almost nothing sends it; browsers send
+   * `application/dxf`, or an empty string, or `text/plain`, depending on
+   * the operating system's own table. Listing only the registered one
+   * would refuse the file every real customer actually uploads.
+   *
+   * 🔴 A DXF IS PLAIN TEXT AND HAS NO MAGIC BYTES, so `sniffUpload`
+   * cannot vouch for it — the same position `text/csv` is already in, and
+   * stated in `lib/validators/magic-bytes.ts`. What DOES vouch for it is
+   * `lib/cad/dxf/lexer.ts#identifyCadFile`, which runs on the bytes
+   * before a revision is recorded and refuses a DWG, a binary DXF or
+   * anything that is not a DXF at all — with a sentence naming what it
+   * actually is.
+   *
+   * ⚠️ DWG IS DELIBERATELY NOT HERE. Ordence cannot read it, and
+   * accepting it would fill the register with files nobody can open,
+   * which is worse than the refusal that names the two-click export.
+   */
+  "image/vnd.dxf",
+  "application/dxf",
 ] as const;
 
 /** Extensions matching the allowlist, used for the file picker's `accept`. */
@@ -63,6 +99,8 @@ export const ALLOWED_EXTENSIONS = [
   ".rtf", ".txt", ".csv",
   ".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic", ".tif", ".tiff",
   ".zip",
+  /** ⭐ Wave 7. DXF only — see the note on DWG above. */
+  ".dxf",
 ] as const;
 
 /**

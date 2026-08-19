@@ -34,6 +34,7 @@ import {
 import { companies } from "@/db/schema/crm";
 import { requirePermission, writeAudit } from "@/server/audit";
 import { toSalesActionError } from "@/server/sales/guards";
+import { requireFeature } from "@/server/entitlements";
 import {
   allocateFefo,
   expiryVerdict,
@@ -45,6 +46,29 @@ import {
 } from "@/lib/inventory/batch";
 import { serializeAmount, toBigIntAmount } from "@/lib/billing/money";
 import type { ActionResult } from "@/lib/validators/crm";
+
+/**
+ * ⭐ THE ENTITLEMENT — Batch 0109.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 THIS MODULE IS THE LINE ITEM, WORD FOR WORD, AND WAS FREE
+ * ══════════════════════════════════════════════════════════════════════
+ * `inventory.traceability` is priced at Advanced and its catalogue entry
+ * reads "Batch and serial tracking, expiry dates, multi-warehouse
+ * transfers and cycle counts with variance postings". That is this file
+ * and `stock-counts.ts`, and neither asked an entitlement question.
+ *
+ * ⚠️ THE NAV DISAGREES AND HAS BEEN LEFT ALONE. `lib/modules/registry.ts`
+ * files the batches and serials screens under `inventory.stock`, which is
+ * Basic. Changing that would HIDE the screens from a workspace that has
+ * batch data, and hiding somebody's data is the one thing the gate design
+ * refuses to do. So the screens stay visible, the records stay readable,
+ * and the WRITE refuses with a sentence naming the plan. The disagreement
+ * between the nav grouping and the price list is reported rather than
+ * silently resolved in either direction.
+ */
+const TRACEABILITY = "inventory.traceability" as const;
+
 
 const READ = "inventory.stock.read" as const;
 const WRITE = "inventory.movements.post" as const;
@@ -240,6 +264,7 @@ export async function updateBatch(
   input: unknown,
 ): Promise<ActionResult<{ id: string }>> {
   try {
+    await requireFeature(TRACEABILITY);
     const data = batchUpdateSchema.parse(input);
     const ctx = await requirePermission(WRITE);
 
@@ -331,6 +356,7 @@ export async function setBatchStatus(
   input: unknown,
 ): Promise<ActionResult<{ id: string; status: string }>> {
   try {
+    await requireFeature(TRACEABILITY);
     const data = statusSchema.parse(input);
     const ctx = await requirePermission(WRITE);
 
@@ -444,6 +470,7 @@ export async function writeOffBatch(input: unknown): Promise<
   }>
 > {
   try {
+    await requireFeature(TRACEABILITY);
     const data = writeOffSchema.parse(input);
     const ctx = await requirePermission(WRITE);
     const day = today();
@@ -871,6 +898,7 @@ export async function setSerialWarranty(
   input: unknown,
 ): Promise<ActionResult<{ warrantyUntil: string }>> {
   try {
+    await requireFeature(TRACEABILITY);
     const data = warrantySchema.parse(input);
     const ctx = await requirePermission(WRITE);
 

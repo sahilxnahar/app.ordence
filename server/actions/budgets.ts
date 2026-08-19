@@ -349,8 +349,11 @@ type ActualRow = {
   ledgerName: string;
   accountType: string;
   costCentreId: string | null;
-  debit: string;
-  credit: string;
+  /** ⭐ Minor units, as digit strings from Postgres. Batch 0108. */
+  debitMinor: string;
+  creditMinor: string;
+  /** ⚠️ Legs 0108 could not scale. Non-zero means refuse, never round. */
+  unscaledLegs: number;
 };
 
 /**
@@ -390,8 +393,18 @@ async function loadActuals(
         ledgerName: ledgers.name,
         accountType: ledgers.accountType,
         costCentreId: journalEntries.costCentreId,
-        debit: sql<string>`COALESCE(SUM(CASE WHEN ${journalEntries.entryType} = 'debit'  THEN ${journalEntries.amount} ELSE 0 END), 0)::text`,
-        credit: sql<string>`COALESCE(SUM(CASE WHEN ${journalEntries.entryType} = 'credit' THEN ${journalEntries.amount} ELSE 0 END), 0)::text`,
+        /**
+         * ⭐ SUMMED IN MINOR UNITS. Batch 0108. This used to sum
+         * `numeric(18,2)` and hand the string to `parseSignedMinor()`,
+         * whose regex `-?\d+(\.\d{1,2})?` REFUSED a three-decimal value
+         * outright — so a dinar book's departmental P&L threw rather than
+         * rounding. The ledger now stores the integer.
+         */
+        debitMinor: sql<string>`COALESCE(SUM(CASE WHEN ${journalEntries.entryType} = 'debit'  THEN ${journalEntries.amountMinor} ELSE 0 END), 0)::text`,
+        creditMinor: sql<string>`COALESCE(SUM(CASE WHEN ${journalEntries.entryType} = 'credit' THEN ${journalEntries.amountMinor} ELSE 0 END), 0)::text`,
+        /** ⚠️ SUM() skips NULLs. A department short by a real amount that
+         *  still reconciles against the P&L is worse than a refusal. */
+        unscaledLegs: sql<number>`COUNT(*) FILTER (WHERE ${journalEntries.amountMinor} IS NULL)::int`,
       })
       .from(journalEntries)
       .innerJoin(
@@ -519,12 +532,21 @@ export async function getCostCentreProfitAndLoss(
       loadCentreRefs(ctx.tenant.id),
     ]);
 
+    const unscaled = actuals.reduce((n, r) => n + r.unscaledLegs, 0);
+    if (unscaled > 0) {
+      throw new Error(
+        `${unscaled} journal line(s) have no amount in minor units, so this departmental ` +
+          `total cannot be trusted. Run the census in SQL-FILES/0108 to see which ` +
+          `currency is unscaled. Nothing has been computed.`,
+      );
+    }
+
     const lines: CostedLine[] = actuals.map((r) => ({
       costCentreId: r.costCentreId,
       ledgerId: r.ledgerId,
       accountType: r.accountType,
-      debitMinor: parseSignedMinor(r.debit),
-      creditMinor: parseSignedMinor(r.credit),
+      debitMinor: BigInt(r.debitMinor),
+      creditMinor: BigInt(r.creditMinor),
     }));
 
     const buckets = groupByCostCentre(lines, centres);
@@ -1128,8 +1150,14 @@ export async function getBudgetVsActual(input: unknown): Promise<ActionResult<Bu
     const actualByCell = new Map<string, bigint>();
     for (const a of actuals) {
       const key = `${a.ledgerId}::${bucketKeyFor(a.costCentreId)}`;
-      const debit = parseSignedMinor(a.debit);
-      const credit = parseSignedMinor(a.credit);
+      if (a.unscaledLegs > 0) {
+        throw new Error(
+          `${a.unscaledLegs} journal line(s) have no amount in minor units, so the actuals ` +
+            `for this budget cannot be trusted. Run the census in SQL-FILES/0108.`,
+        );
+      }
+      const debit = BigInt(a.debitMinor);
+      const credit = BigInt(a.creditMinor);
       const signed = a.accountType === "revenue" ? credit - debit : debit - credit;
       actualByCell.set(key, (actualByCell.get(key) ?? 0n) + signed);
     }

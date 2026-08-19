@@ -6,6 +6,7 @@
  * the shape that breaks a naive posting.
  */
 import { describe, expect, it } from "vitest";
+import { POSTING_MODULES, POSTING_ROLE_REGISTRY } from "@/lib/accounting/sales-posting";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
@@ -152,7 +153,16 @@ describe("⭐ the roles are explainable, and the two TDS roles are distinguished
   });
 
   it("the setup screen has a construction section", () => {
-    expect(read("components/invoices/posting-setup.tsx")).toContain("construction");
+    /**
+     * ⚠️ THIS USED TO GREP THE FORM FOR THE WORD "construction", which was
+     * true only because the section headings were hardcoded there. Batch
+     * 0108 made the sections come from the registry, so the form no longer
+     * contains the literal — and the section is more present than before,
+     * not less. Assert the registry, which is now the thing that decides.
+     */
+    expect(POSTING_MODULES.construction).toBeDefined();
+    expect(POSTING_ROLE_REGISTRY.some((r) => r.modules.includes("construction"))).toBe(true);
+    expect(read("components/invoices/posting-setup.tsx")).toContain("moduleStatus");
   });
 });
 

@@ -46,9 +46,22 @@ import {
   getGstr2bReconciliations,
   getGstr2bSummary,
   getGstr2bWorklist,
+  /**
+   * ⭐⭐⭐ THE SEVEN THAT HAD NO CALLER — wave two.
+   * 4,986 lines of parser, matcher, tolerance and summary engine behind a
+   * screen that could only ever say "nothing reconciled yet".
+   */
+  importGstr2b,
+  runGstr2bReconciliation,
+  decideGstr2bMatch,
+  bulkDecideGstr2bMatches,
+  fileGstr2bReconciliation,
 } from "@/server/actions/gstr2b";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
+import { getRegistrations } from "@/server/actions/gst";
+import { Gstr2bImportPanel } from "@/components/gstr2b/import-panel";
+import { Gstr2bWorklistActions } from "@/components/gstr2b/worklist-actions";
 
 export const dynamic = "force-dynamic";
 
@@ -118,7 +131,22 @@ async function ReconciliationList({
 }: {
   selected: { gstin?: string; taxPeriod?: string };
 }) {
-  const result = await getGstr2bReconciliations();
+  const [result, registrations] = await Promise.all([
+    getGstr2bReconciliations(),
+    getRegistrations(),
+  ]);
+
+  const importPanel = (
+    <Gstr2bImportPanel
+      registrations={
+        registrations.ok
+          ? registrations.data.rows.map((r) => ({ id: r.id, gstin: r.gstin }))
+          : []
+      }
+      importAction={importGstr2b}
+      reconcileAction={runGstr2bReconciliation}
+    />
+  );
 
   if (!result.ok) {
     return (
@@ -141,7 +169,13 @@ async function ReconciliationList({
         <CardHeader>
           <CardTitle>Nothing reconciled yet</CardTitle>
         </CardHeader>
-        <CardContent className="space-y-2 text-sm text-muted-foreground">
+        <CardContent className="space-y-3 text-sm text-muted-foreground">
+          {/**
+            * ⭐⭐⭐ THE BUTTON THE SENTENCE BELOW HAS BEEN ASKING FOR.
+            * "Import a GSTR-2B statement to begin" was an instruction with
+            * no way to follow it: `importGstr2b` had no caller anywhere.
+            */}
+          {importPanel}
           <p>
             Import a GSTR-2B statement for a GSTIN and tax period to begin. The
             engine parses it, matches every row against your purchase invoices,
@@ -162,7 +196,8 @@ async function ReconciliationList({
       <CardHeader>
         <CardTitle>Reconciliations</CardTitle>
       </CardHeader>
-      <CardContent className="p-0">
+      <CardContent className="space-y-4 p-4">
+        {importPanel}
         <div className="overflow-x-auto">
           <table className="w-full text-sm">
             <thead className="border-b bg-muted/40 text-left text-xs uppercase tracking-wide text-muted-foreground">
@@ -282,6 +317,31 @@ async function ReconciliationDetail({
 
   return (
     <div className="space-y-6">
+      {/**
+        * ⭐⭐⭐ THE WORKBENCH — wave two.
+        *
+        * 🔴 `decideGstr2bMatch`, `bulkDecideGstr2bMatches` and
+        * `fileGstr2bReconciliation` had no caller. The engine scored every
+        * match, categorised every exception and explained each one, and
+        * nobody could act on any of it.
+        */}
+      <Gstr2bWorklistActions
+        rows={matches.map((m) => ({
+          id: m.id,
+          category: m.category,
+          supplierGstin: m.supplierGstin,
+          explanation: m.explanation,
+          itcAtRiskMinor: m.itcAtRiskMinor,
+          taxDeltaMinor: m.taxDeltaMinor,
+          action: m.action,
+        }))}
+        gstin={gstin}
+        taxPeriod={taxPeriod}
+        decideAction={decideGstr2bMatch}
+        bulkDecideAction={bulkDecideGstr2bMatches}
+        fileAction={fileGstr2bReconciliation}
+      />
+
       {/* ⚠️ Identity failure first. Everything else is suspect if this fires. */}
       {!s.reconciles && (
         <Card className="border-red-400 dark:border-red-700">

@@ -51,8 +51,32 @@ const fail = (msg) => {
 
 /* ------------------------------------------------------------------ */
 
+/**
+ * ⚠️ TEST SCRATCH FILES ARE SKIPPED UNLESS A TEST ASKS FOR THEM, AND BOTH
+ *    HALVES OF THAT SENTENCE ARE LOAD-BEARING.
+ *
+ * 🔴 THE INCIDENT. `tests/ui/dpdp-inventory.test.ts` and
+ * `tests/ui/boundary-rule-4.test.ts` each write a deliberately-bad file
+ * into the source tree to prove their gate CATCHES it, then delete it.
+ * Run the suite and the gates at the same time — which anybody doing
+ * `npm test & npm run check:*` will, and which I did — and the gate scans
+ * the other's scratch file and fails on a table that does not exist.
+ *
+ * ⚠️ IT LOOKS EXACTLY LIKE A REAL FAILURE. It names a plausible table
+ * (`global_newsletter_signups`), it cites a real rule, and it goes away
+ * on a re-run. A red gate that passes on retry is a gate people learn to
+ * re-run instead of read, which is how a real failure gets clicked past.
+ *
+ * 🔴 AND THE OBVIOUS FIX — SKIP `__` FILES ALWAYS — IS WRONG, WHICH THOSE
+ * TESTS PROVED IMMEDIATELY BY FAILING. Skipping them unconditionally
+ * means the gate can no longer be shown to fire at all, and a check
+ * nobody can demonstrate catching anything is a check nobody should
+ * believe. The tests set `ORDENCE_GATE_FIXTURES=1`; nothing else does.
+ */
+const SCAN_FIXTURES = process.env.ORDENCE_GATE_FIXTURES === "1";
 function walk(dir, out = []) {
   for (const entry of readdirSync(dir)) {
+    if (!SCAN_FIXTURES && entry.includes("__")) continue;
     if (entry === "node_modules" || entry === ".next" || entry.startsWith("._")) continue;
     const full = join(dir, entry);
     const st = statSync(full);

@@ -388,14 +388,47 @@ describe("the gate is used consistently across server actions", () => {
     // the assertion measure that claim instead of a near neighbour. A check
     // that fires on correct code is worse than no check: it is the shape that
     // teaches people to silence checks.
+    //
+    // ══════════════════════════════════════════════════════════════════
+    // ⭐ WIDENED IN BATCH 0109, IN BOTH DIRECTIONS
+    // ══════════════════════════════════════════════════════════════════
+    // ⚠️ IT NOW SEES MORE GATES. `requireFeature(` was the only spelling
+    // it recognised, so `server/payroll/entitlement.ts`'s
+    // `requirePayrollEntitlement()` — which throws the same error for the
+    // same reason — was invisible to it. That is the identical blind spot
+    // the ledger's own matcher had, found in the same batch.
+    //
+    // ⚠️ AND IT NOW ACCEPTS DELEGATION, because most of this directory
+    // does not catch anything itself: it hands every error to
+    // `toSalesActionError`, which has carried a `FeatureLockedError`
+    // branch since Phase 22. Demanding a second, redundant catch in each
+    // file would push people towards duplicating error handling, which is
+    // how two handlers eventually disagree.
+    //
+    // 🔴 THE ESCAPE HATCH IS ITSELF CHECKED, one assertion below, so it
+    // cannot rot into a hatch that handles nothing.
+    const GATE_SPELLINGS = ["requireFeature(", "requirePayrollEntitlement("];
+    const HANDLERS = ["instanceof FeatureLockedError", "toSalesActionError("];
+
+    const delegate = readFileSync(
+      join(process.cwd(), "server/sales/guards.ts"),
+      "utf8",
+    );
+    expect(
+      delegate,
+      "toSalesActionError is trusted as the handler, so it must be one",
+    ).toContain("if (err instanceof FeatureLockedError) return salesFail(err.message);");
+
     for (const file of readdirSync(ACTIONS_DIR).filter((f) => f.endsWith(".ts"))) {
       const source = readFileSync(join(ACTIONS_DIR, file), "utf8");
       const code = source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
-      if (!code.includes("requireFeature(")) continue;
+      if (!GATE_SPELLINGS.some((s) => code.includes(s))) continue;
       expect(
-        code,
-        `${file} gates features but never catches FeatureLockedError`,
-      ).toContain("instanceof FeatureLockedError");
+        HANDLERS.some((h) => code.includes(h)),
+        `${file} gates features and neither catches FeatureLockedError nor ` +
+          `delegates to toSalesActionError — a locked feature would surface ` +
+          `as "something went wrong"`,
+      ).toBe(true);
     }
   });
 

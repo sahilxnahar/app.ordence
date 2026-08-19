@@ -56,7 +56,27 @@ if (!URL_ENV) {
       "   string concatenation, so a wrong column name compiles and passes every other\n" +
       "   gate in this repo. Set HARNESS_DATABASE_URL against a throwaway Postgres.",
   );
-  process.exit(0);
+  /**
+   * ══════════════════════════════════════════════════════════════════
+   * ⭐ 78, NOT 0. A SKIP IS NOT A PASS.
+   * ══════════════════════════════════════════════════════════════════
+   * This used to `process.exit(0)`, and `scripts/run-gates.mjs` has
+   * exactly one predicate: `ok: r.status === 0`. So the step CI prints
+   * as "⭐ Every database gate ... 2/2 passed" would have said that
+   * having checked one thing, the moment HARNESS_DATABASE_URL was
+   * renamed or dropped.
+   *
+   * ⚠️ THIS FILE'S OWN HEADER ALREADY NAMED THE RISK: "a gate that
+   * skips is a gate that can quietly stop running, which is exactly the
+   * shape of the defect this file exists to catch." It was true of the
+   * runner, not of the gate.
+   *
+   * 78 is EX_CONFIG from sysexits.h: the tool is fine, its configuration
+   * is absent. The runner treats it as SKIPPED, reports it separately,
+   * and refuses to call the run green when CI is set , because in CI a
+   * database is guaranteed, so a skip there means the wiring broke.
+   */
+  process.exit(78);
 }
 
 const { default: pg } = await import("pg");

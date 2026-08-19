@@ -53,6 +53,7 @@ import {
 import {
   FxRateError,
   RATE_EXPONENT,
+  describeRateType,
   formatRateScaled,
   identityQuote,
   invertQuote,
@@ -60,8 +61,15 @@ import {
   parseRateToScaled,
   type FxQuote,
   type FxRateSource,
+  type FxRateType,
   type StorableFxRateSource,
+  type StorableFxRateType,
 } from "@/lib/fx/rates";
+import {
+  assertStatutoryQuote,
+  type StatutoryConversion,
+  StatutoryRateError,
+} from "@/lib/fx/statutory";
 import type { StalenessPolicy } from "@/lib/fx/convert";
 
 type Tx = Parameters<Parameters<typeof withTenant>[1]>[0];
@@ -95,6 +103,21 @@ export type RateLookup = {
    * or nothing" — which is the only policy that needs no justification.
    */
   policy?: StalenessPolicy;
+  /**
+   * ⭐⭐ WHICH SIDE OF THE SPREAD IS ACCEPTABLE — 0106.
+   *
+   * 🔴 A FILTER, NOT A PREFERENCE. When set, rows of every other rate
+   * type are excluded from the candidate set in SQL, so a mid rate cannot
+   * be ranked, cannot be picked and cannot be returned. Ranking it lower
+   * would have been the wrong design: "prefer TT buying, fall back to
+   * mid" is the silent substitution this batch exists to end.
+   *
+   * ⚠️ OMITTING IT MEANS "ANY", which is what every AS 11 caller wants and
+   * what every caller written before 0106 already does — an initial
+   * recognition or a closing-rate revaluation names no side of the spread,
+   * so filtering them would refuse conversions that are correct today.
+   */
+  rateType?: FxRateType;
 };
 
 type RateRow = {
@@ -104,6 +127,8 @@ type RateRow = {
   rate: string;
   rateDate: string;
   source: string;
+  /** ⚠️ NOT NULL IN THE DATABASE SINCE 0106. Never derived from `source`. */
+  rateType: string;
   sourceReference: string | null;
 };
 
@@ -121,6 +146,7 @@ function toQuote(row: RateRow): FxQuote {
     rateScaled: scaledFromNumeric(row.rate),
     rateDate: row.rateDate,
     source: row.source as FxRateSource,
+    rateType: row.rateType as FxRateType,
     sourceReference: row.sourceReference,
     rateId: row.id,
   });
@@ -147,7 +173,10 @@ export async function resolveQuote(tx: Tx, lookup: RateLookup): Promise<FxQuote 
   assertKnownCurrency(to);
 
   // ① Identity. No table, exact, and the path every INR workspace takes.
-  if (from === to) return identityQuote(from, lookup.on);
+  // ⚠️ IT CARRIES THE REQUESTED RATE TYPE, because there is no spread
+  // between a currency and itself: the TT buying rate of rupees for rupees
+  // is one, and so is the selling rate and the mid.
+  if (from === to) return identityQuote(from, lookup.on, lookup.rateType ?? "unstated");
 
   const floor = earliestAllowed(lookup.on, lookup.policy);
 
@@ -164,6 +193,7 @@ export async function resolveQuote(tx: Tx, lookup: RateLookup): Promise<FxQuote 
       rate: fxRates.rate,
       rateDate: fxRates.rateDate,
       source: fxRates.source,
+      rateType: fxRates.rateType,
       sourceReference: fxRates.sourceReference,
     })
     .from(fxRates)
@@ -172,6 +202,8 @@ export async function resolveQuote(tx: Tx, lookup: RateLookup): Promise<FxQuote 
         eq(fxRates.tenantId, lookup.tenantId),
         lte(fxRates.rateDate, lookup.on),
         gte(fxRates.rateDate, floor),
+        // ⭐ 0106 — a filter, so a wrong-side rate is never a candidate.
+        ...(lookup.rateType ? [eq(fxRates.rateType, lookup.rateType)] : []),
         or(
           and(eq(fxRates.baseCurrency, from), eq(fxRates.quoteCurrency, to)),
           and(eq(fxRates.baseCurrency, to), eq(fxRates.quoteCurrency, from)),
@@ -188,6 +220,7 @@ export async function resolveQuote(tx: Tx, lookup: RateLookup): Promise<FxQuote 
       rate: fxReferenceRates.rate,
       rateDate: fxReferenceRates.rateDate,
       source: fxReferenceRates.source,
+      rateType: fxReferenceRates.rateType,
       sourceReference: fxReferenceRates.sourceReference,
     })
     .from(fxReferenceRates)
@@ -195,6 +228,7 @@ export async function resolveQuote(tx: Tx, lookup: RateLookup): Promise<FxQuote 
       and(
         lte(fxReferenceRates.rateDate, lookup.on),
         gte(fxReferenceRates.rateDate, floor),
+        ...(lookup.rateType ? [eq(fxReferenceRates.rateType, lookup.rateType)] : []),
         or(
           and(
             eq(fxReferenceRates.baseCurrency, from),
@@ -209,7 +243,7 @@ export async function resolveQuote(tx: Tx, lookup: RateLookup): Promise<FxQuote 
     )
     .orderBy(desc(fxReferenceRates.rateDate))) as RateRow[];
 
-  return pickQuote(own, published, from, to);
+  return pickQuote(own, published, from, to, lookup.rateType);
 }
 
 /**
@@ -222,19 +256,31 @@ export function pickQuote(
   published: readonly RateRow[],
   from: string,
   to: string,
+  /**
+   * ⭐ 0106 — WHEN GIVEN, EVERY OTHER RATE TYPE IS DISCARDED BEFORE
+   * RANKING. Restated here as well as in the SQL because `pickQuote` is
+   * the half that is exercised without a database, and a filter that
+   * exists only in a `WHERE` clause is a filter no test can see.
+   */
+  requiredRateType?: FxRateType,
 ): FxQuote | null {
+  const eligible = (rows: readonly RateRow[]): readonly RateRow[] =>
+    requiredRateType ? rows.filter((r) => r.rateType === requiredRateType) : rows;
+  const ownRows = eligible(own);
+  const publishedRows = eligible(published);
+
   const direct = (rows: readonly RateRow[]): RateRow | null =>
     rows.find((r) => r.baseCurrency === from && r.quoteCurrency === to) ?? null;
   const reverse = (rows: readonly RateRow[]): RateRow | null =>
     rows.find((r) => r.baseCurrency === to && r.quoteCurrency === from) ?? null;
 
-  const ownDirect = direct(own);
+  const ownDirect = direct(ownRows);
   if (ownDirect) return toQuote(ownDirect);
-  const ownReverse = reverse(own);
+  const ownReverse = reverse(ownRows);
   if (ownReverse) return invertQuote(toQuote(ownReverse));
-  const pubDirect = direct(published);
+  const pubDirect = direct(publishedRows);
   if (pubDirect) return toQuote(pubDirect);
-  const pubReverse = reverse(published);
+  const pubReverse = reverse(publishedRows);
   if (pubReverse) return invertQuote(toQuote(pubReverse));
   return null;
 }
@@ -256,6 +302,96 @@ export async function requireQuote(tx: Tx, lookup: RateLookup): Promise<FxQuote>
       `posted. Enter the rate for that date — a figure translated at a rate nobody chose is ` +
       `worse than a figure that is not there.`,
   );
+}
+
+/* ================================================================== */
+/* ⭐⭐⭐ A CONVERSION A STATUTE NAMES THE RATE FOR                     */
+/* ================================================================== */
+
+/**
+ * ⭐⭐⭐ THE RATE RULE 26 NAMES, FOR THE DAY IT NAMES, OR A REFUSAL THAT
+ * SAYS WHICH RATE IS MISSING FOR WHICH DAY.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 WHY THIS IS A SEPARATE ENTRY POINT AND NOT AN ARGUMENT TO
+ *    `requireQuote`
+ * ══════════════════════════════════════════════════════════════════════
+ * Because the difference is not a parameter, it is a promise. Every
+ * caller of `requireQuote` gets the best rate on file, ranked, possibly
+ * inverted, possibly a day old if it passed a staleness policy. A caller
+ * of THIS function gets the number a rule names or an exception — no
+ * ranking across rate types, no inversion, no window. Two behaviours that
+ * different should not be two settings of one function, because a
+ * default is how the wrong one gets chosen.
+ *
+ * ⚠️ IT FOLLOWS `requireQuote`'s SHAPE EXACTLY IN THE ONE WAY THAT
+ * MATTERS: the message names the pair, the date and — new here — the rate
+ * type, so the operator is told precisely which number to go and get.
+ * "No rate available" would send somebody to enter a mid rate, which is
+ * the failure.
+ */
+export async function requireStatutoryQuote(
+  tx: Tx,
+  args: {
+    tenantId: string;
+    from: string;
+    to: string;
+    /** 🔴 The date the STATUTE names. For Rule 26, the deduction date. */
+    on: string;
+    conversion: StatutoryConversion;
+  },
+): Promise<FxQuote> {
+  const from = normaliseCurrencyCode(args.from);
+  const to = normaliseCurrencyCode(args.to);
+
+  const quote = await resolveQuote(tx, {
+    tenantId: args.tenantId,
+    from,
+    to,
+    on: args.on,
+    // 🔴 NO STALENESS POLICY. Rule 26 fixes the date; `resolveQuote`
+    // without a policy looks at that day and no other.
+    rateType: args.conversion.rateType,
+  });
+
+  if (!quote) {
+    /**
+     * ⚠️ THE REFUSAL DISTINGUISHES "NO RATE AT ALL" FROM "A RATE OF THE
+     * WRONG KIND", because the two send the operator to different places.
+     * The second lookup is deliberately unfiltered and is only ever run on
+     * the failure path.
+     */
+    const anyType = await resolveQuote(tx, {
+      tenantId: args.tenantId,
+      from,
+      to,
+      on: args.on,
+    });
+    const alsoOnFile = anyType
+      ? ` A ${describeRateType(anyType.rateType)} for ${from}/${to} IS on file for that day ` +
+        `and has NOT been used: ${describeQuoteSafe(anyType)}. These are different numbers.`
+      : "";
+    throw new StatutoryRateError({
+      conversion: args.conversion,
+      on: args.on,
+      pair: `${from}/${to}`,
+      message:
+        `No ${describeRateType(args.conversion.rateType)} is on file for ${from}/${to} on ` +
+        `${args.on}. Nothing has been converted and no tax has been computed. ` +
+        `${args.conversion.statutoryRef} requires that rate for that date — ` +
+        `${args.conversion.dateMeans}.${alsoOnFile} Enter the ` +
+        `${describeRateType(args.conversion.rateType)} for ${from}/${to} on ${args.on}.`,
+    });
+  }
+
+  // ⭐ The pure gate has the last word: side of the spread, day, direction
+  // and whether we computed the number rather than being given it.
+  assertStatutoryQuote({ quote, conversion: args.conversion, on: args.on, from, to });
+  return quote;
+}
+
+function describeQuoteSafe(q: FxQuote): string {
+  return `${q.baseCurrency}/${q.quoteCurrency} ${formatRateScaled(q.rateScaled)} (${q.source})`;
 }
 
 /* ================================================================== */
@@ -282,6 +418,15 @@ export async function recordTenantRate(
     rate: string;
     rateDate: string;
     source?: StorableFxRateSource;
+    /**
+     * 🔴 REQUIRED SINCE 0106, AND WITH NO DEFAULT ON PURPOSE. The person
+     * entering a rate is holding the advice it came from and knows whether
+     * it is the buying side, the selling side or a mid. A default here
+     * would put a guess in the column that a s.195 deduction is computed
+     * from — and `unstated` is deliberately not offered, because that
+     * value records history, not a new decision.
+     */
+    rateType: StorableFxRateType;
     sourceReference?: string | null;
     note?: string | null;
   },
@@ -303,6 +448,7 @@ export async function recordTenantRate(
     rateScaled: parseRateToScaled(args.rate),
     rateDate: args.rateDate,
     source: args.source ?? "manual",
+    rateType: args.rateType,
   });
 
   const [row] = await tx
@@ -314,12 +460,25 @@ export async function recordTenantRate(
       rate: numericFromScaled(validated.rateScaled),
       rateDate: validated.rateDate,
       source: args.source ?? "manual",
+      rateType: args.rateType,
       sourceReference: args.sourceReference ?? null,
       note: args.note ?? null,
       enteredBy: args.userId,
     })
+    /**
+     * ⚠️ THE RATE TYPE IS PART OF THE CONFLICT TARGET SINCE 0106, matching
+     * `fx_rates_pair_day_type_key`. Without it a TT selling rate entered
+     * on Tuesday would overwrite Tuesday's TT buying rate and the s.195
+     * base would move without anybody touching a deduction.
+     */
     .onConflictDoUpdate({
-      target: [fxRates.tenantId, fxRates.baseCurrency, fxRates.quoteCurrency, fxRates.rateDate],
+      target: [
+        fxRates.tenantId,
+        fxRates.baseCurrency,
+        fxRates.quoteCurrency,
+        fxRates.rateDate,
+        fxRates.rateType,
+      ],
       set: {
         rate: numericFromScaled(validated.rateScaled),
         source: args.source ?? "manual",
@@ -349,6 +508,8 @@ export async function recordReferenceRate(args: {
   rate: string;
   rateDate: string;
   source: "rbi_reference" | "provider";
+  /** 🔴 REQUIRED SINCE 0106. See `recordTenantRate`. */
+  rateType: StorableFxRateType;
   sourceReference?: string | null;
 }): Promise<{ id: string }> {
   const base = normaliseCurrencyCode(args.baseCurrency);
@@ -359,6 +520,7 @@ export async function recordReferenceRate(args: {
     rateScaled: parseRateToScaled(args.rate),
     rateDate: args.rateDate,
     source: args.source,
+    rateType: args.rateType,
   });
 
   return withPlatformScope(
@@ -372,6 +534,7 @@ export async function recordReferenceRate(args: {
           rate: numericFromScaled(validated.rateScaled),
           rateDate: validated.rateDate,
           source: args.source,
+          rateType: args.rateType,
           sourceReference: args.sourceReference ?? null,
         })
         .onConflictDoUpdate({
@@ -380,6 +543,7 @@ export async function recordReferenceRate(args: {
             fxReferenceRates.quoteCurrency,
             fxReferenceRates.rateDate,
             fxReferenceRates.source,
+            fxReferenceRates.rateType,
           ],
           set: {
             rate: numericFromScaled(validated.rateScaled),

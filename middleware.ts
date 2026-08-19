@@ -1017,8 +1017,31 @@ async function run(auth: ClerkAuth, req: NextRequest) {
     if (req.nextUrl.pathname.startsWith("/api/")) {
       return jsonError(403, "no_active_organization", "Select an organization first.", requestId);
     }
-    // Send the user somewhere they can create or pick an org.
-    if (req.nextUrl.pathname !== "/onboarding") {
+    /*
+     * ⭐ TWO DESTINATIONS, NOT ONE — v1.65.0-alpha (Brief A).
+     *
+     * `/onboarding` is where this branch has always sent people and it
+     * stays the redirect target, because it is the address in every
+     * existing bookmark, log and support answer. `/claim` is the same
+     * step reachable at a marketing URL, and it has to be ALLOWED here or
+     * the self-serve funnel is unreachable: a person who has just signed
+     * up has no active organisation by definition, so without this line
+     * every visit to `/claim` is bounced to `/onboarding` and the address
+     * step can never be shown at its own URL.
+     *
+     * 🔴 ALLOWED, NOT REDIRECTED TO. Changing the target from
+     *    `/onboarding` to `/claim` would send a session that has
+     *    organisations but none ACTIVE — a workspace switcher mid-change,
+     *    a revoked membership — to a screen offering to create a new
+     *    workspace, which is the wrong answer to "pick one".
+     *
+     * ⚠️ EXACT PATHS, NEVER A PREFIX MATCH. `/claim(.*)` would make every
+     *    route somebody later adds under `/claim` reachable without a
+     *    workspace, and "it was open because of where I put the file" is
+     *    not a decision anybody made.
+     */
+    const NO_WORKSPACE_ROUTES = ["/onboarding", "/claim"];
+    if (!NO_WORKSPACE_ROUTES.includes(req.nextUrl.pathname)) {
       return applySecurityHeaders(NextResponse.redirect(new URL("/onboarding", req.url)));
     }
     headers.set(TENANT_HEADERS.userId, userId);

@@ -35,6 +35,7 @@ import {
 } from "@/server/actions/accounting";
 import {
   getFinancialPeriods,
+  createFinancialPeriod,
   closeFinancialPeriod,
   reopenFinancialPeriod,
 } from "@/server/actions/periods";
@@ -46,6 +47,7 @@ import {
   type StatementPeriod,
 } from "@/lib/accounting/periods";
 import { JournalEntryForm, type LedgerOption } from "./journal-form";
+import { CreatePeriodForm } from "@/components/accounting/create-period-form";
 import {
   ClosePeriodDialog,
   ReopenPeriodDialog,
@@ -396,11 +398,39 @@ export default async function AccountingPage({
           Financial periods
         </h2>
 
+        {/**
+          * ⭐⭐⭐ THE FORM THAT DID NOT EXIST — wave two.
+          *
+          * ══════════════════════════════════════════════════════════════
+          * 🔴 "No periods defined yet." WAS NOT AN EMPTY STATE. IT WAS THE
+          *    ONLY STATE.
+          * ══════════════════════════════════════════════════════════════
+          * `createFinancialPeriod` is the only insert into
+          * `financial_periods` in this product and nothing called it. Yet
+          * this page calls `closeFinancialPeriod` and
+          * `reopenFinancialPeriod`, and `/accounting/close` calls two more.
+          * You could close a period. You could not create one.
+          *
+          * 🔴 AND `closedPeriodFor()` READS THAT TABLE ON EVERY POSTING.
+          * Against an empty table it always returns null, so the period
+          * lock in `writePosting`, in `0073`, in `0100`, in `0102`, in
+          * Brief D's `0108` trigger and in `0112`'s refusal message has
+          * never once been able to fire in production. None of that code
+          * is wrong. It reads a table one missing form kept empty.
+          */}
+        <CreatePeriodForm
+          createAction={createFinancialPeriod}
+          disabled={!mayClose}
+          disabledReason="Your role does not include permission to define a period."
+        />
+
         {!periodsResult.ok ? (
           <p className="text-sm text-destructive">{periodsResult.error}</p>
         ) : periodSummaries.length === 0 ? (
           <p className="rounded-md border border-dashed border-border p-6 text-center text-sm text-muted-foreground">
-            No periods defined yet.
+            No periods defined yet. Until one exists and is closed, nothing in
+            the ledger is date-locked: the period lock reads this table and an
+            empty table refuses nothing.
           </p>
         ) : (
           <ul className="divide-y divide-border rounded-md border border-border">

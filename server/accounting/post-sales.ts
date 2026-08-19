@@ -35,6 +35,7 @@ import "server-only";
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { withTenant } from "@/db";
 import { transactions, journalEntries, salesPostingAccounts } from "@/db/schema/accounting";
+import { tenants } from "@/db/schema/core";
 import { formatMoneyPlain } from "@/lib/billing/money";
 import {
   buildDemandPosting,
@@ -61,6 +62,7 @@ import {
   buildCreditNotePosting,
   buildReceiptPosting,
   buildBankAdjustmentPosting,
+  buildBankChargeItcPosting,
   type BankAdjustmentKind,
   rolesUsed,
   type PostingLeg,
@@ -85,7 +87,7 @@ import {
   type FxLeg,
   type FxPostingRole,
 } from "@/lib/accounting/sales-posting";
-import { formatMinorPlain } from "@/lib/fx/currency";
+import { formatMinorPlain, functionalCurrencyFromSettings } from "@/lib/fx/currency";
 
 type Tx = Parameters<Parameters<typeof withTenant>[1]>[0];
 
@@ -193,7 +195,19 @@ export type SalesKeyKind =
    * instalments produces three realised differences at three rates, and
    * one key per invoice would post the first and swallow the other two.
    */
-  | "fx_settlement";
+  | "fx_settlement"
+  /**
+   * ⭐⭐ 0112 — the input credit on a bank charge, moved out of the
+   * expense once the bank's own tax invoice is in hand.
+   *
+   * 🔴 KEYED ON THE DEFERRAL, NOT ON THE STATEMENT LINE. The line already
+   * carries `bank_adjustment`, which is the GROSS posting. This is a
+   * second, later journal against the same charge, and the two must be
+   * separately idempotent: a key shared with the gross posting would make
+   * this one look already-posted and silently do nothing, which is
+   * exactly the failure mode the register was built to end.
+   */
+  | "bank_charge_itc";
 
 export function salesTransactionKey(kind: SalesKeyKind, documentId: string): string {
   const tag = SALES_KEY_TAGS[kind];
@@ -254,6 +268,8 @@ const SALES_KEY_TAGS: Record<SalesKeyKind, string> = {
   fx_revaluation: "FXR",
   /** ⭐ 0101. "FXS" — the realised difference when the money actually moved. */
   fx_settlement: "FXS",
+  /** ⭐ 0112. "BITC" — distinct from "BADJ", which is the gross charge. */
+  bank_charge_itc: "BITC",
 };
 
 /**
@@ -321,6 +337,68 @@ export type PostOutcome =
   | { posted: false; reason: "period_closed"; period: string };
 
 /** The tenant's role → ledger map. */
+/* ================================================================== */
+/* ⭐⭐⭐ THE BOOKS' OWN CURRENCY — Batch 0108                          */
+/* ================================================================== */
+
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 EVERY WRITER IN THIS FILE USED TO STAMP THE LITERAL "INR"
+ * ══════════════════════════════════════════════════════════════════════
+ * Nine call sites wrote `currency: "INR"` on the transaction and formatted
+ * every leg with `formatMoneyPlain(x, "INR")`. Only `writeFxPosting`,
+ * added in 0101, asked what the books were actually kept in.
+ *
+ * So a workspace whose functional currency is AED had its transactions
+ * STAMPED "INR" WHILE CARRYING DIRHAM AMOUNTS. 1.66.0 then regrouped
+ * `v_ledger_daily` by `transactions.currency`, which means the dashboard
+ * now faithfully groups by a column the writer filled in wrongly. A view
+ * can only group by what the column says; it cannot repair what the
+ * writer put there.
+ *
+ * ⭐ THE ANSWER COMES FROM THE TENANT, READ INSIDE THE CALLER'S `tx`.
+ *
+ * ⚠️ AND IT IS DELIBERATELY *NOT* A NEW PARAMETER ON THE TWENTY EXPORTED
+ * `post*` FUNCTIONS. Threading a `functionalCurrency` argument through
+ * them would change twenty exported signatures and force edits into
+ * `server/actions/receivables.ts` and `server/actions/banking.ts`, which
+ * belong to other streams in this wave. More importantly it would put the
+ * answer in the hands of every caller, and a caller that forgot would
+ * silently get the old behaviour back — which is precisely how the
+ * literal "INR" survived two multi-currency batches. Reading it here
+ * means there is ONE place that can be wrong, and it has no default.
+ *
+ * ⚠️ `tenants` IS READABLE INSIDE `withTenant`. Its policy is
+ * `id = app_current_tenant_id() OR app_platform_scope()`, so this SELECT
+ * returns exactly one row — the caller's own workspace — and returns
+ * nothing at all if the tenant context was never pinned. That is the
+ * right failure: a posting with no tenant context must not invent a
+ * currency.
+ *
+ * ⚠️ AN UNKNOWN CODE IN THE SETTINGS BLOB THROWS rather than falling back.
+ * `functionalCurrencyFromSettings` refuses a code it does not recognise,
+ * and this function does not catch it. A workspace whose currency reads
+ * "Rs" must not quietly become INR: the functional currency is what every
+ * figure in the ledger is denominated in, and guessing it is how a wrong
+ * answer gets produced confidently.
+ */
+async function functionalCurrencyFor(tx: Tx, tenantId: string): Promise<string> {
+  const [row] = await tx
+    .select({ settings: tenants.settings })
+    .from(tenants)
+    .where(eq(tenants.id, tenantId))
+    .limit(1);
+
+  if (!row) {
+    throw new Error(
+      "The workspace this posting belongs to could not be read, so the currency its " +
+        "books are kept in is unknown. Nothing has been posted.",
+    );
+  }
+
+  return functionalCurrencyFromSettings(row.settings).code;
+}
+
 async function loadRoleMap(tx: Tx, tenantId: string): Promise<Map<PostingRole, string>> {
   const rows = await tx
     .select({ role: salesPostingAccounts.role, ledgerId: salesPostingAccounts.ledgerId })
@@ -434,6 +512,12 @@ async function writePosting(
     .filter((l) => l.entryType === "debit")
     .reduce((sum, l) => sum + l.amountMinor, 0n);
 
+  /**
+   * ⭐ Resolved once, from the tenant, inside the caller's transaction.
+   * Batch 0108. See `functionalCurrencyFor`.
+   */
+  const functionalCurrency = await functionalCurrencyFor(tx, args.tenantId);
+
   const [txn] = await tx
     .insert(transactions)
     .values({
@@ -444,8 +528,14 @@ async function writePosting(
       status: "posted",
       referenceType: args.referenceType,
       referenceId: args.referenceId,
-      currency: "INR",
-      totalAmount: formatMoneyPlain(debitTotal, "INR"),
+      // ⭐ THE BOOKS' OWN CURRENCY. Never the literal "INR". See
+      // `functionalCurrencyFor` above for why this is read here rather
+      // than passed in by twenty callers.
+      currency: functionalCurrency,
+      // ⭐ AND THE EXPONENT COMES FROM THAT CURRENCY. `formatMinorPlain`
+      // gives "1234" for JPY and "1.234" for KWD; `formatMoneyPlain`
+      // gave "12.34" for both.
+      totalAmount: formatMinorPlain(debitTotal, functionalCurrency),
       createdBy: args.userId,
       postedAt: new Date(),
     })
@@ -465,7 +555,17 @@ async function writePosting(
        * for a large n is not, and the failure is a rounded rupee in a
        * ledger that is supposed to balance to the paisa.
        */
-      amount: formatMoneyPlain(l.amountMinor, "INR"),
+      /**
+       * ⭐ THE INTEGER, WRITTEN AS AN INTEGER. Batch 0108.
+       *
+       * ⚠️ THIS USED TO BE `amount: formatMoneyPlain(l.amountMinor, "INR")`
+       * — a bigint of paise turned into a two-decimal string on the way
+       * into a `numeric(18,2)` column. That was correct for rupees and
+       * silently destroyed the third digit of every dinar. The column
+       * `amount` is now filled by trigger from this one; nothing in this
+       * file writes it.
+       */
+      amountMinor: l.amountMinor,
       description: l.description,
       referenceType: args.referenceType,
       referenceId: args.referenceId,
@@ -716,6 +816,12 @@ export async function postPurchaseInvoice(
       .filter((l) => l.entryType === "debit")
       .reduce((sum, l) => sum + l.amountMinor, 0n);
 
+    /**
+     * ⭐ Resolved once, from the tenant, inside the caller's transaction.
+     * Batch 0108. See `functionalCurrencyFor`.
+     */
+    const functionalCurrency = await functionalCurrencyFor(tx, args.tenantId);
+
     const [txn] = await tx
       .insert(transactions)
       .values({
@@ -732,8 +838,8 @@ export async function postPurchaseInvoice(
          */
         referenceType: "invoice",
         referenceId: args.invoiceId,
-        currency: "INR",
-        totalAmount: formatMoneyPlain(debitTotal, "INR"),
+        currency: functionalCurrency,
+        totalAmount: formatMinorPlain(debitTotal, functionalCurrency),
         createdBy: args.userId,
         postedAt: new Date(),
       })
@@ -747,7 +853,17 @@ export async function postPurchaseInvoice(
         transactionId: txn.id,
         ledgerId: roleMap.get(l.role) as string,
         entryType: l.entryType,
-        amount: formatMoneyPlain(l.amountMinor, "INR"),
+        /**
+       * ⭐ THE INTEGER, WRITTEN AS AN INTEGER. Batch 0108.
+       *
+       * ⚠️ THIS USED TO BE `amount: formatMoneyPlain(l.amountMinor, "INR")`
+       * — a bigint of paise turned into a two-decimal string on the way
+       * into a `numeric(18,2)` column. That was correct for rupees and
+       * silently destroyed the third digit of every dinar. The column
+       * `amount` is now filled by trigger from this one; nothing in this
+       * file writes it.
+       */
+      amountMinor: l.amountMinor,
         description: l.description,
         referenceType: "invoice" as const,
         referenceId: args.invoiceId,
@@ -865,6 +981,12 @@ export async function postVendorPayment(
     .filter((l) => l.entryType === "debit")
     .reduce((sum, l) => sum + l.amountMinor, 0n);
 
+  /**
+   * ⭐ Resolved once, from the tenant, inside the caller's transaction.
+   * Batch 0108. See `functionalCurrencyFor`.
+   */
+  const functionalCurrency = await functionalCurrencyFor(tx, args.tenantId);
+
   const [txn] = await tx
     .insert(transactions)
     .values({
@@ -881,8 +1003,14 @@ export async function postVendorPayment(
        */
       referenceType: "payment",
       referenceId: args.paymentId,
-      currency: "INR",
-      totalAmount: formatMoneyPlain(debitTotal, "INR"),
+      // ⭐ THE BOOKS' OWN CURRENCY. Never the literal "INR". See
+      // `functionalCurrencyFor` above for why this is read here rather
+      // than passed in by twenty callers.
+      currency: functionalCurrency,
+      // ⭐ AND THE EXPONENT COMES FROM THAT CURRENCY. `formatMinorPlain`
+      // gives "1234" for JPY and "1.234" for KWD; `formatMoneyPlain`
+      // gave "12.34" for both.
+      totalAmount: formatMinorPlain(debitTotal, functionalCurrency),
       createdBy: args.userId,
       postedAt: new Date(),
     })
@@ -896,7 +1024,17 @@ export async function postVendorPayment(
       transactionId: txn.id,
       ledgerId: roleMap.get(l.role) as string,
       entryType: l.entryType,
-      amount: formatMoneyPlain(l.amountMinor, "INR"),
+      /**
+       * ⭐ THE INTEGER, WRITTEN AS AN INTEGER. Batch 0108.
+       *
+       * ⚠️ THIS USED TO BE `amount: formatMoneyPlain(l.amountMinor, "INR")`
+       * — a bigint of paise turned into a two-decimal string on the way
+       * into a `numeric(18,2)` column. That was correct for rupees and
+       * silently destroyed the third digit of every dinar. The column
+       * `amount` is now filled by trigger from this one; nothing in this
+       * file writes it.
+       */
+      amountMinor: l.amountMinor,
       description: l.description,
       referenceType: "payment" as const,
       referenceId: args.paymentId,
@@ -962,6 +1100,12 @@ export async function postRaBill(
     .filter((l) => l.entryType === "debit")
     .reduce((sum, l) => sum + l.amountMinor, 0n);
 
+  /**
+   * ⭐ Resolved once, from the tenant, inside the caller's transaction.
+   * Batch 0108. See `functionalCurrencyFor`.
+   */
+  const functionalCurrency = await functionalCurrencyFor(tx, args.tenantId);
+
   const [txn] = await tx
     .insert(transactions)
     .values({
@@ -979,8 +1123,14 @@ export async function postRaBill(
        */
       referenceType: "invoice",
       referenceId: args.billId,
-      currency: "INR",
-      totalAmount: formatMoneyPlain(debitTotal, "INR"),
+      // ⭐ THE BOOKS' OWN CURRENCY. Never the literal "INR". See
+      // `functionalCurrencyFor` above for why this is read here rather
+      // than passed in by twenty callers.
+      currency: functionalCurrency,
+      // ⭐ AND THE EXPONENT COMES FROM THAT CURRENCY. `formatMinorPlain`
+      // gives "1234" for JPY and "1.234" for KWD; `formatMoneyPlain`
+      // gave "12.34" for both.
+      totalAmount: formatMinorPlain(debitTotal, functionalCurrency),
       createdBy: args.userId,
       postedAt: new Date(),
     })
@@ -994,7 +1144,17 @@ export async function postRaBill(
       transactionId: txn.id,
       ledgerId: roleMap.get(l.role as never) as string,
       entryType: l.entryType,
-      amount: formatMoneyPlain(l.amountMinor, "INR"),
+      /**
+       * ⭐ THE INTEGER, WRITTEN AS AN INTEGER. Batch 0108.
+       *
+       * ⚠️ THIS USED TO BE `amount: formatMoneyPlain(l.amountMinor, "INR")`
+       * — a bigint of paise turned into a two-decimal string on the way
+       * into a `numeric(18,2)` column. That was correct for rupees and
+       * silently destroyed the third digit of every dinar. The column
+       * `amount` is now filled by trigger from this one; nothing in this
+       * file writes it.
+       */
+      amountMinor: l.amountMinor,
       description: l.description,
       referenceType: "invoice" as const,
       referenceId: args.billId,
@@ -1104,6 +1264,12 @@ async function writePropertyPosting(
     .filter((l) => l.entryType === "debit")
     .reduce((sum, l) => sum + l.amountMinor, 0n);
 
+  /**
+   * ⭐ Resolved once, from the tenant, inside the caller's transaction.
+   * Batch 0108. See `functionalCurrencyFor`.
+   */
+  const functionalCurrency = await functionalCurrencyFor(tx, args.tenantId);
+
   const [txn] = await tx
     .insert(transactions)
     .values({
@@ -1114,8 +1280,14 @@ async function writePropertyPosting(
       status: "posted",
       referenceType: args.referenceType,
       referenceId: args.referenceId,
-      currency: "INR",
-      totalAmount: formatMoneyPlain(debitTotal, "INR"),
+      // ⭐ THE BOOKS' OWN CURRENCY. Never the literal "INR". See
+      // `functionalCurrencyFor` above for why this is read here rather
+      // than passed in by twenty callers.
+      currency: functionalCurrency,
+      // ⭐ AND THE EXPONENT COMES FROM THAT CURRENCY. `formatMinorPlain`
+      // gives "1234" for JPY and "1.234" for KWD; `formatMoneyPlain`
+      // gave "12.34" for both.
+      totalAmount: formatMinorPlain(debitTotal, functionalCurrency),
       createdBy: args.userId,
       postedAt: new Date(),
     })
@@ -1129,7 +1301,17 @@ async function writePropertyPosting(
       transactionId: txn.id,
       ledgerId: roleMap.get(l.role as never) as string,
       entryType: l.entryType,
-      amount: formatMoneyPlain(l.amountMinor, "INR"),
+      /**
+       * ⭐ THE INTEGER, WRITTEN AS AN INTEGER. Batch 0108.
+       *
+       * ⚠️ THIS USED TO BE `amount: formatMoneyPlain(l.amountMinor, "INR")`
+       * — a bigint of paise turned into a two-decimal string on the way
+       * into a `numeric(18,2)` column. That was correct for rupees and
+       * silently destroyed the third digit of every dinar. The column
+       * `amount` is now filled by trigger from this one; nothing in this
+       * file writes it.
+       */
+      amountMinor: l.amountMinor,
       description: l.description,
       referenceType: args.referenceType,
       referenceId: args.referenceId,
@@ -1521,6 +1703,12 @@ export async function postMeterPeriod(
     .filter((l) => l.entryType === "debit")
     .reduce((sum, l) => sum + l.amountMinor, 0n);
 
+  /**
+   * ⭐ Resolved once, from the tenant, inside the caller's transaction.
+   * Batch 0108. See `functionalCurrencyFor`.
+   */
+  const functionalCurrency = await functionalCurrencyFor(tx, args.tenantId);
+
   const [txn] = await tx
     .insert(transactions)
     .values({
@@ -1531,8 +1719,14 @@ export async function postMeterPeriod(
       status: "posted",
       referenceType: "invoice",
       referenceId: args.periodId,
-      currency: "INR",
-      totalAmount: formatMoneyPlain(debitTotal, "INR"),
+      // ⭐ THE BOOKS' OWN CURRENCY. Never the literal "INR". See
+      // `functionalCurrencyFor` above for why this is read here rather
+      // than passed in by twenty callers.
+      currency: functionalCurrency,
+      // ⭐ AND THE EXPONENT COMES FROM THAT CURRENCY. `formatMinorPlain`
+      // gives "1234" for JPY and "1.234" for KWD; `formatMoneyPlain`
+      // gave "12.34" for both.
+      totalAmount: formatMinorPlain(debitTotal, functionalCurrency),
       createdBy: args.userId,
       postedAt: new Date(),
     })
@@ -1546,7 +1740,17 @@ export async function postMeterPeriod(
       transactionId: txn.id,
       ledgerId: roleMap.get(l.role as never) as string,
       entryType: l.entryType,
-      amount: formatMoneyPlain(l.amountMinor, "INR"),
+      /**
+       * ⭐ THE INTEGER, WRITTEN AS AN INTEGER. Batch 0108.
+       *
+       * ⚠️ THIS USED TO BE `amount: formatMoneyPlain(l.amountMinor, "INR")`
+       * — a bigint of paise turned into a two-decimal string on the way
+       * into a `numeric(18,2)` column. That was correct for rupees and
+       * silently destroyed the third digit of every dinar. The column
+       * `amount` is now filled by trigger from this one; nothing in this
+       * file writes it.
+       */
+      amountMinor: l.amountMinor,
       description: l.description,
       referenceType: "invoice" as const,
       referenceId: args.periodId,
@@ -1742,6 +1946,113 @@ export async function postBankAdjustment(
 }
 
 /* ================================================================== */
+/* ⭐⭐⭐ THE INPUT CREDIT ON A BANK CHARGE — 0112                       */
+/* ================================================================== */
+
+/**
+ * ⭐⭐⭐ THE JOURNAL BRIEF F ASKED FOR AND COULD NOT WRITE.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 WHY IT DID NOT EXIST, WHICH IS WORTH KEEPING
+ * ══════════════════════════════════════════════════════════════════════
+ * `0110` built the register, the refusals and the screen. It then wrote,
+ * in its own report:
+ *
+ *     "Every posting builder in this product lives in
+ *      `lib/accounting/sales-posting.ts`, which Brief D owns and I did
+ *      not touch. `writePosting` is not exported from
+ *      `server/accounting/post-sales.ts`, so there is no legitimate route
+ *      from the banking module."
+ *
+ * ⭐ THAT WAS THE RIGHT CALL AND IT IS WHY THIS FUNCTION IS HERE RATHER
+ *    THAN IN `server/banking/`. `0110` could have exported `writePosting`
+ *    or opened a second posting path inside the banking module, and gave
+ *    the reason it did neither: a second posting path is how the period
+ *    lock came to be forgotten once already.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * ⚠️ THE DATE IS THE BANK'S INVOICE DATE, NOT THE CHARGE'S VALUE DATE
+ * ══════════════════════════════════════════════════════════════════════
+ * The gross charge was posted on the value date, because that is when the
+ * money left. The CREDIT arises when the invoice exists — s.16(2)(a) CGST
+ * Act — and the invoice usually arrives in a later month, consolidated.
+ * Dating this journal back to the charge would claim a credit in a return
+ * period in which the taxpayer was not entitled to it, which is the
+ * shape a Rule 36(4) mismatch notice is written about.
+ *
+ * 🔴 AND THAT MEANS THE PERIOD LOCK CAN REFUSE THIS, correctly. A March
+ *    invoice recorded in July, against a closed March, is a real problem
+ *    with a real remedy. `writePosting` returns `period_closed` and the
+ *    caller says so rather than dating around it.
+ *
+ * ⭐ IT GOES THROUGH `writePosting` LIKE EVERYTHING ELSE — same
+ *    idempotency check, same closed-period refusal, same role map, same
+ *    balanced legs.
+ */
+export async function postBankChargeItc(
+  tx: Tx,
+  args: {
+    tenantId: string;
+    userId: string;
+    /** 🔴 THE IDEMPOTENCY SUBJECT: one credit posting per deferral, ever. */
+    deferralId: string;
+    cgstMinor: bigint;
+    sgstMinor: bigint;
+    igstMinor: bigint;
+    cessMinor: bigint;
+    /** ⚠️ THE BANK'S INVOICE DATE. See above. */
+    invoiceDate: string;
+    invoiceNo: string;
+    supplierGstin: string;
+  },
+): Promise<PostOutcome> {
+  const narration =
+    `Input credit on bank charges — ${args.invoiceNo} (${args.supplierGstin})`;
+
+  const legs = buildBankChargeItcPosting({
+    cgstMinor: args.cgstMinor,
+    sgstMinor: args.sgstMinor,
+    igstMinor: args.igstMinor,
+    cessMinor: args.cessMinor,
+    narration,
+  });
+
+  return writePosting(tx, {
+    tenantId: args.tenantId,
+    userId: args.userId,
+    /**
+     * ⚠️ THE CAST IS NARROW AND IT IS SOUND, WHICH IS NOT THE SAME AS
+     * SAFE-LOOKING. `PurchaseLeg` and `PostingLeg` differ only in the
+     * union their `role` is drawn from, and BOTH ROLE MAPS READ THE SAME
+     * TABLE: `loadRoleMap` and `loadPurchaseRoleMap` are the same query
+     * against `sales_posting_accounts` with two different type
+     * annotations. `sales-posting.ts` declares `bank_charges` in both
+     * families precisely so this posting's five roles all resolve.
+     *
+     * ⚠️ THE SAME CAST APPEARS EIGHT TIMES IN THIS FILE ALREADY, as
+     * `missing as unknown as PostingRole[]`, for the same reason. The
+     * honest fix is one role union, and that is a refactor of nine meta
+     * objects rather than a line in a bank-charge posting.
+     */
+    legs: legs as unknown as PostingLeg[],
+    key: salesTransactionKey("bank_charge_itc", args.deferralId),
+    description: `Input credit on bank charges: ${args.invoiceNo}`.slice(0, 200),
+    transactionDate: args.invoiceDate,
+    /**
+     * ⚠️ 'adjustment' AND NOT 'invoice'. `classifyVoucherType()` reads the
+     * legs: an adjustment with no debtor and no creditor leg is a JOURNAL
+     * voucher in Tally, which is what this is. Calling it an invoice
+     * would make it a purchase voucher naming a supplier who is not a
+     * party to it — the bank already invoiced us and was already paid.
+     */
+    referenceType: "adjustment",
+    referenceId: args.deferralId,
+    counterpartyId: null,
+    counterpartyName: null,
+  });
+}
+
+/* ================================================================== */
 /* ⭐⭐⭐ PAYROLL — Batch 15, v1.23.0-alpha                             */
 /* ================================================================== */
 
@@ -1823,6 +2134,12 @@ export async function postPayrollRun(
     .filter((l) => l.entryType === "debit")
     .reduce((sum, l) => sum + l.amountMinor, 0n);
 
+  /**
+   * ⭐ Resolved once, from the tenant, inside the caller's transaction.
+   * Batch 0108. See `functionalCurrencyFor`.
+   */
+  const functionalCurrency = await functionalCurrencyFor(tx, args.tenantId);
+
   const [txn] = await tx
     .insert(transactions)
     .values({
@@ -1837,8 +2154,14 @@ export async function postPayrollRun(
       // which is exactly what this is.
       referenceType: "adjustment",
       referenceId: args.runId,
-      currency: "INR",
-      totalAmount: formatMoneyPlain(debitTotal, "INR"),
+      // ⭐ THE BOOKS' OWN CURRENCY. Never the literal "INR". See
+      // `functionalCurrencyFor` above for why this is read here rather
+      // than passed in by twenty callers.
+      currency: functionalCurrency,
+      // ⭐ AND THE EXPONENT COMES FROM THAT CURRENCY. `formatMinorPlain`
+      // gives "1234" for JPY and "1.234" for KWD; `formatMoneyPlain`
+      // gave "12.34" for both.
+      totalAmount: formatMinorPlain(debitTotal, functionalCurrency),
       createdBy: args.userId,
       postedAt: new Date(),
     })
@@ -1852,7 +2175,17 @@ export async function postPayrollRun(
       transactionId: txn.id,
       ledgerId: roleMap.get(l.role as never) as string,
       entryType: l.entryType,
-      amount: formatMoneyPlain(l.amountMinor, "INR"),
+      /**
+       * ⭐ THE INTEGER, WRITTEN AS AN INTEGER. Batch 0108.
+       *
+       * ⚠️ THIS USED TO BE `amount: formatMoneyPlain(l.amountMinor, "INR")`
+       * — a bigint of paise turned into a two-decimal string on the way
+       * into a `numeric(18,2)` column. That was correct for rupees and
+       * silently destroyed the third digit of every dinar. The column
+       * `amount` is now filled by trigger from this one; nothing in this
+       * file writes it.
+       */
+      amountMinor: l.amountMinor,
       description: l.description,
       referenceType: "adjustment" as const,
       referenceId: args.runId,
@@ -1938,6 +2271,12 @@ export async function postReturnSetoff(
     .filter((l) => l.entryType === "debit")
     .reduce((sum, l) => sum + l.amountMinor, 0n);
 
+  /**
+   * ⭐ Resolved once, from the tenant, inside the caller's transaction.
+   * Batch 0108. See `functionalCurrencyFor`.
+   */
+  const functionalCurrency = await functionalCurrencyFor(tx, args.tenantId);
+
   const [txn] = await tx
     .insert(transactions)
     .values({
@@ -1948,8 +2287,14 @@ export async function postReturnSetoff(
       status: "posted",
       referenceType: "adjustment",
       referenceId: args.returnId,
-      currency: "INR",
-      totalAmount: formatMoneyPlain(debitTotal, "INR"),
+      // ⭐ THE BOOKS' OWN CURRENCY. Never the literal "INR". See
+      // `functionalCurrencyFor` above for why this is read here rather
+      // than passed in by twenty callers.
+      currency: functionalCurrency,
+      // ⭐ AND THE EXPONENT COMES FROM THAT CURRENCY. `formatMinorPlain`
+      // gives "1234" for JPY and "1.234" for KWD; `formatMoneyPlain`
+      // gave "12.34" for both.
+      totalAmount: formatMinorPlain(debitTotal, functionalCurrency),
       createdBy: args.userId,
       postedAt: new Date(),
     })
@@ -1963,7 +2308,17 @@ export async function postReturnSetoff(
       transactionId: txn.id,
       ledgerId: roleMap.get(l.role as never) as string,
       entryType: l.entryType,
-      amount: formatMoneyPlain(l.amountMinor, "INR"),
+      /**
+       * ⭐ THE INTEGER, WRITTEN AS AN INTEGER. Batch 0108.
+       *
+       * ⚠️ THIS USED TO BE `amount: formatMoneyPlain(l.amountMinor, "INR")`
+       * — a bigint of paise turned into a two-decimal string on the way
+       * into a `numeric(18,2)` column. That was correct for rupees and
+       * silently destroyed the third digit of every dinar. The column
+       * `amount` is now filled by trigger from this one; nothing in this
+       * file writes it.
+       */
+      amountMinor: l.amountMinor,
       description: l.description,
       referenceType: "adjustment" as const,
       referenceId: args.returnId,
@@ -2090,6 +2445,12 @@ async function writeFixedAssetPosting(
     .filter((l) => l.entryType === "debit")
     .reduce((sum, l) => sum + l.amountMinor, 0n);
 
+  /**
+   * ⭐ Resolved once, from the tenant, inside the caller's transaction.
+   * Batch 0108. See `functionalCurrencyFor`.
+   */
+  const functionalCurrency = await functionalCurrencyFor(tx, args.tenantId);
+
   const [txn] = await tx
     .insert(transactions)
     .values({
@@ -2104,8 +2465,14 @@ async function writeFixedAssetPosting(
       // is exactly what this is.
       referenceType: "adjustment",
       referenceId: args.referenceId,
-      currency: "INR",
-      totalAmount: formatMoneyPlain(debitTotal, "INR"),
+      // ⭐ THE BOOKS' OWN CURRENCY. Never the literal "INR". See
+      // `functionalCurrencyFor` above for why this is read here rather
+      // than passed in by twenty callers.
+      currency: functionalCurrency,
+      // ⭐ AND THE EXPONENT COMES FROM THAT CURRENCY. `formatMinorPlain`
+      // gives "1234" for JPY and "1.234" for KWD; `formatMoneyPlain`
+      // gave "12.34" for both.
+      totalAmount: formatMinorPlain(debitTotal, functionalCurrency),
       createdBy: args.userId,
       postedAt: new Date(),
     })
@@ -2119,7 +2486,17 @@ async function writeFixedAssetPosting(
       transactionId: txn.id,
       ledgerId: roleMap.get(l.role) as string,
       entryType: l.entryType,
-      amount: formatMoneyPlain(l.amountMinor, "INR"),
+      /**
+       * ⭐ THE INTEGER, WRITTEN AS AN INTEGER. Batch 0108.
+       *
+       * ⚠️ THIS USED TO BE `amount: formatMoneyPlain(l.amountMinor, "INR")`
+       * — a bigint of paise turned into a two-decimal string on the way
+       * into a `numeric(18,2)` column. That was correct for rupees and
+       * silently destroyed the third digit of every dinar. The column
+       * `amount` is now filled by trigger from this one; nothing in this
+       * file writes it.
+       */
+      amountMinor: l.amountMinor,
       description: l.description,
       referenceType: "adjustment" as const,
       referenceId: args.referenceId,
@@ -2363,8 +2740,10 @@ async function writeFxPosting(
       transactionId: txn.id,
       ledgerId: (l.ledgerIdOverride ?? roleMap.get(l.role)) as string,
       entryType: l.entryType,
-      // ⭐ AND AGAIN HERE. The exponent comes from the currency.
-      amount: formatMinorPlain(l.amountMinor, args.functionalCurrency),
+      // ⭐ AND AGAIN HERE — now as the integer itself. Batch 0108 removed
+      // the numeric round-trip that made this the only currency-correct
+      // writer in the file and still could not hold a dinar.
+      amountMinor: l.amountMinor,
       description: l.description,
       referenceType: "adjustment" as const,
       referenceId: args.referenceId,

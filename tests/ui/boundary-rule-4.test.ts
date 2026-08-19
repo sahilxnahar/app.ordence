@@ -20,6 +20,14 @@ const SCRATCH = join(process.cwd(), "server", "__boundary_fixture__");
 function runChecker(): { code: number; output: string } {
   try {
     const output = execFileSync("node", ["scripts/check-server-boundaries.mjs"], {
+      /**
+       * ⭐ THE GATE SKIPS `__`-MARKED SCRATCH FILES BY DEFAULT, so that
+       * running it alongside this suite does not make it fail on this
+       * very fixture. This test is the ONLY thing that asks for them
+       * back, because this test is the only thing that needs the gate
+       * to see a deliberately-broken file.
+       */
+      env: { ...process.env, ORDENCE_GATE_FIXTURES: "1" },
       cwd: process.cwd(),
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],

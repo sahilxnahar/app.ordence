@@ -37,7 +37,7 @@ import { FinancialBarChart } from "@/components/crm/charts/financial-bar-chart";
 import { AssetPipelinePieChart } from "@/components/crm/charts/asset-pipeline-pie-chart";
 import { RecentActivityFeed } from "@/components/crm/charts/recent-activity-feed";
 import { QuickActions, buildQuickActions } from "@/components/crm/quick-actions";
-import { formatCurrencyString, humaniseLabel } from "@/components/crm/charts/use-chart-mode";
+import { formatLabelledValues, humaniseLabel } from "@/components/crm/charts/use-chart-mode";
 
 /** A panel that could not load. One card fails; the page does not. */
 function PanelError({ title, message }: { title: string; message: string }) {
@@ -72,11 +72,18 @@ export async function HeadlineTiles() {
     emphasis?: "normal" | "attention";
   }> = [];
 
+  /*
+    ⭐ THE COUNT IS THE TILE AND THE MONEY IS THE HINT, WHICH IS WHY THIS
+    ONE SURVIVES MULTI-CURRENCY UNCHANGED IN SHAPE. A count is currency-
+    free. `formatLabelledValues` renders one figure per currency, so a
+    workspace holding rupee land and dollar plant sees both rather than
+    their meaningless sum.
+  */
   if (assets.ok) {
     tiles.push({
       label: "Assets under management",
       value: String(assets.data.totalAssets),
-      hint: formatCurrencyString(assets.data.totalValue),
+      hint: formatLabelledValues(assets.data.totalValueByCurrency),
     });
   }
 
@@ -87,10 +94,20 @@ export async function HeadlineTiles() {
       hint: `${contracts.data.signedCount} signed`,
     });
 
+    /*
+      🔴 THE VALUE TILE IS THE ONE THAT WAS LYING. `sum(value)` across a
+      pipeline holding a euro contract and a rupee one is not a contract
+      value; it is two numbers with the units thrown away. It now shows one
+      figure per currency, and the hint says how many there are so a reader
+      who sees two knows it is not a rendering accident.
+    */
     tiles.push({
       label: "Contract value",
-      value: formatCurrencyString(contracts.data.totalValue),
-      hint: "Across all stages",
+      value: formatLabelledValues(contracts.data.totalValueByCurrency),
+      hint:
+        contracts.data.currencies.length > 1
+          ? `Across all stages · ${contracts.data.currencies.length} currencies, not added`
+          : "Across all stages",
     });
 
     tiles.push({
@@ -145,6 +162,17 @@ export async function HeadlineTiles() {
 /* FINANCIAL                                                           */
 /* ------------------------------------------------------------------ */
 
+/**
+ * ⭐ ONE CHART PER CURRENCY POSTED TO.
+ *
+ * `v_ledger_daily` groups by `transactions.currency` since 0104. Rendering
+ * one merged chart would require adding the series together, and a trial
+ * balance is only balanced within a currency — a merged "Out by ₹0.00" can
+ * be two real imbalances in two currencies cancelling as bare numbers.
+ *
+ * ⚠️ THE COMMON CASE IS UNCHANGED. A single-currency workspace gets
+ * exactly one chart, identical to before.
+ */
 export async function FinancialPanel() {
   const result = await getLedgerTrailing30();
 
@@ -152,15 +180,42 @@ export async function FinancialPanel() {
     return <PanelError title="Ledger unavailable" message={result.error} />;
   }
 
+  const { series } = result.data;
+
+  if (series.length === 0) {
+    return (
+      <section className="space-y-3" aria-labelledby="ledger-empty-heading">
+        <h3 id="ledger-empty-heading" className="text-sm font-semibold">
+          Ledger movement — last 30 days
+        </h3>
+        <p className="rounded-md border border-dashed border-border p-6 text-center text-sm text-muted-foreground">
+          Nothing has been posted to the ledger in the last 30 days.
+        </p>
+      </section>
+    );
+  }
+
   return (
-    <FinancialBarChart
-      days={result.data.days}
-      totalDebits={result.data.totalDebits}
-      totalCredits={result.data.totalCredits}
-      isBalanced={result.data.isBalanced}
-      difference={result.data.difference}
-      activeDays={result.data.activeDays}
-    />
+    <div className="space-y-6">
+      {series.length > 1 && (
+        <p className="rounded-md border border-amber-300 bg-amber-50 p-2 text-xs text-amber-800 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-200">
+          ⚠️ This workspace has posted in {series.length} currencies in the last 30 days. They are
+          shown separately and are never added — a trial balance only balances within one currency.
+        </p>
+      )}
+      {series.map((s) => (
+        <FinancialBarChart
+          key={s.currency}
+          currency={s.currency}
+          days={s.days}
+          totalDebits={s.totalDebits}
+          totalCredits={s.totalCredits}
+          isBalanced={s.isBalanced}
+          difference={s.difference}
+          activeDays={s.activeDays}
+        />
+      ))}
+    </div>
   );
 }
 
@@ -179,7 +234,7 @@ export async function AssetPanel() {
     <AssetPipelinePieChart
       slices={result.data.slices}
       totalAssets={result.data.totalAssets}
-      totalValue={result.data.totalValue}
+      totalValueByCurrency={result.data.totalValueByCurrency}
     />
   );
 }
@@ -240,7 +295,7 @@ export async function ContractPipelinePanel() {
                 <span className="shrink-0 tabular-nums text-muted-foreground">
                   {stage.contractCount}
                   <span className="ml-2 text-xs">
-                    {formatCurrencyString(stage.totalValue)}
+                    {formatLabelledValues(stage.valueByCurrency)}
                   </span>
                 </span>
               </div>

@@ -36,7 +36,10 @@ import {
   buildBrs,
   isLockedByReconciliation,
   type Brs,
+  type ResidualItem,
 } from "@/lib/banking/reconciliation";
+import { residueOf, type AllocationRow } from "@/lib/banking/allocation";
+import { allocationsForLines } from "@/server/banking/allocation-service";
 import type { LedgerCandidate, StatementLine } from "@/lib/banking/match";
 
 type Tx = Parameters<Parameters<typeof withTenant>[1]>[0];
@@ -355,36 +358,89 @@ export async function buildReconciliationView(
     bankReference: (r.bankReference as string | null) ?? null,
   }));
 
-  const matches =
-    lines.length === 0
-      ? []
-      : await tx
-          .select({
-            statementLineId: bankLineMatches.statementLineId,
-            matchedId: bankLineMatches.matchedId,
-          })
-          .from(bankLineMatches)
-          .where(
-            and(
-              eq(bankLineMatches.tenantId, tenantId),
-              inArray(
-                bankLineMatches.statementLineId,
-                lines.map((l) => l.id),
-              ),
-            ),
-          );
-
-  const matchedLineIds = new Set(
-    matches.map((m: Record<string, unknown>) => m.statementLineId as string),
-  );
-  const matchedDocumentIds = new Set(
-    matches.map((m: Record<string, unknown>) => m.matchedId as string),
+  /**
+   * ⭐⭐⭐ ALLOCATION-AWARE FROM 0110. See `ResidualItem` in
+   * `lib/banking/reconciliation.ts` for why this is the place the money
+   * used to be able to disappear.
+   *
+   * 🔴 THE OLD CODE WAS `lines.filter(l => !matchedLineIds.has(l.id))`.
+   *    With allocation that is wrong in exactly one way and it is the
+   *    dangerous one: a ₹10,000 line carrying ₹6,000 of allocations HAS
+   *    a match, so it dropped out of the outstanding list, and the
+   *    remaining ₹4,000 reappeared at the bottom of the statement as an
+   *    unexplained difference with nothing saying which line it was.
+   */
+  const allocations = await allocationsForLines(
+    tx,
+    tenantId,
+    lines.map((l) => l.id),
   );
 
   const candidates = await loadCandidates(tx, tenantId, periodFrom, periodTo);
 
-  const unmatchedInBank = lines.filter((l) => !matchedLineIds.has(l.id));
-  const unmatchedInLedger = candidates.filter((c) => !matchedDocumentIds.has(c.id));
+  const allocatedByLine = new Map<string, AllocationRow[]>();
+  const allocatedByDocument = new Map<string, AllocationRow[]>();
+  for (const a of allocations) {
+    const forLine = allocatedByLine.get(a.statementLineId) ?? [];
+    forLine.push(a);
+    allocatedByLine.set(a.statementLineId, forLine);
+
+    const forDoc = allocatedByDocument.get(a.matchedId) ?? [];
+    forDoc.push(a);
+    allocatedByDocument.set(a.matchedId, forDoc);
+  }
+
+  /**
+   * ⚠️ THREE STATES PER LINE, NOT TWO. Untouched, partly explained,
+   * fully explained — and only the third leaves the statement.
+   */
+  const unmatchedInBank = lines.filter(
+    (l) => (allocatedByLine.get(l.id) ?? []).length === 0,
+  );
+
+  const unmatchedInLedger = candidates.filter(
+    (c) => (allocatedByDocument.get(c.id) ?? []).length === 0,
+  );
+
+  const partlyExplained: ResidualItem[] = [];
+
+  for (const line of lines) {
+    const rows = allocatedByLine.get(line.id) ?? [];
+    if (rows.length === 0) continue;
+    const residue = residueOf(
+      { id: line.id, amountMinor: line.amountMinor, label: "line" },
+      rows,
+    );
+    if (residue === 0n) continue;
+    partlyExplained.push({
+      sourceId: line.id,
+      sourceKind: null,
+      side: "bank",
+      occurredOn: line.valueDate,
+      residueMinor: residue,
+      description: `Still outstanding on ${line.narration}`,
+    });
+  }
+
+  for (const candidate of candidates) {
+    const rows = allocatedByDocument.get(candidate.id) ?? [];
+    if (rows.length === 0) continue;
+    const residue = residueOf(
+      { id: candidate.id, amountMinor: candidate.amountMinor, label: "document" },
+      rows,
+    );
+    if (residue === 0n) continue;
+    partlyExplained.push({
+      sourceId: candidate.id,
+      sourceKind: candidate.kind,
+      side: "books",
+      occurredOn: candidate.occurredOn,
+      residueMinor: residue,
+      description: `Still outstanding on ${
+        candidate.documentNo ?? candidate.reference ?? candidate.kind
+      }`,
+    });
+  }
 
   const bookBalance = await ledgerBalanceAt(
     tx,
@@ -406,6 +462,9 @@ export async function buildReconciliationView(
       bookBalanceMinor: bookBalance,
       unmatchedInBank,
       unmatchedInLedger,
+      // 🔴 REQUIRED, NOT OPTIONAL — 0110. A caller that forgets this
+      //    ships a statement which silently drops every partial residue.
+      partlyExplained,
       // 🔴 READ HERE, AT THE COMPARISON. Not defaulted in the engine.
       toleranceMinor: BigInt(header.toleranceMinor as string | bigint),
     }),

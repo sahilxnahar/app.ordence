@@ -84,18 +84,57 @@ describe("coverage", () => {
            AND c.column_name  = 'tenant_id'
            AND t.table_type   = 'BASE TABLE'
            AND tg.tgname IS NULL
+           -- ⭐ READ, NOT COPIED. This used to be a fifteen-name literal,
+           -- the FOURTH hand-maintained copy of the same list (0017's
+           -- attach block, 0017's verification, ALL-IN-ONE-SETUP.sql and
+           -- here). Four copies of one decision is how a list drifts, and
+           -- when this one drifts the symptom is a table that silently
+           -- never syncs. 0122 moved it into the database with a written
+           -- reason per row; every consumer now reads that.
            AND c.table_name NOT IN (
-             'change_log','audit_logs','payment_events','security_events',
-             'error_events','web_vital_events','permission_denials',
-             'lead_activities','contract_signatures','usage_counters','usage_levels',
-             'platform_impersonation_sessions','platform_tenant_flags',
-             'tenant_support_consents','platform_action_log'
+             SELECT e.table_name FROM change_log_exclusions e
            )
       `);
 
       expect(
         rows.map((r) => r.table_name),
         "these tables record no changes, so anything written there can never sync",
+      ).toEqual([]);
+    });
+  });
+
+  it("⭐ every exclusion carries a written reason, so the list cannot grow quietly", async () => {
+    // The list is now data, which makes it easy to add to — and an
+    // exclusion added to make a test pass is exactly how the five
+    // appraisal tables would have been "fixed". The reason is NOT NULL in
+    // the schema; this asserts it is also not a shrug.
+    await asSuperuser(async (c) => {
+      const { rows } = await c.query(`
+        SELECT table_name, reason, category
+          FROM change_log_exclusions
+         WHERE length(reason) < 25
+      `);
+      expect(
+        rows.map((r: { table_name: string }) => r.table_name),
+        "an exclusion with no real reason is a table quietly removed from the sync feed",
+      ).toEqual([]);
+
+      const { rows: all } = await c.query(`SELECT count(*)::int AS n FROM change_log_exclusions`);
+      expect((all[0] as { n: number }).n).toBeGreaterThanOrEqual(15);
+    });
+  });
+
+  it("⭐ the sweep is idempotent — calling it again attaches nothing", async () => {
+    // 0122's function is meant to be called by every later module
+    // migration instead of copying 0017's DO block. That is only safe if
+    // a second call is a no-op, and a CREATE TRIGGER that is not guarded
+    // would raise 42710 on the second run.
+    await asSuperuser(async (c) => {
+      const { rows } = await c.query(`SELECT * FROM attach_change_log_triggers()`);
+      expect(
+        rows,
+        "the sweep attached something on a second run — it is not idempotent, " +
+          "or a table appeared between the two calls",
       ).toEqual([]);
     });
   });

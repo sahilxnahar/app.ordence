@@ -4,7 +4,6 @@
     "calendar_event_attendees",
     "compliance_docs",
     "deployment_backups",
-    "deployment_releases",
     "engineer_certifications",
     "estamp_certificates",
     "flow_submissions",
@@ -12,7 +11,6 @@
     "land_revenue_records",
     "liaison_logs",
     "powers_of_attorney",
-    "rate_analyses",
     "rate_analysis_components",
     "retention_ledger",
     "site_photos",
@@ -20,13 +18,5 @@
     "vault_consents",
     "vendor_defaults",
     "welfare_logs"
-  ],
-  "_why": "Each orphan below is a table nothing in app/, server/, lib/ or components/ reads or writes. The list is a RATCHET, not a to-do: it may shrink, never grow. `why` records the decision made about each one so the next person does not re-litigate it.",
-  "why": {
-    "deployment_releases": "PARKED, v1.22.0-alpha. Belongs to a deploy pipeline Ordence does not have \u2014 releases go GitHub to Railway and nothing in the product records them. Wiring it now would mean the console writing rows nobody reads, which is the exact failure this gate exists to catch. Delete it or wire it when on-prem deployment is real.",
-    "deployment_backups": "PARKED, v1.22.0-alpha. Same pipeline. `scripts/restore-drill.ts` is the real restore evidence today and it writes nothing here; making it write here would be honest work, and it is a batch of its own rather than a line in an admin-panel session.",
-    "ui_governance_checks": "PARKED, v1.22.0-alpha. Created by 0046 for the 460-batch tracker. That tracker lives in markdown and in this repo's session documents, not in the product, and a per-tenant copy of Ordence's own build plan is not something a customer's database should hold. Strong candidate for deletion rather than wiring.",
-    "flow_submissions": "PARKED, v1.22.0-alpha. A generic submission bucket with no flow that submits to it. Every real flow in Ordence writes to its own table with its own constraints, which is better; this one would weaken that.",
-    "_others": "The remaining sixteen belong to construction, land, labour, contracting, CRM and vault batches that are partially built. They are tracked in the session documents rather than here."
-  }
+  ]
 }

@@ -129,8 +129,18 @@ export async function POST(req: NextRequest) {
         .select({ id: tenants.id, slug: tenants.slug })
         .from(tenants)
         .where(and(eq(tenants.status, "active"), isNull(tenants.deletedAt)))
-        .limit(MAX_TENANTS_PER_SWEEP),
+        /**
+         * ⚠️ ONE MORE THAN THE CAP, ON PURPOSE, so the tail is COUNTABLE
+         * rather than merely flagged. Selecting exactly the cap cannot
+         * tell "there were 100" from "there were 6,000", and `truncated:
+         * true` with no number leaves an operator no way to know whether
+         * to raise the cap by ten or by ten thousand.
+         */
+        .limit(MAX_TENANTS_PER_SWEEP + 1),
     );
+
+    const sweepTenants = activeTenants.slice(0, MAX_TENANTS_PER_SWEEP);
+    const notReached = activeTenants.length - sweepTenants.length;
 
     const allResults: Array<{
       tenantId: string;
@@ -139,7 +149,7 @@ export async function POST(req: NextRequest) {
       errors: number;
     }> = [];
 
-    for (const tenant of activeTenants) {
+    for (const tenant of sweepTenants) {
       const results = await runAllWorkers(tenant.id);
       allResults.push({
         tenantId: tenant.id,
@@ -149,15 +159,43 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    return NextResponse.json({
-      ok: true,
-      tenantsSwept: allResults.length,
-      totalAlerts: allResults.reduce((s, r) => s + r.alerts, 0),
-      totalErrors: allResults.reduce((s, r) => s + r.errors, 0),
-      truncated: allResults.length >= MAX_TENANTS_PER_SWEEP,
-      tookMs: Date.now() - startedAt,
-      perTenant: allResults,
-    });
+    const totalErrors = allResults.reduce((s, r) => s + r.errors, 0);
+    const truncated = notReached > 0;
+
+    /**
+     * ══════════════════════════════════════════════════════════════
+     * 🔴 `ok: true` WAS HARDCODED, AND THE STATUS WAS ALWAYS 200 — v1.66.0
+     * ══════════════════════════════════════════════════════════════
+     * This response counted `totalErrors` and then reported success
+     * regardless of it, so a sweep in which every worker failed for every
+     * workspace answered `{"ok":true}` with HTTP 200. A cron dashboard,
+     * an uptime monitor and a `curl -f` all read that as green. The
+     * number was right there in the body and nothing acted on it.
+     *
+     * ⚠️ AND `truncated` HAD THE SAME PROBLEM. It said a cap was hit and
+     * left `ok` true, so "we ran the monitors" and "we ran the monitors
+     * for the first hundred workspaces of six hundred" were the same
+     * answer. A silent cap is a lie. `notReached` is now a number, so an
+     * operator knows whether to raise the cap by ten or by ten thousand.
+     *
+     * `app/api/workers/route.ts` already had this property for the cron
+     * sweep; this route is the same shape and did not.
+     */
+    const ok = totalErrors === 0 && !truncated;
+
+    return NextResponse.json(
+      {
+        ok,
+        tenantsSwept: allResults.length,
+        totalAlerts: allResults.reduce((s, r) => s + r.alerts, 0),
+        totalErrors,
+        truncated,
+        notReached,
+        tookMs: Date.now() - startedAt,
+        perTenant: allResults,
+      },
+      { status: ok ? 200 : 500 },
+    );
   }
 
   return NextResponse.json(

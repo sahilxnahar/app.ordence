@@ -667,8 +667,22 @@ describe("preview and commit stay one path", () => {
     expect(code).toContain('return runImport(input, "preview")');
     expect(code).toContain('return runImport(input, "commit")');
     expect(code.match(/planImport\(/g) ?? []).toHaveLength(1);
-    // One write branch, one audit branch. Never a third.
-    expect(code.match(/mode === "commit"/g) ?? []).toHaveLength(2);
+    /*
+     * ⭐ THREE BRANCHES SINCE WAVE 6, AND THE THIRD BELONGS: the write,
+     * the audit entry, and the chunk record that ties one part of a
+     * migration to its run. All three are on the WRITE side.
+     *
+     * 🔴 THE ASSERTION IS THAT EVERY ONE OF THEM IS BELOW THE PLANNER,
+     * which is the property that actually matters — a `mode === "commit"`
+     * ABOVE it would mean the dry run and the real run were deciding
+     * different things, which is the whole failure this file guards.
+     */
+    const modeReads = [...code.matchAll(/mode === "commit"/g)].map((m) => m.index ?? 0);
+    expect(modeReads).toHaveLength(3);
+    const plannerAt = code.indexOf("planImportRecords(entity, params.records)");
+    expect(plannerAt).toBeGreaterThan(0);
+    for (const at of modeReads) expect(at).toBeGreaterThan(plannerAt);
+
     expect(code).not.toMatch(/skipValidation|quickCheck|shallow/i);
   });
 

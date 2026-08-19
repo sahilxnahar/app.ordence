@@ -87,8 +87,27 @@ export async function movementsByRole(
   const rows = await tx
     .select({
       role: salesPostingAccounts.role,
-      debit: sql<string>`COALESCE(SUM(CASE WHEN ${journalEntries.entryType} = 'debit' THEN ${journalEntries.amount} ELSE 0 END), 0)`,
-      credit: sql<string>`COALESCE(SUM(CASE WHEN ${journalEntries.entryType} = 'credit' THEN ${journalEntries.amount} ELSE 0 END), 0)`,
+      /**
+       * ⭐ SUMMED IN MINOR UNITS. Batch 0108.
+       *
+       * ⚠️ THIS USED TO SUM `journal_entries.amount`, a numeric(18,2), and
+       * hand the decimal string to `rupeeStringToMinor()`, whose last line
+       * was `BigInt(whole) * 100n + ...`. Two hardcoded hundreds between
+       * the ledger and this total, both wrong for a dinar and both wrong
+       * by a different factor for a yen. The ledger now stores the integer
+       * these totals were always trying to reach.
+       */
+      debitMinor: sql<string>`COALESCE(SUM(CASE WHEN ${journalEntries.entryType} = 'debit' THEN ${journalEntries.amountMinor} ELSE 0 END), 0)::text`,
+      creditMinor: sql<string>`COALESCE(SUM(CASE WHEN ${journalEntries.entryType} = 'credit' THEN ${journalEntries.amountMinor} ELSE 0 END), 0)::text`,
+      /**
+       * ⚠️ COUNTED, NOT IGNORED. `SUM()` SKIPS NULLS, so a leg 0108 could
+       * not scale would quietly reduce this total instead of failing it.
+       * The balance trigger refuses any transaction containing one, so
+       * this can only be pre-0108 history — and a trial balance that is
+       * short by a real amount and foots anyway is the worst possible
+       * output. See the census in SQL-FILES/0108.
+       */
+      unscaledLegs: sql<number>`COUNT(*) FILTER (WHERE ${journalEntries.amountMinor} IS NULL)::int`,
     })
     .from(journalEntries)
     .innerJoin(
@@ -113,28 +132,35 @@ export async function movementsByRole(
   for (const r of rows) {
     // ⚠️ `numeric(18,2)` COMES BACK AS A STRING AND IS CONVERTED TO
     // PAISE BY STRING, never by multiplying a float by 100.
-    const debit = rupeeStringToMinor(r.debit);
-    const credit = rupeeStringToMinor(r.credit);
+    if (r.unscaledLegs > 0) {
+      throw new Error(
+        `${r.unscaledLegs} journal line(s) have no amount in minor units, so this total ` +
+          `cannot be trusted. Run the census in SQL-FILES/0108 to see which currency is ` +
+          `unscaled. Nothing has been computed.`,
+      );
+    }
+    const debit = BigInt(r.debitMinor);
+    const credit = BigInt(r.creditMinor);
     out.set(r.role, { debitMinor: debit, creditMinor: credit, netMinor: credit - debit });
   }
   return out;
 }
 
 /**
- * ⚠️ "1234.56" → 123456n, exactly.
+ * ⚠️ `rupeeStringToMinor()` LIVED HERE AND WAS DELETED BY BATCH 0108.
  *
- * 🔴 `Math.round(Number(s) * 100)` IS FINE UNTIL THE NUMBER IS BIG. At
- * a few crore the float has already lost the paise, and the return is
- * then wrong by an amount too small to notice and too large to ignore.
+ * It turned the decimal string a `SUM(journal_entries.amount)` produced
+ * into a bigint, and its arithmetic was `BigInt(whole) * 100n +
+ * BigInt(fraction)`. A hardcoded hundred: right for the rupee, out by a
+ * factor of ten for a Kuwaiti dinar and by a factor of a hundred for a
+ * yen. Four readers depended on it — this file, `server/command/sweep.ts`,
+ * `server/sales/booking-ledger.ts` and `server/actions/returns.ts` — and
+ * every one of them now sums `journal_entries.amount_minor` and needs no
+ * conversion at all.
+ *
+ * It is deleted rather than left exported and unused. Its only remaining
+ * caller was its own test.
  */
-export function rupeeStringToMinor(value: string): bigint {
-  const text = String(value ?? "0").trim();
-  const negative = text.startsWith("-");
-  const bare = negative ? text.slice(1) : text;
-  const [whole = "0", fraction = ""] = bare.split(".");
-  const paise = BigInt(whole) * 100n + BigInt((fraction + "00").slice(0, 2) || "0");
-  return negative ? -paise : paise;
-}
 
 function heads(
   movements: Map<string, RoleMovement>,

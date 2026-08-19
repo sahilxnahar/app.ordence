@@ -68,21 +68,106 @@ function toActionError(err: unknown): ActionResult<never> {
 }
 
 /* ------------------------------------------------------------------ */
+/* ⭐⭐⭐ BATCH 0104 — EVERY TOTAL BELOW CARRIES A CURRENCY             */
+/* ------------------------------------------------------------------ */
+
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 WHAT WAS WRONG, AND WHY NOTHING CAUGHT IT
+ * ══════════════════════════════════════════════════════════════════════
+ * All three views this file reads aggregate over tables that carry a
+ * `currency` column — `assets.currency`, `contracts.currency`,
+ * `transactions.currency` — and all three ignored it. So
+ * `sum(value_amount)` over a portfolio holding rupee land and dollar
+ * plant returned the arithmetic sum of two incomparable quantities, and
+ * this file then added THOSE together again in BigInt, carefully, exactly,
+ * and to no purpose.
+ *
+ * ⚠️ THE ARITHMETIC WAS NEVER THE PROBLEM. The BigInt accumulation below
+ * has always been exact; what it was exact ABOUT was undefined. A total
+ * with no currency label is a bug and a total that silently adds two
+ * currencies is a worse one, and this file shipped the second while
+ * documenting its care about the first.
+ *
+ * ⚠️ AND IT IS RIGHT IN EVERY CASE ANYBODY TESTS. A workspace that has
+ * never left INR gets the correct number from the broken view. The fault
+ * arrives with the first foreign-currency asset, with no deploy, no error
+ * and no visible change on the tile.
+ *
+ * ⭐ THE FIX IS TO GROUP, NOT TO CONVERT.
+ * `SQL-FILES/0104_analytics_views_carry_currency.sql` adds `currency` to
+ * each view's GROUP BY. Every monetary figure that leaves this file is now
+ * an ARRAY of labelled values, one per currency. Converting would need a
+ * rate, a rate date and a policy about which rate — and a dashboard is the
+ * worst place in the product to invent any of the three.
+ *
+ * ⭐ COUNTS ARE STILL ADDED ACROSS CURRENCIES, ON PURPOSE. "17 contracts,
+ * 3 expiring" is true whatever they are denominated in. Only money is
+ * refused.
+ */
+export type LabelledValue = {
+  currency: string;
+  /**
+   * The `numeric(20,2)` figure as a decimal string. Never a float, and
+   * never a "minor unit" — see `decimalToScaled` below.
+   */
+  value: string;
+  /**
+   * 🔴 TRUE when the currency is the workspace's functional currency
+   * applied by ASSUMPTION, because the underlying table has no `currency`
+   * column at all. FALSE everywhere in this file: `assets`, `contracts`
+   * and `transactions` each carry one, so the label is a fact the row
+   * carried and not a guess the reader has to take on trust.
+   *
+   * Same flag, same meaning, as `server/actions/reports.ts`.
+   */
+  currencyAssumed: boolean;
+};
+
+/**
+ * Accumulates minor-ish fixed-point sums per currency and emits them in a
+ * stable order.
+ *
+ * ⚠️ ALPHABETICAL, NOT BY SIZE. Ordering by magnitude would reorder the
+ * list the moment a currency's total changed, and a tile whose figures
+ * swap places between two loads reads as a data change.
+ */
+function emitByCurrency(totals: Map<string, bigint>): LabelledValue[] {
+  return [...totals.entries()]
+    .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+    .map(([currency, scaled]) => ({
+      currency,
+      value: scaledToDecimal(scaled),
+      currencyAssumed: false,
+    }));
+}
+
+function addTo(totals: Map<string, bigint>, currency: string, scaled: bigint): void {
+  totals.set(currency, (totals.get(currency) ?? 0n) + scaled);
+}
+
+/* ------------------------------------------------------------------ */
 /* ASSET PORTFOLIO                                                     */
 /* ------------------------------------------------------------------ */
 
 export type AssetPortfolioSlice = {
   status: string;
   assetCount: number;
-  /** Decimal string. Never a float. */
-  totalValue: string;
+  /** One labelled figure per currency present in the slice. Never summed. */
+  valueByCurrency: LabelledValue[];
 };
 
 export type AssetPortfolioSummary = {
   slices: AssetPortfolioSlice[];
+  byType: Array<{
+    assetType: string;
+    assetCount: number;
+    valueByCurrency: LabelledValue[];
+  }>;
   totalAssets: number;
-  totalValue: string;
-  byType: Array<{ assetType: string; assetCount: number; totalValue: string }>;
+  totalValueByCurrency: LabelledValue[];
+  /** Every currency the portfolio is denominated in. Empty when there are no assets. */
+  currencies: string[];
 };
 
 export async function getAssetPortfolio(): Promise<ActionResult<AssetPortfolioSummary>> {
@@ -96,33 +181,39 @@ export async function getAssetPortfolio(): Promise<ActionResult<AssetPortfolioSu
         .where(eq(vAssetPortfolio.tenantId, ctx.tenant.id)),
     );
 
-    // Roll (type, status) rows up two ways. Done in TypeScript rather than
-    // as two more views: the row count here is at most a few dozen, and a
-    // second round trip would cost more than the loop.
-    const byStatus = new Map<string, { count: number; value: bigint }>();
-    const byType = new Map<string, { count: number; value: bigint }>();
+    // Roll (type, status, currency) rows up two ways. Done in TypeScript
+    // rather than as two more views: the row count here is at most a few
+    // dozen, and a second round trip would cost more than the loop.
+    const byStatus = new Map<string, { count: number; value: Map<string, bigint> }>();
+    const byType = new Map<string, { count: number; value: Map<string, bigint> }>();
+    const totalByCurrency = new Map<string, bigint>();
+    const currencies = new Set<string>();
 
     let totalAssets = 0;
-    let totalPaise = 0n;
 
     for (const row of rows) {
-      // Summed in BigInt paise, never in floating point. Adding a few
+      // Summed in exact fixed point, never in floating point. Adding a few
       // hundred rupee values as floats drifts, and a dashboard total that
       // disagrees with the ledger by ₹0.03 undermines confidence in both.
-      const paise = decimalToPaise(row.totalValue);
+      //
+      // ⭐ AND SUMMED INTO A PER-CURRENCY BUCKET. One accumulator for the
+      // whole loop is what the previous version had, and it is the bug.
+      const scaled = decimalToScaled(row.totalValue);
+      const currency = row.currency;
+      currencies.add(currency);
 
-      const s = byStatus.get(row.status) ?? { count: 0, value: 0n };
+      const s = byStatus.get(row.status) ?? { count: 0, value: new Map<string, bigint>() };
       s.count += row.assetCount;
-      s.value += paise;
+      addTo(s.value, currency, scaled);
       byStatus.set(row.status, s);
 
-      const t = byType.get(row.assetType) ?? { count: 0, value: 0n };
+      const t = byType.get(row.assetType) ?? { count: 0, value: new Map<string, bigint>() };
       t.count += row.assetCount;
-      t.value += paise;
+      addTo(t.value, currency, scaled);
       byType.set(row.assetType, t);
 
       totalAssets += row.assetCount;
-      totalPaise += paise;
+      addTo(totalByCurrency, currency, scaled);
     }
 
     return {
@@ -132,18 +223,19 @@ export async function getAssetPortfolio(): Promise<ActionResult<AssetPortfolioSu
           .map(([status, v]) => ({
             status,
             assetCount: v.count,
-            totalValue: paiseToDecimal(v.value),
+            valueByCurrency: emitByCurrency(v.value),
           }))
           .sort((a, b) => b.assetCount - a.assetCount),
         byType: [...byType.entries()]
           .map(([assetType, v]) => ({
             assetType,
             assetCount: v.count,
-            totalValue: paiseToDecimal(v.value),
+            valueByCurrency: emitByCurrency(v.value),
           }))
           .sort((a, b) => b.assetCount - a.assetCount),
         totalAssets,
-        totalValue: paiseToDecimal(totalPaise),
+        totalValueByCurrency: emitByCurrency(totalByCurrency),
+        currencies: [...currencies].sort(),
       },
     };
   } catch (err) {
@@ -163,15 +255,40 @@ export type LedgerDayPoint = {
   transactionCount: number;
 };
 
-export type LedgerTrailingSummary = {
+/**
+ * ⭐ ONE SERIES PER CURRENCY, AND NOT ONE SERIES WITH A CURRENCY FIELD.
+ *
+ * A trial balance is only balanced WITHIN a currency. Merging two
+ * currencies into one 30-day series and asking whether it foots produces
+ * `isBalanced: false` on a set of books that is perfectly in order, or —
+ * far worse — `true` on a set that is not, because two imbalances in two
+ * currencies happened to cancel as bare numbers.
+ *
+ * ⚠️ `currency` COMES FROM `transactions.currency`; `journal_entries` has
+ * none of its own. And `server/accounting/post-sales.ts` writes the
+ * literal "INR" on nearly every posting rather than the workspace's
+ * functional currency — only `postExchangeDifference()` writes the real
+ * one. This series groups by what the column SAYS. That upstream literal
+ * is named in the batch report; it cannot be repaired from a read.
+ */
+export type LedgerCurrencySeries = {
+  currency: string;
+  /** False: `transactions.currency` is a real column, not an assumption. */
+  currencyAssumed: boolean;
   days: LedgerDayPoint[];
   totalDebits: string;
   totalCredits: string;
-  /** True when the 30-day window balances. */
+  /** True when the 30-day window balances IN THIS CURRENCY. */
   isBalanced: boolean;
   difference: string;
   activeDays: number;
   transactionCount: number;
+};
+
+export type LedgerTrailingSummary = {
+  /** Every currency posted to in the window. Empty when nothing was posted. */
+  currencies: string[];
+  series: LedgerCurrencySeries[];
 };
 
 export async function getLedgerTrailing30(): Promise<ActionResult<LedgerTrailingSummary>> {
@@ -186,45 +303,63 @@ export async function getLedgerTrailing30(): Promise<ActionResult<LedgerTrailing
         .orderBy(vLedgerDaily.day),
     );
 
-    let debitPaise = 0n;
-    let creditPaise = 0n;
-    let activeDays = 0;
-    let transactionCount = 0;
+    type Accumulator = {
+      days: LedgerDayPoint[];
+      debitScaled: bigint;
+      creditScaled: bigint;
+      activeDays: number;
+      transactionCount: number;
+    };
 
-    const days: LedgerDayPoint[] = rows.map((row) => {
-      const d = decimalToPaise(row.debits);
-      const c = decimalToPaise(row.credits);
+    const perCurrency = new Map<string, Accumulator>();
 
-      debitPaise += d;
-      creditPaise += c;
-      if (row.transactionCount > 0) activeDays++;
-      transactionCount += row.transactionCount;
+    for (const row of rows) {
+      const acc: Accumulator = perCurrency.get(row.currency) ?? {
+        days: [],
+        debitScaled: 0n,
+        creditScaled: 0n,
+        activeDays: 0,
+        transactionCount: 0,
+      };
 
-      return {
+      acc.debitScaled += decimalToScaled(row.debits);
+      acc.creditScaled += decimalToScaled(row.credits);
+      if (row.transactionCount > 0) acc.activeDays++;
+      acc.transactionCount += row.transactionCount;
+      acc.days.push({
         day: String(row.day),
         debits: row.debits,
         credits: row.credits,
         netMovement: row.netMovement,
         transactionCount: row.transactionCount,
-      };
-    });
+      });
 
-    const diff = debitPaise - creditPaise;
+      perCurrency.set(row.currency, acc);
+    }
+
+    const series: LedgerCurrencySeries[] = [...perCurrency.entries()]
+      .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+      .map(([currency, acc]) => {
+        const diff = acc.debitScaled - acc.creditScaled;
+        return {
+          currency,
+          currencyAssumed: false,
+          days: acc.days,
+          totalDebits: scaledToDecimal(acc.debitScaled),
+          totalCredits: scaledToDecimal(acc.creditScaled),
+          // Exact BigInt comparison. `Math.abs(a - b) < 0.01` on floats is
+          // the usual shortcut and it hides a genuine one-paisa imbalance,
+          // which is exactly the thing worth surfacing.
+          isBalanced: diff === 0n,
+          difference: scaledToDecimal(diff < 0n ? -diff : diff),
+          activeDays: acc.activeDays,
+          transactionCount: acc.transactionCount,
+        };
+      });
 
     return {
       ok: true,
-      data: {
-        days,
-        totalDebits: paiseToDecimal(debitPaise),
-        totalCredits: paiseToDecimal(creditPaise),
-        // Exact BigInt comparison. `Math.abs(a - b) < 0.01` on floats is
-        // the usual shortcut and it hides a genuine one-paisa imbalance,
-        // which is exactly the thing worth surfacing.
-        isBalanced: diff === 0n,
-        difference: paiseToDecimal(diff < 0n ? -diff : diff),
-        activeDays,
-        transactionCount,
-      },
+      data: { currencies: series.map((s) => s.currency), series },
     };
   } catch (err) {
     return toActionError(err);
@@ -238,13 +373,15 @@ export async function getLedgerTrailing30(): Promise<ActionResult<LedgerTrailing
 export type ContractPipelineStage = {
   status: string;
   contractCount: number;
-  totalValue: string;
+  /** One labelled figure per currency in the stage. Never summed. */
+  valueByCurrency: LabelledValue[];
 };
 
 export type ContractPipelineSummary = {
   stages: ContractPipelineStage[];
   totalContracts: number;
-  totalValue: string;
+  totalValueByCurrency: LabelledValue[];
+  currencies: string[];
   signedCount: number;
   onHoldCount: number;
   expiringSoonCount: number;
@@ -264,31 +401,48 @@ export async function getContractPipeline(): Promise<
     );
 
     let totalContracts = 0;
-    let totalPaise = 0n;
     let signedCount = 0;
     let onHoldCount = 0;
     let expiringSoonCount = 0;
 
-    const stages: ContractPipelineStage[] = rows.map((row) => {
+    // The view now returns one row per (status, currency), so a status can
+    // appear more than once and the stages have to be folded rather than
+    // mapped one-to-one.
+    const byStatus = new Map<string, { count: number; value: Map<string, bigint> }>();
+    const totalByCurrency = new Map<string, bigint>();
+    const currencies = new Set<string>();
+
+    for (const row of rows) {
       totalContracts += row.contractCount;
-      totalPaise += decimalToPaise(row.totalValue);
       signedCount += row.signedCount;
       onHoldCount += row.onHoldCount;
       expiringSoonCount += row.expiringSoonCount;
 
-      return {
-        status: row.status,
-        contractCount: row.contractCount,
-        totalValue: row.totalValue,
-      };
-    });
+      const scaled = decimalToScaled(row.totalValue);
+      currencies.add(row.currency);
+      addTo(totalByCurrency, row.currency, scaled);
+
+      const stage = byStatus.get(row.status) ?? { count: 0, value: new Map<string, bigint>() };
+      stage.count += row.contractCount;
+      addTo(stage.value, row.currency, scaled);
+      byStatus.set(row.status, stage);
+    }
+
+    const stages: ContractPipelineStage[] = [...byStatus.entries()]
+      .map(([status, v]) => ({
+        status,
+        contractCount: v.count,
+        valueByCurrency: emitByCurrency(v.value),
+      }))
+      .sort((a, b) => b.contractCount - a.contractCount);
 
     return {
       ok: true,
       data: {
-        stages: stages.sort((a, b) => b.contractCount - a.contractCount),
+        stages,
         totalContracts,
-        totalValue: paiseToDecimal(totalPaise),
+        totalValueByCurrency: emitByCurrency(totalByCurrency),
+        currencies: [...currencies].sort(),
         signedCount,
         onHoldCount,
         expiringSoonCount,
@@ -447,7 +601,24 @@ function summariseEvent(metadata: Record<string, unknown> | null): string | null
  * unparseable value becomes 0 rather than NaN — a dashboard that renders a
  * zero is recoverable, one that renders "NaN" across every tile is not.
  */
-function decimalToPaise(value: string | null | undefined): bigint {
+/**
+ * ⚠️ THIS IS NOT A MINOR-UNIT CONVERSION AND MUST NEVER BE MISTAKEN FOR ONE.
+ *
+ * Every value it touches comes from a `numeric(20, 2)` view column — a
+ * MAJOR-unit decimal that the database has already fixed at two places.
+ * Scaling by 100 turns it into an exact integer so a sum cannot drift,
+ * and `scaledToDecimal` puts it straight back. The 100 is a property of
+ * the COLUMN, not of a currency.
+ *
+ * 🔴 MINOR UNITS ARE NOT UNIVERSALLY TWO DECIMALS. The yen has none and
+ * the dinar has three, and `lib/fx/currency.ts` holds the exponent per
+ * currency for exactly that reason. Anything that is genuinely in minor
+ * units — every `*_minor` bigint column in this product — must go through
+ * `formatMinorPlain()` / `minorUnitExponent()` there, never through here.
+ * These two functions were called `decimalToPaise` / `paiseToDecimal`,
+ * which invited precisely that mistake for a JPY or KWD workspace.
+ */
+function decimalToScaled(value: string | null | undefined): bigint {
   if (!value) return 0n;
 
   const trimmed = String(value).trim();
@@ -457,15 +628,15 @@ function decimalToPaise(value: string | null | undefined): bigint {
   if (!/^\d+(\.\d*)?$/.test(unsigned)) return 0n;
 
   const [whole = "0", fraction = ""] = unsigned.split(".");
-  const paise = BigInt(whole) * 100n + BigInt(fraction.padEnd(2, "0").slice(0, 2));
+  const scaled = BigInt(whole) * 100n + BigInt(fraction.padEnd(2, "0").slice(0, 2));
 
-  return negative ? -paise : paise;
+  return negative ? -scaled : scaled;
 }
 
-/** BigInt paise → 2-decimal string. */
-function paiseToDecimal(paise: bigint): string {
-  const negative = paise < 0n;
-  const abs = negative ? -paise : paise;
+/** The inverse. Exact integer → the same `numeric(_, 2)` decimal string. */
+function scaledToDecimal(scaled: bigint): string {
+  const negative = scaled < 0n;
+  const abs = negative ? -scaled : scaled;
   const whole = abs / 100n;
   const fraction = (abs % 100n).toString().padStart(2, "0");
   return `${negative ? "-" : ""}${whole}.${fraction}`;

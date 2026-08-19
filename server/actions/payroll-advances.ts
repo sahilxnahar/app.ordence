@@ -48,6 +48,7 @@ import {
 } from "@/db/schema/payroll";
 import { requirePermission, writeAudit } from "@/server/audit";
 import { toSalesActionError } from "@/server/sales/guards";
+import { requirePayrollEntitlement } from "@/server/payroll/entitlement";
 import {
   advanceLedgerIntent,
   advanceStatus,
@@ -113,6 +114,7 @@ const advanceSchema = z.object({
  */
 export async function grantAdvance(input: unknown): Promise<ActionResult<{ id: string }>> {
   try {
+    await requirePayrollEntitlement();
     const ctx = await requirePermission(MANAGE);
     const parsed = advanceSchema.safeParse(input);
     if (!parsed.success) {
@@ -553,6 +555,7 @@ export async function submitReimbursementClaim(
   input: unknown,
 ): Promise<ActionResult<{ id: string; treatment: string; taxableAllowanceMinor: string }>> {
   try {
+    await requirePayrollEntitlement();
     const ctx = await requirePermission(MANAGE);
     const parsed = claimSchema.safeParse(input);
     if (!parsed.success) {

@@ -1738,3 +1738,105 @@ export async function listWorkspacesNeedingAttention(
 
   return { ok: true, data: rows };
 }
+
+/* ================================================================== */
+/* ⭐⭐⭐ WHOSE AI KEYS A WORKSPACE MAY SPEND — 0115                    */
+/* ================================================================== */
+
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 THE "UNLESS I APPROVE IT" HALF, FOR AI CREDITS
+ * ══════════════════════════════════════════════════════════════════════
+ * New workspaces are `byo_required`: Ordence's own keys are not in their
+ * credential set at all. Every workspace that existed when 0115 ran was
+ * grandfathered to `platform_allowed`, so that a deploy did not cut
+ * anybody off mid-sentence.
+ *
+ * ⭐ THIS IS HOW EITHER IS CHANGED, AND ONLY ORDENCE CAN DO IT. A
+ * workspace owner cannot move themselves onto our keys, which is the
+ * whole point — the customer-facing screen shows the policy and the spend
+ * and offers no control over the first.
+ *
+ * 🔴 MOVING SOMEBODY ONTO OUR KEYS IS SPENDING MONEY, so it needs a
+ * reason of at least ten characters and it is audited at `warning`.
+ * Moving them OFF is also recorded, because it can break a working
+ * assistant and somebody will ask why.
+ */
+export const setAiCredentialPolicySchema = z.object({
+  tenantId: z.string().uuid(),
+  policy: z.enum(["platform_allowed", "byo_preferred", "byo_required"]),
+  reason: z
+    .string()
+    .trim()
+    .min(
+      10,
+      "Say why. Putting a workspace on Ordence's keys spends our money, and " +
+        "taking them off can break an assistant that was working — both are " +
+        "questions somebody asks three months later.",
+    )
+    .max(2000),
+});
+
+export async function setAiCredentialPolicy(
+  input: unknown,
+): Promise<ConfigResult<{ policy: string; previous: string }>> {
+  const stepUp = await capabilityOrStepUp("tenants:configure");
+  if (!stepUp.ok) return stepUp.result;
+  const operator = stepUp.operator;
+
+  const parsed = setAiCredentialPolicySchema.safeParse(input);
+  if (!parsed.success) {
+    return {
+      ok: false,
+      error: "Check the form.",
+      fieldErrors: parsed.error.flatten().fieldErrors as Record<string, string[]>,
+    };
+  }
+  const { tenantId, policy, reason } = parsed.data;
+
+  const [before] = await withPlatformScope(
+    "read a workspace's AI credential policy before changing it",
+    (tx) =>
+      tx
+        .select({ policy: tenants.aiCredentialPolicy, name: tenants.name })
+        .from(tenants)
+        .where(eq(tenants.id, tenantId))
+        .limit(1),
+  );
+
+  if (!before) return { ok: false, error: "No such workspace." };
+  const previous = String(before.policy ?? "byo_required");
+
+  if (previous === policy) {
+    return {
+      ok: false,
+      error: `That workspace is already on "${policy}". Nothing was changed, and nothing was recorded — an audit row saying a value was set to what it already was is noise in the trail somebody will one day read.`,
+    };
+  }
+
+  await withPlatformScope("set a workspace's AI credential policy", (tx) =>
+    tx
+      .update(tenants)
+      .set({ aiCredentialPolicy: policy, updatedAt: new Date() })
+      .where(eq(tenants.id, tenantId)),
+  );
+
+  await recordPlatformAudit({
+    operator,
+    tenantId,
+    action: "config_change",
+    resourceType: "tenant_ai_credential_policy",
+    resourceId: tenantId,
+    oldValue: { policy: previous },
+    newValue: { policy },
+    reason,
+    /**
+     * 🔴 `warning` WHEN IT PUTS THEM ON OUR KEYS. That is the direction
+     * that costs money, and it should stand out in a trail somebody
+     * skims. The other direction is `notice`.
+     */
+    severity: policy === "platform_allowed" ? "warning" : "notice",
+  });
+
+  return { ok: true, data: { policy, previous } };
+}

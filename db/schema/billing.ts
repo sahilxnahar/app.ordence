@@ -979,3 +979,197 @@ export function grantsAccess(status: SubscriptionStatus): boolean {
 export function isLiveSubscription(status: SubscriptionStatus): boolean {
   return (LIVE_SUBSCRIPTION_STATUSES as readonly SubscriptionStatus[]).includes(status);
 }
+
+/* ================================================================== */
+/* ⭐⭐⭐ SEAT GRANTS AND SEAT REQUESTS — 0114                          */
+/* ================================================================== */
+
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 WHY THE SEAT LIMIT WAS ADVISORY UNTIL 0114
+ * ══════════════════════════════════════════════════════════════════════
+ * `lib/billing/seats.ts` decided what a seat is, carefully. `seat_limit`
+ * existed. `requireSeat()` existed. And there was NO in-product invite,
+ * so the Clerk webhook was the only door — and it checked the limit,
+ * wrote a high-severity audit row, and created the user anyway.
+ *
+ * ⭐ These two tables are the third state that comment never considered:
+ * admit the person, withhold the seat, and give somebody a queue.
+ */
+
+/**
+ * ⭐⭐ CAPACITY SOMEBODY GAVE, WITH THEIR NAME ON IT.
+ *
+ * 🔴 A GRANT RAISES THE LIMIT RATHER THAN FILLING A SEAT, so it survives
+ * the person who prompted it leaving. `effectiveSeats()` in
+ * `lib/billing/seats.ts` is the arithmetic.
+ */
+export const seatGrants = pgTable(
+  "seat_grants",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    tenantId: uuid("tenant_id")
+      .notNull()
+      .references(() => tenants.id, { onDelete: "cascade" }),
+
+    /** ⚠️ A count, not a user. See above. */
+    seats: integer("seats").notNull(),
+
+    /** `platform` means Ordence gave it; `owner` means the workspace did. */
+    grantedByKind: varchar("granted_by_kind", { length: 16 })
+      .default("platform")
+      .notNull(),
+    grantedByUserId: uuid("granted_by_user_id").references(() => users.id, {
+      onDelete: "set null",
+    }),
+
+    /**
+     * 🔴 AT LEAST TEN CHARACTERS, AND A CHECK ENFORCES IT. A free seat
+     * with no reason is indistinguishable from a mistake in the billing
+     * table, and it is found by an accountant asking why revenue per
+     * workspace does not foot.
+     */
+    reason: text("reason").notNull(),
+
+    grantedAt: timestamp("granted_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+
+    /**
+     * ⚠️ NULL MEANS PERMANENT, and that is the honest default. Inventing
+     * an expiry would withdraw capacity a customer relies on, on a date
+     * nobody chose.
+     */
+    expiresAt: timestamp("expires_at", { withTimezone: true }),
+    revokedAt: timestamp("revoked_at", { withTimezone: true }),
+    revokedReason: text("revoked_reason"),
+  },
+  (t) => ({
+    activeIdx: index("seat_grants_active_idx").on(t.tenantId),
+  }),
+);
+
+/**
+ * ⭐⭐ THE QUEUE. One row per person who could not be given a seat when
+ * they arrived.
+ */
+export const seatRequests = pgTable(
+  "seat_requests",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    tenantId: uuid("tenant_id")
+      .notNull()
+      .references(() => tenants.id, { onDelete: "cascade" }),
+    userId: uuid("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+
+    /**
+     * ⚠️ `identity_provider` means Clerk created them and we parked them.
+     * `invite` means somebody in the product tried and was refused at the
+     * moment they tried. The two need different handling and the
+     * difference is invisible afterwards.
+     */
+    source: varchar("source", { length: 24 }).notNull(),
+
+    requestedAt: timestamp("requested_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+
+    /**
+     * 🔴 FROZEN AT REQUEST TIME. Reading the seat position back from
+     * today's numbers would answer "are they over the limit now", not
+     * "were they over the limit then" — and the second is the one that
+     * explains why this row exists.
+     */
+    seatsUsedAtRequest: integer("seats_used_at_request").notNull(),
+    seatsAvailableAtRequest: integer("seats_available_at_request").notNull(),
+
+    resolvedAt: timestamp("resolved_at", { withTimezone: true }),
+    resolution: varchar("resolution", { length: 24 }),
+    resolvedBy: uuid("resolved_by").references(() => users.id, {
+      onDelete: "set null",
+    }),
+    /**
+     * 🔴 REQUIRED TO DECLINE, NOT TO APPROVE. The seat count already
+     * explains an approval and nothing explains a refusal. Same asymmetry
+     * as the GSTR-2B worklist, and for the same reason: three months
+     * later "why was this person never let in" has no answer.
+     */
+    resolutionReason: text("resolution_reason"),
+  },
+  (t) => ({
+    /**
+     * 🔴 ONE OPEN REQUEST PER PERSON. Clerk replays membership events on
+     * purpose, and this codebase has been bitten by it before. Two open
+     * requests would let an owner approve a seat for somebody who
+     * already has one.
+     *
+     * ⚠️ PARTIAL, so the same person CAN be parked again once the first
+     * request is closed. Declined in March and hired properly in June is
+     * two requests, not an error.
+     */
+    openIdx: index("seat_requests_open_idx").on(t.tenantId, t.requestedAt),
+  }),
+);
+
+/**
+ * ⭐⭐⭐ WHOSE AI CREDITS — 0115.
+ *
+ * 🔴 ONE ROW PER PROVIDER CALL, AND `credentialSource` IS THE POINT.
+ * Every row marked `platform` is money that left Ordence's own account on
+ * a workspace's behalf. Before 0115 that number was unknowable: 0105's
+ * `budget_scope` tracks provider HEALTH, not tokens.
+ *
+ * ⚠️ APPEND-ONLY BY TRIGGER. A metering table somebody can edit is one
+ * nobody can quote in a billing conversation, and the edit that gets made
+ * is always the one that lowers a number.
+ */
+export const aiUsage = pgTable(
+  "ai_usage",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    tenantId: uuid("tenant_id")
+      .notNull()
+      .references(() => tenants.id, { onDelete: "cascade" }),
+
+    occurredAt: timestamp("occurred_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+
+    providerId: varchar("provider_id", { length: 40 }).notNull(),
+    model: varchar("model", { length: 120 }),
+
+    /** 🔴 `platform` means it was OUR key. See the header. */
+    credentialSource: varchar("credential_source", { length: 16 }).notNull(),
+
+    /**
+     * ⚠️ NULLABLE, AND NULL IS NOT ZERO. Not every provider returns
+     * usage. A zero would be a measurement; NULL is the honest statement
+     * that the provider did not say, and summing NULLs as zero would
+     * understate our own spend invisibly.
+     */
+    promptTokens: integer("prompt_tokens"),
+    completionTokens: integer("completion_tokens"),
+    totalTokens: integer("total_tokens"),
+
+    /** What asked. Not a foreign key: this table outlives its subjects. */
+    feature: varchar("feature", { length: 60 }).notNull(),
+    requestRef: varchar("request_ref", { length: 120 }),
+
+    /**
+     * 🔴 FAILURES ARE RECORDED. A call rejected after the prompt was sent
+     * has already cost tokens, and a success-only table reports a
+     * workspace as cheapest in exactly the month its key was broken and
+     * it retried all day.
+     */
+    outcome: varchar("outcome", { length: 16 }).default("ok").notNull(),
+    failureKind: varchar("failure_kind", { length: 40 }),
+  },
+  (t) => ({
+    tenantPeriodIdx: index("ai_usage_tenant_period_idx").on(
+      t.tenantId,
+      t.occurredAt,
+    ),
+  }),
+);

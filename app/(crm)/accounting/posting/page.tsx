@@ -107,7 +107,11 @@ export default async function SalesPostingPage() {
           <CardTitle className="text-base">Where each part posts</CardTitle>
         </CardHeader>
         <CardContent>
-          <PostingSetup roles={setup.data.roles} ledgers={setup.data.ledgers} />
+          <PostingSetup
+            roles={setup.data.roles}
+            ledgers={setup.data.ledgers}
+            moduleStatus={setup.data.moduleStatus}
+          />
         </CardContent>
       </Card>
 

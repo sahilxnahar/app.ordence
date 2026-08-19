@@ -43,9 +43,9 @@ import { db, withPlatformScope, withTenant } from "@/db";
  * than nested closures, which keeps them reviewable.
  */
 type ScopedTx = Parameters<Parameters<typeof withTenant<void>>[1]>[0];
-import { tenants, users, auditLogs } from "@/db/schema";
+import { tenants, users, auditLogs, seatRequests } from "@/db/schema";
 import { countSeatsInUse, countSeatsPurchased } from "@/server/billing/seats";
-import { canTakeSeats } from "@/lib/billing/seats";
+import { canTakeSeats, PENDING_SEAT_STATUS } from "@/lib/billing/seats";
 import type { SystemRole } from "@/db/schema";
 import { recordSecurityEvent } from "@/server/security/record";
 import { recordFailure } from "@/lib/security/lockout";
@@ -65,6 +65,27 @@ import {
 } from "@/server/platform/resolve-slug";
 import type { SlugOrigin } from "@/lib/slug-resolution";
 import type { SlugRejectionCode } from "@/lib/slug";
+/**
+ * ⭐ THE MIRROR KEEPER — Brief A.
+ *
+ * `middleware.ts:1031` compares the hostname label against CLERK'S
+ * `orgSlug`, not against `tenants.slug`. So the address this file grants
+ * and the address Clerk holds are not merely related: they are compared on
+ * every request, and a workspace whose two values differ answers
+ * `/access-denied` to its own staff. Read the header of
+ * `server/platform/clerk-org-slug.ts` for the traced path.
+ */
+import { syncClerkOrganizationSlug } from "@/server/platform/clerk-org-slug";
+/**
+ * ⭐ THE OWNER NOTIFICATION — Brief A, question A3.
+ *
+ * `server/platform/rename-slug.ts` names two things that had to exist
+ * before an address change could come from anywhere but an operator: the
+ * 301 for old links, and somebody telling the workspace it happened. The
+ * first shipped in v1.57.0 as `app/api/internal/host-moved/route.ts`. This
+ * import is the second.
+ */
+import { createNotification } from "@/server/notifications/create";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -428,10 +449,12 @@ const DEFAULT_SETTINGS = {
  *                people and never edit them.
  */
 async function handleOrganizationUpsert(org: ClerkOrganization): Promise<void> {
-  const entry = await withPlatformScope(
+  const outcome = await withPlatformScope(
     `Clerk webhook: provision or update the workspace mirroring organization ${org.id}`,
     (tx) => organizationUpsert(tx, org),
   );
+
+  const entry = outcome?.audit ?? null;
 
   /*
    * ══════════════════════════════════════════════════════════════════
@@ -453,18 +476,151 @@ async function handleOrganizationUpsert(org: ClerkOrganization): Promise<void> {
    *    words. This path now agrees with them.
    */
   if (entry) await writeAudit(entry);
+
+  if (!outcome) return;
+
+  /*
+   * ══════════════════════════════════════════════════════════════════
+   * ⭐ THE OWNER NOTIFICATION — A3's SECOND PRECONDITION, NOW BUILT
+   * ══════════════════════════════════════════════════════════════════
+   * `server/platform/rename-slug.ts` argues that a rename must stay an
+   * operator act until TWO things exist: ① the 301 from the released host,
+   * and ② somebody telling the workspace it happened. ① shipped in
+   * v1.57.0 (`app/api/internal/host-moved/route.ts`). ② is this.
+   *
+   * ⚠️ BROADCAST — `userId` IS DELIBERATELY OMITTED, WHICH MEANS EVERY
+   *    USER IN THE WORKSPACE. The thing that changed is the address in
+   *    every colleague's bookmark bar, not a fact about one person.
+   *
+   * ⚠️ `critical` IS NOT DRAMA, IT IS THE DELIVERY CHANNEL.
+   *    `createNotification()` emails only `critical` and `warning`, and an
+   *    in-app bell is no use to somebody whose problem is that they cannot
+   *    reach the app. `rename-slug.ts` picks the same severity for the
+   *    operator path, calling it "the same severity as a suspension".
+   *
+   * ⚠️ AFTER THE COMMIT AND AFTER THE AUDIT, AND FAILURE IS SWALLOWED BY
+   *    `createNotification` ITSELF. A workspace whose address moved and
+   *    whose notification did not send is worse informed; a webhook that
+   *    500s because Resend was down would make Svix replay the rename.
+   */
+  if (outcome.moved) {
+    const notice = await createNotification({
+      tenantId: outcome.audit.tenantId,
+      category: "system",
+      severity: "critical",
+      title: "Your workspace address has changed",
+      body:
+        `This workspace now answers at ${outcome.moved.to}.ordence.com. ` +
+        `The old address, ${outcome.moved.from}.ordence.com, redirects there ` +
+        `and is held for 365 days, so links already sent keep working — but ` +
+        `bookmarks, saved links and anything printed will show the old name. ` +
+        `The change came from the organisation settings in Clerk.`,
+      metadata: {
+        previousSlug: outcome.moved.from,
+        newSlug: outcome.moved.to,
+        source: "clerk-webhook",
+        clerkOrgId: org.id,
+      },
+      source: "clerk-webhook",
+    });
+    if (!notice.ok) {
+      console.error(
+        `[clerk-webhook] the address of workspace ${outcome.audit.tenantId} moved from ` +
+          `"${outcome.moved.from}" to "${outcome.moved.to}" and NOBODY WAS TOLD: ${notice.error}`,
+      );
+    }
+  }
+
+  /*
+   * ══════════════════════════════════════════════════════════════════
+   * 🔴 THE MIRROR. WITHOUT THIS THE WORKSPACE IS UNREACHABLE BY ITS OWN
+   *    STAFF, AND EVERY OTHER LINE IN THIS FILE STILL LOOKS CORRECT.
+   * ══════════════════════════════════════════════════════════════════
+   * `middleware.ts:1031` refuses a request whose hostname label differs
+   * from the session's CLERK `orgSlug`, and `/api/internal/host-moved`
+   * answers `access-denied` rather than a 301 because a LIVE tenant holds
+   * the label — their own. So an address this file granted but Clerk does
+   * not hold is an address nobody can use.
+   *
+   * ⚠️ THE DECISION IS MADE FROM THE PAYLOAD, NOT FROM A CLERK ROUND TRIP.
+   *    `org.slug` is in the delivery, so the common case — the two already
+   *    agree, which is every signup that got the address it asked for —
+   *    costs nothing at all. Calling the sync unconditionally would issue a
+   *    Clerk write per delivery, and each Clerk write fires another
+   *    `organization.updated`, which is a loop with a network in it.
+   */
+  const clerkSlug = (org.slug ?? "").trim().toLowerCase();
+  if (clerkSlug === outcome.addressOfRecord) return;
+
+  const sync = await syncClerkOrganizationSlug({
+    clerkOrgId: org.id,
+    slug: outcome.addressOfRecord,
+    reason: `Clerk webhook: the address of record for organization ${org.id} is "${outcome.addressOfRecord}".`,
+  });
+
+  if (sync.ok) return;
+
+  if (sync.reason === "unreachable") {
+    /*
+     * 🔴 THROWN, SO SVIX RETRIES. Clerk being unreachable is transient and
+     *    a retry is exactly the right response. The tenant row is already
+     *    committed and every branch below is idempotent, so replaying the
+     *    delivery repeats no write that matters.
+     */
+    throw new Error(
+      `[clerk-webhook] could not write the address "${outcome.addressOfRecord}" back to ` +
+        `organization ${org.id}: ${sync.detail}. Until it lands, that workspace answers ` +
+        `/access-denied to its own staff.`,
+    );
+  }
+
+  /*
+   * ⚠️ NOT THROWN, BECAUSE A RETRY CANNOT SUCCEED. Clerk refused the name
+   *    itself; replaying the delivery asks the same question and gets the
+   *    same answer, forever, at Svix's retry schedule. The workspace row is
+   *    correct and durable; what is needed is a person.
+   */
+  console.error(
+    `[clerk-webhook] CLERK REFUSED the address "${outcome.addressOfRecord}" for organization ` +
+      `${org.id} (${sync.detail}). Clerk still holds "${clerkSlug || "(none)"}", so ` +
+      `middleware will refuse every request from that workspace's own staff. ` +
+      `This needs an operator: rename the workspace to a name Clerk will accept, or fix the ` +
+      `Clerk organisation by hand.`,
+  );
 }
 
 /** What the transaction decided, carried out so it can be audited. */
 type TenantAuditEntry = Parameters<typeof writeAudit>[0];
 
 /**
- * ⚠️ RETURNS THE AUDIT ENTRY RATHER THAN WRITING IT. See above.
+ * Everything the caller needs AFTER the transaction has committed.
+ *
+ * ⚠️ IT IS NO LONGER JUST THE AUDIT ROW, AND THE TWO ADDITIONS ARE BOTH
+ *    THINGS THAT MUST HAPPEN OUTSIDE THE TRANSACTION:
+ *
+ *      `addressOfRecord` — the slug the workspace actually holds. Clerk is
+ *                          made to match it, and a Clerk call inside a
+ *                          database transaction is a network round trip
+ *                          holding a connection open.
+ *      `moved`           — set only when the public hostname CHANGED in
+ *                          this delivery, which is when the people who
+ *                          use it have to be told.
+ */
+type UpsertOutcome = {
+  audit: TenantAuditEntry;
+  /** `tenants.slug` as it stands after this delivery. Never Clerk's ask. */
+  addressOfRecord: string;
+  /** Non-null only when the hostname moved. Both values are slugs. */
+  moved: { from: string; to: string } | null;
+};
+
+/**
+ * ⚠️ RETURNS THE OUTCOME RATHER THAN ACTING ON IT. See above.
  */
 async function organizationUpsert(
   tx: ScopedTx,
   org: ClerkOrganization,
-): Promise<TenantAuditEntry | null> {
+): Promise<UpsertOutcome | null> {
   /*
    * ⭐ "REQUESTED", NOT "SLUG". The name Clerk asks for is an ASK. What
    * the workspace ends up on is whatever the database was willing to
@@ -511,7 +667,7 @@ async function organizationProvision(
   tx: ScopedTx,
   org: ClerkOrganization,
   requested: string,
-): Promise<TenantAuditEntry | null> {
+): Promise<UpsertOutcome | null> {
   const trialEndsAt = new Date();
   trialEndsAt.setDate(trialEndsAt.getDate() + FREE_TIER_DEFAULTS.trialDays);
 
@@ -584,22 +740,38 @@ async function organizationProvision(
   }
 
   return {
-    tenantId: claim.tenantId,
-    action: "create",
-    resourceType: "tenant",
-    resourceId: claim.tenantId,
-    newValue: {
-      name: org.name,
-      /* ⭐ BOTH, ALWAYS. "granted" alone cannot answer the question. */
-      requestedSlug: claim.requested,
-      slug: claim.granted,
-      planTier: FREE_TIER_DEFAULTS.planTier,
-      ...(diverted ? { slugRefusals: refusalsForAudit(claim.refusals) } : {}),
+    audit: {
+      tenantId: claim.tenantId,
+      action: "create",
+      resourceType: "tenant",
+      resourceId: claim.tenantId,
+      newValue: {
+        name: org.name,
+        /* ⭐ BOTH, ALWAYS. "granted" alone cannot answer the question. */
+        requestedSlug: claim.requested,
+        slug: claim.granted,
+        planTier: FREE_TIER_DEFAULTS.planTier,
+        ...(diverted ? { slugRefusals: refusalsForAudit(claim.refusals) } : {}),
+      },
+      reason: diverted
+        ? `Clerk organization.created — the address "${claim.requested}" was not available ` +
+          `(${reasonForRequested(claim.requested, claim.refusals)}); "${claim.granted}" was granted instead.`
+        : "Clerk organization.created",
     },
-    reason: diverted
-      ? `Clerk organization.created — the address "${claim.requested}" was not available ` +
-        `(${reasonForRequested(claim.requested, claim.refusals)}); "${claim.granted}" was granted instead.`
-      : "Clerk organization.created",
+    /*
+     * 🔴 `claim.granted`, NOT `claim.requested` AND NOT `org.slug`. This is
+     *    the one value the whole reconciliation turns on: the ladder may
+     *    have walked, and the address the customer will actually be routed
+     *    to is the one the database granted.
+     */
+    addressOfRecord: claim.granted,
+    /*
+     * ⚠️ A BRAND-NEW WORKSPACE HAS NOT "MOVED". Nobody holds a link to an
+     *    address that did not exist a second ago, so there is nothing to
+     *    warn anybody about — and a "your address changed" notice on the
+     *    first screen a customer ever sees is alarming and untrue.
+     */
+    moved: null,
   };
 }
 
@@ -629,7 +801,7 @@ async function organizationRename(
   org: ClerkOrganization,
   existing: TenantRow,
   requested: string,
-): Promise<TenantAuditEntry> {
+): Promise<UpsertOutcome> {
   const rename = await tryRenameSlugForClerkOrg(tx, {
     tenantId: existing.id,
     currentSlug: existing.slug,
@@ -663,21 +835,41 @@ async function organizationRename(
     .where(eq(tenants.id, existing.id));
 
   return {
-    tenantId: existing.id,
-    action: "update",
-    resourceType: "tenant",
-    resourceId: existing.id,
-    oldValue: { slug: existing.slug },
-    newValue: {
-      name: org.name,
-      requestedSlug: requested,
-      slug: rename.slug,
-      ...(rename.ok ? {} : { slugRefusals: refusalsForAudit([rename.refusal]) }),
+    audit: {
+      tenantId: existing.id,
+      action: "update",
+      resourceType: "tenant",
+      resourceId: existing.id,
+      oldValue: { slug: existing.slug },
+      newValue: {
+        name: org.name,
+        requestedSlug: requested,
+        slug: rename.slug,
+        ...(rename.ok ? {} : { slugRefusals: refusalsForAudit([rename.refusal]) }),
+      },
+      reason: rename.ok
+        ? "Clerk organization.updated"
+        : `Clerk organization.updated — the address "${requested}" was refused ` +
+          `(${rename.refusal.code}); "${existing.slug}" is unchanged and the workspace keeps working.`,
     },
-    reason: rename.ok
-      ? "Clerk organization.updated"
-      : `Clerk organization.updated — the address "${requested}" was refused ` +
-        `(${rename.refusal.code}); "${existing.slug}" is unchanged and the workspace keeps working.`,
+    /*
+     * ⭐ `rename.slug` IS THE ADDRESS OF RECORD ON BOTH BRANCHES, and that
+     *    is why `SlugRenameOutcome` carries it on the refusal too: on
+     *    success it is the new name, on refusal it is the name the
+     *    workspace kept. Either way it is what Clerk must be made to hold.
+     */
+    addressOfRecord: rename.slug,
+    /*
+     * ⚠️ `changed`, NOT `ok`. Most `organization.updated` deliveries carry
+     *    an unchanged slug — a logo, a display name — and
+     *    `tryRenameSlugForClerkOrg` returns `{ ok: true, changed: false }`
+     *    for them. Notifying on `ok` would email every user in the
+     *    workspace every time somebody uploaded a logo.
+     */
+    moved:
+      rename.ok && rename.changed
+        ? { from: existing.slug, to: rename.slug }
+        : null,
   };
 }
 
@@ -952,26 +1144,26 @@ async function upsertUserIn(
   ]);
   const seatVerdict = canTakeSeats(seatsUsed, seatsPurchased, 1);
 
-  if (!seatVerdict.allowed) {
-    await writeAudit({
-      tenantId,
-      // The local audit writer on this path accepts a narrower action
-      // set than `audit_logs` does. `update` is the honest fit: the
-      // workspace's seat position changed.
-      action: "update",
-      resourceType: "seat_limit",
-      resourceId: tenantId,
-      reason:
-        "A member was added through the identity provider while the workspace " +
-        "was at its seat limit. The member was created rather than refused — " +
-        "refusing would make Clerk retry forever and strand the user.",
-      newValue: {
-        seatsUsed,
-        seatsPurchased,
-        overBy: seatsUsed + 1 - seatsPurchased,
-      },
-    });
-  }
+  /**
+   * ══════════════════════════════════════════════════════════════════
+   * ⭐⭐⭐ 0114 — THE THIRD STATE. WHAT THIS CODE USED TO DO WAS ADMIT
+   *        THEM AND WRITE AN AUDIT ROW.
+   * ══════════════════════════════════════════════════════════════════
+   * The paragraph above is still right that REFUSING is wrong: a non-2xx
+   * makes Clerk retry for ever and the person exists in the identity
+   * provider while never existing here.
+   *
+   * 🔴 IT DOES NOT FOLLOW THAT THEY GET A SEAT. They are created as
+   * `pending_seat`, which `SEAT_CONSUMING_STATUSES` deliberately
+   * excludes. Clerk gets its 200 and stops retrying. The person can sign
+   * in and sees one screen saying their administrator has been asked for
+   * a seat. Nobody is stranded and nobody is silently let in.
+   *
+   * ⚠️ AND A `seat_requests` ROW IS THE QUEUE, not a notification. A
+   * notification is read once and lost; a queue is still there next
+   * Tuesday when somebody gets round to it.
+   */
+  const seatless = !seatVerdict.allowed;
 
   const [created] = await tx
     .insert(users)
@@ -983,10 +1175,55 @@ async function upsertUserIn(
       lastName: membership.public_user_data.last_name ?? null,
       avatarUrl: membership.public_user_data.image_url ?? null,
       role,
-      status: "active",
+      status: seatless ? PENDING_SEAT_STATUS : "active",
     })
     .onConflictDoNothing()
     .returning();
+
+  if (seatless && created) {
+    /**
+     * 🔴 THE SEAT POSITION IS FROZEN ONTO THE ROW. Reading it back from
+     * today's numbers would answer "are they over the limit now" rather
+     * than "were they over the limit then", and the second is the only
+     * one that explains why this person is waiting.
+     *
+     * ⚠️ `onConflictDoNothing` ON THE PARTIAL UNIQUE INDEX. Clerk replays
+     * membership events on purpose. A second open request for the same
+     * person would let an owner approve a seat for somebody who already
+     * has one.
+     */
+    await tx
+      .insert(seatRequests)
+      .values({
+        tenantId,
+        userId: created.id,
+        source: "identity_provider",
+        seatsUsedAtRequest: seatsUsed,
+        seatsAvailableAtRequest: Math.max(0, seatsPurchased - seatsUsed),
+      })
+      .onConflictDoNothing();
+
+    await writeAudit({
+      tenantId,
+      // The local audit writer on this path accepts a narrower action
+      // set than `audit_logs` does. `update` is the honest fit: the
+      // workspace's seat position changed.
+      action: "update",
+      resourceType: "seat_limit",
+      resourceId: tenantId,
+      reason:
+        "A member was added through the identity provider while the workspace " +
+        "was at its seat limit. They were created WITHOUT a seat and placed in " +
+        "the approval queue — refusing would make Clerk retry forever and " +
+        "strand them, and admitting them would make the limit advisory.",
+      newValue: {
+        seatsUsed,
+        seatsPurchased,
+        parkedUserId: created.id,
+        status: PENDING_SEAT_STATUS,
+      },
+    });
+  }
 
   if (created) {
     await writeAudit({

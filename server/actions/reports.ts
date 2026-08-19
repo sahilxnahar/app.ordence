@@ -22,13 +22,32 @@ import {
   stockBalances,
   stockItems,
   projects,
-  invoices,
-  invoiceLines,
+  salesInvoices,
+  salesInvoiceLines,
+  salesCreditNotes,
   itcRegister,
 } from "@/db/schema";
 import { requireTenantContext } from "@/server/tenant-context";
 import { functionalCurrencyFromSettings, formatMinorPlain } from "@/lib/fx/currency";
 import { sumByCurrency } from "@/lib/fx/aggregate";
+/**
+ * ⭐⭐ ONE IMPLEMENTATION OF RULE 53, SHARED WITH THE RETURN.
+ * `lib/gstr1/build.ts` calls the same `creditNoteEffect`, so the summary
+ * and GSTR-1 cannot come to different conclusions about whether a credit
+ * note reduces output tax — which is the only way the two figures on the
+ * two screens can be defended as one position.
+ */
+import {
+  GST_HEADS,
+  ZERO_HEADS,
+  addHeads,
+  creditNoteEffect,
+  netCreditNotes,
+  taxPeriodOf,
+  totalOf,
+  type HeadAmounts,
+  type PeriodMovement,
+} from "@/lib/gstr1/netting";
 
 type ReportResult = { ok: true; data: Record<string, unknown> } | { ok: false; error: string };
 
@@ -43,6 +62,11 @@ type ReportResult = { ok: true; data: Record<string, unknown> } | { ok: false; e
  *   ① A SUM OVER A TABLE THAT HAS A `currency` COLUMN. `getGstSummary`
  *      summed `billing.invoices`, which carries one. Dollars and rupees
  *      were added together. FIXED BELOW by grouping.
+ *
+ *      🔴 AND BATCH 0104 THEN FIXED THE DEEPER FAULT 0101 ONLY NAMED:
+ *      `billing.invoices` was the WRONG TABLE ENTIRELY. It is Ordence
+ *      billing its own tenants. This report now reads `sales_invoices` —
+ *      the workspace's own outward supplies — and still groups.
  *
  *   ② A SUM OVER A TABLE WITH NO `currency` COLUMN — `demand_notices`,
  *      `receipts`, `tds_deductions`, `itc_register`, `tds_challans`.
@@ -83,6 +107,33 @@ function labelled(
   };
 }
 
+/**
+ * ⭐ THE FOUR HEADS, EACH CARRYING THE CURRENCY, PLUS THE SUM.
+ *
+ * ⚠️ THE HEADS ARE LABELLED INDIVIDUALLY AND NOT JUST THE TOTAL. CGST is
+ * owed to the Union, SGST to the State and IGST to the Union for
+ * apportionment; they are three liabilities and a single "tax" figure is
+ * three facts flattened into one. The total is provided beside them
+ * because a screen needs one number, not instead of them.
+ */
+type LabelledHeads = {
+  cgst: SingleCurrencyTotal;
+  sgst: SingleCurrencyTotal;
+  igst: SingleCurrencyTotal;
+  cess: SingleCurrencyTotal;
+  total: SingleCurrencyTotal;
+};
+
+function labelledHeads(heads: HeadAmounts, currency: string): LabelledHeads {
+  return {
+    cgst: labelled(heads.cgst, currency, false),
+    sgst: labelled(heads.sgst, currency, false),
+    igst: labelled(heads.igst, currency, false),
+    cess: labelled(heads.cess, currency, false),
+    total: labelled(totalOf(heads), currency, false),
+  };
+}
+
 /** `numeric`/`bigint` arrives as a string on some paths. Never via `Number`. */
 function toMinor(value: string | number | bigint | null | undefined): bigint {
   if (value === null || value === undefined) return 0n;
@@ -101,34 +152,168 @@ export async function getGstSummary(): Promise<ReportResult> {
 
     const data = await withTenant(ctx.tenant.id, async (tx) => {
       /**
-       * 🔴 GROUPED BY `invoices.currency` — BATCH 0101.
+       * ═════════════════════════════════════════════════════════════
+       * 🔴 BATCH 0104 — THIS READ USED TO BE OF THE WRONG TABLE
+       * ═════════════════════════════════════════════════════════════
+       * It joined `invoice_lines` to `invoices` — and `invoices` in
+       * `db/schema/billing.ts` is ORDENCE BILLING ITS OWN TENANTS. Those
+       * rows carry `subscription_id`, `provider_invoice_id` and
+       * `hosted_invoice_url`; their customer is the workspace, and
+       * `server/billing/invoice-generator.ts` fills `customer_legal_name`
+       * from the TENANT.
        *
-       * ⚠️ `invoices` HERE IS `billing.invoices`, WHICH CARRIES A
-       * `currency` COLUMN, and the old ungrouped `sum()` added every
-       * currency together. Grouping is the fix that needs no rate and
-       * cannot be wrong.
+       * So an Indian business opening "GST Summary" was shown the output
+       * tax on ITS OWN SUBSCRIPTION BILLS FROM ORDENCE. Not a rounding
+       * error, not a stale figure — somebody else's sales, presented as
+       * the workspace's outward supply position, on the screen used to
+       * decide what to file.
        *
-       * ⚠️ SEPARATELY, AND NOT FIXED BY THIS BATCH: this report reads
-       * ORDENCE'S OWN SUBSCRIPTION INVOICES to the tenant, not the
-       * tenant's outward GST supplies. `db/schema/index.ts` says in as
-       * many words that `billing.invoices` is "Ordence billing its own
-       * tenants" while `sales_invoices` is "a tenant billing its
-       * customers", and this GST summary reads the wrong one. That is a
-       * pre-existing defect of a different kind and it is named in the
-       * batch report rather than silently repaired here.
+       * ⚠️ AND IT FOOTED. Both tables have `cgst_minor`, `sgst_minor`,
+       * `igst_minor` and `taxable_value_minor` in exactly those names, so
+       * the query compiled, ran, returned plausible rupee figures and
+       * never once mentioned that it was describing the wrong business.
+       * `db/schema/sales-invoices.ts` opens by saying the two tables
+       * "MUST NEVER MERGE" and that merging them "would put Ordence's own
+       * revenue into its tenants' GSTR-1" — which is what this report did
+       * on screen, short of the return itself.
+       *
+       * ⭐ THE RIGHT TABLE IS `sales_invoices` / `sales_invoice_lines`:
+       * the workspace billing ITS customers. Same shape, opposite
+       * direction. `lib/gstr1/build.ts` and the GSTR-1 path already read
+       * these; this report was the outlier.
+       */
+
+      /**
+       * ⭐ GROUPED BY `sales_invoices.currency`, WHICH IS A REAL COLUMN.
+       * An exporter raising a USD invoice and a domestic invoice in the
+       * same period has two output-tax figures and no third one. Grouping
+       * needs no exchange rate and cannot be wrong.
+       *
+       * ⚠️ STATUS, NOT PAYMENT. The GST liability on an outward supply
+       * arises when the tax invoice is ISSUED, not when it is paid, so
+       * `part_paid` and `paid` count exactly as much as `issued`. `draft`
+       * is not a document and `cancelled` was withdrawn under the narrow
+       * lawful window; neither is a supply. The old query filtered
+       * `status = 'open'`, which is a BILLING lifecycle value that does
+       * not exist in `sales_invoice_status` at all.
+       *
+       * ⚠️ `count(DISTINCT invoice)`, NOT `count(*)`. The old version
+       * counted LINES and the screen labelled the result "invoices", so a
+       * single five-line invoice was reported as five.
        */
       const outputTaxRows = await tx
         .select({
-          currency: invoices.currency,
-          count: sql<number>`count(*)::int`,
-          totalTax: sql<string>`coalesce(sum(invoice_lines.cgst_minor + invoice_lines.sgst_minor + invoice_lines.igst_minor), 0)::text`,
-          totalValue: sql<string>`coalesce(sum(invoice_lines.taxable_value_minor), 0)::text`,
+          currency: salesInvoices.currency,
+          count: sql<number>`count(distinct ${salesInvoices.id})::int`,
+          totalTax: sql<string>`coalesce(sum(${salesInvoiceLines.cgstMinor} + ${salesInvoiceLines.sgstMinor} + ${salesInvoiceLines.igstMinor}), 0)::text`,
+          totalValue: sql<string>`coalesce(sum(${salesInvoiceLines.taxableValueMinor}), 0)::text`,
+          /**
+           * ⭐ THE SAME FIGURES HEAD BY HEAD, so they can be compared
+           * against the DOCUMENT totals read below. See `tiesToDocument`.
+           */
+          lineCgst: sql<string>`coalesce(sum(${salesInvoiceLines.cgstMinor}), 0)::text`,
+          lineSgst: sql<string>`coalesce(sum(${salesInvoiceLines.sgstMinor}), 0)::text`,
+          lineIgst: sql<string>`coalesce(sum(${salesInvoiceLines.igstMinor}), 0)::text`,
+          lineCess: sql<string>`coalesce(sum(${salesInvoiceLines.cessMinor}), 0)::text`,
         })
-        .from(invoiceLines)
-        .innerJoin(invoices, eq(invoiceLines.invoiceId, invoices.id))
-        .where(sql`invoices.status = 'open'`)
-        .groupBy(invoices.currency)
-        .orderBy(invoices.currency);
+        .from(salesInvoiceLines)
+        .innerJoin(
+          salesInvoices,
+          and(
+            eq(salesInvoiceLines.invoiceId, salesInvoices.id),
+            // Belt and braces beside RLS: a join across tenants would be
+            // arithmetic nonsense even where a policy permitted it.
+            eq(salesInvoiceLines.tenantId, salesInvoices.tenantId),
+          ),
+        )
+        .where(sql`${salesInvoices.status} IN ('issued', 'part_paid', 'paid')`)
+        .groupBy(salesInvoices.currency)
+        .orderBy(salesInvoices.currency);
+
+      /**
+       * ══════════════════════════════════════════════════════════════
+       * ⭐⭐⭐ v1.67.0 — THE SUPPLY SIDE, BY TAX PERIOD AND BY HEAD
+       * ══════════════════════════════════════════════════════════════
+       * ⚠️ READS THE DOCUMENT TOTALS, NOT THE LINE TOTALS, AND THAT IS
+       * WHAT MAKES THIS AGREE WITH THE RETURN. `loadGstr1Documents`
+       * carries `sales_credit_notes` and the document-level tax columns
+       * into GSTR-1, so a summary built from line sums and a return
+       * built from document totals are two answers whenever a trigger
+       * has not kept them in step. Both are read here and compared —
+       * see `tiesToDocument` on the payload.
+       *
+       * ⚠️ THE PERIOD IS THE UTC MONTH OF `issued_at`, WHICH IS THE
+       * BASIS `server/invoicing/documents.ts` USES FOR THE RETURN. It is
+       * the wrong basis in law — a tax period is an Indian calendar
+       * month, and a UTC boundary puts every document raised in the
+       * first five and a half hours of an Indian month into the previous
+       * return — but it is the basis the return uses, and a summary that
+       * disagreed with the return would be a second wrong number rather
+       * than a check on the first. Named on the payload as
+       * `periodBoundary` and in the batch report.
+       */
+      const supplyPeriods = await tx
+        .select({
+          currency: salesInvoices.currency,
+          period: sql<string>`to_char(${salesInvoices.issuedAt} at time zone 'UTC', 'YYYY-MM')`,
+          cgst: sql<string>`coalesce(sum(${salesInvoices.cgstMinor}), 0)::text`,
+          sgst: sql<string>`coalesce(sum(${salesInvoices.sgstMinor}), 0)::text`,
+          igst: sql<string>`coalesce(sum(${salesInvoices.igstMinor}), 0)::text`,
+          cess: sql<string>`coalesce(sum(${salesInvoices.cessMinor}), 0)::text`,
+          taxableValue: sql<string>`coalesce(sum(${salesInvoices.taxableValueMinor}), 0)::text`,
+        })
+        .from(salesInvoices)
+        .where(
+          and(
+            sql`${salesInvoices.status} IN ('issued', 'part_paid', 'paid')`,
+            sql`${salesInvoices.issuedAt} IS NOT NULL`,
+          ),
+        )
+        .groupBy(salesInvoices.currency, sql`2`)
+        .orderBy(salesInvoices.currency, sql`2`);
+
+      /**
+       * ══════════════════════════════════════════════════════════════
+       * 🔴 THE REDUCTIONS — ROW BY ROW, AND DELIBERATELY NOT AGGREGATED
+       * ══════════════════════════════════════════════════════════════
+       * Section 34(2) is decided per document, against the date of the
+       * ORIGINAL SUPPLY, and a month can straddle the 30 November
+       * deadline. Aggregating in SQL would mean restating the deadline
+       * as SQL date arithmetic — a second implementation of a statutory
+       * rule, which is how two parts of a system come to disagree about
+       * a return. `lib/gstr1/netting.ts` decides it once and both this
+       * summary and `lib/gstr1/build.ts` call it.
+       *
+       * ⚠️ A LEFT JOIN, NOT AN INNER ONE. `invoice_id` is NOT NULL but a
+       * note whose original document cannot be resolved must be reported
+       * as unverifiable rather than dropped — dropping it would restore
+       * the very overstatement this batch exists to remove.
+       *
+       * ⚠️ ONE ROW PER CREDIT NOTE, NOT PER LINE. Credit notes are rare
+       * next to invoices; the invoice side above stays aggregated in the
+       * database precisely because it is not.
+       */
+      const creditNoteRows = await tx
+        .select({
+          currency: salesCreditNotes.currency,
+          noteDate: salesCreditNotes.noteDate,
+          issuedAt: salesCreditNotes.issuedAt,
+          supplyDate: salesInvoices.invoiceDate,
+          cgst: salesCreditNotes.cgstMinor,
+          sgst: salesCreditNotes.sgstMinor,
+          igst: salesCreditNotes.igstMinor,
+          cess: salesCreditNotes.cessMinor,
+          taxableValue: salesCreditNotes.taxableValueMinor,
+        })
+        .from(salesCreditNotes)
+        .leftJoin(
+          salesInvoices,
+          and(
+            eq(salesCreditNotes.invoiceId, salesInvoices.id),
+            eq(salesCreditNotes.tenantId, salesInvoices.tenantId),
+          ),
+        )
+        .where(sql`${salesCreditNotes.status} IN ('issued', 'part_paid', 'paid')`);
 
       const inputTax = await tx
         .select({
@@ -150,20 +335,190 @@ export async function getGstSummary(): Promise<ReportResult> {
           sql`${complianceObligations.authority} = 'gst'`,
         ));
 
+      /**
+       * ⭐ ONE ROW PER CURRENCY, OVER THE UNION OF BOTH SIDES. A
+       * workspace can hold a credit note in a currency it raised no
+       * supply in during the same window, and that note must still
+       * appear rather than vanish for want of a matching supply row.
+       */
+      const grossByCurrency = new Map(outputTaxRows.map((r) => [r.currency, r]));
+      const currencies = [
+        ...new Set([
+          ...outputTaxRows.map((r) => r.currency),
+          ...supplyPeriods.map((r) => r.currency),
+          ...creditNoteRows.map((r) => r.currency),
+        ]),
+      ].sort();
+
+      const netted = currencies.map((currency) => {
+        const supplies: PeriodMovement[] = supplyPeriods
+          .filter((r) => r.currency === currency)
+          .map((r) => ({
+            period: r.period,
+            heads: {
+              cgst: toMinor(r.cgst),
+              sgst: toMinor(r.sgst),
+              igst: toMinor(r.igst),
+              cess: toMinor(r.cess),
+            },
+            taxableValueMinor: toMinor(r.taxableValue),
+          }));
+
+        const notes = creditNoteRows.filter((r) => r.currency === currency);
+        const reductions: PeriodMovement[] = [];
+        let timeBarredCount = 0;
+        let windowUnverifiedCount = 0;
+        let withoutIssueTimestamp = 0;
+        let timeBarredTax = 0n;
+
+        for (const note of notes) {
+          const heads = {
+            cgst: toMinor(note.cgst),
+            sgst: toMinor(note.sgst),
+            igst: toMinor(note.igst),
+            cess: toMinor(note.cess),
+          };
+          const effect = creditNoteEffect({
+            noteDate: String(note.noteDate),
+            supplyDate: note.supplyDate === null ? null : String(note.supplyDate),
+          });
+          if (effect.reason === "supply_date_unknown") windowUnverifiedCount += 1;
+          if (!effect.reducesOutputTax) {
+            timeBarredCount += 1;
+            timeBarredTax += totalOf(heads);
+            continue;
+          }
+          /**
+           * ⚠️ THE PERIOD OF THE NOTE, NEVER THE PERIOD OF THE INVOICE.
+           * A note declared in August against a June supply reduces
+           * August. Netting it back into June would restate a return
+           * that has already been filed.
+           *
+           * ⚠️ `issued_at` FIRST, `note_date` ONLY AS A FALLBACK, so the
+           * period matches the one the return would put it in. Unlike
+           * `sales_invoices`, `sales_credit_notes` carries no CHECK
+           * requiring an issued document to have a timestamp, and the
+           * GSTR-1 loader filters on that timestamp — so a note without
+           * one is invisible to the return and is counted here.
+           */
+          if (note.issuedAt === null) withoutIssueTimestamp += 1;
+          reductions.push({
+            period: taxPeriodOf(
+              note.issuedAt ? note.issuedAt.toISOString() : String(note.noteDate),
+            ),
+            heads,
+            taxableValueMinor: toMinor(note.taxableValue),
+          });
+        }
+
+        const netting = netCreditNotes({ supplies, reductions });
+        const gross = grossByCurrency.get(currency);
+
+        /**
+         * 🔴 DOES THE DOCUMENT AGREE WITH ITS OWN LINES? The headline
+         * above sums `sales_invoice_lines`; the netting sums the
+         * document totals, which is what GSTR-1 files. They are kept in
+         * step by a trigger, so a difference is not a rounding artefact
+         * — it is a document whose lines and header have diverged, and
+         * the return and the books will disagree by exactly that much.
+         */
+        const lineHeads = {
+          cgst: toMinor(gross?.lineCgst),
+          sgst: toMinor(gross?.lineSgst),
+          igst: toMinor(gross?.lineIgst),
+          cess: toMinor(gross?.lineCess),
+        };
+        const documentHeads = supplies.reduce<HeadAmounts>(
+          (acc, s) => addHeads(acc, s.heads),
+          ZERO_HEADS,
+        );
+        const driftMinor = totalOf(documentHeads) - totalOf(lineHeads);
+
+        return {
+          currency,
+          count: gross?.count ?? 0,
+          totalTax: labelled(toMinor(gross?.totalTax), currency, false),
+          totalValue: labelled(toMinor(gross?.totalValue), currency, false),
+          /** ⭐ The same supplies read the way the return reads them. */
+          documentTax: labelledHeads(documentHeads, currency),
+          creditNotes: {
+            count: notes.length,
+            nettedCount: reductions.length,
+            timeBarredCount,
+            windowUnverifiedCount,
+            withoutIssueTimestamp,
+            timeBarredTax: labelled(timeBarredTax, currency, false),
+            reducedTax: labelledHeads(
+              reductions.reduce<HeadAmounts>((acc, r) => addHeads(acc, r.heads), ZERO_HEADS),
+              currency,
+            ),
+          },
+          /** 🔴 SIGNED. Below zero is a real answer — see `carriedForward`. */
+          netTax: labelledHeads(netting.net, currency),
+          /** ⭐ What is payable, head by head, after carry. Never negative. */
+          liability: labelledHeads(netting.liability, currency),
+          /**
+           * ⭐ REDUCTION NOT YET USED. A period whose credit notes
+           * exceeded its supplies does not produce a negative liability
+           * and does not produce a zero either: the excess carries into
+           * the next period on the SAME head, and whatever is left at
+           * the end is this figure.
+           */
+          carriedForward: labelledHeads(netting.carriedForward, currency),
+          hasNegativePeriod: netting.hasNegativePeriod,
+          periods: netting.periods.map((p) => ({
+            period: p.period,
+            grossTax: labelled(totalOf(p.gross), currency, false),
+            reducedTax: labelled(totalOf(p.reductions), currency, false),
+            netTax: labelled(totalOf(p.net), currency, false),
+            liability: labelled(totalOf(p.liability), currency, false),
+            carriedOut: labelled(totalOf(p.carriedOut), currency, false),
+            /** Which heads went below zero, so it is not a mystery. */
+            negativeHeads: GST_HEADS.filter((h) => p.net[h] < 0n),
+          })),
+          tiesToDocument: {
+            agrees: driftMinor === 0n,
+            differenceMinor: driftMinor.toString(),
+          },
+        };
+      });
+
       return {
+        /**
+         * ⭐ NAMED SO THE SOURCE IS NOT A GUESS. A reader who has just
+         * been shown the wrong table's numbers deserves to see, on the
+         * payload, which table these came from.
+         */
+        source: "sales_invoices",
         /**
          * ⭐ AN ARRAY, ONE ENTRY PER CURRENCY. Never a single scalar,
          * because there is no single scalar to give when the underlying
          * set spans currencies — and a shape that can only hold one
          * number is how the previous version came to hold a wrong one.
          */
-        outputTaxByCurrency: outputTaxRows.map((r) => ({
-          currency: r.currency,
-          count: r.count,
-          totalTax: labelled(toMinor(r.totalTax), r.currency, false),
-          totalValue: labelled(toMinor(r.totalValue), r.currency, false),
-        })),
-        outputTaxCurrencies: outputTaxRows.map((r) => r.currency),
+        outputTaxByCurrency: netted,
+        outputTaxCurrencies: currencies,
+        /**
+         * ⭐ NETTED SINCE v1.67.0, AND THE FLAG STAYS SO THAT A SCREEN
+         * BUILT AGAINST THE OLD PAYLOAD SAYS THE RIGHT THING RATHER THAN
+         * SILENTLY CHANGING MEANING. `totalTax` is still the GROSS
+         * figure; `liability` is what Rule 53 leaves.
+         */
+        outputTaxExcludesCreditNotes: false,
+        /**
+         * ⚠️ THE BASIS EVERY FIGURE ABOVE IS BUCKETED ON, stated because
+         * it is the wrong one in law and the right one for agreeing with
+         * the return. See the comment on `supplyPeriods`.
+         */
+        periodBoundary: "utc_month_of_issued_at",
+        /**
+         * ⚠️ THE EARLIER LIMB OF s.34(2) IS NOT APPLIED. The window ends
+         * on the annual return's filing date when that is before 30
+         * November, and nothing in Ordence records a GSTR-9 filing — so
+         * the window applied is the latest lawful one and a note in the
+         * gap between the two dates is netted when it should not be.
+         */
+        section34AnnualReturnLimbApplied: false,
         /**
          * ⚠️ `itc_register` HAS NO `currency` COLUMN, and it correctly has
          * none: input tax credit under the CGST Act is a rupee amount in a
@@ -373,7 +728,30 @@ export async function getComplianceStatus(): Promise<ReportResult> {
         .select({
           authority: complianceObligations.authority,
           pending: sql<number>`count(*) FILTER (WHERE ${complianceTasks.status} = 'pending')::int`,
-          completed: sql<number>`count(*) FILTER (WHERE ${complianceTasks.status} = 'completed')::int`,
+          /**
+           * ══════════════════════════════════════════════════════════
+           * 🔴 v1.67.0 — `'completed'` IS NOT A `compliance_task_status`
+           * ══════════════════════════════════════════════════════════
+           * The enum in `db/schema/compliance.ts:157` is pending,
+           * in_progress, awaiting_client, ready_to_file, filed,
+           * late_filed, missed, not_applicable. There has never been a
+           * `completed`.
+           *
+           * ⚠️ THIS IS THE SAME FAULT v1.66.0 FOUND IN `getGstSummary`,
+           * which filtered `status = 'open'` — a value
+           * `sales_invoice_status` does not contain either. Comparing an
+           * enum column to a literal outside its labels is not a
+           * mismatch that returns nothing; Postgres refuses the input
+           * value, so the whole compliance report failed rather than
+           * quietly reading zero.
+           *
+           * ⭐ A GST OBLIGATION IS DISCHARGED BY BEING FILED, and a
+           * return filed after its due date is still filed — the
+           * lateness is a separate fact carried by its own label, and
+           * counting `late_filed` as outstanding would show a workspace
+           * arrears it has already cleared.
+           */
+          completed: sql<number>`count(*) FILTER (WHERE ${complianceTasks.status} IN ('filed', 'late_filed'))::int`,
           overdue: sql<number>`count(*) FILTER (WHERE ${complianceTasks.status} = 'pending' AND ${complianceTasks.dueDate} < ${today})::int`,
         })
         .from(complianceTasks)

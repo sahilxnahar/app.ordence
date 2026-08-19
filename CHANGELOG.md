@@ -1,3 +1,209 @@
+# v1.68.0-alpha , TWO STATUTES THE PRODUCT WAS NOT APPLYING
+
+**Repo: `app.ordence`** * 🔴 **SQL: `0106`, run it before or after the push, either order is safe** * ⚠️ **No new environment variables**
+
+**175 test files. 5,839 tests. All 15 gates green.**
+
+- 🔴🔴 **RULE 53 , OUTPUT TAX WAS GROSS OF CREDIT NOTES.** Every workspace that
+  has ever taken a return has been shown a GST liability that is **too high,
+  every month**. The obvious fix, subtracting the credit notes, is wrong in four
+  separate ways and each one produces a figure that foots:
+  ① **s.34(2) has a deadline.** A note issued after 30 November following the
+  financial year of the ORIGINAL supply does not reduce output tax at all. It is
+  a commercial document; the tax stays. Subtracting it **under-declares**, which
+  is the expensive direction. ② A reduction lands in the period it is **declared**
+  in, not the period of the invoice it reverses. ③ **CGST reduces CGST.** The
+  heads are different governments and netting across them is not netting.
+  ④ **Netting below zero is carried, never clamped.** If credit notes exceed
+  supplies in a period that is real, and it carries forward.
+  ⭐ **One implementation, reached from both screens.** `lib/gstr1/netting.ts` is
+  pure, and `getGstSummary` and `build.ts` both call the same
+  `creditNoteEffect`, so the summary and the return cannot drift.
+- 🔴🔴 **RULE 26 , TDS ON FOREIGN PAYMENTS USED NO RATE AT ALL.** Section 195
+  deduction must be computed at the **telegraphic transfer buying rate**. The
+  blocker was that `fx_rates` recorded *who published* a rate and not **which
+  side of the spread it is** , mid, TT buying and TT selling are different
+  numbers and the statute names one of them. `0106` adds the rate type.
+  🔴 **It REFUSES rather than falling back.** No TT buying rate for the required
+  date means no computation, by name. A short deduction makes the deductor
+  **personally liable under s.201** plus interest under s.201(1A), so guessing a
+  mid rate is the one answer that must never be available. `invertQuote`
+  downgrades `tt_buying` to `unstated`, so a reciprocal cannot satisfy the rule
+  either.
+  ⭐ **The specified date is the earlier of credit and payment**, per s.195(1),
+  and the code **refuses when it has neither** rather than defaulting to a clock.
+  The common shape is credit in March and remittance in June; taking June gets
+  the rate, the quarter **and** the s.201(1A) interest start all wrong.
+  ⭐ The rate type is a **filter, not a preference**: excluded in SQL, excluded
+  again in `pickQuote`, and refused by name if it somehow arrives. Turning the
+  gate off makes 7 of 25 tests fail, so it cannot be decorative.
+
+### ⚠️ A comment that had become a lie
+
+`server/tds/registry.ts:173` still read *"Ordence applies Rule 26 nowhere, so
+`chargeable_base_minor` is whatever rupee figure somebody typed."* True when
+written, false as of this release, and it would have sent the next reader
+hunting a gap that is closed. **A stale comment is a defect with a long fuse.**
+
+### ⭐ Two gates ran for real for the first time
+
+`check:sql-executes` and `check:rls-writes` have always **skipped** for want of a
+database. This batch pointed `HARNESS_DATABASE_URL` at the throwaway PostgreSQL
+and ran them properly. Both pass. `0106` applied **39 of 39 statements twice**,
+one statement per connection, and 14 of 14 isolation and constraint refusals
+held as a role with `rolsuper = f, rolbypassrls = f`.
+
+### ⚠️ Known and not fixed
+
+A tenant's reverse-direction rate outranks a correctly published direct one
+(0101's precedence, not this batch's), so a conversion can **falsely refuse**
+where a valid published rate exists. It fails **closed**, so no wrong deduction
+results. And no screen yet lets a human enter a foreign-currency s.195 payment ,
+the action and validator accept it, nothing calls them.
+
+# v1.67.0-alpha , THREE STREAMS MERGED, ZERO COLLISIONS
+
+**Repo: `app.ordence`** * 🔴 **SQL: `0104` then `0105`, in that order** * ⚠️ **No new environment variables**
+
+**173 test files. 5,789 tests. All 15 gates green. `tsc` clean.**
+
+Brief A (self-serve subdomains) and Brief B (per-tenant AI credentials) merged
+into wave 5. **The three change sets did not overlap on a single file**, which
+is what the partition was for.
+
+## Brief A , the subdomain funnel exists
+
+- 🔴 **The CSRF origin check now derives from `NEXT_PUBLIC_ZONE_DOMAIN`.** Every
+  write from every tenant subdomain was answering 403 before Clerk and before
+  routing, and every read worked, because GET is exempt. ⭐ The suffix match
+  reuses `lib/tenant.ts`'s own `labelUnder()` rather than a private copy, so
+  **the set of hosts that may WRITE and the set that RESOLVE are the same
+  function**. A private copy in a security module is how those two drift, and
+  the CSRF half is the one nobody notices.
+- ⭐ **Depth is one label, refusing deeper.** `acme.ordence.com` is allowed,
+  `a.b.ordence.com` is refused. Tenant slugs are one DNS label by construction.
+- 🔴 **`/sign-up` → `/claim` → workspace, and the address is chosen BEFORE the
+  Clerk organisation exists.** Choosing afterwards is a rename of a
+  thirty-second-old workspace: it races the sole writer, and it spends 365 days
+  of `0091`'s retention on an address nobody ever used.
+- 🔴 **Every operator rename in this product took the workspace off the
+  internet.** `middleware.ts:1031` compares Clerk's organisation slug against
+  the host, and `renameTenantSlug` changed `tenants.slug` and never touched
+  Clerk , so the console reported success, printed the new URL, and locked every
+  member out with `/access-denied` on their own workspace. There is now a mirror
+  that keeps the two equal, and it reconciles after commit.
+- ⭐ **The rename decision went the other way from my inclination, with a better
+  argument.** Recording a Clerk rename without applying it does not leave the
+  address where it was , the dashboard edit has **already** changed the session
+  claim, so not applying locks the workspace out. The precondition
+  `rename-slug.ts` demanded (an owner notification) was built rather than
+  waived, and the 301 already existed.
+
+## Brief B , a workspace can bring its own AI key
+
+- 🔴 **`lib/ai/client.ts` read `process.env[provider.envVar]` with no tenant
+  dimension**, so every workspace shared one key, one budget, one rate limit and
+  one circuit breaker. The key is now injected and the state is keyed by budget
+  scope: `platform` or `tenant:<uuid>`.
+- ⭐ **`budgetScopeFor("tenant", null)` throws** rather than falling back to the
+  platform scope, because a silent fallback makes a resolver bug invisible by
+  charging the platform for it.
+- 🔴 **`lib/ai/client.ts:186` read `CLOUDFLARE_ACCOUNT_ID` directly**, which
+  would have interpolated the platform's account id into a **customer's**
+  Cloudflare token. It now comes from the credential.
+- ⭐ **The confidential lane holds. A tenant's own open-lane key does not become
+  eligible for tenant data**, and there is no override flag anywhere. The
+  argument: the lane is about where the data goes, not about who pays, and a
+  workspace admin cannot consent on behalf of four thousand contacts who have
+  never heard of Cerebras. The honest answer to the customer is not "no" but
+  "yes, with a Cloudflare key", which is self-service and one link away.
+- ⭐ **A failure that a later provider papered over is still reported.** If a
+  customer's Groq key is dead and Gemini answers, the request succeeds and the
+  customer would otherwise never learn the key they pay for has stopped working.
+- ⚠️ `settings/ai/page.tsx` hard-coded seven provider names against a registry of
+  nine, so **OpenRouter , the only provider actually configured on production ,
+  did not appear on the screen that exists to say which providers are
+  configured.**
+
+## What the merge proved
+
+⭐ **Zero collisions.** Brief A touched 18 files, Brief B touched 26, wave 5
+touched 21, and the intersection of all three was **empty** except for
+`db/schema/index.ts`, which Brief B appended to at the very end exactly as the
+brief demanded, and which wave 5 never touched.
+
+`0105` was drilled independently: 15 of 15 statements twice, one statement per
+connection, then tenant isolation proved as `ordence_app` with
+`rolsuper = f, rolbypassrls = f`. A cannot forge a row for B, B cannot read or
+delete A's rows, and **the table holds no column whose name contains key, secret
+or token** , the credential itself lives in the vault.
+
+# v1.66.0-alpha , THE ENGINES BECOME VISIBLE, AND A COMPLIANCE REPORT STOPS LYING
+
+**Repo: `app.ordence`** * 🔴 **SQL: `0104`, run it before or after the push, either order is safe** * ⚠️ **No new environment variables**
+
+Four batches in parallel. Two of them put a screen in front of an engine that
+had none; two of them fixed numbers that were wrong.
+
+- 🔴🔴 **THE GST REPORT WAS READING ORDENCE'S OWN SUBSCRIPTION INVOICES.**
+  `getGstSummary` summed `billing.invoices` , the table where **Ordence bills
+  its tenants** , and presented it as the tenant's outward supplies. An Indian
+  business opened its GST report and saw its Ordence subscription bills.
+  ⚠️ **Nothing caught it because both tables carry `cgst_minor`, `sgst_minor`,
+  `igst_minor` and `taxable_value_minor` under exactly those names.** It
+  compiled, it returned plausible rupee figures, and `db/schema/sales-invoices.ts`
+  had warned about precisely this merge in its own header.
+  Two more defects fell out of the same query: it filtered on `status = 'open'`,
+  **which is not a value of `sales_invoice_status` at all**, and it counted
+  LINES while the screen said "invoices".
+  ⚠️ Named and not fixed: output tax is still gross of credit notes. Surfaced
+  on the payload as `outputTaxExcludesCreditNotes` rather than left to be
+  discovered at a return.
+- 🔴 **FIXED ASSETS NOW HAS A SCREEN.** `0100` shipped Schedule II and Income
+  Tax depreciation four batches ago and **nothing rendered it**. Register,
+  depreciation run, whole-life schedule, income-tax block view, deferred tax,
+  disposal. ⭐ **Compute and post are two separate buttons** , a posted run
+  writes a journal and is frozen by a database trigger. The income-tax panel
+  contains no path to `postDepreciation` at all, and a test asserts it.
+- 🔴 **MULTI-CURRENCY NOW HAS A SCREEN.** `0101` shipped rates, restatement and
+  revaluation and nothing called any of it. Rates, revaluation with its working
+  paper, exposure by currency, conversion preview.
+  ⭐ **A rate derived by inversion is labelled `derived` all the way to the
+  screen**, because a customer evidencing a figure to an auditor needs to know
+  the rate was computed rather than published.
+  ⭐ **Skipped lines are shown with their reason.** A revaluation that silently
+  ignores rows is worse than one that refuses.
+- 🔴 **PAYABLES WERE CARRIED AT ZERO.** `0101` wired initial recognition for
+  sales only and said so. So a foreign-currency bill had no functional figure,
+  and its first revaluation booked **the entire invoice value** as an exchange
+  difference. Now recognised at the bill-date rate, refusing rather than
+  guessing when no rate exists for that date.
+  ⭐ The ITC split apportions an already-translated tax head rather than
+  re-converting it , re-converting is two more roundings that need not add back,
+  and the balance check would refuse the journal by a paisa. **The odd minor
+  unit is floored into cost, never into an input tax credit**: overstating a
+  credit is a claim on the Government, overstating an expense is not.
+- ⭐ **Three analytics views stopped adding currencies together.** `0104`
+  regroups `v_asset_portfolio`, `v_contract_pipeline` and `v_ledger_daily` by
+  the currency their underlying tables already carried.
+  ⚠️ `v_ledger_daily` mattered most: a merged `isBalanced` could read **true**
+  because two real imbalances in different currencies cancelled as bare numbers.
+
+### ⚠️ Found on the way, not fixed, and it is the next thing to go wrong
+
+`server/accounting/post-sales.ts` writes the literal `currency: "INR"` on nearly
+every posting. Only `postExchangeDifference()` writes the functional currency.
+So a workspace whose books are kept in dirhams has transactions **stamped INR
+carrying dirham amounts**, and `v_ledger_daily` can only group by what the
+column says , it cannot repair what the writer put there.
+
+### ⚠️ And one of my own
+
+`0100` shipped a complete depreciation engine that **no navigation reached for
+four batches**. The screen in this release was added with a nav entry in the
+same change, because built-and-unreachable is the same defect as
+declared-and-unenforced wearing a different hat.
+
 # v1.65.0-alpha , A RESERVED NAME MEANS A DIFFERENT ADDRESS, NEVER NO WORKSPACE
 
 **Repo: `app.ordence`** * ⭐ **SQL: NONE. Push and it works.** * ⚠️ **No new environment variables**

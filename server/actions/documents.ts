@@ -36,6 +36,7 @@ import {
   auditLogs,
 } from "@/db/schema";
 import { requirePermission } from "@/server/audit";
+import { requireFeature, FeatureLockedError } from "@/server/entitlements";
 import { requireTenantContext, TenantAccessError } from "@/server/tenant-context";
 import { enqueueJob, describeJobTransport } from "@/lib/queue/jobs";
 import { substituteMergeFields } from "@/lib/queue/processors";
@@ -68,6 +69,11 @@ function fail(error: string, fieldErrors?: Record<string, string[]>): ActionResu
 
 function toActionError(err: unknown): ActionResult<never> {
   if (err instanceof TenantAccessError) return fail(err.message);
+  /**
+   * 🔴 WITHOUT THIS LINE THE GATE ABOVE IS AN OUTAGE — Batch 0109.
+   * The refusal already names the plan; "Something went wrong" does not.
+   */
+  if (err instanceof FeatureLockedError) return fail(err.message);
   if (err instanceof z.ZodError) {
     return fail("Validation failed.", err.flatten().fieldErrors as Record<string, string[]>);
   }
@@ -84,6 +90,11 @@ export async function createContract(
 ): Promise<ActionResult<Contract>> {
   try {
     const ctx = await requireTenantContext();
+    // ⭐ Batch 0109 — `clm.contracts` is priced at Advanced and was
+    // refused by nothing. Entitlement before permission: a workspace
+    // owner on Basic must be told to upgrade, not to ask an
+    // administrator who is themselves.
+    await requireFeature("clm.contracts", ctx);
     /**
      * 🔴 ADDED IN v1.26.0-alpha BY `check:guards`. Drafting a contract was reachable by any member of the workspace, including read-only roles that the permission table grants `contracts:read` and nothing more.
      */
@@ -145,7 +156,32 @@ export async function createContract(
 
     // Append clauses from the library, tenant-scoped.
     const sections = [...data.sections];
+    /**
+     * ⭐⭐ WAVE 9 — `clauses:read`, AND ONLY WHEN CLAUSES ARE ACTUALLY
+     * BEING PULLED IN.
+     *
+     * ══════════════════════════════════════════════════════════════════
+     * 🔴 THE CLAUSE LIBRARY IS A SEPARATE ASSET FROM THE CONTRACT
+     * ══════════════════════════════════════════════════════════════════
+     * `clauses:read` and `clauses:manage` have existed since Phase 8.
+     * `manager` and `read_only` hold the first; `manager` holds the
+     * second. NEITHER WAS EVER CHECKED. The only code in the product
+     * that touches `clause_library` is the query immediately below, and
+     * it ran under `contracts:create`.
+     *
+     * That is the wrong key for this read. A firm's negotiated clause
+     * bank — its indemnity wording, its liability caps, the language its
+     * counsel spent money on — is reusable intellectual property that
+     * happens to be stored next to contracts. Anybody who could create a
+     * contract could pull any of it into one and read it back.
+     *
+     * ⚠️ CHECKED INSIDE THE `length > 0` BRANCH, so creating a contract
+     * with no clauses reads no clauses and needs no clause permission.
+     * Demanding it unconditionally would refuse a legitimate create for
+     * touching something it never touched.
+     */
     if (data.clauseIds.length > 0) {
+      await requirePermission("clauses:read");
       const { inArray } = await import("drizzle-orm");
       const clauses = await withTenant(ctx.tenant.id, (tx) =>
         tx
@@ -277,10 +313,15 @@ export async function assembleDocument(
 ): Promise<ActionResult<AssembleResult>> {
   try {
     const ctx = await requireTenantContext();
+    // ⭐ Batch 0109 — `clm.document_assembly` is priced at Advanced and
+    // was refused by nothing. Generating a document from templates and
+    // clauses is the capability the line item names.
+    await requireFeature("clm.document_assembly", ctx);
     /**
      * 🔴 ADDED IN v1.26.0-alpha BY `check:guards`. Assembling a document writes contract content. `contracts:update` rather than `create`, because assembly happens against a contract that already exists.
      */
     await requirePermission("contracts:update");
+
     const data = assembleDocumentSchema.parse(input);
 
     const contract = await withTenant(ctx.tenant.id, (tx) =>

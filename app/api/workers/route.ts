@@ -87,6 +87,30 @@ import {
   type JobData,
 } from "@/lib/queue/jobs";
 import { processJob } from "@/lib/queue/processors";
+/**
+ * ⭐⭐⭐ THE SCHEDULED WORK THAT NOTHING RAN — Brief C.
+ *
+ * Six functions existed, were correct, were tested, and had no caller:
+ * the dunning sweep, workflow maintenance, anomaly detection, the rhythm
+ * recompute, storage reconciliation and the RERA dunning plan. They are
+ * registered as DATA in `server/scheduling/registry.ts` and dispatched by
+ * id below.
+ *
+ * ⚠️ EXTENDED HERE RATHER THAN GIVEN ITS OWN ROUTE, for one reason that
+ * decided it: `middleware.ts` matches public paths EXACTLY, not by
+ * prefix — `/api/workers` and `/api/workers/ai-monitors` are two separate
+ * entries. A new path would need a new line in `middleware.ts`, which
+ * belongs to another stream this cycle, and a scheduled route that is not
+ * in the public list is refused by Clerk on every single run: present,
+ * correct, never executed, which is the exact failure this batch exists
+ * to remove.
+ */
+import {
+  SCHEDULED_JOBS,
+  SCHEDULED_JOB_IDS,
+  findScheduledJob,
+  runScheduledJob,
+} from "@/server/scheduling/registry";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -209,7 +233,20 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: auth.reason }, { status: auth.status });
   }
 
-  let parsed: { job?: unknown; mode?: string; cron?: string };
+  let parsed: {
+    job?: unknown;
+    mode?: string;
+    cron?: string;
+    /**
+     * ⚠️ `jobId`, NOT `job`. `job` already means "an inline JobData
+     * object" on this route, and overloading one key with a string in one
+     * mode and an object in another is how a typo becomes a 400 that
+     * nobody can read. A separate key costs one word in the runbook.
+     */
+    jobId?: unknown;
+    tenantId?: unknown;
+    limit?: unknown;
+  };
   try {
     parsed = rawBody ? (JSON.parse(rawBody) as typeof parsed) : {};
   } catch {
@@ -219,6 +256,17 @@ export async function POST(req: Request) {
   /* ---- CRON SWEEP -------------------------------------------------- */
   if (parsed.mode === "cron") {
     return runCronSweep({ authMethod: auth.method, cron: parsed.cron, startedAt });
+  }
+
+  /* ---- ONE REGISTERED SCHEDULED JOB -------------------------------- */
+  if (parsed.mode === "scheduled") {
+    return runRegisteredJob({
+      jobId: parsed.jobId,
+      tenantId: parsed.tenantId,
+      limit: parsed.limit,
+      authMethod: auth.method,
+      startedAt,
+    });
   }
 
   /* ---- ONE JOB ----------------------------------------------------- */
@@ -281,6 +329,102 @@ async function runOneJob(args: {
       tookMs: Date.now() - args.startedAt,
     },
     { status: result.ok ? 200 : 500 },
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* ONE REGISTERED SCHEDULED JOB                                        */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Run one job from `server/scheduling/registry.ts`.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 THE STATUS CODE IS THE ALERT
+ * ══════════════════════════════════════════════════════════════════════
+ * No scheduler reads JSON. A cron dashboard, an uptime monitor and a
+ * `curl -f` in a runbook agree on exactly one thing: 2xx is green,
+ * everything else is red. So a run in which any workspace failed, or in
+ * which the bound refused to reach a workspace, answers 500 — the same
+ * property `runCronSweep` already has and for the same reason. A
+ * partially failed sweep that reports green is a sweep nobody fixes.
+ *
+ * ⚠️ AN UNKNOWN JOB ID IS 400 AND NAMES THE VALID ONES. A typo in a cron
+ * body that returned 200-and-did-nothing would be indistinguishable from
+ * a working schedule for as long as anybody cared to look.
+ */
+async function runRegisteredJob(args: {
+  jobId: unknown;
+  tenantId: unknown;
+  limit: unknown;
+  authMethod: string;
+  startedAt: number;
+}): Promise<NextResponse> {
+  if (typeof args.jobId !== "string" || args.jobId.length === 0) {
+    return NextResponse.json(
+      {
+        ok: false,
+        error: 'Send {"mode":"scheduled","jobId":"<id>"}.',
+        validJobIds: SCHEDULED_JOB_IDS,
+      },
+      { status: 400 },
+    );
+  }
+
+  const job = findScheduledJob(args.jobId);
+  if (!job) {
+    return NextResponse.json(
+      {
+        ok: false,
+        error: `No scheduled job called "${args.jobId}".`,
+        /**
+         * ⚠️ THE VALID IDS COME BACK WITH THE REFUSAL. A typo in a cron
+         * body that answered a bare 400 would look identical to a
+         * scheduler that had not been set up yet.
+         */
+        validJobIds: SCHEDULED_JOB_IDS,
+      },
+      { status: 400 },
+    );
+  }
+
+  const onlyTenantId = typeof args.tenantId === "string" ? args.tenantId : null;
+  const limit = typeof args.limit === "number" ? args.limit : undefined;
+
+  const run = await runScheduledJob({ job, onlyTenantId, limit });
+
+  if (!run.ok) {
+    console.error(
+      `[workers] scheduled job ${job.id}: ${run.tenantsFailed} failed, ${run.notReached} not reached`,
+      run.error ?? run.results.filter((r) => !r.ok).slice(0, 10),
+    );
+  }
+
+  return NextResponse.json(
+    {
+      ok: run.ok,
+      authMethod: args.authMethod,
+      mode: "scheduled",
+      jobId: run.jobId,
+      label: job.label,
+      scope: run.scope,
+      tenantsConsidered: run.tenantsConsidered,
+      tenantsRun: run.tenantsRun,
+      tenantsSkipped: run.tenantsSkipped,
+      tenantsFailed: run.tenantsFailed,
+      /**
+       * 🔴 THE WORKSPACES THE BOUND DROPPED, AS A NUMBER. "A silent cap is
+       * a lie": `truncated: true` says a cap was hit and not how far past
+       * it the tail goes, so nobody knows whether to raise it by ten or by
+       * ten thousand.
+       */
+      notReached: run.notReached,
+      platformDetail: run.platformDetail ?? null,
+      results: run.results,
+      error: run.error ?? null,
+      tookMs: Date.now() - args.startedAt,
+    },
+    { status: run.ok ? 200 : 500 },
   );
 }
 
@@ -442,5 +586,22 @@ export async function GET() {
     enabled: isQueueEnabled(),
     transport: describeJobTransport(),
     inlineFallback: isInlineFallbackEnabled(),
+    /**
+     * ⭐ THE SCHEDULED WORK, ENUMERABLE. An operator setting Railway up
+     * can ask the deployment what it expects to be called with, rather
+     * than trusting that a document in the repository still matches the
+     * code. `consequenceWhenStopped` is here because a list of job ids
+     * does not tell anybody which red tick to get out of bed for.
+     */
+    scheduledJobs: SCHEDULED_JOBS.map((j) => ({
+      id: j.id,
+      label: j.label,
+      scope: j.scope,
+      feature: j.feature,
+      cronUtc: j.cronUtc,
+      cadenceInIst: j.cadenceInIst,
+      consequenceWhenStopped: j.consequenceWhenStopped,
+      idempotency: j.idempotency,
+    })),
   });
 }

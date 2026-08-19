@@ -41,12 +41,15 @@ import {
   ageingQuerySchema,
   bounceReceiptSchema,
   cancelDemandSchema,
+  dunningBoardSchema,
   dunningSweepSchema,
   issueDemandSchema,
+  previewDunningSchema,
   raiseDemandSchema,
   reallocateReceiptSchema,
   recordReceiptSchema,
   renderDemandNoticeSchema,
+  recordDeemedServiceSchema,
   recordPostalServiceSchema,
   sendDunningSchema,
   statementQuerySchema,
@@ -64,11 +67,20 @@ import {
 import { bounceReceipt, recordReceipt, reallocateReceipt } from "@/server/receivables/receipts";
 import {
   describeNoticeService,
+  dunningBoard,
   planDunningSweep,
+  previewDunningLetter,
+  recordDeemedService,
   recordPostalService,
   sendDunningLetter,
+  type DunningPreview,
+  type LadderBoard,
   type NoticeServiceView,
 } from "@/server/receivables/dunning";
+import {
+  ladderAuthorityProblem,
+  permissionForStage,
+} from "@/lib/receivables/notice-authority";
 import { assembleStatement } from "@/server/receivables/statement";
 import {
   ageingRows,
@@ -1123,10 +1135,20 @@ export async function sendDunningNotice(
   try {
     const data = sendDunningSchema.parse(input);
 
-    const permission =
-      data.stage === "cancellation_warning"
-        ? "receivables:warn_cancellation"
-        : "receivables:dun";
+    /*
+     * ⭐⭐ ONE SOURCE FOR THE PER-RUNG RIGHT.
+     *
+     * 🔴 THIS WAS A TERNARY HERE UNTIL v1.67.0, AND A TERNARY IS ENOUGH
+     * TO REFUSE AND NOT ENOUGH TO OFFER. No screen could read it, so the
+     * board that shows an accountant which rungs they may send would have
+     * had to write the mapping out a second time — and the second copy is
+     * always the permissive one. `permissionForStage` is now read by this
+     * guard, by the row that gets written
+     * (`dunning_events.authorised_permission`), by the preview and by the
+     * board. SQL 0111 restates it as a CHECK, so an import that never
+     * comes through here is refused too.
+     */
+    const permission = permissionForStage(data.stage);
 
     const ctx = await guardReceivablesWrite({
       operation: permission,
@@ -1165,16 +1187,45 @@ export async function sendDunningNotice(
       // ⭐ A cancellation warning is `critical` in the audit log. It is the
       // most consequential thing this product does to a person.
       severity: data.stage === "cancellation_warning" ? "critical" : "notice",
+      /*
+       * ⭐⭐⭐ WHO AUTHORISED IT, UNDER WHICH RIGHT, AT WHAT TIME, AGAINST
+       * WHICH RUNG — ALL FOUR, ON ONE ROW.
+       *
+       * ⚠️ THE ACTOR AND THE TIME WERE ALREADY THERE. `writeAudit` fills
+       * the actor columns from `ctx` and `created_at` from the insert, so
+       * "who" and "when" have never been the gap. THE RIGHT AND THE RUNG
+       * WERE. An audit row saying "created a dunning_event" answers a
+       * question nobody asks; the question asked at a hearing is which
+       * rung of the statutory ladder this was and under whose authority
+       * it was climbed, and neither was recorded until now.
+       *
+       * 🔴 `permission` IS THE KEY THAT WAS ACTUALLY CHECKED, not a
+       * re-derivation. It is the same `const` the guard above was given,
+       * so the log cannot claim a right that was not the one enforced —
+       * which is the failure mode of writing `"receivables:dun"` in here
+       * as a literal.
+       *
+       * ⚠️ `rung` IS THE INTEGER, beside the stage name. The names are an
+       * enum whose order a tidy-up could change; the integer is what SQL
+       * 0027 §6 compares and what a reader counts.
+       */
       metadata: {
         demandId: data.demandId,
         stage: data.stage,
+        rung: outcome.event.rung,
+        permission,
+        authorisedAt: new Date().toISOString(),
         channel: data.channel,
         language: outcome.language,
         authorisedReason: data.authorisedReason ?? null,
+        // ⭐ Whether anything actually left the building, or whether the
+        // row is raised and waiting for somebody to record a delivery.
+        queuedForDispatch: outcome.queuedForDispatch,
       },
     });
 
     revalidatePath("/receivables");
+    revalidatePath("/receivables/ladder");
     return {
       ok: true,
       data: {
@@ -1318,18 +1369,255 @@ export async function recordNoticePostalService(
       severity: "notice",
       metadata: {
         evidence: "human_recorded",
+        stage: outcome.event.stage,
+        rung: outcome.event.rung,
+        permission: "receivables:dun",
         channel: outcome.event.channel,
         reference: data.reference,
       },
     });
 
     revalidatePath("/receivables");
+    revalidatePath("/receivables/ladder");
     return {
       ok: true,
       data: { id: outcome.event.id, evidenceWord: outcome.event.serviceEvidence },
     };
   } catch (err) {
     return toReceivablesActionError(err, "recordNoticePostalService");
+  }
+}
+
+/**
+ * ⭐⭐⭐ RECORD THAT A NOTICE IS SERVED IN LAW WITHOUT PROOF OF RECEIPT.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 THE PERMISSION IS `receivables:warn_cancellation`, NOT
+ *    `receivables:dun`, AND THAT IS THE ESCALATING RIGHT IN ACTION
+ * ══════════════════════════════════════════════════════════════════════
+ * Deeming service is not a stronger version of recording the post. It is
+ * a CONCLUSION IN LAW drawn about a letter nobody watched arrive, and it
+ * is the conclusion that turns an unproven rung into one the cancellation
+ * gate will clear. `human_recorded` says "I posted it and here is the
+ * consignment number" — a fact the person witnessed. `deemed` says "the
+ * allottee is fixed with notice whether or not they read it", which is
+ * an argument, and the person who has been chasing the money all quarter
+ * is not the person who should be making it unreviewed.
+ *
+ * ⚠️ SO IT SITS WITH THE SAME KEY AS THE CANCELLATION WARNING — counsel
+ * and the owner — because it is a step on the same road and because the
+ * two are almost always decided in the same conversation.
+ *
+ * 🔴 AND IT CANNOT PRODUCE A DISPATCH RECORD, WHATEVER IT IS SENT.
+ * `dunning_events_human_record_is_not_a_dispatch` (0098) refuses a
+ * `deemed` row a `dispatched_at` at all, and
+ * `dunning_events_deemed_states_its_basis` (0111) refuses one that does
+ * not name a person, a date, a reference and the clause relied on.
+ */
+export async function recordNoticeDeemedService(
+  input: unknown,
+): Promise<ActionResult<{ id: string; evidenceWord: string }>> {
+  try {
+    const data = recordDeemedServiceSchema.parse(input);
+
+    /*
+     * ⭐ DERIVED FROM THE TOP RUNG, NOT SPELT OUT AGAIN.
+     *
+     * 🔴 A LITERAL HERE WOULD BE A SECOND COPY OF THE MAPPING, which is
+     * the thing this batch removed from `sendDunningNotice`. If the key
+     * that guards a forfeiture warning is ever changed, the right to
+     * conclude that service happened must move with it — those two are
+     * decided in the same conversation by the same person, and a rename
+     * that split them would leave the weaker key guarding the step that
+     * makes the stronger one possible.
+     */
+    const permission = permissionForStage("cancellation_warning");
+
+    const ctx = await guardReceivablesWrite({
+      operation: permission,
+      feature: FEATURE,
+      permission,
+      resource: { type: "dunning_event", id: data.eventId },
+    });
+
+    const outcome = await recordDeemedService({
+      tenantId: ctx.tenant.id,
+      userId: ctx.user.id,
+      eventId: data.eventId,
+      reference: data.reference,
+      basis: data.basis,
+      servedOn: data.servedOn ?? null,
+      notes: data.notes ?? null,
+    });
+
+    if (!outcome.ok) return receivablesFail(outcome.error);
+
+    await writeAudit(ctx, {
+      action: "update",
+      resourceType: "dunning_event",
+      resourceId: outcome.event.id,
+      /*
+       * ⚠️ CRITICAL, LIKE THE CANCELLATION WARNING ITSELF, AND NOT
+       * `notice` LIKE RECORDING THE POST. This is the entry that will be
+       * read back when somebody asks why the gate said the ladder was
+       * served, and the answer is "a named person concluded it was".
+       */
+      severity: "critical",
+      metadata: {
+        evidence: "deemed",
+        stage: outcome.event.stage,
+        rung: outcome.event.rung,
+        permission,
+        authorisedAt: new Date().toISOString(),
+        channel: outcome.event.channel,
+        reference: data.reference,
+        // ⭐ The basis travels into the log verbatim. A conclusion whose
+        // stated reason lives only on the row it justifies is a
+        // conclusion that can be edited into a different one.
+        basis: data.basis,
+      },
+    });
+
+    revalidatePath("/receivables");
+    revalidatePath("/receivables/ladder");
+    return {
+      ok: true,
+      data: { id: outcome.event.id, evidenceWord: outcome.event.serviceEvidence },
+    };
+  } catch (err) {
+    return toReceivablesActionError(err, "recordNoticeDeemedService");
+  }
+}
+
+/**
+ * ⭐⭐⭐ THE STATUTORY LADDER BOARD — WHO IS DUE FOR WHICH RUNG.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 THIS IS THE SCREEN THE CHASE WAS MISSING, AND IT SENDS NOTHING
+ * ══════════════════════════════════════════════════════════════════════
+ * `planDunningSweep` has been able to say which allottees have fallen
+ * due for the next rung since Phase 38, and it writes nothing, which is
+ * correct. `sendDunningNotice` has been able to send one, and it had NO
+ * IMPORTER ANYWHERE in `app/` or `components/` — a legal instrument with
+ * a permission model, four constraints and no way for a person to reach
+ * it.
+ *
+ * ⚠️ AND IT IS NOT ON A CRON, DELIBERATELY. A cron holds no permission,
+ * so putting the ladder on a clock would not be running it as somebody
+ * with the right — it would be removing the right from the design. The
+ * top rung precedes forfeiting what a family has paid towards a home;
+ * "the system sent it automatically" is not an answer anybody can give at
+ * a hearing.
+ *
+ * ⭐ `receivables:read`, AND WIDE ON PURPOSE. This is the list the person
+ * who chases payments works from every morning, and gating the sight of
+ * it behind the right to act on it would hide the arrears from the site
+ * and from the CFO. Every act on it is guarded separately, at its own
+ * rung's key.
+ */
+export async function getDunningLadderBoard(
+  input: unknown,
+): Promise<ActionResult<LadderBoard>> {
+  try {
+    const data = dunningBoardSchema.parse(input);
+    await requirePermission("receivables:read");
+    const ctx = await requireTenantContext();
+
+    /*
+     * ══════════════════════════════════════════════════════════════════
+     * 🔴🔴 THE BOARD REFUSES TO RENDER IF THE PER-RUNG SPLIT IS GONE
+     * ══════════════════════════════════════════════════════════════════
+     * This screen's whole claim is that the escalating rung needs an
+     * escalating right. That claim rests on `ROLE_TEMPLATES`, which lives
+     * in another file and can be edited in one line by somebody being
+     * helpful — give the accountant `receivables:warn_cancellation` and
+     * every type still checks, every other test still passes, and the
+     * safety catch is gone with no symptom.
+     *
+     * ⚠️ SO IT IS CHECKED HERE, AT READ TIME, AND THE ANSWER IS A
+     * SENTENCE RATHER THAN A CRASH. A screen that offered a per-rung
+     * authority the role model no longer honours would be worse than no
+     * screen: it would be a screen asserting the catch is on.
+     */
+    const authorityProblem = ladderAuthorityProblem();
+    if (authorityProblem) {
+      return receivablesFail(
+        `The dunning ladder's permission model is not intact, so this board will not show it. ${authorityProblem}`,
+      );
+    }
+
+    const board = await dunningBoard({
+      tenantId: ctx.tenant.id,
+      projectId: data.projectId,
+      asOf: data.asOf ?? today(),
+      limit: data.limit,
+    });
+
+    return { ok: true, data: board };
+  } catch (err) {
+    return toReceivablesActionError(err, "getDunningLadderBoard");
+  }
+}
+
+/**
+ * ⭐⭐⭐ THE EXACT LETTER, BEFORE ANYBODY SENDS IT.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 THE PERMISSION IS THE RUNG'S OWN, NOT `receivables:read`
+ * ══════════════════════════════════════════════════════════════════════
+ * A preview here is not a report. It renders the actual instrument — the
+ * allottee by name, the amount to be demanded, and for rung four the
+ * words that precede terminating their allotment — and its only purpose
+ * is to be confirmed. Gating it at `receivables:read` would mean anybody
+ * in the workspace could compose a cancellation warning against a named
+ * family and read it back, which is the document itself minus the
+ * sending.
+ *
+ * ⚠️ AND IT MEANS THE SCREEN NEEDS NO SECOND COPY OF THE RULE. What the
+ * preview returns is what may be sent; what it refuses is what may not.
+ * A button that offered a rung the server would refuse is how people
+ * learn a rule by hitting an error, and a rule learned that way is a rule
+ * people work around.
+ *
+ * 🔴 IT WRITES NOTHING. No document row, no event row, no outbox row —
+ * see `previewDunningLetter`. So it uses `requirePermission` rather than
+ * `guardReceivablesWrite`: an entitlement gate here would refuse to
+ * render the confirmation on a workspace whose plan lapsed, instead of
+ * refusing the send, which is the check that matters.
+ */
+export async function previewDunningNotice(
+  input: unknown,
+): Promise<ActionResult<DunningPreview>> {
+  try {
+    const data = previewDunningSchema.parse(input);
+    const permission = permissionForStage(data.stage);
+    const ctx = await requirePermission(permission, {
+      type: "demand_notice",
+      id: data.demandId,
+    });
+
+    const head = await letterhead();
+    const preview = await previewDunningLetter({
+      tenantId: ctx.tenant.id,
+      demandId: data.demandId,
+      stage: data.stage,
+      channel: data.channel,
+      language: data.language,
+      recipient: data.recipient,
+      developerName: head.developerName,
+      contactLine: head.contactLine,
+      asOf: today(),
+    });
+
+    if ("ok" in preview && preview.ok === false) {
+      return receivablesFail(
+        preview.remedy ? `${preview.error} ${preview.remedy}` : preview.error,
+      );
+    }
+
+    return { ok: true, data: preview as DunningPreview };
+  } catch (err) {
+    return toReceivablesActionError(err, "previewDunningNotice");
   }
 }
 

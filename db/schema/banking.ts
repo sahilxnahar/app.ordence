@@ -241,6 +241,44 @@ export const bankLineMatches = pgTable(
     matchedKind: varchar("matched_kind", { length: 30 }).notNull(),
     matchedId: uuid("matched_id").notNull(),
 
+    /**
+     * ⭐⭐⭐ HOW MUCH OF THE LINE THIS ROW EXPLAINS — 0110.
+     *
+     * ══════════════════════════════════════════════════════════════════
+     * 🔴 THE COLUMN THAT MAKES ONE RECEIPT AGAINST THREE INVOICES
+     *    REPRESENTABLE WITHOUT MAKING A FALSE BALANCE POSSIBLE
+     * ══════════════════════════════════════════════════════════════════
+     * 0070 made matching strictly 1:1 with two unique indexes, and its
+     * comment gives the right reason: without an amount per row, one
+     * receipt could explain two statement lines and the residue would
+     * still come to zero, because the same rupees were counted on both
+     * sides. Dropping those indexes alone would have shipped exactly
+     * that.
+     *
+     * ⭐ SO THE UNIT OF MATCHING IS THE AMOUNT, NOT THE PAIR. Two sums
+     * bound it, both enforced by `ordence_guard_summed_bank_allocation`
+     * in 0110 and both mirrored by `allocationRefusal` in
+     * `lib/banking/allocation.ts`:
+     *
+     *     |Σ allocations on one statement line| ≤ |line amount|
+     *     |Σ allocations on one document|       ≤ |document amount|
+     *
+     * ⚠️ `≤` AND NOT `=`, AND THAT IS DELIBERATE. Matching one receipt
+     * to three invoices is three acts by a person; equality would refuse
+     * the first of them. Equality is a PROPERTY instead — and the BRS
+     * reads it: a line whose allocations do not sum to it is PARTLY
+     * explained, and its unexplained residue is an outstanding item on
+     * the statement by name. See `ResidualItem` in
+     * `lib/banking/reconciliation.ts`. That is the half that makes the
+     * false balance impossible: every paisa is either allocated to a
+     * document or printed as outstanding, and there is no third place.
+     *
+     * 🔴 SIGNED, same sign as the line and the document. An allocation
+     * pointing the other way would let two rows cancel to nothing while
+     * both claiming to explain money that moved.
+     */
+    allocatedMinor: bigint("allocated_minor", { mode: "bigint" }).notNull(),
+
     proposedScore: integer("proposed_score"),
     wasAmbiguous: boolean("was_ambiguous").default(false).notNull(),
 
@@ -250,17 +288,37 @@ export const bankLineMatches = pgTable(
   },
   (t) => ({
     /**
-     * 🔴🔴 BOTH HALVES ARE REQUIRED. Matching one receipt to two
-     * statement lines explains twice as much money as actually moved,
-     * and the residue still comes out to zero because the same rupees
-     * were counted on both sides.
+     * ⭐⭐ ONE ROW PER (LINE, DOCUMENT) PAIR — 0110, REPLACING THE TWO
+     *    1:1 INDEXES `bank_line_matches_one_per_line` AND
+     *    `bank_line_matches_one_per_document`, WHICH 0110 DROPS.
+     *
+     * 🔴 THE OLD PAIR ENFORCED THE RIGHT INVARIANT WITH THE WRONG
+     *    MECHANISM. They stopped double-explaining by forbidding N:M
+     *    entirely, which also forbade the ordinary case — a customer
+     *    paying three invoices with one NEFT. `allocated_minor` and the
+     *    two sum bounds now stop double-explaining directly, so the
+     *    1:1 restriction is no longer carrying that weight.
+     *
+     * ⚠️ THIS INDEX IS STILL NEEDED AND IS A DIFFERENT RULE. One line
+     *    may be allocated to many documents and one document to many
+     *    lines, but the SAME line and the SAME document may only meet
+     *    once. Two rows for one pair would sum correctly and be
+     *    impossible to read, and "unmatch this document from this line"
+     *    would have no single answer.
      */
-    onePerLine: uniqueIndex("bank_line_matches_one_per_line").on(t.statementLineId),
-    onePerDocument: uniqueIndex("bank_line_matches_one_per_document").on(
+    onePerPair: uniqueIndex("bank_line_matches_one_row_per_pair").on(
+      t.tenantId,
+      t.statementLineId,
+      t.matchedKind,
+      t.matchedId,
+    ),
+    /** ⭐ The sum bound is read per document, so the lookup needs an index. */
+    documentIdx: index("bank_line_matches_document_idx").on(
       t.tenantId,
       t.matchedKind,
       t.matchedId,
     ),
+    lineIdx: index("bank_line_matches_line_idx").on(t.tenantId, t.statementLineId),
   }),
 );
 
@@ -493,6 +551,165 @@ export const bankReconciliationItemsRelations = relations(
     }),
   }),
 );
+
+/* ================================================================== */
+/* ⭐⭐⭐ THE INPUT CREDIT ON A BANK CHARGE — 0110                        */
+/* ================================================================== */
+
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 0102 POSTS THE GROSS CHARGE AND SAYS "CLAIM THE CREDIT BY HAND"
+ * ══════════════════════════════════════════════════════════════════════
+ * Nothing recorded that it was owed, nothing totalled it, and nothing
+ * ever asked. So the credit on every bank charge was silently unclaimed,
+ * and "silently" is the word that matters — a business paying ₹1,180 a
+ * month in charges gives up about ₹2,160 of credit a year with no line
+ * anywhere that says so.
+ *
+ * ⭐⭐ THIS TABLE IS THE LINE. Posting stays gross, because gross is what
+ * left the account and there is no invoice yet; what changes is that the
+ * deferred credit is now a row with a state, a period and a total on a
+ * screen.
+ *
+ * 🔴 THE RATE IS NEVER DERIVED, CONFIGURED OR DEFAULTED. The full
+ * argument is in `lib/banking/bank-charge-itc.ts`; the short form is
+ * three statutes:
+ *
+ *   • s.16(2)(a) CGST Act — credit needs the tax invoice IN HAND, and at
+ *     write-up time there is none.
+ *   • s.16(2)(aa) with Rule 36(4) — it must have reached GSTR-2B, which
+ *     a figure with no supplier invoice number never can.
+ *   • s.12(12) IGST Act — place of supply for banking services is the
+ *     recipient's location on the bank's records, so a charge can be
+ *     IGST rather than CGST+SGST and a computed split would file it in
+ *     the wrong box. Interest is exempt outright, under Notification
+ *     12/2017-Central Tax (Rate) entry 27.
+ *
+ * ⚠️ SO THE SPLIT IS TRANSCRIBED FROM THE BANK'S INVOICE AND MUST FOOT
+ * TO THE MONEY THAT MOVED: taxable + CGST + SGST + IGST + cess = gross.
+ * A CHECK enforces it. That is the constraint that refuses an assumed
+ * 18% coming back in through the form.
+ */
+export const bankChargeItcDeferrals = pgTable(
+  "bank_charge_itc_deferrals",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    tenantId: uuid("tenant_id")
+      .notNull()
+      .references(() => tenants.id, { onDelete: "cascade" }),
+    bankAccountId: uuid("bank_account_id")
+      .notNull()
+      .references(() => bankAccounts.id, { onDelete: "cascade" }),
+
+    /**
+     * 🔴 UNIQUE. One statement line is one charge and one deferral. The
+     * unique index is also the idempotency guard on the posting path:
+     * `postBankLineAdjustment` writes this row in the same transaction
+     * as the journal, so a second posting cannot create a second
+     * deferral for the same money.
+     */
+    statementLineId: uuid("statement_line_id")
+      .notNull()
+      .references(() => bankStatementLines.id, { onDelete: "cascade" }),
+
+    /**
+     * ⚠️ NOT A FOREIGN KEY, for the same reason
+     * `bank_reconciliation_items.source_id` is not one: this points at
+     * the posted transaction, and the register has to survive whatever
+     * happens to it. A cascade here would delete the evidence that a
+     * credit was ever deferred.
+     */
+    transactionId: uuid("transaction_id"),
+
+    /** 🔴 POSITIVE MAGNITUDE IN PAISE. What the bank took, gross. */
+    grossMinor: bigint("gross_minor", { mode: "bigint" }).notNull(),
+
+    /** The bank's own value date on the charge. */
+    valueDate: date("value_date").notNull(),
+
+    /**
+     * ⚠️ `YYYY-MM`, DERIVED FROM `value_date` AND NEVER FROM TODAY. A
+     * March charge found in June belongs in March's return. Same rule as
+     * the posting date in `postBankAdjustment`.
+     */
+    taxPeriod: varchar("tax_period", { length: 7 }).notNull(),
+
+    /** awaiting_invoice · invoice_recorded · not_claimable */
+    status: varchar("status", { length: 20 }).default("awaiting_invoice").notNull(),
+
+    /* ⭐ ALL NULL UNTIL AN INVOICE IS ACTUALLY IN HAND. */
+    invoiceNo: varchar("invoice_no", { length: 100 }),
+    invoiceDate: date("invoice_date"),
+    supplierGstin: varchar("supplier_gstin", { length: 15 }),
+    taxableValueMinor: bigint("taxable_value_minor", { mode: "bigint" }),
+    cgstMinor: bigint("cgst_minor", { mode: "bigint" }),
+    sgstMinor: bigint("sgst_minor", { mode: "bigint" }),
+    igstMinor: bigint("igst_minor", { mode: "bigint" }),
+    cessMinor: bigint("cess_minor", { mode: "bigint" }),
+
+    /**
+     * ⚠️ REQUIRED WHEN `status` IS `not_claimable`, and a CHECK says so.
+     * "We are not claiming this" with no reason is indistinguishable
+     * from an oversight six months later, which is when somebody asks.
+     */
+    notClaimableReason: text("not_claimable_reason"),
+
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    resolvedAt: timestamp("resolved_at", { withTimezone: true }),
+    resolvedBy: uuid("resolved_by").references(() => users.id, { onDelete: "set null" }),
+
+    /**
+     * ⭐⭐⭐ POSTING IS A FACT ABOUT THIS ROW, NOT A FOURTH STATUS — 0112.
+     *
+     * 🔴 SIX OF THIS TABLE'S CHECKS ARE WRITTEN `status <>
+     *    'invoice_recorded' OR <rule>`. A `credit_posted` status would
+     *    have made every one of them pass trivially for exactly the rows
+     *    whose figures are already in the ledger. The status stays
+     *    `invoice_recorded` after posting and all six keep applying.
+     *
+     * ⚠️ NOT A DRIZZLE `.references()`, deliberately, matching
+     *    `transactionId` above: the register is the evidence that a
+     *    credit was taken and must outlive the transaction it names.
+     *
+     * ⚠️ AND THE PAIR IS ALL-OR-NOTHING, enforced by
+     *    `bank_charge_itc_deferrals_posting_pair`. A posted-at that
+     *    cannot name its journal is worse than no record at all.
+     */
+    creditTransactionId: uuid("credit_transaction_id"),
+    creditPostedAt: timestamp("credit_posted_at", { withTimezone: true }),
+    creditPostedBy: uuid("credit_posted_by").references(() => users.id, {
+      onDelete: "set null",
+    }),
+  },
+  (t) => ({
+    lineUnique: uniqueIndex("bank_charge_itc_deferrals_line_unique").on(
+      t.tenantId,
+      t.statementLineId,
+    ),
+    /** ⭐ The register is read per tax period, which is how a return is filed. */
+    periodIdx: index("bank_charge_itc_deferrals_period_idx").on(
+      t.tenantId,
+      t.taxPeriod,
+      t.status,
+    ),
+  }),
+);
+
+export const bankChargeItcDeferralsRelations = relations(
+  bankChargeItcDeferrals,
+  ({ one }) => ({
+    account: one(bankAccounts, {
+      fields: [bankChargeItcDeferrals.bankAccountId],
+      references: [bankAccounts.id],
+    }),
+    line: one(bankStatementLines, {
+      fields: [bankChargeItcDeferrals.statementLineId],
+      references: [bankStatementLines.id],
+    }),
+  }),
+);
+
+export type BankChargeItcDeferral = typeof bankChargeItcDeferrals.$inferSelect;
 
 export type BankAccount = typeof bankAccounts.$inferSelect;
 export type BankStatement = typeof bankStatements.$inferSelect;

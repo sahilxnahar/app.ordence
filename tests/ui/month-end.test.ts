@@ -494,11 +494,30 @@ describe("nothing edits the bank's own evidence", () => {
     expect(inserts.length).toBeGreaterThan(0);
 
     for (const m of inserts) {
-      // 🔴 EVERY MATCH RECORDS WHO DECIDED IT. A row written without a
-      // person on it is an auto-confirm however it got there.
-      expect(action.slice(m.index!, m.index! + 800)).toContain(
-        "confirmedBy: ctx.user.id",
-      );
+      /**
+       * 🔴 EVERY MATCH RECORDS WHO DECIDED IT. A row written without a
+       * person on it is an auto-confirm however it got there.
+       *
+       * ⚠️ THE WINDOW IS THE `values({ ... })` OBJECT, NOT 800
+       * CHARACTERS. It was a fixed 800 until 0110 added
+       * `allocated_minor` and its comment to the adjustment path, at
+       * which point `confirmedBy` fell outside the window and a correct
+       * change failed a correct test. The property is unchanged; only
+       * the way it is located is. Two files asserted this the same
+       * brittle way and both are fixed.
+       */
+      const start = action.indexOf("{", action.indexOf(".values(", m.index!));
+      let depth = 0;
+      let end = start;
+      while (end < action.length) {
+        if (action[end] === "{") depth += 1;
+        if (action[end] === "}") {
+          depth -= 1;
+          if (depth === 0) break;
+        }
+        end += 1;
+      }
+      expect(action.slice(start, end + 1)).toContain("confirmedBy: ctx.user.id");
     }
 
     const confirmFn = action.slice(

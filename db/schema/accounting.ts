@@ -272,11 +272,66 @@ export const journalEntries = pgTable(
     entryType: entryTypeEnum("entry_type").notNull(),
 
     /**
+     * ══════════════════════════════════════════════════════════════════
+     * 🔴🔴 THE AUTHORITATIVE AMOUNT — Batch 0108, SQL 0108
+     * ══════════════════════════════════════════════════════════════════
+     * The leg in the MINOR UNITS of its transaction's currency: paise for
+     * INR, fils for KWD, whole yen for JPY. `bigint`, like every other
+     * money column in this product.
+     *
+     * 🔴 WHY THIS EXISTS AND `amount` NO LONGER DECIDES ANYTHING.
+     * `amount` is `numeric(18,2)`. Two decimal places CANNOT REPRESENT A
+     * DINAR. One Kuwaiti dinar is 1000 fils, and the same is true of the
+     * Bahraini, Iraqi, Jordanian, Libyan, Omani and Tunisian units. A
+     * workspace keeping its books in KWD did not merely find the old
+     * column inconvenient: `writeFxPosting` wrote `formatMinorPlain(1234,
+     * "KWD")` = "1.234" and the column ROUNDED IT TO 1.23 on the way in,
+     * silently, with nothing anywhere reporting a problem. Batches 0101
+     * and 1.66.0 built multi-currency everywhere except the one place it
+     * has to work, and post-sales.ts said so in writing rather than
+     * hiding it. This column is the other half of that sentence.
+     *
+     * ⭐ THE EXPONENT IS PER CURRENCY. `lib/fx/currency.ts` carries it and
+     * `currency_units` carries it for SQL. A hardcoded divide-by-100 is
+     * wrong the first time somebody invoices in yen and wrong by a factor
+     * of ten the first time somebody invoices in dinars.
+     *
+     * ⚠️ NULLABLE IN THE TYPE, NOT NULL IN A HEALTHY DATABASE. 0108 adds
+     * the column nullable so the window between the SQL running and this
+     * code deploying is survivable, backfills it, and then does
+     * `SET NOT NULL` — a statement it is ALLOWED to fail, on a book
+     * containing legs it could not scale honestly. The column stays
+     * optional here so that a workspace in that state still compiles and
+     * still reports rather than crashing.
+     *
      * Always POSITIVE. Direction is carried by `entryType`, never by sign.
-     * A negative amount plus a debit/credit flag gives two ways to express the
-     * same thing — and two ways to get it wrong. A CHECK constraint enforces > 0.
+     * A negative amount plus a debit/credit flag gives two ways to express
+     * the same thing — and two ways to get it wrong. `journal_entries_
+     * amount_minor_positive` enforces it, and the balance trigger foots on
+     * THIS column, not on `amount`.
      */
-    amount: numeric("amount", { precision: 18, scale: 2 }).notNull(),
+    amountMinor: bigint("amount_minor", { mode: "bigint" }),
+
+    /**
+     * ⚠️ LEGACY MIRROR. DERIVED BY TRIGGER. LOSSY ABOVE TWO DECIMALS.
+     * DO NOT ADD A NEW READER OF THIS COLUMN.
+     *
+     * Kept, and kept maintained, because readers outside Batch 0108's
+     * ownership still sum it — `server/actions/receivables.ts` is owned by
+     * another stream and could not be converted in this batch. Trigger
+     * `journal_entries_aa_fill_minor` fills it from `amountMinor` and the
+     * transaction's currency exponent.
+     *
+     * 🔴 IT ROUNDS for KWD/BHD/OMR/JOD/TND/LYD/IQD (exponent 3) and
+     * CLF/UYW (exponent 4), and it is NULL where that rounding would
+     * produce zero — a 4-fil leg is 0.004 KWD, which is 0.00 at two
+     * decimals, and `CHECK (amount > 0)` would have refused the row.
+     * NULL is the honest answer: there is no two-decimal number for that
+     * leg. `amountMinor` carries it exactly.
+     *
+     * ⚠️ NULLABLE SINCE 0108 for that reason. It was NOT NULL before.
+     */
+    amount: numeric("amount", { precision: 18, scale: 2 }),
 
     description: text("description"),
 
@@ -363,6 +418,17 @@ export const journalEntries = pgTable(
      * screen somebody opens once a month and waits for.
      */
     costCentreIdx: index("journal_entries_cost_centre_idx").on(t.tenantId, t.costCentreId),
+    /**
+     * ⭐ THE TRIAL BALANCE AND THE STATEMENT OF ACCOUNT, Batch 0108. Every
+     * sum that used to read `amount` now reads `amount_minor`, and a
+     * ledger's running total over a date window without this index is a
+     * sequential scan of the tenant's whole journal.
+     */
+    ledgerMinorIdx: index("journal_entries_ledger_minor_idx").on(
+      t.tenantId,
+      t.ledgerId,
+      t.amountMinor,
+    ),
   }),
 );
 
@@ -472,7 +538,23 @@ export const financialPeriods = pgTable(
      */
     closingBalances: jsonb("closing_balances")
       .$type<{
+        /**
+         * ⭐ MINOR UNITS SINCE BATCH 0108, and named so that an old blob
+         * and a new one cannot be confused.
+         *
+         * ⚠️ `totalDebits` / `totalCredits` ARE THE PRE-0108 KEYS and hold
+         * a two-decimal rupee string. They are kept in the type because
+         * closed periods carrying them still exist and this snapshot is
+         * evidence: an auditor comparing today's reconciliation against a
+         * period sealed last year must be able to read what was written
+         * then. Reusing one key for two units would make the older
+         * snapshots silently unreadable.
+         */
+        totalDebitsMinor?: string;
+        totalCreditsMinor?: string;
+        /** @deprecated Pre-0108 rupee strings. Read, never written. */
         totalDebits?: string;
+        /** @deprecated Pre-0108 rupee strings. Read, never written. */
         totalCredits?: string;
         entryCount?: number;
         ledgerBalances?: Array<{ ledgerId: string; code: string; balance: string }>;

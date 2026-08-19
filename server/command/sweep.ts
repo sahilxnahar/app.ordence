@@ -43,7 +43,6 @@ import {
   salesPostingAccounts,
 } from "@/db/schema";
 import { buildDueList } from "@/lib/compliance/statutory-due";
-import { rupeeStringToMinor } from "@/server/returns/assemble";
 import { stateFor, type ExceptionSignal } from "@/lib/command/exceptions";
 
 type Tx = Parameters<Parameters<typeof withTenant>[1]>[0];
@@ -146,8 +145,27 @@ async function statutorySignals(
   const rows = await tx
     .select({
       role: salesPostingAccounts.role,
-      debit: sql<string>`COALESCE(SUM(CASE WHEN ${journalEntries.entryType} = 'debit' THEN ${journalEntries.amount} ELSE 0 END), 0)`,
-      credit: sql<string>`COALESCE(SUM(CASE WHEN ${journalEntries.entryType} = 'credit' THEN ${journalEntries.amount} ELSE 0 END), 0)`,
+      /**
+       * ⭐ SUMMED IN MINOR UNITS. Batch 0108.
+       *
+       * ⚠️ THIS USED TO SUM `journal_entries.amount`, a numeric(18,2), and
+       * hand the decimal string to `rupeeStringToMinor()`, whose last line
+       * was `BigInt(whole) * 100n + ...`. Two hardcoded hundreds between
+       * the ledger and this total, both wrong for a dinar and both wrong
+       * by a different factor for a yen. The ledger now stores the integer
+       * these totals were always trying to reach.
+       */
+      debitMinor: sql<string>`COALESCE(SUM(CASE WHEN ${journalEntries.entryType} = 'debit' THEN ${journalEntries.amountMinor} ELSE 0 END), 0)::text`,
+      creditMinor: sql<string>`COALESCE(SUM(CASE WHEN ${journalEntries.entryType} = 'credit' THEN ${journalEntries.amountMinor} ELSE 0 END), 0)::text`,
+      /**
+       * ⚠️ COUNTED, NOT IGNORED. `SUM()` SKIPS NULLS, so a leg 0108 could
+       * not scale would quietly reduce this total instead of failing it.
+       * The balance trigger refuses any transaction containing one, so
+       * this can only be pre-0108 history — and a trial balance that is
+       * short by a real amount and foots anyway is the worst possible
+       * output. See the census in SQL-FILES/0108.
+       */
+      unscaledLegs: sql<number>`COUNT(*) FILTER (WHERE ${journalEntries.amountMinor} IS NULL)::int`,
     })
     .from(journalEntries)
     .innerJoin(
@@ -171,7 +189,14 @@ async function statutorySignals(
   for (const r of rows) {
     // ⚠️ Liabilities: credits less debits, clamped at zero rather than
     // shown as a government owing money back.
-    const net = rupeeStringToMinor(r.credit) - rupeeStringToMinor(r.debit);
+    if (r.unscaledLegs > 0) {
+      throw new Error(
+        `${r.unscaledLegs} journal line(s) have no amount in minor units, so this total ` +
+          `cannot be trusted. Run the census in SQL-FILES/0108 to see which currency is ` +
+          `unscaled. Nothing has been computed.`,
+      );
+    }
+    const net = BigInt(r.creditMinor) - BigInt(r.debitMinor);
     balances[r.role] = net > 0n ? net : 0n;
   }
 

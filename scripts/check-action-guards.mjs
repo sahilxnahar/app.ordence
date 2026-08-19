@@ -266,6 +266,47 @@ const ALLOWED = {
     "Same as markAsRead. The `mine` predicate is the authorisation, and a test asserts it is present.",
   "notifications.ts#dismissNotification":
     "Same as markAsRead. The `mine` predicate is the authorisation, and a test asserts it is present.",
+
+  /**
+   * ⭐⭐ THE CALLER HAS NO WORKSPACE. THAT IS THE POINT OF THE ENDPOINT.
+   *
+   * Self-serve signup runs between "this person has a Clerk account" and
+   * "this person has a workspace". `requireTenantContext()` resolves the
+   * tenant from the session's organisation, so on this path it refuses
+   * EVERY legitimate caller — there is no organisation yet, which is
+   * precisely what the endpoint exists to create. There is likewise no
+   * permission table to consult, because permissions are tenant-scoped
+   * rows and the tenant does not exist.
+   *
+   * ⚠️ SO THE GUARD IS THE CLERK SESSION, CHECKED INSIDE THE FUNCTION,
+   *    FIRST. `const { userId, orgId } = await auth()` and an immediate
+   *    refusal when `userId` is absent — and a second refusal when
+   *    `orgId` is PRESENT, because a session that already has a workspace
+   *    has no business creating another through this path. Then a rate
+   *    limit keyed on the user id.
+   *
+   * 🔴 THIS IS THE ENTRY MOST WORTH BEING SUSPICIOUS OF, in the same way
+   *    `signatures.ts#signContractViaPortal` is: "it uses a different
+   *    mechanism" is also what a genuinely unguarded endpoint would say.
+   *    What makes it true here is that the session check is the first
+   *    statement in the body and returns before anything is read, created
+   *    or written. If that ever stops being the first statement, this
+   *    entry is wrong and should be deleted rather than widened.
+   */
+  "claim.ts#claimWorkspaceAddress":
+    "Runs before the caller has a workspace, so there is no tenant to scope to and no permission row to check. Authenticated by the Clerk session (userId) as the first statement in the body, refused outright when the session already has an organisation, and rate-limited per user.",
+
+  /**
+   * ⭐ THE ORGANISATION COMES FROM THE SESSION, NEVER FROM A PARAMETER.
+   *
+   * This reports whether the webhook has finished provisioning the
+   * workspace behind the CALLER'S OWN organisation, and it takes no
+   * arguments at all — so there is nothing an attacker can point it at.
+   * An `orgId` parameter would have made it a cross-tenant read wearing a
+   * status check, which is why it does not have one.
+   */
+  "claim.ts#workspaceProvisioningStatus":
+    "Takes no arguments. Reads only the organisation on the caller's own Clerk session, and returns one slug — the address of the workspace that session already belongs to.",
 };
 
 /* ------------------------------------------------------------------ */

@@ -444,6 +444,93 @@ export const recordPostalServiceSchema = z.object({
 });
 
 export type RecordPostalServiceInput = z.infer<typeof recordPostalServiceSchema>;
+
+/**
+ * ⭐⭐⭐ DEEMING SERVICE — THE HARDEST CLAIM IN THE PRODUCT TO MAKE.
+ *
+ * 🔴 `deemed` OUTRANKS EVERY OTHER GRADE. It is `strength: 3` in
+ * `lib/receivables/service-evidence.ts`, it clears the cancellation gate,
+ * and no machine ever touches it. Until 0111 nothing wrote it at all.
+ *
+ * ⚠️ SO THE FORM ASKS FOR THE ONE THING THAT SEPARATES LAWFUL DEEMED
+ * SERVICE FROM A TICK BOX AT THE TOP OF THE EVIDENCE SCALE: the clause or
+ * the section, in the words somebody would use at a hearing. Twenty
+ * characters is not a quality bar and is not pretending to be one — it is
+ * the floor below which the field is obviously not an answer. The CHECK
+ * `dunning_events_deemed_states_its_basis` (0111) refuses an empty one
+ * whatever route the row came in by.
+ *
+ * ⚠️ THERE IS NO `channel` FIELD AND NO `evidence` FIELD. The channel is
+ * read from the row, which is also what refuses this for email — an email
+ * the outbox can dispatch has provable evidence available to it, and
+ * deeming service on it would be choosing the weaker record and calling
+ * it the stronger.
+ */
+export const recordDeemedServiceSchema = z.object({
+  eventId: z.string().uuid(),
+  reference: z
+    .string()
+    .trim()
+    .min(4, "Give the consignment number of the cover that came back, or the postal endorsement reference.")
+    .max(120),
+  basis: z
+    .string()
+    .trim()
+    .min(
+      20,
+      "State the clause of the agreement, or the section, that makes this good service — in the words you would use at a hearing.",
+    )
+    .max(400),
+  /** Civil day service is taken to have happened. Defaults to now. */
+  servedOn: z
+    .string()
+    .regex(/^\d{4}-\d{2}-\d{2}$/, "Use YYYY-MM-DD.")
+    .optional(),
+  notes: z.string().trim().max(2000).optional(),
+});
+
+export type RecordDeemedServiceInput = z.infer<typeof recordDeemedServiceSchema>;
+
+/**
+ * ⭐ THE READ-ONLY BOARD. What is due for which rung, and what was served
+ * before.
+ *
+ * ⚠️ `limit` IS A PAGE SIZE, NOT A SEND CAP, because this action sends
+ * nothing. It is capped at 200 so one workspace's arrears cannot make the
+ * screen the slowest thing in the product.
+ */
+export const dunningBoardSchema = z.object({
+  projectId: uuid.optional(),
+  asOf: civilDaySchema.optional(),
+  limit: z.number().int().min(1).max(200).default(50),
+});
+
+export type DunningBoardInput = z.infer<typeof dunningBoardSchema>;
+
+/**
+ * ⭐⭐ THE PREVIEW THAT COMES BEFORE A SEND.
+ *
+ * 🔴 ONE DEMAND AND ONE RUNG. There is no array here and there must never
+ * be one: a preview that accepted a list is one field away from a confirm
+ * that accepts a list, and a confirm that accepts a list is forty
+ * cancellation warnings from a single click.
+ *
+ * ⚠️ IT MIRRORS `sendDunningSchema` FIELD FOR FIELD ON THE FOUR FIELDS
+ * THAT CHANGE THE DOCUMENT — demand, stage, channel, language — so what
+ * is shown is what would be sent. It deliberately omits
+ * `authorisedReason`: the preview happens BEFORE the reason is written,
+ * and a preview that required it would put the confirmation after the
+ * decision.
+ */
+export const previewDunningSchema = z.object({
+  demandId: uuid,
+  stage: dunningStageSchema,
+  channel: dunningChannelSchema,
+  language: noticeLanguageSchema.optional(),
+  recipient: z.string().trim().max(320).optional().nullable(),
+});
+
+export type PreviewDunningInput = z.infer<typeof previewDunningSchema>;
 export type DunningSweepInput = z.infer<typeof dunningSweepSchema>;
 export type AgeingQueryInput = z.infer<typeof ageingQuerySchema>;
 export type StatementQueryInput = z.infer<typeof statementQuerySchema>;

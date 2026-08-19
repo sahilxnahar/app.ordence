@@ -57,8 +57,30 @@ import type { SystemRole } from "@/db/schema/core";
 /* WHAT OCCUPIES A SEAT                                                */
 /* ------------------------------------------------------------------ */
 
-/** User statuses that hold a seat. */
+/**
+ * User statuses that hold a seat.
+ *
+ * ⚠️ `pending_seat` IS DELIBERATELY NOT HERE — 0114.
+ *
+ * 🔴 THAT IS THE ENTIRE POINT OF THE STATUS. A workspace at 10 of 10 with
+ * three people parked is still at 10 of 10, so its owner is asked to buy
+ * three seats rather than discovering they are at 13. If a parked person
+ * consumed a seat, parking them would be indistinguishable from admitting
+ * them and the limit would go on being advisory.
+ *
+ * ⚠️ AND IT IS NOT `suspended`. Suspension means somebody was in and was
+ * taken out. This means they were never let in. Six months later, "why
+ * was Priya suspended in March" and "Priya waited eleven days for a seat"
+ * are different facts, and only one of them is a story about onboarding.
+ */
 export const SEAT_CONSUMING_STATUSES = ["invited", "active"] as const;
+
+/**
+ * ⭐ The status a person is created in when their workspace had no seat.
+ * Exported so the webhook, the team screen and the approval queue all
+ * spell it the same way.
+ */
+export const PENDING_SEAT_STATUS = "pending_seat" as const;
 
 /** Roles that never hold a seat, whatever their status. */
 export const SEAT_EXEMPT_ROLES: readonly SystemRole[] = [
@@ -113,6 +135,54 @@ export type SeatState = {
  * At five seats it fires on the fourth, which is the right moment.
  */
 export const SEAT_WARNING_THRESHOLD = 0.8;
+
+/**
+ * ⭐⭐⭐ CAPACITY SOMEBODY GRANTED, ON TOP OF WHAT WAS BOUGHT — 0114.
+ *
+ * 🔴 A GRANT RAISES THE LIMIT. IT DOES NOT FILL A SEAT. Modelling it the
+ * other way — marking a user as "granted" and skipping them in the count
+ * — would mean the capacity disappears the day that person leaves, and
+ * the customer silently loses a concession somebody deliberately made.
+ *
+ * ⚠️ A GRANT WITH NO EXPIRY IS PERMANENT, and that is the honest default.
+ * A grant with a date on it is a decision to revisit; a grant without one
+ * is a decision that was made. Inventing an expiry would withdraw
+ * capacity a customer is relying on, on a date nobody chose.
+ */
+export type SeatGrant = {
+  seats: number;
+  expiresAt?: Date | string | null;
+  revokedAt?: Date | string | null;
+};
+
+export function grantedSeats(
+  grants: readonly SeatGrant[],
+  now: Date = new Date(),
+): number {
+  return grants.reduce((total, g) => {
+    if (g.revokedAt) return total;
+    if (g.expiresAt !== null && g.expiresAt !== undefined) {
+      const at = g.expiresAt instanceof Date ? g.expiresAt : new Date(g.expiresAt);
+      /**
+       * ⚠️ AN UNPARSEABLE DATE IS TREATED AS EXPIRED, not as permanent.
+       * The failure that matters here is a customer being charged for
+       * capacity they no longer have, so the conservative direction is to
+       * withdraw it and let somebody ask why.
+       */
+      if (Number.isNaN(at.getTime()) || at.getTime() <= now.getTime()) return total;
+    }
+    return total + Math.max(0, Math.trunc(g.seats));
+  }, 0);
+}
+
+/** ⭐ What the workspace may actually use: bought plus granted. */
+export function effectiveSeats(
+  purchased: number,
+  grants: readonly SeatGrant[],
+  now: Date = new Date(),
+): number {
+  return Math.max(0, Math.trunc(purchased)) + grantedSeats(grants, now);
+}
 
 export function computeSeatState(used: number, purchased: number): SeatState {
   const safePurchased = Math.max(0, Math.trunc(purchased));

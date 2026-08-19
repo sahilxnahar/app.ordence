@@ -88,6 +88,7 @@ import { operatorSlugSchema } from "@/lib/slug-schema";
 import { tenantUrl } from "@/lib/tenant";
 import type { PlatformResult } from "@/lib/platform/schemas";
 import { claimSlug } from "./claim-slug";
+import { syncClerkOrganizationSlug } from "./clerk-org-slug";
 import { recordPlatformAudit, requireCapability } from "./guard";
 
 /* ------------------------------------------------------------------ */
@@ -276,7 +277,23 @@ export async function renameTenantSlug(
       `Platform console: rename workspace ${tenantId} to "${newSlug}". ${releaseReason.slice(0, 120)}`,
       async (tx) => {
         const [tenant] = await tx
-          .select({ id: tenants.id, slug: tenants.slug, name: tenants.name })
+          .select({
+            id: tenants.id,
+            slug: tenants.slug,
+            name: tenants.name,
+            /*
+             * ⭐ READ SO THE RENAME CAN BE FINISHED IN CLERK — Brief A.
+             *
+             * `middleware.ts:1031` compares the hostname label against the
+             * session's CLERK `orgSlug`. Changing `tenants.slug` alone
+             * therefore moves the front door and leaves the gate comparing
+             * against the OLD name, so every member of the workspace is
+             * answered `/access-denied` at the new address. Until this
+             * column was read here, that was the outcome of every operator
+             * rename in the product.
+             */
+            clerkOrgId: tenants.clerkOrgId,
+          })
           .from(tenants)
           .where(eq(tenants.id, tenantId))
           .limit(1);
@@ -379,7 +396,11 @@ export async function renameTenantSlug(
         });
         if (!claim.ok) throw new SlugClaimRefused(claim.rejection);
 
-        return { previousSlug: tenant.slug, name: tenant.name };
+        return {
+          previousSlug: tenant.slug,
+          name: tenant.name,
+          clerkOrgId: tenant.clerkOrgId,
+        };
       },
     );
 
@@ -416,6 +437,37 @@ export async function renameTenantSlug(
       },
     });
 
+    /*
+     * ══════════════════════════════════════════════════════════════════
+     * 🔴 THE HALF OF A RENAME THAT LIVES OUTSIDE THIS DATABASE
+     * ══════════════════════════════════════════════════════════════════
+     * `tenants.slug` is now `newSlug`. Clerk still holds the old one, and
+     * `middleware.ts:1031` refuses any request whose hostname label differs
+     * from the session's Clerk `orgSlug`:
+     *
+     *   • the customer opens `newSlug.ordence.com`,
+     *   • `locator.slug` is `newSlug`, `orgSlug` is still `previousSlug`,
+     *   • middleware rewrites to `/api/internal/host-moved`, which finds a
+     *     LIVE tenant on `newSlug` — theirs — and so does NOT redirect,
+     *   • and the fallback answers `/access-denied`.
+     *
+     * ⚠️ SO A RENAME THAT STOPS AT THE DATABASE DOES NOT MOVE A WORKSPACE.
+     *    IT TAKES ONE OFF THE INTERNET. Every operator rename before this
+     *    block did exactly that, and the failure is invisible from the
+     *    console, which reports success and prints the new URL.
+     *
+     * ⭐ AFTER THE COMMIT AND AFTER THE AUDIT, on purpose. An external call
+     *    cannot be rolled back with the transaction, so it must not be
+     *    inside one; and if it fails, the rename genuinely happened and the
+     *    operator has to be told what is left to do rather than shown an
+     *    error that implies nothing changed.
+     */
+    const mirror = await syncClerkOrganizationSlug({
+      clerkOrgId: outcome.clerkOrgId,
+      slug: newSlug,
+      reason: `Operator rename by ${operator.email}: ${releaseReason.slice(0, 120)}`,
+    });
+
     const retainedUntil = new Date(Date.now() + RETENTION_DAYS * 86_400_000)
       .toISOString()
       .slice(0, 10);
@@ -431,6 +483,19 @@ export async function renameTenantSlug(
         pending: [
           `Tell ${outcome.name}'s owner that the address changed — nothing in this product notifies them.`,
           `${workspaceUrlFor(outcome.previousSlug)} now answers 301 to the new address, and stays blocked for everybody until ${retainedUntil}.`,
+          /*
+           * ⚠️ THE FAILURE IS PUT IN FRONT OF THE OPERATOR RATHER THAN IN A
+           *    LOG. If Clerk was not updated, the workspace is unreachable
+           *    by its own staff RIGHT NOW, and the only person who can fix
+           *    it is the one reading this list.
+           */
+          ...(mirror.ok
+            ? []
+            : [
+                `🔴 CLERK WAS NOT UPDATED (${mirror.detail}). Until the Clerk organisation's ` +
+                  `slug reads "${newSlug}", every member of this workspace is answered ` +
+                  `access-denied at the new address. Fix it in the Clerk dashboard now.`,
+              ]),
         ],
       },
     };

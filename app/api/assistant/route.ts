@@ -29,6 +29,8 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { auth } from "@clerk/nextjs/server";
 import { getTenantContext } from "@/server/tenant-context";
+import { checkFeature } from "@/server/entitlements";
+import { refusalFor } from "@/lib/entitlements/upgrade";
 import { runAgent, listAgents } from "@/server/ai/agent-runner";
 import type { AgentId } from "@/lib/ai/agents/registry";
 import type { McpSession } from "@/server/mcp/dispatch";
@@ -78,6 +80,38 @@ export async function POST(req: NextRequest) {
    * `UNKNOWN_PLAN_FALLBACK_TIER`.
    */
   void publishPlanHint(ctx.clerkOrgId, ctx.tenant.planTier);
+
+  /* ---- 2c. ⭐ IS THE COPILOT IN THE PLAN? — Batch 0109 ------------
+   *
+   * ══════════════════════════════════════════════════════════════════
+   * 🔴 `ai.copilot` IS PRICED AT THE AI TIER AND WAS REFUSED BY NOTHING
+   * ══════════════════════════════════════════════════════════════════
+   * The assistant answered on every plan, including the free one. The
+   * nav entry for `/assistant` carried `feature: null`, so not even the
+   * menu hid it — there was no gate anywhere between a signed-in user on
+   * the cheapest tier and a model call we pay for.
+   *
+   * ⚠️ THE GATE IS HERE AND NOT IN THE PANEL. Hiding the chat box stops
+   * nobody: this route is reachable with a session cookie and `curl`,
+   * and every call it forwards costs us tokens at a third party.
+   *
+   * ⚠️ 402, NOT 403. The two mean different things to whoever reads the
+   * network tab: 403 says "you are not allowed", which sends a workspace
+   * owner to ask an administrator who is themselves. 402 says the plan
+   * does not include it, and the body names which plan does.
+   */
+  const copilot = await checkFeature("ai.copilot", ctx);
+  if (!copilot.allowed) {
+    const refusal = refusalFor(copilot, null);
+    return NextResponse.json(
+      {
+        error: refusal.sentence,
+        requiredTier: refusal.requiredTier,
+        upgradeHref: refusal.href,
+      },
+      { status: 402 },
+    );
+  }
 
   /* ---- 3. parse the request ---- */
   //

@@ -41,7 +41,27 @@ import {
   getTallyConnections,
   getTallyLedgerMappings,
   getTallyExportBatches,
+  /* ⭐⭐⭐ WAVE 10 — the write half of this module, which had no caller. */
+  getTallyCostCentreMappings,
+  getTallyImportBatches,
+  getTallyMappableSources,
+  getTallyReconciliation,
+  getTallyTaxHeads,
+  generateTallyExport,
+  importTallyExport,
+  markTallyExportDelivered,
+  pushTallyExport,
+  resolveTallyReconciliationItem,
+  retireTallyLedgerMapping,
+  upsertTallyConnection,
+  upsertTallyCostCentreMapping,
+  upsertTallyLedgerMapping,
 } from "@/server/actions/tally";
+import { TallyConnectionForm } from "./tally-connection-form";
+import { TallyMappingEditor } from "./tally-mapping-editor";
+import { TallyExportPanel } from "./tally-export-panel";
+import { TallyImportPanel } from "./tally-import-panel";
+import { TallyCostCentres } from "./tally-cost-centres";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 
@@ -71,15 +91,46 @@ function bytes(n: number | null): string {
 }
 
 async function TallyBody() {
-  const [connections, mappings, batches] = await Promise.all([
+  const [
+    connections,
+    mappings,
+    batches,
+    sources,
+    taxHeads,
+    costCentres,
+    importBatches,
+  ] = await Promise.all([
     getTallyConnections(true),
     getTallyLedgerMappings(),
     getTallyExportBatches({ limit: 25 }),
+    /*
+      ⭐ WAVE 10 — everything the editors need, fetched with the page
+      rather than on a click. Each is `tally:read`, so a caller who can
+      see this page can see all of it, and a failure in one leaves the
+      others working: every result is checked independently below.
+    */
+    getTallyMappableSources(),
+    getTallyTaxHeads(),
+    getTallyCostCentreMappings(),
+    getTallyImportBatches(),
   ]);
 
   const connectionRows = connections.ok ? connections.data.rows : [];
   const mappingRows = mappings.ok ? mappings.data.rows : [];
   const batchRows = batches.ok ? batches.data.rows : [];
+  const sourceRows = sources.ok ? sources.data.rows : [];
+  const sourcesTruncated = sources.ok ? sources.data.truncated : false;
+  const taxHeadList = taxHeads.ok ? taxHeads.data.heads : [];
+  /**
+   * ⚠️ `groups` IS THE TALLY GROUP TABLE, value to label , not a
+   * head-to-group map. The tax head's group is decided by the editor,
+   * which defaults it to Duties & Taxes and says why.
+   */
+  const primaryGroups = Object.entries(taxHeads.ok ? taxHeads.data.groups : {}).map(
+    ([value, label]) => ({ value, label }),
+  );
+  const costCentreRows = costCentres.ok ? costCentres.data.rows : [];
+  const importBatchRows = importBatches.ok ? importBatches.data.rows : [];
 
   /*
    * ⚠️ NOT "rows with no Tally name" — a mapping row always has one, because
@@ -387,6 +438,56 @@ async function TallyBody() {
           )}
         </CardContent>
       </Card>
+
+      {/*
+        ⭐⭐⭐ WAVE 10 — THE WRITE HALF.
+
+        Everything above this line existed and was read-only. Thirteen
+        server actions , connections, mappings, cost centres, generate,
+        push, deliver, import, reconcile , were built, tested, guarded,
+        and reachable from nowhere. A screen that can only observe a
+        module nobody can configure shows an empty list on every workspace
+        and reads as a feature that does not work.
+      */}
+      <TallyConnectionForm rows={connectionRows} save={upsertTallyConnection} />
+
+      <TallyMappingEditor
+        rows={mappingRows}
+        sources={sourceRows}
+        sourcesTruncated={sourcesTruncated}
+        taxHeads={taxHeadList}
+        primaryGroups={primaryGroups}
+        save={upsertTallyLedgerMapping}
+        retire={retireTallyLedgerMapping}
+      />
+
+      <TallyCostCentres rows={costCentreRows} save={upsertTallyCostCentreMapping} />
+
+      <TallyExportPanel
+        connections={connectionRows.map((c) => ({
+          id: c.id,
+          name: c.name,
+          isActive: c.isActive,
+          host: c.host,
+        }))}
+        /*
+          ⚠️ THE COMPANY NAME DEFAULTS FROM THE FIRST ACTIVE CONNECTION.
+          Tally matches the company by name on import, and re-typing it
+          per export is how a trailing space creates a second company
+          there rather than failing.
+        */
+        defaultCompanyName={activeConnections[0]?.companyName ?? ""}
+        generate={generateTallyExport}
+        push={pushTallyExport}
+        markDelivered={markTallyExportDelivered}
+      />
+
+      <TallyImportPanel
+        batches={importBatchRows}
+        runImport={importTallyExport}
+        loadReconciliation={getTallyReconciliation}
+        resolve={resolveTallyReconciliationItem}
+      />
 
       <div className="rounded-md border border-border bg-muted/30 p-4">
         <p className="text-sm font-medium">Why re-sending a batch is safe</p>

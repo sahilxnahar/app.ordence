@@ -10,7 +10,11 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { auth } from "@clerk/nextjs/server";
 import { getTenantContext } from "@/server/tenant-context";
+import { checkFeature } from "@/server/entitlements";
+import { refusalFor } from "@/lib/entitlements/upgrade";
 import { planGoal } from "@/lib/ai/goal-planner";
+// ⭐ 0105 · this workspace's own provider keys where it has supplied any.
+import { tenantChatCompletion } from "@/server/ai/chat";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -29,6 +33,32 @@ export async function POST(req: NextRequest) {
     return NextResponse.json(
       { error: "No workspace is active." },
       { status: 403 },
+    );
+  }
+
+  /**
+   * ⭐ THE COPILOT GATE — Batch 0109.
+   *
+   * ⚠️ BEFORE THE BODY IS EVEN PARSED, because everything below this
+   * line ends in a model call this company pays a third party for. A
+   * gate placed after the work has been done refuses nothing that costs
+   * anything.
+   *
+   * 402 rather than 403: this is a plan boundary, not a permission one,
+   * and the body names the plan that includes it. See
+   * `lib/entitlements/upgrade.ts` for why those are different remedies
+   * aimed at different people.
+   */
+  const copilot = await checkFeature("ai.copilot", ctx);
+  if (!copilot.allowed) {
+    const refusal = refusalFor(copilot, null);
+    return NextResponse.json(
+      {
+        error: refusal.sentence,
+        requiredTier: refusal.requiredTier,
+        upgradeHref: refusal.href,
+      },
+      { status: 402 },
     );
   }
 
@@ -60,6 +90,9 @@ export async function POST(req: NextRequest) {
   const result = await planGoal({
     goal,
     tenantId: ctx.tenant.id,
+    // ⚠️ The tenant comes from the SESSION, never from the body.
+    chat: (request) =>
+      tenantChatCompletion({ ...request, tenantId: ctx.tenant.id }),
   });
 
   if (!result.ok && result.reason && !result.errors.length) {

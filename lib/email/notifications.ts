@@ -21,33 +21,62 @@ type EmailPayload = {
 };
 
 /**
- * Send an email via Resend. Returns true if sent, false if not configured
- * or if sending failed (errors are logged but not thrown — the in-app
- * notification is the primary delivery channel).
+ * Send a notification email.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 THIS USED TO BE A SECOND, BROKEN COPY OF THE DISPATCHER
+ * ══════════════════════════════════════════════════════════════════════
+ * It called `resend.emails.send(...)` and then `return true`, with the
+ * result discarded. The Resend SDK does NOT throw when the provider
+ * rejects a message — it returns `{ data, error }`. So this function
+ * returned `true` for a suppressed address, an unverified domain, a rate
+ * limit, and a malformed payload alike. Every notification email that
+ * never arrived was reported as sent.
+ *
+ * ⚠️ AND IT WAS A KNOWN DEFECT. Three separate files name this exact
+ * function, by path, as the thing not to do:
+ *
+ *   server/email/outbox.ts      "which is how the codebase already ended
+ *   server/receivables/dunning.ts   up with a `sendEmail` in
+ *                               lib/email/notifications.ts that ignores
+ *                               every safeguard in the real one"
+ *   lib/email/outbox.ts         "🔴 SUCCESS WITHOUT A PROVIDER ID IS NOT
+ *                               SUCCESS"
+ *
+ * It was documented as wrong and left wired to a live caller.
+ *
+ * ⭐ SO IT IS NOW A THIN ADAPTER over `lib/email/resend.ts`, which checks
+ * `error`, refuses success without a provider message id, classifies rate
+ * limits, validates and de-duplicates recipients, and logs with context.
+ * One dispatcher, one set of safeguards.
+ *
+ * The boolean return is kept because that is the contract this module's
+ * callers were written against; the difference is that it is now the
+ * truth.
  */
 export async function sendEmail(payload: EmailPayload): Promise<boolean> {
-  const apiKey = process.env.RESEND_API_KEY;
-  if (!apiKey) return false;
+  const { sendEmail: dispatch } = await import("./resend");
 
-  const fromEmail =
-    process.env.RESEND_FROM_EMAIL ||
-    "Ordence <notifications@mail.ordence.com>";
+  const result = await dispatch({
+    to: payload.to,
+    subject: payload.subject,
+    html: payload.html,
+    text: payload.text,
+    logContext: { channel: "notification" },
+  });
 
-  try {
-    const { Resend } = await import("resend");
-    const resend = new Resend(apiKey);
-    await resend.emails.send({
-      from: fromEmail,
-      to: payload.to,
-      subject: payload.subject,
-      html: payload.html,
-      text: payload.text,
-    });
-    return true;
-  } catch (err) {
-    console.error("[email] Failed to send notification email:", err);
+  if (!result.ok) {
+    // ⚠️ Named, not swallowed. `resend.ts` already logged the provider's
+    // own words; this line says which subsystem lost the message, because
+    // "[email] provider error" alone does not tell an operator whether a
+    // notification, an invoice or a dunning notice went missing.
+    console.error(
+      `[email:notification] not delivered (${result.reason}): ${result.message}`,
+    );
     return false;
   }
+
+  return true;
 }
 
 /**

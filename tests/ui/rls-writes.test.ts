@@ -56,11 +56,34 @@ function walk(dir: string, out: string[] = []): string[] {
 /* ================================================================== */
 
 describe("check:rls-writes is wired in", () => {
-  it("is a script, an npm target and a preflight step", () => {
+  /**
+   * ══════════════════════════════════════════════════════════════════
+   * ⭐ THE MANIFEST IS WHAT DECIDES WHETHER A GATE RUNS
+   * ══════════════════════════════════════════════════════════════════
+   * This used to grep `scripts/preflight.mjs` for the script filename
+   * and a label. That was the honest assertion when preflight held a
+   * hand-written list — and it broke, correctly, the moment infra wave
+   * 12 replaced that list with `gatesInTier()` over
+   * `scripts/gates.mjs`.
+   *
+   * ⚠️ THE FILENAME IS NO LONGER IN preflight.mjs AND THE GATE STILL
+   * RUNS. Grepping the consumer was always a proxy for the real
+   * question, which is: is this gate on the one list that preflight,
+   * CI and `check:gate-coverage` all read? Ask that instead.
+   */
+  it("is a script, an npm target and an entry in the gate manifest", async () => {
     expect(read("package.json")).toContain('"check:rls-writes"');
-    const pre = read("scripts/preflight.mjs");
-    expect(pre).toContain("check-rls-writes.mjs");
-    expect(pre).toContain("RLS writes");
+
+    // preflight reads the manifest rather than naming gates itself.
+    expect(read("scripts/preflight.mjs")).toContain("gatesInTier");
+
+    const { GATES } = await import("../../scripts/gates.mjs");
+    const gate = GATES.find((g: { id: string }) => g.id === "rls-writes");
+    expect(
+      gate,
+      "check:rls-writes is not in scripts/gates.mjs, so preflight and CI both skip it",
+    ).toBeDefined();
+    expect(gate!.script).toBe("scripts/check-rls-writes.mjs");
   });
 
   /**

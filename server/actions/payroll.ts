@@ -44,6 +44,7 @@ import {
 } from "@/db/schema/payroll";
 import { requirePermission, writeAudit } from "@/server/audit";
 import { requireAccess } from "@/server/billing/access";
+import { requirePayrollEntitlement } from "@/server/payroll/entitlement";
 import { toSalesActionError } from "@/server/sales/guards";
 import { postPayrollRun } from "@/server/accounting/post-sales";
 import { computeRun, daysInPeriod, daysOnRollsIn, writeRun } from "@/server/payroll/run";
@@ -94,6 +95,7 @@ export async function saveEmployee(
   input: unknown,
 ): Promise<ActionResult<{ id: string }>> {
   try {
+    await requirePayrollEntitlement();
     const ctx = await requirePermission(MANAGE);
     const parsed = employeeSchema.extend({ id: z.string().uuid().optional() }).safeParse(input);
     if (!parsed.success) {
@@ -192,6 +194,7 @@ export async function seedPayrollSetup(): Promise<
   ActionResult<{ components: number; rates: number; note: string }>
 > {
   try {
+    await requirePayrollEntitlement();
     const ctx = await requirePermission(MANAGE);
 
     const result = await withTenant(ctx.tenant.id, async (tx) => {
@@ -274,6 +277,7 @@ export async function setPayStructure(
   input: unknown,
 ): Promise<ActionResult<{ id: string; note: string }>> {
   try {
+    await requirePayrollEntitlement();
     const ctx = await requirePermission(MANAGE);
     const parsed = structureSchema.safeParse(input);
     if (!parsed.success) return { ok: false, error: "Check the form." };
@@ -419,6 +423,7 @@ export async function openPayrollRun(
   input: unknown,
 ): Promise<ActionResult<{ id: string; runNo: string }>> {
   try {
+    await requirePayrollEntitlement();
     const ctx = await requirePermission(MANAGE);
     const parsed = openRunSchema.safeParse(input);
     if (!parsed.success) return { ok: false, error: "Check the dates." };

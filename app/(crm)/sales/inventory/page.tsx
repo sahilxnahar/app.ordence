@@ -24,7 +24,25 @@ import Link from "next/link";
 import { Suspense } from "react";
 import { Plus } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { listUnits, listProjects, releaseExpiredHolds } from "@/server/actions/sales-inventory";
+/**
+ * ⭐⭐⭐ `createProject` AND `createUnit` ADDED AS CALLERS — wave two.
+ *
+ * 🔴 They are the only inserts into `projects` and `units`, and nothing
+ * called either. Forty-three reachable actions read one of those two
+ * tables: bookings, payment plans, cost control, RA bills, BOQ, meters,
+ * rate cards, the cost-centre P&L, credit notes, timesheets. The whole
+ * real-estate vertical read two tables that could not receive a row.
+ */
+import {
+  listUnits,
+  listProjects,
+  releaseExpiredHolds,
+  createProject,
+  createUnit,
+  /** ⭐ Wave 10 — see `components/sales/project-unit-forms.tsx`. */
+  updateProject,
+} from "@/server/actions/sales-inventory";
+import { ProjectUnitForms } from "@/components/sales/project-unit-forms";
 import { InventoryGrid } from "@/components/sales/inventory-grid";
 import { SavedViewsShell } from "@/components/views/saved-views-shell";
 
@@ -46,11 +64,22 @@ export default async function InventoryPage({
             Units, availability and holds across every project.
           </p>
         </div>
+        {/*
+          ⭐ WAVE 10 — THIS POINTED AT `/sales/inventory/new`, WHICH DOES
+          NOT EXIST AND NEVER DID. It has been in `check:links`' dead-link
+          budget since the page was written.
+
+          ⚠️ FIXED BY REMOVING THE SECOND SURFACE, NOT BY BUILDING ONE.
+          The forms that create a project and a unit are already on this
+          page, below the header. A separate `/new` route would be a
+          second place for the same eleven fields to drift, and this
+          codebase has paid for that shape of duplication before.
+        */}
         <Button asChild>
-          <Link href="/sales/inventory/new">
+          <a href="#add-units">
             <Plus className="h-4 w-4" aria-hidden="true" />
             Add units
-          </Link>
+          </a>
         </Button>
       </div>
 
@@ -95,7 +124,36 @@ async function InventoryView({ projectId }: { projectId?: string }) {
     );
   }
 
+  /**
+   * ⚠️ WAVE 10 — MORE COLUMNS THAN BEFORE, AND STILL NOT THE WHOLE ROW.
+   * The edit form needs the six fields it can change; `ProjectRow` also
+   * carries counts, timestamps and dates that nothing on the client
+   * reads, and passing a whole database row into a client component is
+   * how a column added later silently reaches the browser.
+   */
+  const projectOptions = projectsResult.ok
+    ? projectsResult.data.rows.map((p) => ({
+        id: p.id,
+        code: p.code,
+        name: p.name,
+        description: p.description,
+        addressLine: p.addressLine,
+        city: p.city,
+        state: p.state,
+        reraNumber: p.reraNumber,
+      }))
+    : [];
+
   return (
+    <div className="space-y-4">
+      <div id="add-units" className="scroll-mt-6">
+        <ProjectUnitForms
+          projects={projectOptions}
+          createProjectAction={createProject}
+          createUnitAction={createUnit}
+          updateProjectAction={updateProject}
+        />
+      </div>
     <InventoryGrid
       summary={unitsResult.data.summary}
       total={unitsResult.data.total}
@@ -127,6 +185,7 @@ async function InventoryView({ projectId }: { projectId?: string }) {
         holdHoursRemaining: unit.holdHoursRemaining,
       }))}
     />
+    </div>
   );
 }
 

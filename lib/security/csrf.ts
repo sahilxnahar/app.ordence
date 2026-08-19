@@ -60,11 +60,94 @@
 import "server-only";
 
 import { readRuntimeEnv } from "@/lib/env";
+import { isHostInZone } from "@/lib/tenant";
 
 /**
- * Hosts this deployment answers to. Pulled from the public app URL and
- * enriched by the deployment platform variable, so preview URLs are not
- * flagged as attacks.
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 THE DEFECT THIS BLOCK REPLACES — EVERY WRITE FROM EVERY TENANT
+ *    SUBDOMAIN WAS REFUSED
+ * ══════════════════════════════════════════════════════════════════════
+ * `resolveAllowedHosts()` built its set from three explicit variables and
+ * had no wildcard and no zone derivation. Railway serves
+ * `app.ordence.com`, `admin.ordence.com` and `*.ordence.com` from one
+ * service, so a POST from `acme.ordence.com` carried an Origin that was
+ * in none of them, `verifyCsrf` answered `origin_mismatch`, and
+ * `middleware.ts` returned 403 "Cross-site request refused." before
+ * Clerk, before routing, before anything.
+ *
+ * ⚠️ IT WAS INVISIBLE UNTIL SOMEBODY TRIED TO SAVE. GET is exempt at the
+ *    top of `verifyCsrf`, so every page in every tenant workspace READ
+ *    perfectly and every write died. The product sells "your own
+ *    subdomain" and could not deliver a working one.
+ *
+ * ⭐ THE FIX IS TO DERIVE THE SET FROM THE ZONE, so that any host under
+ *    `NEXT_PUBLIC_ZONE_DOMAIN` is same-site BY CONSTRUCTION and nobody
+ *    has to remember to add a variable when a tenant signs up. The three
+ *    explicit variables are kept as additional entries, because a
+ *    deployment that has not set the zone must not change behaviour.
+ */
+
+/**
+ * ⚠️ READ AT RUNTIME, NOT AT BUILD. `NEXT_PUBLIC_*` names are INLINED BY
+ *    NEXT.JS AT BUILD TIME wherever they appear as a literal
+ *    `process.env.NEXT_PUBLIC_ZONE_DOMAIN`. The Railway build machine has
+ *    no application variables, so that literal would be frozen into the
+ *    output as `undefined` and this whole control would silently fall
+ *    back to the three-variable behaviour it is replacing — a security
+ *    fix that compiles away.
+ *
+ *    `readRuntimeEnv()` looks the name up through a VARIABLE, which
+ *    defeats the substitution. `lib/env.ts` exports it for exactly this
+ *    reason and `middleware.ts` carries its own copy for the same one.
+ */
+function resolveZoneDomain(): string | undefined {
+  return readRuntimeEnv("NEXT_PUBLIC_ZONE_DOMAIN");
+}
+
+/**
+ * The staff console host.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * ⚠️ TWO VARIABLES NAMED THE SAME CONCEPT. THAT IS THE 0091 DEFECT.
+ * ══════════════════════════════════════════════════════════════════════
+ *   `PLATFORM_HOST`          documented, in `.env.example`, in
+ *                            `RAILWAY-VARIABLES-PASTE.txt`, in
+ *                            `lib/platform/env-catalog.ts`, and read by
+ *                            the console router at `middleware.ts:98`.
+ *   `ORDENCE_PLATFORM_HOST`  undocumented, in none of those files, read
+ *                            by this module and by nothing else.
+ *
+ * Two lists that mean one thing, drifting silently, is precisely the
+ * shape of the two-reserved-word-lists incident that produced migration
+ * 0091 — and it had already produced its own outage here: an operator
+ * setting the documented name got no CSRF entry for the console at all.
+ *
+ * ⭐ CONVERGED, KEEPING BOTH NAMES. `PLATFORM_HOST` first because it is
+ *    the one the rest of the product uses; `ORDENCE_PLATFORM_HOST` second
+ *    so the LIVE deployment, which may be running on it, does not break
+ *    on the deploy that lands this file; `admin.<zone>` last, which is
+ *    the same default `middleware.ts` applies, so the two agree without
+ *    either of them being configured.
+ */
+function resolvePlatformHost(): string | undefined {
+  const explicit = readRuntimeEnv("PLATFORM_HOST");
+  if (explicit) return explicit.toLowerCase();
+  /** ⚠️ Legacy name. Kept for backward compatibility, never introduced anew. */
+  const legacy = readRuntimeEnv("ORDENCE_PLATFORM_HOST");
+  if (legacy) return legacy.toLowerCase();
+  const zone = resolveZoneDomain();
+  return zone ? `admin.${zone.toLowerCase()}` : undefined;
+}
+
+/**
+ * The EXPLICIT hosts this deployment answers to.
+ *
+ * ⚠️ THIS IS NO LONGER THE WHOLE ANSWER, AND CALLERS MUST NOT TREAT IT AS
+ *    ONE. A zone is not enumerable — `acme.ordence.com` exists the moment
+ *    a customer signs up and no list can be updated in time. Ask
+ *    `isAllowedHost()`, which consults this set AND the zone. This
+ *    function stays exported because the operator console and the tests
+ *    read it to show what is configured.
  */
 export function resolveAllowedHosts(): string[] {
   const hosts = new Set<string>();
@@ -73,7 +156,7 @@ export function resolveAllowedHosts(): string[] {
     const host = extractHost(appUrl);
     if (host) hosts.add(host);
   }
-  const platformHost = readRuntimeEnv("ORDENCE_PLATFORM_HOST");
+  const platformHost = resolvePlatformHost();
   if (platformHost) hosts.add(platformHost);
   // Production host without a scheme — the canonical case.
   const prodHost = readRuntimeEnv("APP_HOST");
@@ -85,6 +168,83 @@ export function resolveAllowedHosts(): string[] {
     hosts.add("");
   }
   return [...hosts];
+}
+
+/**
+ * ⭐ THE ONE PREDICATE. Everything that used to ask
+ * `resolveAllowedHosts().includes(host)` asks this instead.
+ *
+ * Order matters only for cost, not for meaning: the explicit set is a
+ * handful of strings and the zone test is a string comparison.
+ *
+ * 🔴 THE ZONE TEST IS `isHostInZone()` FROM `lib/tenant.ts`, WHICH IS THE
+ *    SAME FUNCTION THE TENANT ROUTER USES TO DECIDE WHAT RESOLVES. A
+ *    second, private copy of "is this host under our zone" living in a
+ *    security module is how the set of hosts that ROUTE and the set of
+ *    hosts that may WRITE drift apart — and this file would be the half
+ *    nobody notices, because the symptom is a 403 on a save.
+ *
+ * ⚠️ DEPTH: SINGLE LABEL ONLY, DELIBERATELY. `acme.ordence.com` is
+ *    allowed; `a.b.ordence.com` is REFUSED. Tenant slugs are one DNS
+ *    label by construction (`lib/slug.ts` bans dots because the wildcard
+ *    certificate `*.ordence.com` covers exactly one label), so nothing we
+ *    serve is ever deeper than one label, and refusing deeper names is
+ *    both tighter and free. If a future feature needs `a.b.ordence.com`,
+ *    the certificate has to change first and this line should be revisited
+ *    then rather than pre-emptively widened now.
+ */
+let warnedUnconfigured = false;
+
+export function isAllowedHost(
+  host: string | null | undefined,
+  requestHost?: string | null,
+): boolean {
+  if (!host) return false;
+  const candidate = host.toLowerCase();
+  const allowed = resolveAllowedHosts();
+
+  /*
+   * ══════════════════════════════════════════════════════════════════
+   * 🔴 THE UNCONFIGURED DEGRADATION. THIS USED TO BE `return true`.
+   * ══════════════════════════════════════════════════════════════════
+   * The comment that stood here said the degradation was "same-site
+   * only". The code did not compare anything with the request host — it
+   * returned true for every candidate. So with `NEXT_PUBLIC_APP_URL`,
+   * `PLATFORM_HOST` and `APP_HOST` all unset,
+   * `isAllowedHost("evil.example")` was true: `verifyCsrf` accepted a
+   * cross-site POST, and `isSuspiciousCrossOrigin` reported false, so
+   * the control and the telemetry that would have shown it missing
+   * disappeared in the same instant.
+   *
+   * ⚠️ THE ORIGINAL CONCERN IS REAL AND IS PRESERVED. Failing closed on
+   * a missing variable turns one absent env var into a product-wide 403
+   * on the first deploy. That is why this is not `return false`.
+   *
+   * ⭐ SO: DO WHAT THE OLD COMMENT SAID. With a request host to compare
+   * against, "unconfigured" means SAME-SITE ONLY, which is a strictly
+   * smaller hole than "any site" and costs one string comparison. Only
+   * when the caller cannot supply a request host either does this fall
+   * back to accepting, and then it says so, once, loudly, because an
+   * unconfigured CSRF anchor in production is a real finding and the
+   * whole failure above was silent.
+   */
+  if (allowed.includes("")) {
+    if (typeof requestHost === "string" && requestHost.length > 0) {
+      return candidate === requestHost.toLowerCase();
+    }
+    if (!warnedUnconfigured) {
+      warnedUnconfigured = true;
+      console.error(
+        "[csrf] No host is configured (NEXT_PUBLIC_APP_URL, PLATFORM_HOST and " +
+          "APP_HOST are all unset) and no request host was supplied, so the " +
+          "origin check is accepting every origin. Set one of them.",
+      );
+    }
+    return true;
+  }
+
+  if (allowed.includes(candidate)) return true;
+  return isHostInZone(candidate, resolveZoneDomain());
 }
 
 export function extractHost(url: string | null | undefined): string | null {
@@ -155,12 +315,12 @@ export function verifyCsrf(args: {
   // 1. Origin binding: explicit Origin present → must be one of ours.
   if (origin) {
     const originHost = extractHost(origin);
-    const allowed = resolveAllowedHosts();
-    if (originHost && allowed.includes(originHost)) {
-      // Same host — good. Fall through to the digest check below.
-    } else if (originHost && allowed.includes("")) {
-      // Unconfigured hosts: anything matching the request host is fine.
-    } else if (originHost) {
+    /*
+     * ⭐ `isAllowedHost` FOLDS THE THREE OLD BRANCHES INTO ONE. It already
+     *    answers "explicit host", "under our zone" and the unconfigured
+     *    degradation, in that order — see its comment.
+     */
+    if (originHost && !isAllowedHost(originHost, requestHost)) {
       return { ok: false, reason: "origin_mismatch" };
     }
   } else if (referer) {
@@ -169,8 +329,7 @@ export function verifyCsrf(args: {
     // origin binding; the digest check below is what catches the rest.
     const refererHost = extractHost(referer);
     if (refererHost && refererHost !== (requestHost ?? "").toLowerCase()) {
-      const allowed = resolveAllowedHosts();
-      if (!allowed.includes(refererHost)) {
+      if (!isAllowedHost(refererHost, requestHost)) {
         return { ok: false, reason: "origin_mismatch" };
       }
     }
@@ -199,13 +358,11 @@ export function isSuspiciousCrossOrigin(args: {
   if (!/^(POST|PUT|PATCH|DELETE)$/i.test(args.method)) return false;
   const originHost = args.origin ? extractHost(args.origin) : null;
   if (originHost) {
-    const allowed = resolveAllowedHosts();
-    return !allowed.includes(originHost);
+    return !isAllowedHost(originHost, args.requestHost);
   }
   const refererHost = args.referer ? extractHost(args.referer) : null;
   if (refererHost && refererHost !== (args.requestHost ?? "").toLowerCase()) {
-    const allowed = resolveAllowedHosts();
-    return !allowed.includes(refererHost);
+    return !isAllowedHost(refererHost, args.requestHost);
   }
   return false;
 }

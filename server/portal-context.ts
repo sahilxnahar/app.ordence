@@ -55,7 +55,9 @@ import { headers } from "next/headers";
 import { and, eq, sql } from "drizzle-orm";
 import { db, withPlatformScope, withTenant } from "@/db";
 import { portalLinks, auditLogs } from "@/db/schema";
-import { hashPortalToken, isWellFormedToken } from "@/lib/portal/tokens";
+import { hashPortalToken, isWellFormedToken, portalTokenRef } from "@/lib/portal/tokens";
+import { recordSecurityEvent } from "@/server/security/record";
+import type { SecurityEventType } from "@/lib/security/events";
 import type { PortalLink } from "@/db/schema";
 
 /* ------------------------------------------------------------------ */
@@ -147,10 +149,115 @@ export async function resolvePortalToken(token: unknown): Promise<PortalResoluti
   // available" page as every other failure.
   // ══════════════════════════════════════════════════════════════════
   try {
-    return await resolvePortalTokenUnsafe(token);
+    const resolution = await resolvePortalTokenUnsafe(token);
+    if (!resolution.ok) await recordPortalRefusal(token, resolution.reason);
+    return resolution;
   } catch (err) {
     console.error("[portal] token lookup failed", err);
     return { ok: false, reason: "lookup_failed" };
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* WAVE 9 — THE REFUSAL BECOMES EVIDENCE                               */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Which refusals are worth a `security_events` row, and as what.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 UNTIL WAVE 9 THIS FUNCTION DID NOT EXIST AND NOTHING REPLACED IT
+ * ══════════════════════════════════════════════════════════════════════
+ * `lib/security/events.ts` has declared four portal event types since
+ * Phase 20 — `portal.token_invalid`, `portal.token_expired`,
+ * `portal.token_revoked_use`, `portal.token_shared_suspected` — each with
+ * a default severity, a label and a SIEM mapping.
+ *
+ * NOT ONE OF THEM HAD EVER BEEN WRITTEN. The rejection reasons were
+ * computed carefully, documented at length as being "for us, not for the
+ * visitor", returned to the caller, and thrown away. The whole apparatus
+ * existed except the line that recorded anything.
+ *
+ * The consequence was not only a missing log. `detectPortalTokenSharing`
+ * in `server/security/anomalies.ts` filters observations by
+ * `eventType.startsWith("portal.")` — so a detection rule with its own
+ * threshold, its own test and its own justification could not fire, ever,
+ * for any input. A rule that cannot fire is indistinguishable from a rule
+ * that is not firing because everything is fine.
+ *
+ * ⚠️ EMITTED HERE, IN THE RESOLVER, AND NOT AT THE THREE CALL SITES.
+ * `resolvePortalToken` is the single door: the page, the document
+ * download route and `server/actions/signatures.ts` all pass through it.
+ * A per-surface emission would be three chances to forget, and the one
+ * that forgot would be the new surface added next year.
+ */
+const REFUSAL_EVENT: Partial<Record<PortalRejectionReason, SecurityEventType>> = {
+  /**
+   * A path that is not 64 hex characters. Almost always a crawler or a
+   * truncated link in an email client, occasionally the first probe of
+   * someone testing what the route does with rubbish.
+   */
+  malformed: "portal.token_invalid",
+  /** Well-formed and unknown. This is what enumeration looks like. */
+  not_found: "portal.token_invalid",
+  expired: "portal.token_expired",
+  /**
+   * ⚠️ REVOKED, NOT `already_signed`. A revoked link being presented means
+   * somebody still holds a credential we deliberately withdrew, which is
+   * the reason the type is `warning` and the other two are `info`. A
+   * signed link being reopened is a client re-reading their own contract
+   * and is not a security event by any definition.
+   */
+  revoked: "portal.token_revoked_use",
+};
+
+/**
+ * Record a portal refusal. Never throws, never blocks the refusal itself.
+ *
+ * ⚠️ `already_signed`, `tenant_inactive` and `lookup_failed` are absent
+ * from the map on purpose. The first is ordinary use; the second is our
+ * own administrative state; the third is our database being unwell, which
+ * is an OUTAGE and belongs in Sentry, not in a table a security reviewer
+ * reads for signs of an attacker.
+ */
+async function recordPortalRefusal(
+  token: unknown,
+  reason: PortalRejectionReason,
+): Promise<void> {
+  const type = REFUSAL_EVENT[reason];
+  if (!type) return;
+
+  try {
+    const facts = await getVisitorFacts();
+
+    /**
+     * ⚠️ A REFERENCE ONLY WHEN THE INPUT WAS SHAPED LIKE A TOKEN.
+     * Hashing `<script>alert(1)</script>` would produce a stable-looking
+     * 16 characters that groups every piece of junk from one scanner
+     * under one "token", and `detectPortalTokenSharing` would then report
+     * a shared portal link that never existed.
+     */
+    const subjectId = isWellFormedToken(token) ? portalTokenRef(token) : null;
+
+    await recordSecurityEvent({
+      type,
+      tenantId: null, // Unknown by construction — the token did not resolve.
+      source: "portal",
+      subjectType: "portal_token_ref",
+      subjectId,
+      ipAddress: facts.ipAddress,
+      userAgent: facts.userAgent,
+      detail: { reason, wellFormed: isWellFormedToken(token) },
+      reason: `Portal token refused: ${reason}.`,
+    });
+  } catch (err) {
+    /*
+     * Recording must not be able to change the outcome of a refusal. The
+     * visitor is being denied either way; a failure here is our telemetry
+     * being broken, and `onSecurityRecordFailure` (wired in
+     * `instrumentation.ts` since wave 9) is what escalates that.
+     */
+    console.error("[portal] could not record refusal", err);
   }
 }
 

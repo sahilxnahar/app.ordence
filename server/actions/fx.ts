@@ -37,7 +37,12 @@ import {
   isKnownCurrency,
   normaliseCurrencyCode,
 } from "@/lib/fx/currency";
-import { describeQuote, formatRateScaled, parseRateToScaled } from "@/lib/fx/rates";
+import {
+  STORABLE_FX_RATE_TYPES,
+  describeQuote,
+  formatRateScaled,
+  parseRateToScaled,
+} from "@/lib/fx/rates";
 import { CLOSING_RATE_WINDOW } from "@/lib/fx/convert";
 import { sumByCurrency, convertBuckets, describeConvertedTotal } from "@/lib/fx/aggregate";
 import {
@@ -48,6 +53,8 @@ import {
   type CurrencyUnitsDivergence,
 } from "@/server/fx/rate-service";
 import { runRevaluation } from "@/server/fx/revaluation-service";
+import { buildFxRevaluationPosting, type FxLeg } from "@/lib/accounting/sales-posting";
+import { postFxRevaluation as writeFxRevaluationJournal } from "@/server/accounting/post-sales";
 
 function fail(error: string, fieldErrors?: Record<string, string[]>): ActionResult<never> {
   return { ok: false, error, fieldErrors };
@@ -302,6 +309,26 @@ const recordRateSchema = z.object({
   /** ⚠️ TEXT, never a number. See `parseRateToScaled`. */
   rate: z.string().trim().min(1, "Enter the rate."),
   rateDate: isoDate,
+  /**
+   * ⭐⭐ WHICH SIDE OF THE SPREAD — 0106, AND THERE IS NO DEFAULT.
+   *
+   * 🔴 A DEFAULT HERE WOULD BE THE WHOLE DEFECT BACK AGAIN. The person
+   * entering a rate is looking at the advice it came from and knows
+   * whether it is the bank's buying rate, its selling rate or a mid off a
+   * feed. Rule 26 computes a s.195 chargeable base from the telegraphic
+   * transfer BUYING rate and from nothing else, so a field that defaulted
+   * to `mid` would produce a rate that is silently ineligible, and a field
+   * that defaulted to `tt_buying` would produce one that is silently
+   * WRONG. 'unstated' is not offered: it records history, not a decision.
+   */
+  rateType: z.enum(STORABLE_FX_RATE_TYPES, {
+    errorMap: () => ({
+      message:
+        "Say which rate this is: the telegraphic transfer buying rate, the selling rate, " +
+        "or a mid rate. They are three different numbers on the same day and tax law names " +
+        "one of them.",
+    }),
+  }),
   sourceReference: z.string().trim().max(300).optional().nullable(),
   note: z.string().trim().max(500).optional().nullable(),
 });
@@ -340,6 +367,10 @@ export async function recordFxRate(
             eq(fxRates.baseCurrency, data.baseCurrency),
             eq(fxRates.quoteCurrency, data.quoteCurrency),
             eq(fxRates.rateDate, data.rateDate),
+            // ⚠️ THE PREVIOUS VALUE IS THE ONE OF THE SAME TYPE. Comparing
+            // a new TT buying rate against the day's mid would make every
+            // first entry look like a change of half a rupee.
+            eq(fxRates.rateType, data.rateType),
           ),
         )
         .limit(1);
@@ -352,6 +383,7 @@ export async function recordFxRate(
         rate: data.rate,
         rateDate: data.rateDate,
         source: "manual",
+        rateType: data.rateType,
         sourceReference: data.sourceReference ?? null,
         note: data.note ?? null,
       });
@@ -368,6 +400,7 @@ export async function recordFxRate(
         pair: `${data.baseCurrency}/${data.quoteCurrency}`,
         rateDate: data.rateDate,
         rate: formatRateScaled(outcome.saved.rateScaled),
+        rateType: data.rateType,
       },
       metadata: auditMeta({
         event: "fx_rate_recorded",
@@ -725,11 +758,27 @@ export async function checkCurrencyUnits(): Promise<
  * figure and its source BEFORE committing to it — rather than discovering
  * at the trial balance which rate the system picked.
  */
+export type ConversionPreview = {
+  found: boolean;
+  description: string | null;
+  rate: string | null;
+  /**
+   * ⭐ THE THREE THINGS THAT MAKE THE NUMBER A RATE, RETURNED SEPARATELY
+   * SO THE SCREEN DOES NOT HAVE TO READ THEM OUT OF A SENTENCE.
+   * `derived` is true when the quote was obtained by inverting a pair
+   * published the other way round — the screen says so.
+   */
+  pair: string | null;
+  rateDate: string | null;
+  source: string | null;
+  derived: boolean;
+};
+
 export async function previewConversion(input: {
   from: string;
   to: string;
   on: string;
-}): Promise<ActionResult<{ found: boolean; description: string | null; rate: string | null }>> {
+}): Promise<ActionResult<ConversionPreview>> {
   try {
     const ctx = await requirePermission("fx:read");
     const parsed = z
@@ -753,6 +802,10 @@ export async function previewConversion(input: {
           found: false,
           description: null,
           rate: null,
+          pair: null,
+          rateDate: null,
+          source: null,
+          derived: false,
         },
       };
     }
@@ -762,6 +815,10 @@ export async function previewConversion(input: {
         found: true,
         description: describeQuote(quote),
         rate: formatRateScaled(quote.rateScaled),
+        pair: `${quote.baseCurrency}/${quote.quoteCurrency}`,
+        rateDate: quote.rateDate,
+        source: quote.source,
+        derived: quote.derived,
       },
     };
   } catch (err) {
@@ -781,6 +838,174 @@ export async function validateRateText(
   try {
     await requirePermission("fx:read");
     return { ok: true, data: { normalised: formatRateScaled(parseRateToScaled(rate)) } };
+  } catch (err) {
+    return toActionError(err);
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* POSTING A RUN — DELIBERATELY NOT PART OF RUNNING IT                 */
+/* ------------------------------------------------------------------ */
+
+export type PostRevaluationResult = {
+  revaluationId: string;
+  posted: boolean;
+  /** Why it did not reach the ledger, when it did not. */
+  reason: string | null;
+};
+
+/**
+ * ⭐⭐ PUT A COMPUTED RESTATEMENT INTO THE LEDGER, AS ITS OWN ACT.
+ *
+ * 🔴 RUNNING AND POSTING ARE TWO DECISIONS AND THIS IS THE SECOND ONE.
+ * `runFxRevaluation` computes the working and records every line,
+ * including the ones it did not restate, and it attempts the journal.
+ * When the attempt is refused — no `fx_gain` / `fx_loss` ledger mapped,
+ * or the reporting date falls in a closed period — the run survives as a
+ * draft with `unposted_reason` saying which, and the sentence it stores
+ * ends "…and post the run". This is that action.
+ *
+ * ⚠️ IT IS IDEMPOTENT BECAUSE THE JOURNAL IS KEYED. `writeFxPosting`
+ * looks for a transaction numbered from the revaluation id and answers
+ * `already_posted` rather than writing a second one, so a double click
+ * cannot double-count an exchange difference.
+ *
+ * ⚠️ THE PER-ITEM CONTROL LEDGER IS NOT PERSISTED ON THE LINE, so the
+ * legs rebuilt here carry no `ledgerIdOverride` and the contra falls to
+ * the role mapping — which is the same mapping whose absence refused the
+ * run's own attempt in the first place. Nothing is guessed: an unmapped
+ * role is refused again, with the roles named.
+ */
+export async function postFxRevaluationRun(
+  revaluationId: string,
+): Promise<ActionResult<PostRevaluationResult>> {
+  try {
+    const ctx = await requirePermission("fx:revalue", {
+      type: "fx_revaluation",
+      id: revaluationId,
+    });
+    const parsed = z.string().uuid("That is not a revaluation.").parse(revaluationId);
+
+    const outcome = await withTenant(ctx.tenant.id, async (tx) => {
+      const [run] = await tx
+        .select({
+          id: fxRevaluations.id,
+          asOfDate: fxRevaluations.asOfDate,
+          functionalCurrency: fxRevaluations.functionalCurrency,
+          status: fxRevaluations.status,
+          transactionId: fxRevaluations.transactionId,
+        })
+        .from(fxRevaluations)
+        .where(and(eq(fxRevaluations.tenantId, ctx.tenant.id), eq(fxRevaluations.id, parsed)))
+        .limit(1);
+
+      if (!run) return { kind: "missing" as const };
+      if (run.transactionId !== null) return { kind: "already" as const };
+      if (run.status === "void") return { kind: "void" as const };
+
+      const lines = await tx
+        .select({
+          itemKind: fxRevaluationLines.itemKind,
+          plEffectMinor: fxRevaluationLines.plEffectMinor,
+          sourceReference: fxRevaluationLines.sourceReference,
+          foreignCurrency: fxRevaluationLines.foreignCurrency,
+          foreignAmountMinor: fxRevaluationLines.foreignAmountMinor,
+          rate: fxRevaluationLines.rate,
+          restated: fxRevaluationLines.restated,
+        })
+        .from(fxRevaluationLines)
+        .where(
+          and(
+            eq(fxRevaluationLines.tenantId, ctx.tenant.id),
+            eq(fxRevaluationLines.revaluationId, parsed),
+          ),
+        );
+
+      const items = lines
+        .filter((l) => l.restated && l.plEffectMinor !== 0n)
+        .map((l) => ({
+          kind: l.itemKind,
+          plEffectMinor: l.plEffectMinor,
+          contraLedgerId: null,
+          description:
+            `${l.sourceReference ?? l.itemKind}: ${l.foreignCurrency} ` +
+            `${formatMinorPlain(l.foreignAmountMinor, l.foreignCurrency)} restated at ` +
+            `${l.rate ?? "no rate"}`,
+        }));
+
+      if (items.length === 0) return { kind: "nothing" as const };
+
+      const legs: FxLeg[] = buildFxRevaluationPosting({ items, asOfDate: run.asOfDate });
+      const written = await writeFxRevaluationJournal(tx, {
+        tenantId: ctx.tenant.id,
+        userId: ctx.user.id,
+        revaluationId: run.id,
+        asOfDate: run.asOfDate,
+        functionalCurrency: run.functionalCurrency,
+        legs,
+      });
+
+      if (!written.posted) return { kind: "refused" as const, outcome: written };
+
+      await tx
+        .update(fxRevaluations)
+        .set({
+          status: "posted",
+          transactionId: written.transactionId,
+          postedAt: new Date(),
+          unpostedReason: null,
+        })
+        .where(and(eq(fxRevaluations.tenantId, ctx.tenant.id), eq(fxRevaluations.id, parsed)));
+
+      return { kind: "posted" as const, transactionId: written.transactionId };
+    });
+
+    if (outcome.kind === "missing") {
+      return fail("That revaluation does not exist in this workspace.");
+    }
+    if (outcome.kind === "void") {
+      return fail("That revaluation has been voided. Run the reporting date again.");
+    }
+    if (outcome.kind === "already") {
+      return fail(
+        "That revaluation is already in the ledger. Posting it again would double-count the " +
+          "exchange difference.",
+      );
+    }
+    if (outcome.kind === "nothing") {
+      return fail(
+        "Nothing to post: no monetary item's closing rate differed from the rate it was " +
+          "carried at, so there is no exchange difference to book.",
+      );
+    }
+    if (outcome.kind === "refused") {
+      const reason =
+        outcome.outcome.reason === "unmapped_roles"
+          ? `Not posted: no ledger is mapped for ${outcome.outcome.missing.join(", ")}. ` +
+            `Map them on the posting-accounts screen, then post the run.`
+          : outcome.outcome.reason === "period_closed"
+            ? `Not posted: that reporting date falls in ${outcome.outcome.period}, which is closed.`
+            : outcome.outcome.reason === "already_posted"
+              ? "A journal already exists for this revaluation."
+              : "Nothing to post.";
+      return fail(reason);
+    }
+
+    await writeAudit(ctx, {
+      action: "update",
+      resourceType: "fx_revaluation",
+      resourceId: parsed,
+      severity: "warning",
+      newValue: { posted: true, transactionId: outcome.transactionId },
+      metadata: auditMeta({
+        event: "fx_revaluation_posted",
+        revaluationId: parsed,
+      }),
+    });
+
+    revalidatePath("/fx");
+    revalidatePath("/accounting");
+    return { ok: true, data: { revaluationId: parsed, posted: true, reason: null } };
   } catch (err) {
     return toActionError(err);
   }

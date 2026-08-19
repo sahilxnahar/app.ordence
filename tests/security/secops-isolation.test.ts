@@ -191,17 +191,76 @@ describe("security_events — tenant isolation", () => {
     expect(rows).toHaveLength(0);
   });
 
-  it("platform scope sees the unattributed events and NOT any tenant's", async () => {
+  it("⭐ platform scope sees the unattributed events AND attributed ones — 0079", async () => {
+    // ══════════════════════════════════════════════════════════════════
+    // ⚠️ THIS TEST USED TO ASSERT `every(tenant_id === null)`.
+    // ══════════════════════════════════════════════════════════════════
+    // It was correct under the 0012 policy and wrong from 0079 onwards,
+    // and it kept asserting the old shape for sixty-seven migrations
+    // because nothing outside CI had ever run this suite.
+    //
+    // 0079_rls_opt_in_and_telemetry.sql, Section 2: the old policy admitted
+    // a row only when the row's tenant equalled the session's tenant, or
+    // BOTH were null. `server/security/record.ts` runs under
+    // `withPlatformScope` — session tenant null — and stamps a REAL tenant
+    // id when the caller is signed in. Neither branch matched, Postgres
+    // raised 42501, and the writer caught it and moved on, by design,
+    // because recording an event must never break the request it describes.
+    //
+    // 🔴 SO `security_events` HELD ANONYMOUS PRE-AUTH ROWS AND NOTHING
+    // ELSE. Every cross-tenant access attempt, every permission denial,
+    // every export burst attributed to a workspace was dropped on the
+    // floor. The SecOps console was green because it was empty, which is
+    // indistinguishable from "nothing has happened" — the same shape as
+    // the ten never-emitted event types that gate 21 now refuses.
+    //
+    // 0079 added `OR app_platform_scope()` to USING and WITH CHECK. The
+    // rows are the platform's observations ABOUT a workspace; the
+    // workspace is the subject, not the author.
+    //
+    // ══════════════════════════════════════════════════════════════════
+    // ⭐ THE CONTROL IS NOT THE POLICY, IT IS THE FLAG
+    // ══════════════════════════════════════════════════════════════════
+    // `app_platform_scope()` is false unless something set
+    // `app.platform_scope`, which only `withPlatformScope(reason, cb)`
+    // does and never without a stated reason. The fail-closed default is
+    // asserted separately: a session with NO context sees zero rows.
     const rows = await asPlatform(async (c) => {
       const { rows } = await c.query(`SELECT id, tenant_id, source FROM security_events`);
-      return rows;
+      return rows as { id: string; tenant_id: string | null }[];
     });
 
-    // Other phases' fixtures may leave orphan rows behind, so assert the
-    // shape rather than an exact count: everything visible is unattributed,
-    // and ours is among them.
-    expect(rows.every((r: { tenant_id: string | null }) => r.tenant_id === null)).toBe(true);
-    expect(rows.some((r: { id: string }) => r.id === fx.eventOrphan)).toBe(true);
+    // Our unattributed perimeter event is visible.
+    expect(rows.some((r) => r.id === fx.eventOrphan)).toBe(true);
+
+    // ⚠️ And so is an attributed one. If this flips to false, 0079 has been
+    // reverted and every tenant-attributed security event is being silently
+    // discarded again — invisible from the application, because the writer
+    // swallows the 42501 on purpose.
+    expect(
+      rows.some((r) => r.tenant_id !== null),
+      "platform scope sees no attributed security events — 0079's policy has " +
+        "been reverted and security history is on the floor",
+    ).toBe(true);
+  });
+
+  it("⭐ a session with NO context sees ZERO events — the fail-closed default", async () => {
+    // This is what makes the platform branch above safe. `withoutTenant`
+    // sets neither a tenant nor the platform flag: it is the shape of a
+    // connection that escaped `withTenant` and `withPlatformScope` both.
+    // It must see the unattributed rows at most, never a tenant's.
+    const attributed = await withoutTenant(async (c) => {
+      const { rows } = await c.query(
+        `SELECT count(*)::int AS n FROM security_events WHERE tenant_id IS NOT NULL`,
+      );
+      return (rows[0] as { n: number }).n;
+    });
+
+    expect(
+      attributed,
+      "a connection with no tenant and no platform scope can read attributed " +
+        "security events — 'no context' has come to mean 'all rows'",
+    ).toBe(0);
   });
 
   it("a tenant CANNOT insert an event stamped with another tenant's id", async () => {

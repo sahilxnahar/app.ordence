@@ -258,7 +258,20 @@ export const MODULE_REGISTRY: Readonly<Record<string, ModuleDescriptor>> =
       label: "Assistant",
       description: "AI assistant for GST, receivables, compliance, and more.",
       group: "home",
-      feature: null,
+      /**
+       * ⭐ WAS `null` UNTIL BATCH 0109, AND `null` MEANS "PART OF WHAT A
+       * WORKSPACE IS, RATHER THAN SOMETHING SOLD".
+       *
+       * The assistant is sold: `ai.copilot` sits at the `ai` tier in
+       * `lib/entitlements/features.ts`. So the menu entry advertised a
+       * paid module to every plan, and `/api/assistant` answered them.
+       *
+       * ⚠️ THIS LINE IS THE MENU, NOT THE GATE. The gate is in
+       * `app/api/assistant/route.ts`, because a hidden link stops nobody
+       * holding a session cookie and every call it forwards costs us
+       * tokens at a third party.
+       */
+      feature: "ai.copilot",
       status: "live",
       href: "/assistant",
     },
@@ -611,6 +624,31 @@ export const MODULE_REGISTRY: Readonly<Record<string, ModuleDescriptor>> =
      * payment engine or charging an estimator for it. See
      * `lib/entitlements/features.ts`.
      */
+    /**
+     * ⭐⭐ WAVE 7 — DRAWINGS, ON THEIR OWN FEATURE KEY.
+     *
+     * 🔴 THIS ENTRY EXISTS BECAUSE TWO TESTS REFUSED THE WAVE WITHOUT IT:
+     *
+     *     "These nav items are not in lib/modules/registry.ts. Until they
+     *      are, they ignore the customer's plan and are shown to
+     *      everyone."
+     *
+     * ⚠️ THAT IS THE WHOLE POINT OF THE REGISTRY and it is easy to miss —
+     * a nav item added to a template renders perfectly, links correctly,
+     * and is simply not gated. The customer on the tier that does not
+     * include drawings sees the menu and a screen that works.
+     */
+    drawings: {
+      navId: "drawings",
+      label: "Drawings",
+      description:
+        "The register: which sheet is current, what it supersedes, and what can be measured off it.",
+      group: "site",
+      feature: "construction.drawings",
+      status: "live",
+      href: "/drawings",
+    },
+
     boq: {
       navId: "boq",
       label: "BOQ",
@@ -1073,6 +1111,31 @@ export const MODULE_REGISTRY: Readonly<Record<string, ModuleDescriptor>> =
       description: "Demands raised, ageing and the dunning ladder.",
       group: "money", feature: "sales.receivables", status: "live", href: "/receivables",
     },
+    /**
+     * ⭐⭐ THE RERA STATUTORY LADDER — v1.67.0.
+     *
+     * 🔴 ITS OWN ENTRY, NOT A TAB UNDER `receivables`. "What is owed and
+     * how late" and "which family is one letter away from losing their
+     * flat" are read by different people, on different days, under
+     * different rights — the second needs
+     * `receivables:warn_cancellation`, which the accountant who reads the
+     * first deliberately does not hold. Filing the ladder inside the
+     * ageing report would bury a statutory process behind a finance
+     * screen and hide it from the person whose decision it is.
+     *
+     * ⚠️ GATED ON `sales.receivables`, THE SAME KEY THE DEMANDS NEED.
+     * A workspace that may raise a demand may see the ladder that chases
+     * it; a workspace that may not has nothing for this screen to show.
+     *
+     * ⚠️ REAL ESTATE ONLY. This is the RERA ladder, ending in a letter
+     * that precedes forfeiting a home deposit.
+     */
+    "dunning-ladder": {
+      navId: "dunning-ladder", label: "Statutory Ladder",
+      description: "Which allottees are due for which rung, and what was served before.",
+      group: "money", feature: "sales.receivables", status: "live", href: "/receivables/ladder",
+      industries: ["real_estate_developer"],
+    },
     statements: {
       navId: "statements", label: "Statements",
       description: "Statement of account, per customer.",
@@ -1097,6 +1160,84 @@ export const MODULE_REGISTRY: Readonly<Record<string, ModuleDescriptor>> =
       feature: "accounting.period_close",
       status: "live",
       href: "/accounting/close",
+    },
+    /**
+     * ⭐⭐ THE FIXED ASSET REGISTER — batch 100.
+     *
+     * 🔴 UNDER `money` AND BESIDE THE LEDGER, because the charge it
+     * produces is a line of the profit and loss account and the person
+     * who runs it is the person who closes the month. Filing it under
+     * `site` with the stock it physically resembles would put a
+     * statutory computation behind a storekeeper's menu.
+     *
+     * ⚠️ GATED ON `accounting.ledger`, THE SAME KEY THE POSTING NEEDS.
+     * Depreciation ends in a journal entry; showing the register to a
+     * workspace that cannot post one would advertise a screen whose
+     * whole purpose is refused at the last step.
+     */
+    "fixed-assets": {
+      navId: "fixed-assets",
+      label: "Fixed Assets",
+      description:
+        "The register, Schedule II depreciation, the section 32 allowance and the difference between them.",
+      group: "money",
+      feature: "accounting.ledger",
+      status: "live",
+      href: "/fixed-assets",
+    },
+    /**
+     * ⭐⭐⭐ BANK RECONCILIATION — REGISTERED IN 0110, AND IT SHOULD HAVE
+     *    BEEN REGISTERED IN 0070.
+     *
+     * ══════════════════════════════════════════════════════════════════
+     * 🔴 `/banking` HAS EXISTED SINCE v1.18.0 WITH NO REGISTRY ENTRY AND
+     *    NO NAV ITEM ANYWHERE
+     * ══════════════════════════════════════════════════════════════════
+     * `0070` built statement import and matching; `0102` built the
+     * reconciliation statement, the sign-off and the lock. Both shipped
+     * with every gate green, because no gate asked whether the screen
+     * could be REACHED. The only routes to it were the URL bar and a
+     * back-link from a page nobody could reach either.
+     *
+     * ⚠️ AND WITH NO REGISTRY ENTRY IT WOULD IGNORE THE CUSTOMER'S PLAN
+     *    ENTIRELY, which is defect number three on this codebase's list:
+     *    34 of 71 entitlement keys built and never gated.
+     *
+     * ⭐ GATED ON `accounting.ledger`, THE SAME KEY THE POSTING NEEDS,
+     *    and for the same reason `fixed-assets` is. A reconciliation ends
+     *    in a journal — the bank charge written up from the statement —
+     *    so showing this to a workspace that cannot post one would
+     *    advertise a screen whose central button is refused at the last
+     *    step. A `banking.*` key of its own would be the right answer and
+     *    `lib/entitlements/features.ts` is not this batch's to change.
+     */
+    banking: {
+      navId: "banking",
+      label: "Bank Reconciliation",
+      description:
+        "Import the bank statement, explain every line against the books, and sign the reconciliation off on a date after which the month stops moving.",
+      group: "money",
+      feature: "accounting.ledger",
+      status: "live",
+      href: "/banking",
+    },
+    /**
+     * ⭐ THE REGISTER THE RECONCILIATION SCREEN FEEDS — 0110.
+     *
+     * ⚠️ A SEPARATE ENTRY RATHER THAN A SUB-PAGE OF `banking`, because it
+     * is opened by a different person at a different time: the
+     * reconciliation is worked during the month and this is read when the
+     * return is filed.
+     */
+    "bank-charge-itc": {
+      navId: "bank-charge-itc",
+      label: "Bank Charge Credit",
+      description:
+        "Bank charges are posted gross because the bank's tax invoice arrives separately. This is the input credit that is therefore not claimed yet, per tax period, with the invoice recorded against each charge.",
+      group: "money",
+      feature: "accounting.ledger",
+      status: "live",
+      href: "/banking/input-credit",
     },
     /**
      * ⭐ UNDER `money`, BESIDE RATES. A price check is opened while
@@ -1193,6 +1334,53 @@ export const MODULE_REGISTRY: Readonly<Record<string, ModuleDescriptor>> =
       navId: "tds", label: "TDS",
       description: "Deductions, challans and quarterly returns.",
       group: "money", feature: "tds.deductions", status: "live", href: "/tds",
+    },
+    /**
+     * ⭐⭐⭐ RECORDING A DEDUCTION — WAVE ONE, AND IT IS ITS OWN ENTRY.
+     *
+     * ══════════════════════════════════════════════════════════════════
+     * 🔴 `recordDeduction` HELD THE ONLY INSERT INTO `tds_deductions` AND
+     *    NOTHING CALLED IT
+     * ══════════════════════════════════════════════════════════════════
+     * `/tds` imports three reads. The register could never receive a row,
+     * so the interest exposure could only report zero, Form 26Q could
+     * only be empty and Form 16A could only be empty — and every one of
+     * those screens rendered correctly. An empty TDS register reads as
+     * "nothing owed".
+     *
+     * ⚠️ ITS OWN ENTRY RATHER THAN A TAB UNDER `tds`, because it is the
+     * one thing here that is done BEFORE a payment rather than after a
+     * quarter. The register, the challans and the return are all read by
+     * somebody closing a period; this is used by whoever is about to
+     * transfer money, and burying it two clicks inside a compliance
+     * screen is most of why nobody noticed it was missing.
+     *
+     * ⚠️ GATED ON `tds.deductions`, the same key the register uses. A
+     * workspace that may not see the register has nothing to record into.
+     */
+    "tds-deduct": {
+      navId: "tds-deduct", label: "Record a deduction",
+      description: "Ask what comes off a payment before it is made, then record what was withheld.",
+      group: "money", feature: "tds.deductions", status: "live", href: "/tds/deduct",
+    },
+    /**
+     * ⭐⭐ MULTI-CURRENCY AND FX — v1.65.0-alpha, batch 0101.
+     *
+     * ⚠️ GATED ON `accounting.ledger` RATHER THAN ON A GATE OF ITS OWN.
+     * The restatement this screen runs posts a double-entry journal, so a
+     * workspace without the ledger has nowhere for an exchange difference
+     * to land. One gate for the capability and its consequence, rather
+     * than two that can disagree.
+     */
+    fx: {
+      navId: "fx",
+      label: "Currency & FX",
+      description:
+        "Exchange rates with a direction, a date and a source; exposure by currency; and the reporting-date restatement under AS 11 / Ind AS 21.",
+      group: "money",
+      feature: "accounting.ledger",
+      status: "live",
+      href: "/fx",
     },
     /**
      * ⭐⭐⭐ WHAT IS DUE — v1.24.0-alpha, batch 16.

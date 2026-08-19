@@ -329,12 +329,43 @@ export default function ReceivablesPage() {
             What is owed, how late it is, and who to chase.
           </p>
         </div>
-        <Link
-          href="/settings/financial"
-          className="text-sm text-muted-foreground hover:underline"
-        >
-          Dunning settings
-        </Link>
+        <div className="flex items-center gap-4">
+          {/*
+            ⭐ THE LADDER IS LINKED FROM THE PAGE THE ARREARS ARE READ ON,
+            NOT ONLY FROM THE SIDEBAR. Whoever reads "in arrears" is the
+            person who then asks "so who do I chase, and how far up the
+            ladder are they" — and the answer used to be a screen that
+            did not exist. A sidebar-only route is one collapsed menu
+            away from being unreachable again.
+          */}
+          <Link
+            href="/receivables/ladder"
+            className="text-sm text-muted-foreground hover:underline"
+          >
+            Statutory ladder
+          </Link>
+          {/*
+            ⭐ WAVE 10 — REPOINTED. This said "Dunning settings" and went
+            to `/settings/financial`, which is a different screen about
+            different things. The interest policy and the dunning ladder ,
+            the two settings that decide every number on every demand
+            notice and the morning each letter leaves , had no screen at
+            all, and `getReceivableSettings`, `saveReceivablePolicy` and
+            `saveDunningPolicy` had no caller.
+          */}
+          <Link
+            href="/receivables/settings"
+            className="text-sm text-muted-foreground hover:underline"
+          >
+            Interest and dunning settings
+          </Link>
+          <Link
+            href="/settings/financial"
+            className="text-sm text-muted-foreground hover:underline"
+          >
+            Financial settings
+          </Link>
+        </div>
       </header>
 
       <Suspense fallback={<Skeleton />}>

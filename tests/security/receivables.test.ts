@@ -282,8 +282,10 @@ beforeAll(async () => {
     /* --- A ladder on B's demand, so isolation has something to hide. */
     await c.query(
       `INSERT INTO dunning_events
-         (tenant_id, demand_id, stage, rung, channel, days_overdue, outstanding_minor)
-       VALUES ($1,$2,'reminder',1,'email',5,$3)`,
+         (tenant_id, demand_id, stage, rung, channel, days_overdue, outstanding_minor,
+          raised_at, authorised_permission)
+       VALUES ($1,$2,'reminder',1,'email',5,$3, TIMESTAMPTZ '2026-02-01 10:00+05:30',
+               'receivables:dun')`,
       [tenantB, demandB1, R(7_50_000).toString()],
     );
 
@@ -1493,8 +1495,10 @@ describe("⭐⭐ the database refuses a skipped rung too", () => {
       asTenant(tenantA, async (c) => {
         await c.query(
           `INSERT INTO dunning_events
-             (tenant_id, demand_id, stage, rung, channel, days_overdue, outstanding_minor)
-           VALUES ($1,$2,'final_notice',3,'email',45,100000)`,
+             (tenant_id, demand_id, stage, rung, channel, days_overdue, outstanding_minor,
+              raised_at, authorised_permission)
+           VALUES ($1,$2,'final_notice',3,'email',45,100000,
+                   TIMESTAMPTZ '2026-03-01 10:00+05:30','receivables:dun')`,
           [tenantA, demandA1],
         );
       }),
@@ -1507,14 +1511,18 @@ describe("⭐⭐ the database refuses a skipped rung too", () => {
     await asTenant(tenantA, async (c) => {
       await c.query(
         `INSERT INTO dunning_events
-           (tenant_id, demand_id, stage, rung, channel, days_overdue, outstanding_minor, sent_at)
-         VALUES ($1,$2,'reminder',1,'whatsapp',3,100000, TIMESTAMPTZ '2026-01-30 10:00+05:30')`,
+           (tenant_id, demand_id, stage, rung, channel, days_overdue, outstanding_minor,
+            raised_at, authorised_permission)
+         VALUES ($1,$2,'reminder',1,'whatsapp',3,100000, TIMESTAMPTZ '2026-01-30 10:00+05:30',
+                 'receivables:dun')`,
         [tenantA, demandA2],
       );
       await c.query(
         `INSERT INTO dunning_events
-           (tenant_id, demand_id, stage, rung, channel, days_overdue, outstanding_minor, sent_at)
-         VALUES ($1,$2,'first_notice',2,'email',15,100000, TIMESTAMPTZ '2026-03-14 10:00+05:30')`,
+           (tenant_id, demand_id, stage, rung, channel, days_overdue, outstanding_minor,
+            raised_at, authorised_permission)
+         VALUES ($1,$2,'first_notice',2,'email',15,100000, TIMESTAMPTZ '2026-03-14 10:00+05:30',
+                 'receivables:dun')`,
         [tenantA, demandA2],
       );
     });
@@ -1534,9 +1542,10 @@ describe("⭐⭐ the database refuses a skipped rung too", () => {
       asTenant(tenantA, async (c) => {
         await c.query(
           `INSERT INTO dunning_events
-             (tenant_id, demand_id, stage, rung, channel, days_overdue, outstanding_minor, sent_at)
+             (tenant_id, demand_id, stage, rung, channel, days_overdue, outstanding_minor,
+              raised_at, authorised_permission)
            VALUES ($1,$2,'final_notice',3,'courier',30,100000,
-                   TIMESTAMPTZ '2026-02-01 10:00+05:30')`,
+                   TIMESTAMPTZ '2026-02-01 10:00+05:30','receivables:dun')`,
           [tenantA, demandA2],
         );
       }),
@@ -1545,14 +1554,94 @@ describe("⭐⭐ the database refuses a skipped rung too", () => {
     expect(error?.message).toContain("out of order");
   });
 
+  it("⭐ the chronology check reads raised_at, because 0098 emptied sent_at", async () => {
+    // ══════════════════════════════════════════════════════════════════
+    // 🔴 THIS TEST EXISTS BECAUSE THE CHECK ABOVE HAD STOPPED FIRING.
+    // ══════════════════════════════════════════════════════════════════
+    // 0027 §6 compared `sent_at`. 0098 then made `sent_at` NULL on every
+    // new row on purpose — "an INSERT can no longer carry a send timestamp
+    // at all" — because a send timestamp is not evidence that a family
+    // ever received the notice their allotment is about to be cancelled
+    // over. Correct decision, and it left the comparison reading an empty
+    // column: NULL < anything is NULL, so the IF was never taken, and the
+    // insert succeeded silently.
+    //
+    // ⚠️ THE OLD TEST PASSED THROUGHOUT, because it supplied `sent_at` on
+    // the INSERT — a statement the product itself can no longer make,
+    // since `dunning_events_sent_at_is_not_a_claim` refuses `sent_at` on a
+    // row whose service_evidence is still 'none'. A fixture that the
+    // product cannot reproduce proves nothing about the product.
+    //
+    // 0123 orders on coalesce(sent_at, served_at, dispatched_at,
+    // raised_at). This asserts the half that matters: a row with ONLY
+    // raised_at, which is what every real insert looks like now.
+    // ══════════════════════════════════════════════════════════════════
+
+    // First: the shape the old fixture used is refused by the database, so
+    // nobody can quietly restore it.
+    const sentAtRefused = await expectError(() =>
+      asTenant(tenantA, (c) =>
+        c.query(
+          `INSERT INTO dunning_events
+             (tenant_id, demand_id, stage, rung, channel, days_overdue, outstanding_minor,
+              sent_at, raised_at, authorised_permission)
+           VALUES ($1,$2,'reminder',1,'email',3,100000,
+                   TIMESTAMPTZ '2026-06-01 10:00+05:30',
+                   TIMESTAMPTZ '2026-06-01 10:00+05:30','receivables:dun')`,
+          [tenantA, demandA3],
+        ),
+      ),
+    );
+    expect(
+      sentAtRefused,
+      "an INSERT carrying sent_at was accepted — 0098's constraint is gone and " +
+        "a send timestamp can again masquerade as proof of service",
+    ).not.toBeNull();
+
+    // Then: a rung raised BEFORE the rung below it is refused on raised_at
+    // alone, with no sent_at anywhere in the picture.
+    await asTenant(tenantA, (c) =>
+      c.query(
+        `INSERT INTO dunning_events
+           (tenant_id, demand_id, stage, rung, channel, days_overdue, outstanding_minor,
+            raised_at, authorised_permission)
+         VALUES ($1,$2,'reminder',1,'email',3,100000,
+                 TIMESTAMPTZ '2026-06-01 10:00+05:30','receivables:dun')`,
+        [tenantA, demandA3],
+      ),
+    );
+
+    const backwards = await expectError(() =>
+      asTenant(tenantA, (c) =>
+        c.query(
+          `INSERT INTO dunning_events
+             (tenant_id, demand_id, stage, rung, channel, days_overdue, outstanding_minor,
+              raised_at, authorised_permission)
+           VALUES ($1,$2,'first_notice',2,'email',15,100000,
+                   TIMESTAMPTZ '2026-05-01 10:00+05:30','receivables:dun')`,
+          [tenantA, demandA3],
+        ),
+      ),
+    );
+
+    expect(
+      backwards,
+      "a first notice raised a month BEFORE the reminder was accepted — the " +
+        "ladder can be reconstructed after the event and the bundle produced " +
+        "at a hearing will show it",
+    ).not.toBeNull();
+    expect(backwards!.message).toContain("out of order");
+  });
+
   it("⭐⭐ a cancellation warning with nobody named behind it is REFUSED by the database", async () => {
     // Climb to the top first, properly.
     await asTenant(tenantA, async (c) => {
       await c.query(
         `INSERT INTO dunning_events
-           (tenant_id, demand_id, stage, rung, channel, days_overdue, outstanding_minor, sent_at)
+           (tenant_id, demand_id, stage, rung, channel, days_overdue, outstanding_minor,
+            raised_at, authorised_permission)
          VALUES ($1,$2,'final_notice',3,'courier',30,100000,
-                 TIMESTAMPTZ '2026-04-01 10:00+05:30')`,
+                 TIMESTAMPTZ '2026-04-01 10:00+05:30','receivables:dun')`,
         [tenantA, demandA2],
       );
     });
@@ -1561,9 +1650,10 @@ describe("⭐⭐ the database refuses a skipped rung too", () => {
       asTenant(tenantA, async (c) => {
         await c.query(
           `INSERT INTO dunning_events
-             (tenant_id, demand_id, stage, rung, channel, days_overdue, outstanding_minor, sent_at)
+             (tenant_id, demand_id, stage, rung, channel, days_overdue, outstanding_minor,
+              raised_at, authorised_permission)
            VALUES ($1,$2,'cancellation_warning',4,'post',60,100000,
-                   TIMESTAMPTZ '2026-05-01 10:00+05:30')`,
+                   TIMESTAMPTZ '2026-05-01 10:00+05:30','receivables:warn_cancellation')`,
           [tenantA, demandA2],
         );
       }),
@@ -1575,10 +1665,11 @@ describe("⭐⭐ the database refuses a skipped rung too", () => {
       await c.query(
         `INSERT INTO dunning_events
            (tenant_id, demand_id, stage, rung, channel, days_overdue, outstanding_minor,
-            sent_at, authorised_by, authorised_reason)
+            raised_at, authorised_by, authorised_reason, authorised_permission)
          VALUES ($1,$2,'cancellation_warning',4,'post',60,100000,
                  TIMESTAMPTZ '2026-05-01 10:00+05:30', $3,
-                 'No contact after three letters; approved by counsel.')`,
+                 'No contact after three letters; approved by counsel.',
+                 'receivables:warn_cancellation')`,
         [tenantA, demandA2, userA],
       );
     });

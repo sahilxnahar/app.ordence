@@ -976,6 +976,54 @@ export const dunningEvents = pgTable(
     /** Speed post / RPAD consignment or courier AWB. Required by CHECK. */
     serviceReference: varchar("service_reference", { length: 120 }),
 
+    /**
+     * ⭐⭐ 0111. THE CLAUSE OR SECTION RELIED ON WHEN SERVICE IS DEEMED.
+     *
+     * 🔴 `deemed` HAD NO WRITER AT ALL BEFORE 0111. It was on the grade
+     * list, described with `strength: 3` — the strongest in the product —
+     * and `supportsEnforcement: true`, so `noticeHasService` would have
+     * cleared a cancellation on it, and nothing anywhere could produce
+     * one. Wiring it needed this column, because the difference between
+     * lawful deemed service and a tick box at the top of the scale IS the
+     * stated basis. `dunning_events_deemed_states_its_basis` requires it.
+     *
+     * ⚠️ THE TEXT IS NOT VALIDATED AND MUST NOT BE. A refused RPAD, a
+     * "not claimed" endorsement and a delivery to the address named in
+     * the agreement are three different arguments citing three different
+     * things, and a regex over them would refuse the real ones.
+     */
+    serviceBasis: varchar("service_basis", { length: 400 }),
+
+    /**
+     * ⭐⭐⭐ 0111. THE RIGHT THIS RUNG WAS RAISED UNDER.
+     *
+     * ══════════════════════════════════════════════════════════════════
+     * 🔴 WHY IT IS ON THE NOTICE AND NOT ONLY IN THE AUDIT LOG
+     * ══════════════════════════════════════════════════════════════════
+     * This table's own opening sentence says what it is for: "what was
+     * sent, when, through what channel, AND ON WHOSE AUTHORITY". Until
+     * 0111 it recorded the authority for exactly one rung —
+     * `authorised_by` on a cancellation warning — and nothing at all for
+     * the other three. The audit log knew, and the audit log is a
+     * different table with a different retention that does not travel
+     * with the evidence bundle a developer prints for an Authority.
+     *
+     * ⭐ NOT NULL WITH NO DEFAULT, DELIBERATELY. 0111 adds it with
+     * `DEFAULT 'legacy_unrecorded'`, which fills every pre-existing row
+     * at DDL time without an UPDATE — the trick 0098 used and for the
+     * same reason — and then DROPS the default. So a row written from now
+     * on must state its authority explicitly or Postgres refuses the
+     * insert. A writer that forgets does not produce an unattributed
+     * notice; it produces an error.
+     *
+     * ⚠️ AND A CHECK TIES THE KEY TO THE RUNG. A cancellation warning
+     * claiming it was raised under `receivables:dun` is refused by the
+     * database, so the per-rung permission is a fact about the row rather
+     * than a promise made by one server action.
+     * See `lib/receivables/notice-authority.ts`.
+     */
+    authorisedPermission: varchar("authorised_permission", { length: 60 }).notNull(),
+
     /** Days past due at the moment it was sent. Frozen; never recomputed. */
     daysOverdue: integer("days_overdue").notNull(),
     outstandingMinor: bigint("outstanding_minor", { mode: "bigint" }).notNull(),
@@ -1084,6 +1132,58 @@ export const dunningEvents = pgTable(
           OR (${t.dispatchedAt} IS NULL
               AND ${t.dispatchProviderMessageId} IS NULL
               AND ${t.servedAt} IS NULL)`,
+    ),
+
+    /* ---- 🔴🔴 0111 · THE STRONGEST GRADE, AND WHO MAY RAISE ------ */
+
+    /**
+     * ⭐⭐ THE CONSTRAINT THAT MADE `deemed` SAFE TO WIRE.
+     *
+     * ⚠️ IT IS THE SAME SHAPE AS `human_recorded_names_a_person` AND ONE
+     * FIELD STRICTER. `deemed` outranks every other grade — it is
+     * `strength: 3` and it clears the cancellation gate — and it is the
+     * only grade no machine ever touches. So it names the person, carries
+     * a reference somebody can look up, states in words which clause or
+     * section makes it good service, and says when. Take any one of those
+     * away and what is left is a tick box at the top of the evidence
+     * scale, which is worse than the defect 0098 removed.
+     */
+    deemedStatesItsBasis: check(
+      "dunning_events_deemed_states_its_basis",
+      sql`${t.serviceEvidence} <> 'deemed'
+          OR (${t.serviceRecordedBy} IS NOT NULL
+              AND ${t.serviceRecordedAt} IS NOT NULL
+              AND ${t.servedAt} IS NOT NULL
+              AND btrim(coalesce(${t.serviceReference}, '')) <> ''
+              AND btrim(coalesce(${t.serviceBasis}, '')) <> '')`,
+    ),
+
+    /**
+     * 🔴🔴 THE PER-RUNG PERMISSION, AS A FACT ABOUT THE ROW.
+     *
+     * ⚠️ THE RULE ALREADY EXISTED IN ONE SERVER ACTION, AND ONE SERVER
+     * ACTION IS NOT WHERE ROWS COME FROM. A back-fill of a year's
+     * collection history, an import from a spreadsheet, a future second
+     * write path — none of them come through `sendDunningNotice`, and
+     * every one of them is a route by which a cancellation warning could
+     * be recorded as ordinary chasing work. The ladder itself is enforced
+     * in three places for exactly this reason (SQL 0027 §6); its
+     * authority now is too.
+     *
+     * ⭐ `legacy_unrecorded` IS PERMITTED FOR ANY RUNG because it is what
+     * the ADD COLUMN stamped onto three years of history. It is not a
+     * hole: it asserts nothing, `cancellationServiceFinding` names every
+     * rung carrying it, and no new row can be written with it — new rows
+     * must supply the column and any value other than the right one for
+     * their rung is refused here.
+     */
+    authorityMatchesRung: check(
+      "dunning_events_authority_matches_rung",
+      sql`${t.authorisedPermission} = 'legacy_unrecorded'
+          OR (${t.stage} = 'cancellation_warning'
+              AND ${t.authorisedPermission} = 'receivables:warn_cancellation')
+          OR (${t.stage} <> 'cancellation_warning'
+              AND ${t.authorisedPermission} = 'receivables:dun')`,
     ),
   }),
 );

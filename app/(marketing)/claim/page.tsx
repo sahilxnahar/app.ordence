@@ -1,51 +1,58 @@
 /**
- * Ordence — "Choose your address" (PLACEHOLDER HOST)
- * Version: v1.57.0-alpha
+ * Ordence — "Choose your address" (self-serve signup, step 1)
+ * Version: v1.65.0-alpha (Brief A)
  *
  * ══════════════════════════════════════════════════════════════════════
- * ⚠️ THIS PAGE IS A HOST, NOT A SIGNUP FLOW.
+ * ⭐ THIS IS NO LONGER A PLACEHOLDER. Continue creates the workspace.
  * ══════════════════════════════════════════════════════════════════════
- * The real self-serve funnel does not exist yet. Signup today is Clerk's
- * `<SignUp />` at `/sign-up`, and workspace creation is Clerk's
- * `<CreateOrganization>` at `/onboarding`; neither of them asks for a
- * subdomain, because provisioning currently derives one. This page exists
- * so that `ClaimSubdomain` is mounted, reachable and testable in a real
- * browser at a real URL rather than only in somebody's head.
+ * The flow, end to end:
  *
- * 🔴 THE CONTINUE BUTTON HAS NO DESTINATION YET, AND THAT IS STATED ON
- *    SCREEN RATHER THAN HIDDEN. A button that silently does nothing is
- *    how a placeholder becomes a bug report. When the funnel lands, the
- *    step that owns it should render `<ClaimSubdomain>` with `onContinue`
- *    (or its own client wrapper around a server action) and pass the
- *    claim path's refusal back in through `serverRejection` — see the
- *    `ClaimRejection` type, which deliberately carries the slug it is
- *    about so the banner can never accuse a different name.
+ *   /sign-up  →  Clerk creates the person
+ *   /claim    →  the person chooses an address, and the CLERK ORGANISATION
+ *                IS CREATED CARRYING IT as its slug
+ *   webhook   →  `organization.created` provisions the `tenants` row with
+ *                that address (or the next one the database will grant)
+ *   redirect  →  `https://<slug>.ordence.com/dashboard`
+ *
+ * 🔴 THE ADDRESS IS CHOSEN BEFORE THE ORGANISATION EXISTS, NOT AFTER, and
+ *    the argument is written out in `server/actions/claim.ts`. In one
+ *    sentence: the webhook is the sole writer and it is delivered
+ *    asynchronously, so an address chosen afterwards is a RENAME of a
+ *    thirty-second-old workspace — which races the writer and spends 365
+ *    days of 0091's retention on a name nobody ever used.
  *
  * ══════════════════════════════════════════════════════════════════════
  * 🔴 A SERVER COMPONENT MAY NOT CALL A CLIENT HOOK.
  * ══════════════════════════════════════════════════════════════════════
- * This file has no `"use client"`, so it may render `<ClaimSubdomain>`
- * but may not define a wrapper that calls anything the component uses.
- * A function declared in a server module is server code wherever the hook
- * it calls lives — that mistake in `app/layout.tsx` returned 500 for
- * every route in the product while the build and every gate stayed green.
- * `scripts/check-client-hooks.mjs` is the cheap static check for it.
+ * This file still has no `"use client"`, and that has not changed because
+ * the problem has not changed: a function declared in a server module is
+ * server code wherever the hook it calls lives, and it cannot be handed
+ * `onContinue` either, because a function prop is not serialisable across
+ * the boundary. That is why the button was inert.
  *
- * It also cannot pass `onContinue`: a function prop is not serialisable
- * across the server/client boundary. That is the other reason the button
- * is inert here rather than wired to a stub.
+ * ⭐ THE FIX IS A SEPARATE FILE, NOT A MOVED ONE.
+ *    `components/signup/claim-workspace.tsx` carries the `"use client"`
+ *    directive, owns the hooks and the server-action calls, and renders
+ *    `<ClaimSubdomain>` with a real `onContinue`. This page composes it.
+ *    `scripts/check-client-hooks.mjs` is the cheap static check that the
+ *    boundary stayed where it is.
+ *
+ * ⚠️ NOT ON `isPublicRoute` IN `middleware.ts`, AND THAT IS DELIBERATE.
+ *    The Clerk organisation is created for a specific person, so this step
+ *    needs a session. A signed-out visitor is sent to `/sign-in` with
+ *    `redirect_url=/claim` and arrives back here afterwards.
  */
 
 import type { Metadata } from "next";
 
-import { ClaimSubdomain } from "@/components/signup/claim-subdomain";
+import { ClaimWorkspace } from "@/components/signup/claim-workspace";
 
 export const metadata: Metadata = {
   title: "Choose your Ordence address",
   /**
-   * ⚠️ NOINDEX, matching the root layout. This is an unfinished surface,
-   * and an indexed placeholder is a support ticket from somebody who
-   * found it in a search result.
+   * ⚠️ NOINDEX, matching the root layout. A signup step behind a session
+   * has nothing to offer a search result, and an indexed one is a support
+   * ticket from somebody who found it and could not use it.
    */
   robots: { index: false, follow: false },
 };
@@ -66,12 +73,7 @@ export default function ClaimPage() {
         </p>
       </header>
 
-      <ClaimSubdomain />
-
-      <p className="rounded-md border border-dashed border-border px-3 py-2 text-xs text-muted-foreground">
-        Placeholder screen. Continue is not wired to anything yet — the self-serve signup flow
-        that owns this step has not shipped.
-      </p>
+      <ClaimWorkspace />
     </main>
   );
 }

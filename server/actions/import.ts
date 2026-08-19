@@ -83,6 +83,7 @@ import {
   isImportEntityKey,
   openingBatchKey,
   planImport,
+  planImportRecords,
   type ImportEntityDefinition,
   type ImportLookup,
   type ImportNaturalKey,
@@ -92,6 +93,37 @@ import {
 } from "@/lib/import";
 import type { TenantContext } from "@/server/tenant-context";
 import type { ActionResult } from "@/lib/validators/crm";
+import { IMPORT_SOURCE_FORMATS } from "@/lib/import/sources";
+/**
+ * ⭐⭐⭐ WAVE 6 — THE MIGRATION ENGINE'S OWN PIECES.
+ *
+ * ⚠️ EVERY ONE OF THESE IS PURE OR SERVER-SCOPED, AND NONE OF THEM
+ * REPLACES ANYTHING ABOVE. The one-shot import that predates wave 6 is
+ * untouched; these add a run around it.
+ */
+import {
+  proposeMapping,
+  mayAutoCommit,
+  parseAutoCommitPolicy,
+  type AutoCommitPolicy,
+  type AutoCommitVerdict,
+  type MappingProposal,
+} from "@/lib/import/proposal";
+import { EVIDENCE_SAMPLE_ROWS } from "@/lib/import/shapes";
+import { MAX_IMPORT_ROWS } from "@/lib/import/plan";
+import {
+  proposeMappingWithAi,
+  type AiMappingOutcome,
+} from "@/server/import/ai-mapper";
+import { recordProposal } from "@/server/import/proposals";
+import { recordChunk } from "@/server/import/runs";
+import {
+  startImportRun,
+  finishImportRun,
+  listImportRuns,
+  type FinishResult,
+  type ImportRunView,
+} from "@/server/import/runs";
 
 /* ------------------------------------------------------------------ */
 /* INPUT                                                               */
@@ -109,20 +141,72 @@ import type { ActionResult } from "@/lib/validators/crm";
  * unable to submit until a radio is ticked, which is exactly the
  * behaviour wanted.
  */
-const importInputSchema = z.object({
-  entity: z.string().min(1),
+const importInputSchema = z
+  .object({
+    entity: z.string().min(1),
+    /**
+     * The file contents as text. Read in the browser with `File.text()`
+     * rather than uploaded as multipart, because the wizard needs the same
+     * string to build the failed-rows download and re-run a preview without
+     * a second round trip.
+     *
+     * ⚠️ OPTIONAL SINCE WAVE 6, AND ONLY BECAUSE `records` EXISTS. Every
+     * caller that predates wave 6 still sends it and is unchanged.
+     */
+    csvText: z.string().optional(),
+    /**
+     * ⭐⭐⭐ WAVE 6 — THE ROW STREAM, WHEN THE SOURCE WAS NOT CSV.
+     *
+     * `lib/import/sources/` reads Excel, JSON and Tally XML into exactly
+     * the shape `parseCsv` produces, IN THE BROWSER, because every reader
+     * in that directory is pure. What arrives here is therefore the same
+     * records a CSV would have produced, and `planImportRecords` cannot
+     * tell the difference — which is the entire cost of supporting every
+     * input format.
+     *
+     * 🔴 SENT AS RECORDS RATHER THAN RE-SERIALISED TO CSV. Round-tripping
+     * a spreadsheet back through CSV text to reuse the old entry point
+     * would put every CSV ambiguity — quoting, embedded newlines, the
+     * formula guard — between the customer's file and the importer, for
+     * data that had already been read correctly.
+     */
+    records: z
+      .array(
+        z.object({
+          recordNumber: z.number().int().nonnegative(),
+          cells: z.array(z.string()),
+        }),
+      )
+      .optional(),
+    /** Which reader produced the records. Recorded on the run. */
+    sourceFormat: z.enum(IMPORT_SOURCE_FORMATS).optional(),
+    sourceName: z.string().max(255).optional(),
+    sourceSheet: z.string().max(120).optional(),
+    /**
+     * ⭐ WAVE 6 — WHICH CHUNK OF WHICH MIGRATION THIS IS.
+     *
+     * Absent for an ordinary one-shot upload, which is still the common
+     * case and still behaves exactly as it did.
+     */
+    run: z
+      .object({
+        id: z.string().uuid(),
+        chunkIndex: z.number().int().nonnegative(),
+      })
+      .optional(),
+    duplicateMode: z.enum(["skip", "update", "fail"], {
+      required_error: "Choose what should happen to records that already exist.",
+      invalid_type_error: "Choose what should happen to records that already exist.",
+    }),
+  })
   /**
-   * The file contents as text. Read in the browser with `File.text()`
-   * rather than uploaded as multipart, because the wizard needs the same
-   * string to build the failed-rows download and re-run a preview without
-   * a second round trip.
+   * ⚠️ EXACTLY ONE OF THE TWO. Accepting both and preferring one is how a
+   * caller ends up importing the file it did not mean to, with nothing
+   * saying which was used.
    */
-  csvText: z.string(),
-  duplicateMode: z.enum(["skip", "update", "fail"], {
-    required_error: "Choose what should happen to records that already exist.",
-    invalid_type_error: "Choose what should happen to records that already exist.",
-  }),
-});
+  .refine((v) => Boolean(v.csvText) !== Boolean(v.records), {
+    message: "An import needs either the file's text or its parsed rows, and not both.",
+  });
 
 export type ImportInput = z.input<typeof importInputSchema>;
 
@@ -767,10 +851,20 @@ async function runImport(
 
     /*
      * ⭐ THE SHARED LINE. Preview and commit both get their entire idea
-     * of what is in the file from here, and `planImport` takes no
+     * of what is in the file from here, and neither planner takes an
      * argument that could make it behave differently for one of them.
+     *
+     * ⚠️ THE BRANCH IS OVER WHERE THE ROWS CAME FROM AND NOTHING ELSE.
+     * `planImport` parses CSV text and then calls `planImportRecords`;
+     * a spreadsheet, a JSON export and a Tally day book have already been
+     * turned into records by `lib/import/sources/` in the browser. From
+     * this line down there is one code path for every format, which is
+     * what stops "we support Excel" from becoming a second importer with
+     * its own bugs.
      */
-    const plan = planImport(entity, params.csvText);
+    const plan = params.records
+      ? planImportRecords(entity, params.records)
+      : planImport(entity, params.csvText ?? "");
 
     if (plan.fatal) {
       return {
@@ -950,7 +1044,52 @@ async function runImport(
       revalidatePath(REVALIDATE_AFTER[entity.table]);
     }
 
-    return { ok: true, data: report };
+    /*
+     * ══════════════════════════════════════════════════════════════
+     * ⭐⭐⭐ WAVE 6 — THIS CHUNK, RECORDED AGAINST ITS RUN
+     * ══════════════════════════════════════════════════════════════
+     * ⚠️ AFTER THE WRITES AND BEFORE THE RETURN, and only on a commit.
+     * A preview writes nothing and must not move a run's totals.
+     *
+     * 🔴 AND IT IS ALLOWED TO SAY "already done". `recordChunk` inserts
+     * against a unique index on (run, chunk) rather than checking first,
+     * because a chunk that timed out has often already committed and the
+     * browser cannot tell "never arrived" from "arrived and the answer
+     * was lost". The insert losing that race is the correct outcome and
+     * the note says so.
+     *
+     * ⚠️ A FAILURE HERE DOES NOT DISCARD THE REPORT. The rows are already
+     * written; refusing to hand back the report to protect a counter
+     * would leave the customer with no idea what happened to them. The
+     * run's totals are recomputed from the chunk table on every
+     * subsequent chunk, so one lost record self-corrects — and the run
+     * still refuses to call itself completed if it does not.
+     */
+    let chunkNote: string | null = null;
+    if (mode === "commit" && params.run) {
+      try {
+        const outcome = await recordChunk({
+          tenantId: ctx.tenant.id,
+          runId: params.run.id,
+          chunkIndex: params.run.chunkIndex,
+          rowCount: report.totalRows,
+          outcome: {
+            rowsWritten: report.counts.create + report.counts.update,
+            rowsSkipped: report.counts.skip,
+            rowsFailed: report.counts.error,
+          },
+        });
+        chunkNote = outcome.note ?? null;
+      } catch (chunkFailure) {
+        console.error("[import:recordChunk]", chunkFailure);
+        chunkNote =
+          "This part was imported and Ordence could not update the migration's running total. " +
+          "The total is recalculated from the parts on the next one, so this corrects itself — " +
+          "and if it does not, the migration will refuse to report itself as finished.";
+      }
+    }
+
+    return { ok: true, data: chunkNote ? { ...report, chunkNote } : report };
   } catch (err) {
     return toImportActionError(err, mode);
   }
@@ -1194,12 +1333,16 @@ async function writeOpeningTrialBalance(
             ledgerId: String(item.payload.ledgerId),
             entryType: isDebit ? ("debit" as const) : ("credit" as const),
             /*
-             * ⚠️ `numeric(18,2)` FROM `bigint` PAISE BY STRING, never by
-             * dividing. `Number(n) / 100` for a large n loses precision,
-             * and the failure is a rounded rupee in a ledger that is
-             * supposed to balance to the paisa.
+             * ⭐ THE INTEGER, WRITTEN AS AN INTEGER. Batch 0108.
+             *
+             * ⚠️ THIS WAS `formatMoneyPlain(x, "INR")` — a bigint turned
+             * into a two-decimal string on the way into a numeric(18,2),
+             * with the currency hardcoded. The import already counts in
+             * minor units (`debitMinor` / `creditMinor` above); the round
+             * trip through a decimal string existed only because the
+             * column could not hold what the importer already had.
              */
-            amount: formatMoneyPlain(isDebit ? debit : credit, "INR"),
+            amountMinor: isDebit ? debit : credit,
             description: `Opening balance as at ${asAt}`,
             referenceType: "opening_balance" as const,
           };
@@ -1539,4 +1682,275 @@ export async function previewImport(input: ImportInput): Promise<ActionResult<Im
  */
 export async function commitImport(input: ImportInput): Promise<ActionResult<ImportReport>> {
   return runImport(input, "commit");
+}
+
+/* ================================================================== */
+/* ⭐⭐⭐ WAVE 6 — THE MIGRATION ENGINE                                */
+/* ================================================================== */
+/*                                                                     */
+/* Everything above imports ONE FILE of at most `MAX_IMPORT_ROWS` rows */
+/* and is unchanged. Everything below turns that into a MIGRATION:     */
+/* many chunks, one run, a mapping somebody decided, and a finish that */
+/* refuses to call itself complete when rows are missing.              */
+/*                                                                     */
+/* ⚠️ THE FILE NEVER LEAVES THE CUSTOMER'S MACHINE. It is read there   */
+/* by `lib/import/sources/`, planned there by `planImportRecords`, and */
+/* submitted in chunks. Storing it server-side would be a second copy  */
+/* of a workspace's entire master data in a table nobody thinks of as  */
+/* sensitive — the same argument `data_exports` makes in 0116.         */
+/* ================================================================== */
+
+/**
+ * ⭐⭐ WHAT ORDENCE THINKS THE CUSTOMER'S COLUMNS MEAN, AND HOW SURE.
+ *
+ * ⚠️ NOTHING IS WRITTEN BY THIS ACTION. It reads headers and a sample of
+ * values, proposes, and returns. The proposal is recorded — because a
+ * proposal nobody recorded is indistinguishable afterwards from a
+ * person's decision — and nothing else happens.
+ *
+ * 🔴 THE SAMPLE VALUES NEVER LEAVE THIS PROCESS WHEN THE MODEL IS USED.
+ * `server/import/ai-mapper.ts` sends headings and statistical
+ * descriptions only, and `assertPromptIsHeadersOnly` fails the call if a
+ * future edit ever puts a value in the prompt.
+ */
+export async function proposeImportMapping(
+  input: unknown,
+): Promise<ActionResult<ProposeMappingResult>> {
+  try {
+    const params = z
+      .object({
+        entity: z.string().min(1),
+        headers: z.array(z.string()).min(1).max(512),
+        /** ⚠️ CAPPED. Two hundred rows support every conclusion the
+         * detectors draw, and more is bandwidth for nothing. */
+        sampleRows: z.array(z.array(z.string())).max(EVIDENCE_SAMPLE_ROWS).default([]),
+        useAi: z.boolean().default(false),
+      })
+      .parse(input);
+
+    if (!isImportEntityKey(params.entity)) {
+      return fail("That is not something this can import.");
+    }
+    const entity: ImportEntityDefinition = ALL_IMPORT_ENTITIES[params.entity];
+
+    /**
+     * ⚠️ THE SAME PERMISSION AS THE IMPORT ITSELF. Proposing a mapping
+     * reveals the shape of the entity being imported into, and a person
+     * who may not import into it has no business asking.
+     */
+    const ctx = await requirePermission(entity.createPermission);
+
+    let modelOutcome: AiMappingOutcome = { proposal: {}, used: false };
+    if (params.useAi) {
+      modelOutcome = await proposeMappingWithAi({
+        tenantId: ctx.tenant.id,
+        entity,
+        sourceHeaders: params.headers,
+        sampleRows: params.sampleRows,
+      });
+    }
+
+    const proposal = proposeMapping(entity, params.headers, {
+      sampleRows: params.sampleRows,
+      ...(modelOutcome.used ? { model: modelOutcome.proposal } : {}),
+    });
+
+    const policy = parseAutoCommitPolicy(ctx.tenant.importAutoCommitPolicy);
+    const verdict = mayAutoCommit(proposal, entity, policy);
+
+    await recordProposal({
+      tenantId: ctx.tenant.id,
+      proposedFor: ctx.user.id,
+      proposal,
+      outcome: "proposed",
+      ...(modelOutcome.used && modelOutcome.credentialSource
+        ? { modelSource: modelOutcome.credentialSource }
+        : {}),
+    });
+
+    return {
+      ok: true,
+      data: {
+        proposal,
+        autoCommit: verdict,
+        policy,
+        ...(modelOutcome.refusal ? { aiRefusal: modelOutcome.refusal } : {}),
+      },
+    };
+  } catch (err) {
+    return toImportActionError(err, "propose");
+  }
+}
+
+export type ProposeMappingResult = {
+  readonly proposal: MappingProposal;
+  readonly autoCommit: AutoCommitVerdict;
+  readonly policy: AutoCommitPolicy;
+  /** Present when the model could not be reached. Never fatal. */
+  readonly aiRefusal?: string;
+};
+
+/**
+ * ⭐ RECORD WHAT THE PERSON DID WITH THE PROPOSAL.
+ *
+ * 🔴 `corrected` IS THE INTERESTING OUTCOME AND IT IS THE ONE WITH THE
+ * MOST DETAIL. Every correction is a case the matcher got wrong, recorded
+ * by the only process that can tell: somebody who knew the answer.
+ */
+export async function recordMappingDecision(
+  input: unknown,
+): Promise<ActionResult<{ id: string }>> {
+  try {
+    const params = z
+      .object({
+        entity: z.string().min(1),
+        proposal: z.custom<MappingProposal>((v) => typeof v === "object" && v !== null),
+        outcome: z.enum(["confirmed", "corrected", "discarded", "auto"]),
+        runId: z.string().uuid().optional(),
+        corrections: z
+          .record(
+            z.object({ from: z.string().nullable(), to: z.string().nullable() }),
+          )
+          .default({}),
+      })
+      .parse(input);
+
+    if (!isImportEntityKey(params.entity)) {
+      return fail("That is not something this can import.");
+    }
+    const entity: ImportEntityDefinition = ALL_IMPORT_ENTITIES[params.entity];
+    const ctx = await requirePermission(entity.createPermission);
+
+    const id = await recordProposal({
+      tenantId: ctx.tenant.id,
+      proposedFor: ctx.user.id,
+      proposal: params.proposal,
+      outcome: params.outcome,
+      ...(params.runId ? { runId: params.runId } : {}),
+      corrections: params.corrections,
+    });
+
+    return { ok: true, data: { id } };
+  } catch (err) {
+    return toImportActionError(err, "mapping decision");
+  }
+}
+
+/**
+ * ⭐⭐⭐ BEGIN A MIGRATION.
+ *
+ * ⚠️ `expectedRows` IS DECLARED HERE, BEFORE THE FIRST CHUNK, AND IT IS
+ * WHAT MAKES "IT FINISHED" A CLAIM RATHER THAN A HOPE. Without it a run
+ * that lost its last chunk to a closed laptop is indistinguishable from
+ * one that completed.
+ */
+export async function beginImportRun(
+  input: unknown,
+): Promise<ActionResult<{ runId: string; chunkSize: number }>> {
+  try {
+    const params = z
+      .object({
+        entity: z.string().min(1),
+        sourceFormat: z.enum(IMPORT_SOURCE_FORMATS),
+        sourceName: z.string().max(255).optional(),
+        sourceSheet: z.string().max(120).optional(),
+        duplicateMode: z.enum(["skip", "update", "fail"]),
+        expectedRows: z.number().int().positive(),
+      })
+      .parse(input);
+
+    if (!isImportEntityKey(params.entity)) {
+      return fail("That is not something this can import.");
+    }
+    const entity: ImportEntityDefinition = ALL_IMPORT_ENTITIES[params.entity];
+
+    /** ⚠️ The same four gates the one-shot import passes. */
+    const ctx = await guardImport(entity, params.duplicateMode);
+
+    const runId = await startImportRun({
+      tenantId: ctx.tenant.id,
+      startedBy: ctx.user.id,
+      entityKey: entity.key,
+      sourceFormat: params.sourceFormat,
+      sourceName: params.sourceName ?? null,
+      sourceSheet: params.sourceSheet ?? null,
+      duplicateMode: params.duplicateMode,
+      expectedRows: params.expectedRows,
+    });
+
+    return { ok: true, data: { runId, chunkSize: MAX_IMPORT_ROWS } };
+  } catch (err) {
+    return toImportActionError(err, "begin run");
+  }
+}
+
+/**
+ * ⭐⭐ CLOSE A MIGRATION — AND THE DATABASE DECIDES WHETHER IT FINISHED.
+ *
+ * 🔴 `import_runs_completed_is_complete` refuses `completed` unless every
+ * expected row is accounted for, so this cannot report a finish that did
+ * not happen even if a future caller asks it to.
+ */
+export async function endImportRun(
+  input: unknown,
+): Promise<ActionResult<FinishResult>> {
+  try {
+    const params = z
+      .object({
+        runId: z.string().uuid(),
+        abandoned: z.boolean().default(false),
+      })
+      .parse(input);
+
+    /**
+     * 🔴 A PERMISSION, NOT AN IDENTITY CHECK — AND `check:guards` REFUSED
+     * THE FIRST DRAFT OF THIS FUNCTION FOR EXACTLY THAT.
+     *
+     * The first version used `requireTenantContext()` alone, reasoning
+     * that RLS already stops one workspace closing another's run. True,
+     * and beside the point: it left ANY MEMBER of the workspace able to
+     * close a migration somebody else was running, which marks it
+     * incomplete and tells the person who started it that rows are
+     * missing. "Who are you" is not "may you do this".
+     *
+     * ⚠️ THE PERMISSION IS THE RUN'S OWN ENTITY'S, resolved from the run
+     * rather than taken from the caller. Letting the caller name the
+     * entity would let them name one they happen to have rights to and
+     * close a run of one they do not.
+     */
+    const ctx = await requireTenantContext();
+    const runs = await listImportRuns(ctx.tenant.id, 200);
+    const run = runs.find((r) => r.id === params.runId);
+    if (!run) {
+      return fail("That migration is not one this workspace started.");
+    }
+    if (!isImportEntityKey(run.entityKey)) {
+      return fail("That migration refers to something this can no longer import.");
+    }
+    await requirePermission(ALL_IMPORT_ENTITIES[run.entityKey].createPermission);
+
+    const result = await finishImportRun({
+      tenantId: ctx.tenant.id,
+      runId: params.runId,
+      abandoned: params.abandoned,
+    });
+    revalidatePath("/settings/import");
+    return { ok: true, data: result };
+  } catch (err) {
+    return toImportActionError(err, "end run");
+  }
+}
+
+/**
+ * ⭐ THE RUNS — AND THE UNFINISHED ONES ARE THE POINT. "Which of my
+ * uploads did not finish" is the only question this list is really for.
+ */
+export async function getImportRuns(): Promise<ActionResult<ImportRunView[]>> {
+  try {
+    const ctx = await requireTenantContext();
+    const runs = await listImportRuns(ctx.tenant.id);
+    return { ok: true, data: runs };
+  } catch (err) {
+    return toImportActionError(err, "runs");
+  }
 }

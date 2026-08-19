@@ -116,7 +116,16 @@ export type BuiltExport = {
 type LedgerLeg = {
   ledgerId: string;
   entryType: "debit" | "credit";
-  amount: string;
+  /**
+   * ⭐ THE INTEGER, AS AN INTEGER. Batch 0108.
+   *
+   * ⚠️ THIS WAS `amount: string` AND WENT THROUGH `toPaise()`. The ledger
+   * now stores the minor units it was always counting in, so the string
+   * surgery that used to stand between them is gone — along with its
+   * hardcoded two decimal places, which turned a dinar into a rupee and a
+   * yen into a hundredth of one.
+   */
+  amountMinor: bigint;
   description: string | null;
   counterpartyName: string | null;
 };
@@ -188,7 +197,7 @@ export async function buildExport(args: {
         transactionId: journalEntries.transactionId,
         ledgerId: journalEntries.ledgerId,
         entryType: journalEntries.entryType,
-        amount: journalEntries.amount,
+        amountMinor: journalEntries.amountMinor,
         description: journalEntries.description,
         counterpartyName: journalEntries.counterpartyName,
       })
@@ -207,7 +216,24 @@ export async function buildExport(args: {
     existing.push({
       ledgerId: row.ledgerId,
       entryType: row.entryType,
-      amount: row.amount,
+      /**
+       * ⚠️ REFUSED, NOT DEFAULTED, WHEN THE LEDGER HAS NOT BEEN SCALED.
+       * `amount_minor` is nullable in the type because 0108 is allowed to
+       * leave a leg unscaled — a currency `currency_units` does not carry,
+       * or a value that is not a whole number of that currency's minor
+       * units. Exporting such a leg as zero would send Tally a voucher
+       * that is short by a real amount and balances anyway.
+       */
+      amountMinor: (() => {
+        if (row.amountMinor === null) {
+          throw new Error(
+            `A journal line in transaction ${row.transactionId} has no amount in minor units, ` +
+              `so it cannot be exported. Run the census in SQL-FILES/0108 to see which ` +
+              `currency is unscaled, and correct it before exporting.`,
+          );
+        }
+        return row.amountMinor;
+      })(),
       description: row.description,
       counterpartyName: row.counterpartyName,
     });
@@ -263,7 +289,7 @@ export async function buildExport(args: {
     const partyMapping = resolved.find(({ mapping }) => mapping.isParty)?.mapping;
 
     const voucherLegs: VoucherLeg[] = resolved.map(({ leg, mapping }) => {
-      const amountMinor = toPaise(leg.amount);
+      const amountMinor = leg.amountMinor;
       const centre = gst?.projectId
         ? costCentreByProject.get(gst.projectId)
         : undefined;
@@ -618,24 +644,20 @@ async function loadGstFacts(
 /* ------------------------------------------------------------------ */
 
 /**
- * ⚠️ `journal_entries.amount` IS `NUMERIC(18,2)` AND ARRIVES AS A STRING.
+ * ⚠️ `toPaise()` LIVED HERE AND WAS DELETED BY BATCH 0108, NOT ORPHANED.
  *
- * Phase 4 chose NUMERIC deliberately — exact decimal arithmetic, no
- * float drift. This phase counts in paise. The conversion is string
- * surgery for the same reason `lib/tally/amounts.ts` does it that way:
- * `Number("150000.00") * 100` is exact for this value and is not exact
- * for all of them, and the failure is one paisa on one voucher in a file
- * of two thousand.
+ * It turned the `numeric(18,2)` string this table used to hold into a
+ * bigint of paise by string surgery — correctly, and with a good reason
+ * written down for why it was not `Number(x) * 100`. What it could not do
+ * was be right for any currency but a two-decimal one: its last line was
+ * `BigInt(whole) * 100n + BigInt(paise)`, a hardcoded hundred, so a KWD
+ * voucher left here understated by a factor of ten.
+ *
+ * `journal_entries.amount_minor` now holds the integer directly, so there
+ * is nothing left to convert. Deleting it was the point of the batch;
+ * leaving it behind unused would have been one more thing in this
+ * codebase that exists and is reached by nothing.
  */
-function toPaise(numeric: string): bigint {
-  const trimmed = numeric.trim();
-  const negative = trimmed.startsWith("-");
-  const unsigned = negative ? trimmed.slice(1) : trimmed;
-  const [whole = "0", fraction = ""] = unsigned.split(".");
-  const paise = fraction.padEnd(2, "0").slice(0, 2);
-  const value = BigInt(whole || "0") * 100n + BigInt(paise || "0");
-  return negative ? -value : value;
-}
 
 /** For the "what is still unmapped?" screen. Exported for the actions layer. */
 export function describeGroup(group: string): string {

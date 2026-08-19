@@ -348,9 +348,21 @@ describe("🔴 posting never blocks issuing, and is never silent", () => {
 describe("🔴 money reaches the ledger without touching a float", () => {
   it("amounts are formatted from bigint, never divided", () => {
     const c = code(POST);
-    expect(c).toContain("formatMoneyPlain(l.amountMinor");
+    /**
+     * ⚠️ THIS USED TO ASSERT `toContain("formatMoneyPlain(l.amountMinor")`.
+     * Batch 0108 removed that call entirely — the leg is now written as
+     * the bigint itself, which is strictly better than formatting it into
+     * a decimal string, and the old assertion failed the improvement.
+     *
+     * The property both versions were reaching for is that MONEY NEVER
+     * TOUCHES A FLOAT on the way into the ledger. That is what is asserted
+     * now, plus the stronger thing 0108 makes true: it is not converted at
+     * all.
+     */
+    expect(c).toMatch(/amountMinor:\s*l\.amountMinor/);
     expect(c).not.toMatch(/\/\s*100\b/);
     expect(c).not.toContain("parseFloat");
+    expect(c).not.toContain("Number(");
   });
 
   /** Adding both sides reports a ₹1,180 invoice as ₹2,360 — plausible and twice the truth. */

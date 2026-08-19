@@ -72,6 +72,9 @@ import {
   toRegisterEntry,
 } from "@/server/tds/registry";
 import { assessDeduction as runAssessment } from "@/server/tds/engine";
+import { measureForeignPayment } from "@/server/tds/foreign-payment";
+import { RULE_26_TT_BUYING } from "@/lib/fx/statutory";
+import { formatRateScaled } from "@/lib/fx/rates";
 import {
   assembleQuarterCertificates,
   assembleReturn,
@@ -90,6 +93,12 @@ import {
 import { parseMoney, serializeAmount } from "@/lib/billing/money";
 import type { ActionResult } from "@/lib/validators/crm";
 import type { TdsQuarter, TdsSectionCode } from "@/db/schema/tds";
+/**
+ * ⭐ THE SECTION TABLE IS THE STATUTE. The form is built from it rather
+ * than from a list somebody typed, so a section this product knows about
+ * cannot be one the form has never heard of.
+ */
+import { TDS_SECTION_CODES, sectionRule } from "@/lib/tds/sections";
 
 /* ------------------------------------------------------------------ */
 /* SERIALISABLE SHAPES                                                 */
@@ -167,6 +176,110 @@ export async function getDeductees(
     };
   } catch (err) {
     return toTdsActionError(err, "getDeductees");
+  }
+}
+
+/**
+ * ⭐⭐⭐ EVERYTHING THE DEDUCTION FORM NEEDS TO RENDER, IN ONE CALL.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴🔴🔴 WHY THIS DID NOT EXIST, AND IT IS THE WORST INSTANCE YET
+ * ══════════════════════════════════════════════════════════════════════
+ * `recordDeduction` below is the ONLY INSERT INTO `tds_deductions`
+ * anywhere in this product. `server/mcp/dispatch.ts` reads the table;
+ * `server/actions/reports.ts` reads it; nothing else writes it.
+ *
+ * And until this batch, `recordDeduction` WAS CALLED BY NOTHING. No
+ * screen, no route, no job. `/tds` imports `getDeductees`, `getRegister`
+ * and `getInterestExposure` — three reads. So:
+ *
+ *   • the register could never receive a row;
+ *   • `getInterestExposure` could only ever report zero;
+ *   • `buildQuarterlyReturn` could only ever produce an empty 26Q;
+ *   • `buildCertificates` could only ever produce an empty 16A;
+ *   • and the Rule 26 foreign-payment engine added in 0106 sat behind
+ *     all of it, with the `foreignPayment` argument reachable from
+ *     nowhere.
+ *
+ * ⚠️ AND THE SCREEN LOOKED FINE. `/tds` renders "undeposited TDS" and
+ * "interest exposure" panels which were correct, empty and reassuring.
+ * A statutory module from 0025 onwards, with no way in, showing zeroes
+ * that read as "nothing owed".
+ *
+ * ⭐ THIS IS THE THIRTEENTH TIME THIS PRODUCT HAS SHIPPED A CAPABILITY
+ * NOTHING COULD REACH — approval policies, `requireMfa`, 34 of 71
+ * entitlement keys, dunning letters that queued and never sent, RERA
+ * notices recording their own service, ESI hardcoded, `valuationMethod`
+ * read at zero computations, `bank_accounts.reconciled_to`, `0087`
+ * citing a trigger that did not exist, `suggestSlugs` unused on the
+ * workspace-creation path, `0100`'s depreciation engine unreachable for
+ * four batches, `settings.clerkSlug` written and never reconciled, and
+ * `/banking` in no navigation since v1.18.0. It is also the largest.
+ *
+ * ⚠️ `tds:read` ONLY. This is what the form needs to draw itself. The
+ * write permission is checked by `recordDeduction`, where the write is.
+ */
+export async function getDeductionFormOptions(): Promise<
+  ActionResult<{
+    deductees: DeducteeRow[];
+    sections: Array<{
+      code: string;
+      label: string;
+      statutoryRef: string;
+      /**
+       * ⚠️ FALSE FOR 192 AND 195, and the form must say so BEFORE the
+       * person fills it in. The engine refuses to invent those rates —
+       * salary is a projected annual liability and a non-resident's rate
+       * is whichever of the Act and the DTAA is more beneficial — so
+       * those two need a rate and a written reason, and a form that
+       * discovers this on submit has wasted somebody's afternoon.
+       */
+      rateResolvable: boolean;
+      note: string;
+    }>;
+  }>
+> {
+  try {
+    const ctx = await requirePermission("tds:read");
+    const rows = await listDeductees(ctx.tenant.id, { includeInactive: false });
+
+    return {
+      ok: true,
+      data: {
+        deductees: rows.map((r) => ({
+          id: r.id,
+          code: r.code,
+          legalName: r.legalName,
+          panNumber: r.panNumber,
+          panStatus: r.panStatus,
+          deducteeType: r.deducteeType,
+          isNonResident: r.isNonResident,
+          isSpecifiedPerson206ab: r.isSpecifiedPerson206ab,
+          specifiedPersonCheckedOn: r.specifiedPersonCheckedOn,
+          vendorId: r.vendorId,
+          channelPartnerId: r.channelPartnerId,
+          isActive: r.isActive,
+        })),
+        /**
+         * ⭐ BUILT FROM `TDS_SECTIONS`, NOT RETYPED. A hand-written list
+         * here would be a second copy of the statute, and the drift
+         * would be silent in the direction that matters: a section
+         * missing from this list is a deduction nobody can record.
+         */
+        sections: TDS_SECTION_CODES.map((code) => {
+          const rule = sectionRule(code);
+          return {
+            code: rule.code,
+            label: rule.label,
+            statutoryRef: rule.statutoryRef,
+            rateResolvable: rule.rateResolvable,
+            note: rule.note,
+          };
+        }),
+      },
+    };
+  } catch (err) {
+    return toTdsActionError(err, "getDeductionFormOptions");
   }
 }
 
@@ -338,6 +451,108 @@ export async function upsertLowerDeductionCertificate(
 /* ------------------------------------------------------------------ */
 /* ⭐⭐ THE ASSESSMENT, BEFORE ANYTHING IS WRITTEN                      */
 /* ------------------------------------------------------------------ */
+/* ⭐⭐ RULE 26 · THE RUPEE BASE OF A PAYMENT IN FOREIGN CURRENCY       */
+/* ------------------------------------------------------------------ */
+
+/**
+ * ⭐ ONE PLACE THAT TURNS A DEDUCTION INPUT INTO A RUPEE PAYMENT BASE.
+ *
+ * ⚠️ BOTH ACTIONS BELOW GO THROUGH IT, AND THAT IS THE POINT. `assess`
+ * shows the operator a figure before the money moves and `record` writes
+ * one; if they computed the base differently the screen would promise one
+ * deduction and the register would hold another. The difference between
+ * them is only that `record` keeps the working to store on the row.
+ */
+type ResolvedPaymentBase = {
+  paymentBaseMinor: bigint;
+  deductionDate: string;
+  /** Null on a rupee payment. The Rule 26 working, for the row. */
+  foreign: {
+    currency: string;
+    amountMinor: bigint;
+    rateScaled: bigint;
+    rateDate: string;
+    rateType: string;
+    rateSource: string;
+    rateId: string | null;
+    statutoryRef: string;
+    creditDate: string | null;
+    paymentDate: string | null;
+    explanation: string;
+  } | null;
+};
+
+async function resolvePaymentBase(
+  tenantId: string,
+  data: {
+    paymentBaseMinor?: string | null;
+    deductionDate: string;
+    foreignPayment?: {
+      currency: string;
+      amountMinor: string;
+      creditDate?: string | null;
+      paymentDate?: string | null;
+    } | null;
+  },
+): Promise<ResolvedPaymentBase> {
+  if (!data.foreignPayment) {
+    // The schema's `exactlyOneBase` has already refused the case where
+    // neither is present, so this is a rupee payment with a rupee base.
+    return {
+      paymentBaseMinor: parseMoney(data.paymentBaseMinor ?? "0"),
+      deductionDate: data.deductionDate,
+      foreign: null,
+    };
+  }
+
+  const measured = await measureForeignPayment(tenantId, {
+    foreignAmountMinor: BigInt(data.foreignPayment.amountMinor),
+    foreignCurrency: data.foreignPayment.currency,
+    creditDate: data.foreignPayment.creditDate ?? null,
+    paymentDate: data.foreignPayment.paymentDate ?? null,
+  });
+
+  /**
+   * 🔴 THE DEDUCTION DATE IS DERIVED AND THEN CHECKED AGAINST THE ONE THE
+   * CALLER SENT, AND A DISAGREEMENT IS REFUSED RATHER THAN RESOLVED.
+   *
+   * Silently preferring the derived date would be defensible arithmetic
+   * and indefensible practice: the operator would see one date on the
+   * screen and another in the register, and under Rule 26 the date is also
+   * the rate — so the figure they approved would not be the figure that
+   * was posted. Refusing puts the disagreement in front of the person who
+   * can settle it.
+   */
+  if (measured.date.deductionDate !== data.deductionDate) {
+    throw new Error(
+      `The deduction date given is ${data.deductionDate}, but the tax on this payment is ` +
+        `required to be deducted on ${measured.date.deductionDate}. ` +
+        `${measured.date.explanation} Nothing has been recorded. Under Rule 26 that date is ` +
+        `also the date whose telegraphic transfer buying rate measures the payment in ` +
+        `rupees, so the two cannot differ.`,
+    );
+  }
+
+  return {
+    paymentBaseMinor: measured.base.chargeableBaseMinor,
+    deductionDate: measured.date.deductionDate,
+    foreign: {
+      currency: measured.base.foreignCurrency,
+      amountMinor: measured.base.foreignAmountMinor,
+      rateScaled: measured.base.quote.rateScaled,
+      rateDate: measured.base.quote.rateDate,
+      rateType: measured.base.quote.rateType,
+      rateSource: measured.base.quote.source,
+      rateId: measured.base.quote.rateId,
+      statutoryRef: measured.base.statutoryRef,
+      creditDate: measured.date.creditDate,
+      paymentDate: measured.date.paymentDate,
+      explanation: `${measured.date.explanation} ${measured.base.explanation}`,
+    },
+  };
+}
+
+/* ------------------------------------------------------------------ */
 
 /**
  * ⭐ "What comes off this payment?" — answered before the transfer.
@@ -377,11 +592,14 @@ export async function assessDeduction(input: unknown): Promise<
     const ctx = await requirePermission("tds:read");
     const data = assessDeductionSchema.parse(input);
 
+    // ⭐ RULE 26 — a foreign payment's rupee base before anything is shown.
+    const base = await resolvePaymentBase(ctx.tenant.id, data);
+
     const assessed = await runAssessment(ctx.tenant.id, {
       deducteeId: data.deducteeId,
       section: data.section as TdsSectionCode,
-      paymentBaseMinor: parseMoney(data.paymentBaseMinor),
-      deductionDate: data.deductionDate,
+      paymentBaseMinor: base.paymentBaseMinor,
+      deductionDate: base.deductionDate,
     });
 
     return {
@@ -401,7 +619,9 @@ export async function assessDeduction(input: unknown): Promise<
         statutoryRef: assessed.resolution.statutoryRef,
         tdsMinor: serializeAmount(assessed.row.tdsMinor),
         netPayableMinor: serializeAmount(assessed.computation.netPayableMinor),
-        explanation: assessed.explanation,
+        explanation: base.foreign
+          ? `${base.foreign.explanation} ${assessed.explanation}`
+          : assessed.explanation,
         warnings: assessed.warnings,
         problem: assessed.problem,
       },
@@ -433,11 +653,17 @@ export async function recordDeduction(
 
     const data = recordDeductionSchema.parse(input);
 
+    // ⭐ RULE 26 — recomputed here rather than carried from the assessment
+    // screen, for the same reason the assessment itself is re-run: the rate
+    // for the deduction date may have been corrected in between, and the
+    // figure that is posted has to be the one on file now.
+    const base = await resolvePaymentBase(ctx.tenant.id, data);
+
     const assessed = await runAssessment(ctx.tenant.id, {
       deducteeId: data.deducteeId,
       section: data.section as TdsSectionCode,
-      paymentBaseMinor: parseMoney(data.paymentBaseMinor),
-      deductionDate: data.deductionDate,
+      paymentBaseMinor: base.paymentBaseMinor,
+      deductionDate: base.deductionDate,
       manualRateBps: data.manualRateBps ?? null,
       manualRateReason: data.manualRateReason ?? null,
     });
@@ -459,7 +685,24 @@ export async function recordDeduction(
           section: assessed.section,
           financialYear: assessed.financialYear,
           quarter: assessed.quarter,
-          deductionDate: data.deductionDate,
+          deductionDate: base.deductionDate,
+          /**
+           * ⭐ THE RULE 26 WORKING, ON THE ROW. The CHECK
+           * `tds_deductions_rule_26_complete` refuses the row unless the
+           * rate type is 'tt_buying' and the rate date IS the deduction
+           * date, so a future writer that skipped this file cannot post a
+           * foreign-currency deduction measured at anything else.
+           */
+          creditDate: base.foreign?.creditDate ?? null,
+          paymentDate: base.foreign?.paymentDate ?? null,
+          paymentCurrency: base.foreign?.currency ?? null,
+          foreignPaymentBaseMinor: base.foreign?.amountMinor ?? null,
+          fxRate: base.foreign ? formatRateScaled(base.foreign.rateScaled) : null,
+          fxRateDate: base.foreign?.rateDate ?? null,
+          fxRateType: base.foreign?.rateType ?? null,
+          fxRateSource: base.foreign?.rateSource ?? null,
+          fxRateId: base.foreign?.rateId ?? null,
+          fxStatutoryRef: base.foreign?.statutoryRef ?? null,
           paymentBaseMinor: assessed.row.paymentBaseMinor,
           catchUpBaseMinor: assessed.row.catchUpBaseMinor,
           chargeableBaseMinor: assessed.row.chargeableBaseMinor,
@@ -469,7 +712,9 @@ export async function recordDeduction(
           rateBasis: assessed.resolution.basis,
           lowerDeductionCertificateId: assessed.row.lowerDeductionCertificateId,
           statutoryRef: assessed.resolution.statutoryRef,
-          explanation: assessed.explanation,
+          explanation: base.foreign
+            ? `${base.foreign.explanation} ${assessed.explanation}`
+            : assessed.explanation,
           tdsMinor: assessed.row.tdsMinor,
           surchargeMinor: assessed.outcome === "deducted" ? surcharge : 0n,
           cessMinor: assessed.outcome === "deducted" ? cess : 0n,
@@ -503,8 +748,22 @@ export async function recordDeduction(
         chargeableBaseMinor: serializeAmount(assessed.row.chargeableBaseMinor),
         catchUpBaseMinor: serializeAmount(assessed.row.catchUpBaseMinor),
         tdsMinor: serializeAmount(assessed.row.tdsMinor),
+        // ⭐ WHICH RATE MEASURED THIS BASE, IN THE AUDIT TRAIL. "Why is
+        // the base ₹83,60,000" is the first question of a s.201 enquiry.
+        ...(base.foreign
+          ? {
+              paymentCurrency: base.foreign.currency,
+              foreignAmountMinor: base.foreign.amountMinor.toString(),
+              fxRate: formatRateScaled(base.foreign.rateScaled),
+              fxRateDate: base.foreign.rateDate,
+              fxRateType: base.foreign.rateType,
+              fxStatutoryRef: base.foreign.statutoryRef,
+            }
+          : {}),
       },
-      reason: assessed.explanation,
+      reason: base.foreign
+        ? `${base.foreign.explanation} ${assessed.explanation}`
+        : assessed.explanation,
     });
 
     revalidatePath("/tds/register");

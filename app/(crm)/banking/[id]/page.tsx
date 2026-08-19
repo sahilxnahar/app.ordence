@@ -72,6 +72,18 @@ export default async function StatementPage({
           headline: l.proposal.headline,
           ambiguous: l.proposal.ambiguous,
           matched: l.matched,
+          /**
+           * ⭐ EVERY ALLOCATION AND THE RESIDUE — 0110. `bigint` cannot
+           * cross into a client component, so both go as exact decimal
+           * strings. Neither is ever a Number.
+           */
+          allocations: l.allocations.map((a) => ({
+            kind: a.kind,
+            id: a.id,
+            documentNo: a.documentNo,
+            allocatedMinor: a.allocatedMinor.toString(),
+          })),
+          residueMinor: l.residueMinor.toString(),
           ranked: l.proposal.ranked.map((r) => ({
             candidateId: r.candidateId,
             score: r.score,
@@ -110,7 +122,19 @@ export default async function StatementPage({
           differenceMinor={brs.data.brs.differenceMinor.toString()}
           differenceAbsorbedMinor={brs.data.brs.differenceAbsorbedMinor.toString()}
           toleranceMinor={brs.data.brs.toleranceMinor.toString()}
-          notes={[...brs.data.brs.notes]}
+          notes={[
+            ...brs.data.brs.notes,
+            /**
+             * ⭐⭐ THE UNCLAIMED INPUT CREDIT ON THIS PERIOD'S CHARGES —
+             * 0110. It belongs on THIS screen and not only on its own
+             * register: this is where bank charges are discovered and
+             * written up gross, so it is where the consequence of doing
+             * so should be read.
+             */
+            ...(brs.data.unclaimedCreditNote === null
+              ? []
+              : [brs.data.unclaimedCreditNote]),
+          ]}
           unpostedLines={brs.data.brs.items
             .filter((i) => i.side === "bank")
             .map((i) => ({

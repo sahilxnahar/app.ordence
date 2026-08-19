@@ -485,3 +485,36 @@ export * from "./fixed-assets";
  * header of `fx.ts` argues the split.
  */
 export * from "./fx";
+
+/**
+ * ⭐⭐ PER-TENANT AI PROVIDER CREDENTIALS — Batch 0105 (SQL 0105).
+ *
+ * 🔴 FLAGGED LOUDLY, BECAUSE THIS FILE IS THE COLLISION POINT WHEN THREE
+ * STREAMS LAND AT ONCE: this is ONE new line at the END, and it must
+ * stay one line at the end. Nothing above it was touched.
+ *
+ * 🔴 EXPORTED AFTER `./core`, WHICH IT REFERENCES — the tenant that owns
+ * the key and the user who typed it. It deliberately does NOT reference
+ * `./vault`: the secret lives in `vault_secrets` under a loose
+ * (owner_kind, owner_id) pair, exactly as a connection's credential
+ * does, so the vault needs no foreign key to yet another table.
+ *
+ * ⚠️ THE TABLE HOLDS NO KEY. See the header of `ai-credentials.ts` for
+ * why the row and the secret are separate objects, and why there is no
+ * `lane` column on it.
+ */
+export * from "./ai-credentials";
+
+/**
+ * ⭐ Batch H — DPDPA 2023 data-principal requests, erasure refusals and
+ * breach intimations. DDL in SQL-FILES/0110.
+ *
+ * ⚠️ EXPORTED AFTER `./core`, WHICH IT REFERENCES.
+ */
+export * from "./dpdp";
+/** ⭐ 0117 · wave 6 — the migration engine. See db/schema/import-runs.ts. */
+export * from "./import-runs";
+/** ⭐ 0118 · wave 7 — the drawing register. See db/schema/drawings.ts. */
+export * from "./drawings";
+/** ⭐ 0119 · wave 8 — the cross-instance rate limit counter. */
+export * from "./rate-limit";

@@ -96,17 +96,56 @@ export async function POST(request: Request): Promise<NextResponse> {
      * attributed to anyone, because attributing it would mean trusting
      * the very bytes that just failed authentication.
      */
+    /**
+     * ⭐⭐ WAVE 9 — A STALE TIMESTAMP IS NOT A BAD SIGNATURE.
+     *
+     * `webhook.replay_suspected` has existed in the catalogue since Phase
+     * 20 with its own severity and SIEM mapping, and had NEVER been
+     * emitted, because this branch mapped everything except a missing
+     * secret onto `webhook.signature_invalid`.
+     *
+     * The two mean opposite things to whoever reads the row:
+     *
+     *   signature_invalid  — the HMAC did not verify. Either an attacker
+     *                        is guessing, or OUR SECRET IS WRONG, and the
+     *                        second one silently loses payments. Critical.
+     *   replay_suspected   — the HMAC verified perfectly and the
+     *                        timestamp was outside tolerance. Nobody is
+     *                        guessing anything; somebody is REPLAYING a
+     *                        request that was genuine once. That is a
+     *                        captured payload being re-sent, and it says
+     *                        the attacker has read traffic rather than
+     *                        that they are probing blind.
+     *
+     * Merging them meant a replay presented as a possible secret rotation
+     * failure, which is the wrong investigation.
+     *
+     * ⚠️ ONLY STRIPE CAN MAKE THIS DISTINCTION, and only because its
+     * signature header carries the timestamp as a separate field that
+     * `lib/billing/providers/stripe.ts` checks BEFORE computing the HMAC.
+     * Razorpay's scheme has no timestamp at all (its replay defence is the
+     * unique index on the event id) and Svix verifies both inside one
+     * opaque call, so neither of those routes can tell the two apart and
+     * neither pretends to.
+     */
+    const eventType =
+      verification.reason === "missing_secret"
+        ? "webhook.secret_missing"
+        : verification.reason === "timestamp_out_of_tolerance"
+          ? "webhook.replay_suspected"
+          : "webhook.signature_invalid";
+
     await recordSecurityEvent({
-      type:
-        verification.reason === "missing_secret"
-          ? "webhook.secret_missing"
-          : "webhook.signature_invalid",
+      type: eventType,
       source: "api/webhooks/stripe",
       tenantId: null,
       ipAddress: sourceIp,
       route: "/api/webhooks/stripe",
       detail: { provider: "stripe", reason: verification.reason },
-      reason: "Webhook signature verification failed.",
+      reason:
+        eventType === "webhook.replay_suspected"
+          ? "Webhook signature was valid but its timestamp was outside tolerance."
+          : "Webhook signature verification failed.",
     });
     const status = verification.reason === "missing_secret" ? 503 : 401;
     return NextResponse.json({ received: false }, { status });

@@ -181,3 +181,39 @@ export function maskToken(token: string): string {
   if (typeof token !== "string" || token.length < PREFIX_LENGTH) return "…";
   return `${token.slice(0, PREFIX_LENGTH)}…${token.slice(-4)}`;
 }
+
+/**
+ * ⭐⭐ WAVE 9 — THE STABLE, NON-CREDENTIAL REFERENCE TO A TOKEN.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 WHY THIS EXISTS: THE PORTAL SHARING DETECTOR COULD NEVER FIRE
+ * ══════════════════════════════════════════════════════════════════════
+ * `server/security/anomalies.ts#detectPortalTokenSharing` groups portal
+ * events by `subjectId` and fires when one token appears from many
+ * networks. Its own doc says the subject is *"the token HASH prefix that
+ * the portal surface records"*.
+ *
+ * No portal surface recorded one. The two places that wrote a
+ * `portal_token_ref` subject wrote `token.slice(0, 8)` — the first eight
+ * characters of the LIVE CREDENTIAL — and the rule filtered on
+ * `eventType.startsWith("portal.")`, which nothing emitted at all. So the
+ * rule read a field nobody wrote, keyed on a value nobody else used.
+ *
+ * ⚠️ THE HASH, NOT THE TOKEN. A raw-token prefix in `security_events` is
+ * eight characters of a live credential sitting in a table that is
+ * append-only by design and exported to a SIEM. It is not enough to guess
+ * the rest — 224 bits remain — but it is a credential fragment in a place
+ * that has no deletion path, for no benefit: the hash prefix identifies
+ * the token exactly as well and reveals nothing.
+ *
+ * ⚠️ 16 CHARACTERS = 64 BITS. Long enough that two distinct tokens
+ * colliding would take ~2^32 links before it was even likely, which this
+ * product will not reach; short enough to read in a console.
+ *
+ * ⚠️ ONE FUNCTION, SO THE RULE'S GROUPING KEY CANNOT DRIFT. Two surfaces
+ * computing "a reference to this token" two ways is precisely how one
+ * token became two rows and the sharing count stayed under the threshold.
+ */
+export function portalTokenRef(token: string): string {
+  return hashPortalToken(token).slice(0, 16);
+}

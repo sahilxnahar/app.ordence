@@ -279,6 +279,26 @@ export const FEATURE_CATALOG = {
    * tier, which means either giving away the payment engine or charging
    * an estimator for it.
    */
+  /**
+   * ⭐⭐ WAVE 7 — THE DRAWING REGISTER, ON ITS OWN KEY.
+   *
+   * 🔴 NOT FOLDED INTO `construction.boq`, for exactly the reason the note
+   * above gives about the BOQ and RA bills: a drawing register is useful
+   * to somebody who never raises a bill of quantities. An architect, an
+   * interior contractor and a facilities team all keep drawings and none
+   * of them measure a BOQ.
+   *
+   * ⚠️ AND IT IS `basic`. The register is the thing that stops a site
+   * building to a superseded sheet, which is not a premium concern.
+   */
+  "construction.drawings": {
+    label: "Drawing register",
+    description:
+      "DXF drawings with revisions, layers, markups and measurements that cite the sheet " +
+      "and the unit basis they came from. A revision supersedes the one before it and is " +
+      "then frozen.",
+    minTier: "basic",
+  },
   "construction.boq": {
     label: "BOQ & measurement",
     description:

@@ -170,14 +170,24 @@ describe("the cash flow statement exists", () => {
    * unguarded one here returns a company's bank balances to anybody who
    * knows the action id.
    */
-  it("guards the new server export", () => {
+  /**
+   * ⭐ WAVE 9 — THE GUARD CHANGED, AND THE OLD ASSERTION WAS TOO WEAK.
+   *
+   * This asserted `requireTenantContext()`, which proves only that the
+   * endpoint is not anonymous. Every member of every workspace could call
+   * it, and `ledgers:read` — the key the role model gives to finance
+   * roles and withholds from `manager` and `member` — was checked by
+   * nothing anywhere. A session is not a role.
+   */
+  it("guards the new server export on the permission, not merely on a session", () => {
     const code = codeOnly(ACTIONS);
     const body = code
       .split(/export async function /)
       .slice(1)
       .find((b) => b.startsWith("getCashFlowStatement"));
     expect(body, "getCashFlowStatement is exported").toBeDefined();
-    expect(body).toContain("await requireTenantContext()");
+    expect(body).toContain('await requirePermission("ledgers:read")');
+    expect(body).not.toContain("await requireTenantContext()");
   });
 
   it("is rendered on the statements page for the same period", () => {

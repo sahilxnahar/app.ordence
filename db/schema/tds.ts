@@ -82,6 +82,7 @@ import {
   boolean,
   integer,
   bigint,
+  numeric,
   index,
   uniqueIndex,
   check,
@@ -1027,6 +1028,74 @@ export const tdsDeductions = pgTable(
     deductionDate: date("deduction_date", { mode: "string" }).notNull(),
     /** When the net actually left the bank. For the audit trail only. */
     paymentDate: date("payment_date", { mode: "string" }),
+    /**
+     * ⭐⭐ THE OTHER HALF OF "WHICHEVER IS EARLIER" — SQL 0106.
+     *
+     * 🔴 BEFORE THIS COLUMN, `deduction_date` WAS AN ASSERTION AND NOT A
+     * DERIVATION. Its comment above says it is the earlier of credit and
+     * payment; the schema held only ONE of the two dates, so nothing could
+     * check the claim and a caller that passed the payment date got a row
+     * that looked identical to a correct one. That is tolerable while a
+     * wrong deduction date only mis-files a quarter. It stops being
+     * tolerable under Rule 26, where the deduction date IS the rate date:
+     * a March credit paid in June, dated June, is translated at June's
+     * dollar and the chargeable base itself is wrong.
+     *
+     * ⚠️ THE DATE THE SUM IS CREDITED TO THE PAYEE'S ACCOUNT IN OUR BOOKS
+     * — the day the expense and the creditor are recognised, not the
+     * invoice date. An invoice dated 28 March and booked on 4 April was
+     * credited on 4 April. `lib/tds/foreign-payments.ts#deductionDateFor`
+     * is the only thing that turns the pair into a deduction date, and the
+     * CHECK below refuses a row whose date disagrees with its own inputs.
+     *
+     * ⚠️ NULL ON EVERY PRE-0106 ROW and null is honest: nobody was ever
+     * asked. The CHECK binds only where it is known.
+     */
+    creditDate: date("credit_date", { mode: "string" }),
+
+    /* --- ⭐⭐ RULE 26 · THE FOREIGN-CURRENCY MEASUREMENT ------------ */
+
+    /**
+     * ⭐ THE CURRENCY THE PAYMENT WAS MADE IN. NULL means the payment was
+     * in rupees and no translation happened — which is every row written
+     * before 0106 and every domestic payment after it.
+     *
+     * 🔴 THE COLUMNS BELOW ARE THE WORKING FOR `chargeable_base_minor`
+     * WHEN THIS IS SET. Before 0106 the rupee base of a s.195 payment was
+     * whatever figure somebody typed, translated at a rate nobody
+     * recorded, and "which rate did this deduction use" had no answer —
+     * which is precisely the question a s.201 proceeding opens with.
+     */
+    paymentCurrency: varchar("payment_currency", { length: 3 }),
+    /**
+     * The amount as it was actually paid, in that currency's OWN minor
+     * units. ⚠️ NOT ALWAYS HUNDREDTHS — JPY has none and KWD has three.
+     * `lib/fx/currency.ts` carries the exponent; nothing here assumes one.
+     */
+    foreignPaymentBaseMinor: bigint("foreign_payment_base_minor", { mode: "bigint" }),
+    /** The rate applied, at the same twelve decimals `fx_rates` stores. */
+    fxRate: numeric("fx_rate", { precision: 30, scale: 12 }),
+    /**
+     * 🔴 THE DATE THE RATE IS FOR, AND THE CHECK BELOW FORCES IT TO EQUAL
+     * `deduction_date`. That equality IS Rule 26 — "as on the date on
+     * which the tax is required to be deducted" — expressed where it
+     * cannot be forgotten.
+     */
+    fxRateDate: date("fx_rate_date", { mode: "string" }),
+    /** ⭐ 'tt_buying', and the CHECK below permits nothing else. */
+    fxRateType: varchar("fx_rate_type", { length: 12 }),
+    /** 'rbi_reference' | 'provider' | 'manual' — WHO published it. */
+    fxRateSource: varchar("fx_rate_source", { length: 20 }),
+    /**
+     * The `fx_rates` or `fx_reference_rates` row it came from.
+     * ⚠️ NO FOREIGN KEY: the two rate tables are different scopes (one
+     * tenant, one platform) so no single FK can name both, and a rate row
+     * deleted years later must not delete or null a filed deduction's
+     * evidence. The rate itself is copied onto this row for that reason.
+     */
+    fxRateId: uuid("fx_rate_id"),
+    /** "Rule 26, Income-tax Rules 1962". The rule, so the figure can be defended. */
+    fxStatutoryRef: varchar("fx_statutory_ref", { length: 60 }),
 
     /* --- ⭐ THE CUMULATIVE ARITHMETIC ------------------------------ */
 
@@ -1226,6 +1295,70 @@ export const tdsDeductions = pgTable(
              AND ${t.tdsMinor} = 0 AND ${t.surchargeMinor} = 0 AND ${t.cessMinor} = 0)
           OR (${t.outcome} = 'exempt'
              AND ${t.tdsMinor} = 0 AND ${t.chargeableBaseMinor} = 0)`,
+    ),
+    /**
+     * ⭐⭐ THE DEDUCTION DATE IS DERIVED FROM ITS OWN INPUTS, NOT ASSERTED.
+     *
+     * Binds only where `credit_date` is known, which is every row written
+     * through the 0106 path and no row written before it. Where both dates
+     * are known the deduction date is the earlier; where only the credit
+     * is known it is the credit date.
+     *
+     * ⚠️ IT DELIBERATELY DOES NOT BIND ON `payment_date` ALONE. A March
+     * bill credited in March and paid in June is a correct row with
+     * `deduction_date` in March and `payment_date` in June — the shape the
+     * column's own comment describes — and a check that forced them equal
+     * would refuse the very case Chapter XVII-B is most often got wrong.
+     */
+    deductionDateIsEarlier: check(
+      "tds_deductions_deduction_date_is_earlier",
+      sql`${t.creditDate} IS NULL
+          OR ${t.deductionDate} = LEAST(${t.creditDate}, COALESCE(${t.paymentDate}, ${t.creditDate}))`,
+    ),
+    /**
+     * ⭐⭐⭐ RULE 26, IN THE DATABASE.
+     *
+     * A payment in a currency other than the rupee carries its whole
+     * working or it does not exist: the foreign amount, the rate, the
+     * rate's date, its type and its publisher. And two of those are
+     * pinned rather than merely recorded —
+     *
+     *   • `fx_rate_type = 'tt_buying'`. The rule names the telegraphic
+     *     transfer buying rate. A mid rate is a different number and using
+     *     it under-deducts or over-deducts; s.201(1) makes the deductor
+     *     personally liable for a shortfall.
+     *   • `fx_rate_date = deduction_date`. The rule fixes the date at the
+     *     date the tax is required to be deducted. The invoice date is not
+     *     it, and the payment date is not it either whenever the credit
+     *     came first.
+     *
+     * ⚠️ IT IS A CHECK AND NOT A CONVENTION BECAUSE THE APPLICATION IS NOT
+     * THE ONLY WRITER. A backfill, a support fix or a future import path
+     * that never read `lib/tds/foreign-payments.ts` is refused here.
+     */
+    rule26Complete: check(
+      "tds_deductions_rule_26_complete",
+      sql`${t.paymentCurrency} IS NULL
+          OR ${t.paymentCurrency} = 'INR'
+          OR (${t.foreignPaymentBaseMinor} IS NOT NULL
+              AND ${t.foreignPaymentBaseMinor} >= 0
+              AND ${t.fxRate} IS NOT NULL AND ${t.fxRate} > 0
+              AND ${t.fxRateDate} IS NOT NULL
+              AND ${t.fxRateDate} = ${t.deductionDate}
+              AND ${t.fxRateType} = 'tt_buying'
+              AND ${t.fxRateSource} IS NOT NULL
+              AND ${t.fxStatutoryRef} IS NOT NULL)`,
+    ),
+    /** A rupee payment carries no translation, so it must carry no rate. */
+    domesticCarriesNoRate: check(
+      "tds_deductions_domestic_carries_no_rate",
+      sql`${t.paymentCurrency} IS NOT NULL AND ${t.paymentCurrency} <> 'INR'
+          OR (${t.fxRate} IS NULL AND ${t.fxRateDate} IS NULL
+              AND ${t.fxRateType} IS NULL AND ${t.foreignPaymentBaseMinor} IS NULL)`,
+    ),
+    currencyShape: check(
+      "tds_deductions_payment_currency_shape",
+      sql`${t.paymentCurrency} IS NULL OR ${t.paymentCurrency} ~ '^[A-Z]{3}$'`,
     ),
     /**
      * ⭐⭐ A REDUCED RATE MUST NAME THE CERTIFICATE THAT AUTHORISED IT.

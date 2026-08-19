@@ -504,4 +504,17 @@ export type ImportReport = {
   failedRowsCsv: string | null;
 
   fatal: string | null;
+
+  /**
+   * ⭐ WAVE 6 — SET ONLY WHEN THIS WAS ONE PART OF A LARGER MIGRATION,
+   * and only when there is something to say about the part itself rather
+   * than about its rows.
+   *
+   * ⚠️ THE SENTENCE THAT MATTERS MOST HERE IS "this part had already been
+   * imported, so it was not imported again". A customer whose connection
+   * dropped mid-migration and who re-ran it needs to know their rows are
+   * there ONCE — not to be shown a report of zero rows written and
+   * conclude the second attempt failed.
+   */
+  chunkNote?: string;
 };

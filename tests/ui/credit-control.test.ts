@@ -75,6 +75,7 @@ const ENFORCE = read("lib/credit/enforce.ts");
 const HOLD = read("lib/credit/hold.ts");
 const DUNNING = read("lib/credit/dunning.ts");
 const CREDIT_ACTIONS = read("server/actions/credit.ts");
+const DUNNING_SWEEP = read("server/credit/dunning-sweep.ts");
 const SQL_0083 = read("SQL-FILES/0083_credit_control_and_dunning.sql");
 const VERIFY_0083 = read("SQL-FILES/VERIFY-0083-neon-safe.sql");
 const DRILL_0083 = read("SQL-FILES/DRILL-DO-NOT-RUN-IN-NEON-0083.sql");
@@ -769,8 +770,15 @@ describe("🔴 the sweep queues; it does not send", () => {
   });
 
   it("⚠️ the date comes from Asia/Kolkata, never from toISOString", () => {
+    /*
+     * ⚠️ THE CLAMP MOVED WITH THE SWEEP in v1.66.0-alpha. It is read from
+     * `server/credit/dunning-sweep.ts` now, and it matters MORE than it
+     * did: the recommended cron fires at 19:30 UTC, which is 01:00 IST
+     * the next morning, so a `toISOString()` date would be yesterday on
+     * every single scheduled run.
+     */
     const sweep = codeOnly(
-      CREDIT_ACTIONS.slice(CREDIT_ACTIONS.indexOf("export async function runDunningSweep")),
+      DUNNING_SWEEP.slice(DUNNING_SWEEP.indexOf("export async function sweepDunningForTenant")),
     );
     expect(sweep).toMatch(/todayInIndia\(/);
     expect(sweep).not.toMatch(/toISOString/);

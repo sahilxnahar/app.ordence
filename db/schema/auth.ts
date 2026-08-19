@@ -589,6 +589,27 @@ export const PERMISSION_CATALOG = {
   "documents:create": "Upload and attach documents",
   "documents:delete": "Delete stored documents",
 
+  // ── Drawings ─────────────────────────────────────────────────────
+  //
+  // ⭐ WAVE 7. Four keys, and the split between the last two is the one
+  // that matters on a site.
+  //
+  // 🔴 `drawings:measure` IS NOT `drawings:read`. A quantity taken off a
+  // drawing goes into a BOQ and into a running bill. Anybody on the
+  // project should be able to LOOK at the sheet; taking a measurement off
+  // it that somebody gets paid against is a different act, and a site
+  // engineer who may check a dimension is not automatically a quantity
+  // surveyor.
+  //
+  // ⚠️ AND `drawings:markup` IS SEPARATE FROM `drawings:manage`. Raising
+  // a comment on a sheet is what a design review is for and should be
+  // wide; issuing a revision and superseding the one the site is building
+  // to is not.
+  "drawings:read": "View drawings and their revisions",
+  "drawings:manage": "Add drawings and issue revisions",
+  "drawings:markup": "Raise and resolve markups on a drawing",
+  "drawings:measure": "Take measurements off a drawing",
+
   // ── Accounting ───────────────────────────────────────────────────
   "ledgers:read": "View ledgers and balances",
   "ledgers:create": "Create ledgers",
@@ -1417,6 +1438,22 @@ export const ROLE_TEMPLATES: Readonly<Record<SystemRole, RoleTemplate>> = {
        */
       "documents:create",
       /**
+       * ⭐ WAVE 7 — LOOKING AT A DRAWING AND RAISING A COMMENT ON IT IS
+       * ORDINARY DAILY WORK on any project, and a design review that only
+       * two people can contribute to is not a design review.
+       *
+       * 🔴 AND `drawings:measure` IS NOT HERE. A quantity taken off a
+       * drawing goes into a BOQ and into a running bill somebody gets
+       * paid against. A team member who may check a dimension on screen
+       * is not automatically a quantity surveyor, and the difference is
+       * money.
+       *
+       * ⚠️ `drawings:manage` IS NOT HERE EITHER. Superseding the sheet
+       * the site is building to is not a member's act.
+       */
+      "drawings:read",
+      "drawings:markup",
+      /**
        * ⭐ v1.46.0 — APPLYING FOR YOUR OWN LEAVE IS ORDINARY DAILY WORK.
        *
        * ⚠️ AND IT IS THE ONLY LEAVE KEY HERE. `leave.read` is the whole
@@ -1523,6 +1560,12 @@ export const ROLE_TEMPLATES: Readonly<Record<SystemRole, RoleTemplate>> = {
       "contacts:read", "companies:read", "deals:read", "assets:read",
       "custom_objects:read", "contracts:read", "clauses:read",
       "ledgers:read", "transactions:read", "periods:read",
+      /**
+       * ⚠️ WAVE 7 — READS THE SHEET, MARKS UP NOTHING. A markup is a
+       * comment somebody has to answer, which is a change to the project's
+       * work list, and this role changes nothing.
+       */
+      "drawings:read",
       "leads:read", "projects:read", "units:read", "bookings:read",
       "payment_plans:read", "partners:read",
       "gst:read",

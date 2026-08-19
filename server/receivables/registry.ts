@@ -65,6 +65,12 @@ import type { DemandPolicyTerms } from "@/lib/receivables/demand";
  * that is symmetric by construction under Section 2(za), and a product
  * whose out-of-the-box default was 18% would be shipping a flagged
  * position to every workspace that never opened the settings page.
+ *
+ * ⚠️ THE MARGIN IS PRESCRIBED BY THE STATE'S RULES under s.84 read with
+ * s.2(za), and it is NOT the same in every State — some prescribe plus
+ * 2%, others plus 1%. This is a starting point a workspace overrides, and
+ * never a statement about any particular State's rules. See
+ * `lib/receivables/rera-state.ts` for what is Central and what is not.
  */
 export const DEFAULT_RECEIVABLE_TERMS: DemandPolicyTerms = Object.freeze({
   demandDueDays: 15,
@@ -86,11 +92,23 @@ export type ResolvedPolicies = {
   defaultStrategy: "oldest_first" | "specified";
 };
 
-export async function resolvePolicies(
-  tenantId: string,
-  projectId: string | null,
-): Promise<ResolvedPolicies> {
-  const [receivableRows, dunningRows] = await withTenant(tenantId, async (tx) => [
+/**
+ * ⭐ THE TWO POLICY TABLES, LOADED ONCE.
+ *
+ * ⚠️ SPLIT OUT SO A SCREEN THAT RESOLVES POLICIES FOR FIFTY DEMANDS DOES
+ * NOT RUN A HUNDRED QUERIES. `resolvePolicies` reads every active policy
+ * row for the workspace and then picks in memory — so calling it per
+ * demand was never reading different data, it was reading the same data
+ * fifty times. The ladder board does exactly that, and it is the screen
+ * somebody is waiting in front of.
+ */
+export type PolicySets = {
+  receivable: ReceivablePolicy[];
+  dunning: DunningPolicy[];
+};
+
+export async function loadPolicySets(tenantId: string): Promise<PolicySets> {
+  const [receivable, dunning] = await withTenant(tenantId, async (tx) => [
     await tx
       .select()
       .from(receivablePolicies)
@@ -107,19 +125,32 @@ export async function resolvePolicies(
         and(eq(dunningPolicies.tenantId, tenantId), eq(dunningPolicies.isActive, true)),
       ),
   ]);
+  return { receivable, dunning };
+}
 
+/**
+ * ⭐ THE FALLBACK CHAIN IS PROJECT → WORKSPACE → BUILT-IN.
+ *
+ * 🔴 PURE. It picks; it does not query. `resolvePolicies` is the thin
+ * wrapper that loads and then picks, so the two can never disagree about
+ * which policy wins.
+ */
+export function resolvePoliciesFrom(
+  sets: PolicySets,
+  projectId: string | null,
+): ResolvedPolicies {
   // ⭐ A project-specific policy wins over the workspace default. Terms
   // are negotiated per project — a subvention tower and an affordable
   // block do not collect on the same rate — and a single workspace rate
   // would be quietly wrong for one of them.
   const receivable =
-    receivableRows.find((p) => p.projectId === projectId && projectId !== null) ??
-    receivableRows.find((p) => p.projectId === null) ??
+    sets.receivable.find((p) => p.projectId === projectId && projectId !== null) ??
+    sets.receivable.find((p) => p.projectId === null) ??
     null;
 
   const dunning =
-    dunningRows.find((p) => p.projectId === projectId && projectId !== null) ??
-    dunningRows.find((p) => p.projectId === null) ??
+    sets.dunning.find((p) => p.projectId === projectId && projectId !== null) ??
+    sets.dunning.find((p) => p.projectId === null) ??
     null;
 
   return {
@@ -153,6 +184,13 @@ export async function resolvePolicies(
   };
 }
 
+export async function resolvePolicies(
+  tenantId: string,
+  projectId: string | null,
+): Promise<ResolvedPolicies> {
+  return resolvePoliciesFrom(await loadPolicySets(tenantId), projectId);
+}
+
 export async function listReceivablePolicies(
   tenantId: string,
 ): Promise<ReceivablePolicy[]> {
@@ -184,6 +222,18 @@ export type BookingContext = {
   reference: string;
   projectId: string | null;
   projectName: string;
+  /**
+   * ⚠️ `projects.state_code` VERBATIM, AND NULL IS THE COMMON ANSWER.
+   *
+   * Added in 0080 for GST place of supply under s.12(3) of the IGST Act
+   * and unset on the live deployment. It is carried here because RERA is
+   * a Central Act with State-made rules (s.84) and a State Authority
+   * (s.20), so which State a flat is in decides the cure period, the
+   * prescribed interest margin and the forfeiture position — and the
+   * ladder board has to be able to say that it does not know rather than
+   * silently applying one State's assumptions to every project.
+   */
+  projectStateCode: string | null;
   unitLabel: string;
   leadId: string | null;
   buyerName: string;
@@ -194,26 +244,67 @@ export type BookingContext = {
   agreementValueMinor: bigint | null;
 };
 
+const BOOKING_CONTEXT_COLUMNS = {
+  bookingId: bookings.id,
+  reference: bookings.reference,
+  agreementValueMinor: bookings.agreementValueMinor,
+  leadId: bookings.leadId,
+  unitCode: units.code,
+  unitTower: units.tower,
+  projectId: projects.id,
+  projectName: projects.name,
+  projectStateCode: projects.stateCode,
+  buyerName: leads.name,
+  buyerEmail: leads.email,
+  buyerPhone: leads.phone,
+  preferredLang: leads.preferredLang,
+} as const;
+
+type BookingContextRow = {
+  bookingId: string;
+  reference: string;
+  agreementValueMinor: bigint | null;
+  leadId: string | null;
+  unitCode: string | null;
+  unitTower: string | null;
+  projectId: string | null;
+  projectName: string | null;
+  projectStateCode: string | null;
+  buyerName: string | null;
+  buyerEmail: string | null;
+  buyerPhone: string | null;
+  preferredLang: string | null;
+};
+
+/**
+ * ⚠️ ONE MAPPER, USED BY BOTH THE SINGULAR AND THE PLURAL READ. Two
+ * mappers is how a board and a detail screen come to disagree about what
+ * a unit with no tower is called.
+ */
+function toBookingContext(row: BookingContextRow): BookingContext {
+  return {
+    bookingId: row.bookingId,
+    reference: row.reference,
+    projectId: row.projectId ?? null,
+    projectName: row.projectName ?? "—",
+    projectStateCode: row.projectStateCode ?? null,
+    unitLabel: row.unitTower ? `${row.unitTower}-${row.unitCode ?? ""}` : (row.unitCode ?? "—"),
+    leadId: row.leadId ?? null,
+    buyerName: row.buyerName ?? "—",
+    buyerEmail: row.buyerEmail ?? null,
+    buyerPhone: row.buyerPhone ?? null,
+    preferredLang: row.preferredLang ?? null,
+    agreementValueMinor: row.agreementValueMinor ?? null,
+  };
+}
+
 export async function findBookingContext(
   tenantId: string,
   bookingId: string,
 ): Promise<BookingContext | null> {
   const rows = await withTenant(tenantId, async (tx) =>
     tx
-      .select({
-        bookingId: bookings.id,
-        reference: bookings.reference,
-        agreementValueMinor: bookings.agreementValueMinor,
-        leadId: bookings.leadId,
-        unitCode: units.code,
-        unitTower: units.tower,
-        projectId: projects.id,
-        projectName: projects.name,
-        buyerName: leads.name,
-        buyerEmail: leads.email,
-        buyerPhone: leads.phone,
-        preferredLang: leads.preferredLang,
-      })
+      .select(BOOKING_CONTEXT_COLUMNS)
       .from(bookings)
       .leftJoin(units, eq(units.id, bookings.unitId))
       .leftJoin(projects, eq(projects.id, units.projectId))
@@ -223,21 +314,35 @@ export async function findBookingContext(
   );
 
   const row = rows[0];
-  if (!row) return null;
+  return row ? toBookingContext(row) : null;
+}
 
-  return {
-    bookingId: row.bookingId,
-    reference: row.reference,
-    projectId: row.projectId ?? null,
-    projectName: row.projectName ?? "—",
-    unitLabel: row.unitTower ? `${row.unitTower}-${row.unitCode ?? ""}` : (row.unitCode ?? "—"),
-    leadId: row.leadId ?? null,
-    buyerName: row.buyerName ?? "—",
-    buyerEmail: row.buyerEmail ?? null,
-    buyerPhone: row.buyerPhone ?? null,
-    preferredLang: row.preferredLang ?? null,
-    agreementValueMinor: row.agreementValueMinor ?? null,
-  };
+/**
+ * ⭐ THE SAME FACTS FOR A PAGE OF BOOKINGS, IN ONE ROUND TRIP.
+ *
+ * ⚠️ RETURNS A MAP, AND A MISSING KEY IS A REAL ANSWER. A demand whose
+ * booking has been deleted still has a row in `demand_notices`; the board
+ * has to be able to show that it cannot name the allottee rather than
+ * throwing or, worse, printing somebody else's name.
+ */
+export async function listBookingContexts(
+  tenantId: string,
+  bookingIds: readonly string[],
+): Promise<Map<string, BookingContext>> {
+  const ids = [...new Set(bookingIds)];
+  if (ids.length === 0) return new Map();
+
+  const rows = await withTenant(tenantId, async (tx) =>
+    tx
+      .select(BOOKING_CONTEXT_COLUMNS)
+      .from(bookings)
+      .leftJoin(units, eq(units.id, bookings.unitId))
+      .leftJoin(projects, eq(projects.id, units.projectId))
+      .leftJoin(leads, eq(leads.id, bookings.leadId))
+      .where(and(eq(bookings.tenantId, tenantId), inArray(bookings.id, ids))),
+  );
+
+  return new Map(rows.map((row) => [row.bookingId, toBookingContext(row)]));
 }
 
 export async function findMilestone(tenantId: string, milestoneId: string) {

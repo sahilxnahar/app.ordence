@@ -36,12 +36,22 @@ import { db, withTenant } from "@/db";
 import { users } from "@/db/schema";
 import { requirePermission, writeAudit, auditMeta } from "@/server/audit";
 import { TenantAccessError } from "@/server/tenant-context";
+/**
+ * ⭐ 0114 — the approval queue. `server/billing/seat-approval.ts` holds
+ * the decisions; these actions are the door onto them.
+ */
+import {
+  listPendingSeats,
+  approvePendingSeat,
+  declinePendingSeat,
+  SeatApprovalRefusal,
+} from "@/server/billing/seat-approval";
 import {
   assertImpersonationAllows,
   ImpersonationForbiddenError,
 } from "@/server/platform/impersonation";
 import { PermissionDeniedError } from "@/lib/permissions";
-import { permissionsForRole } from "@/db/schema/auth";
+import { permissionsForRole, ROLE_TEMPLATES, PERMISSION_CATALOG } from "@/db/schema/auth";
 import type { ActionResult } from "@/lib/validators/crm";
 import { ASSIGNABLE_ROLES, ROLE_RANK } from "@/lib/validators/team";
 import {
@@ -430,6 +440,260 @@ export async function getSeatUsage(): Promise<
         warningMessage: summary.warningMessage,
       },
     };
+  } catch (err) {
+    return toActionError(err);
+  }
+}
+
+/* ================================================================== */
+/* ⭐⭐⭐ THE SEAT APPROVAL QUEUE — 0114                                */
+/* ================================================================== */
+
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 WHY THIS EXISTS
+ * ══════════════════════════════════════════════════════════════════════
+ * There is no in-product invite, so people arrive through Clerk. That
+ * path used to check the seat limit, write an audit row, and admit them
+ * anyway — which made a ten-seat licence a ten-seat suggestion.
+ *
+ * They now arrive as `pending_seat`, which consumes no seat, and land in
+ * this queue. Clerk gets its 200 and stops retrying; the person can sign
+ * in and sees one screen explaining that a seat has been requested.
+ */
+
+export type PendingSeatView = {
+  requestId: string;
+  userId: string;
+  email: string;
+  name: string;
+  role: string;
+  source: string;
+  requestedAt: string;
+  seatsUsedAtRequest: number;
+  seatsAvailableAtRequest: number;
+  waitingDays: number;
+};
+
+/**
+ * ⚠️ `users:read`, THE SAME AS SEEING THE MEMBER LIST, and for the reason
+ * `getSeatUsage` gives above: the person managing the team needs to see
+ * why somebody is waiting, and gating it behind a billing permission
+ * would hide the queue from exactly the person who works it.
+ */
+export async function getPendingSeats(): Promise<
+  ActionResult<{ rows: PendingSeatView[]; seatsAvailable: number }>
+> {
+  try {
+    const ctx = await requirePermission("users:read");
+
+    const [rows, summary] = await Promise.all([
+      withTenant(ctx.tenant.id, (tx) => listPendingSeats(tx, ctx.tenant.id)),
+      getSeatSummary(ctx.tenant.id, ctx.tenant.seatLimit),
+    ]);
+
+    return {
+      ok: true,
+      data: { rows: [...rows], seatsAvailable: summary.available },
+    };
+  } catch (err) {
+    return toActionError(err);
+  }
+}
+
+/**
+ * ⭐⭐ APPROVE, AND IT CONSUMES A SEAT.
+ *
+ * 🔴 IT CAN FAIL, AND THAT IS THE POINT. If no seat is free the approval
+ * is refused with the price named, rather than letting the person in and
+ * adding a line to next month's invoice. `lib/billing/seats.ts` already
+ * argues that case: *"an admin adding twelve people on a Friday afternoon
+ * discovers a bill they never agreed to on the first of the month, and
+ * the support conversation that follows is one you cannot win."*
+ *
+ * ⚠️ `users:manage` AND NOT `users:read`. Reading the queue is
+ * operational; letting somebody into the workspace is not.
+ */
+export async function approveSeatRequest(
+  input: unknown,
+): Promise<ActionResult<{ note: string }>> {
+  try {
+    const data = z.object({ requestId: z.string().uuid() }).parse(input);
+    /**
+     * ⚠️ `users:invite`, NOT `users:update`. Approving a seat is letting
+     * somebody INTO the workspace, which is exactly what the invite
+     * permission is for. `users:update` is for changing somebody who is
+     * already in, and an admin trusted to edit a job title is not
+     * necessarily trusted to add a person and a line to the bill.
+     */
+    const ctx = await requirePermission("users:invite");
+
+    const result = await withTenant(ctx.tenant.id, async (tx) => {
+      const outcome = await approvePendingSeat(tx, {
+        tenantId: ctx.tenant.id,
+        requestId: data.requestId,
+        approvedByUserId: ctx.user.id,
+        fallbackSeatLimit: ctx.tenant.seatLimit,
+      });
+
+      await writeAudit(ctx, {
+        action: "update",
+        resourceType: "seat_request",
+        resourceId: data.requestId,
+        newValue: { resolution: "approved", userId: outcome.userId },
+        reason: "A seat was approved for a person who arrived without one.",
+        severity: "notice",
+      });
+
+      return outcome;
+    });
+
+    revalidatePath("/settings/team");
+    return {
+      ok: true,
+      data: {
+        note:
+          result.seatsRemaining === 0
+            ? "Approved. That was your last seat."
+            : `Approved. ${result.seatsRemaining} seat${result.seatsRemaining === 1 ? "" : "s"} remaining.`,
+      },
+    };
+  } catch (err) {
+    if (err instanceof SeatApprovalRefusal) return fail(err.message);
+    return toActionError(err);
+  }
+}
+
+/**
+ * ⭐ DECLINE, AND IT NEEDS A REASON.
+ *
+ * ⚠️ THE PERSON IS NOT DELETED. They stay `pending_seat`, so they can
+ * still sign in and still see where they stand. Deleting them would make
+ * the decision invisible to the only person it affects, and they would go
+ * on waiting for an answer that already exists.
+ */
+export async function declineSeatRequest(
+  input: unknown,
+): Promise<ActionResult<{ note: string }>> {
+  try {
+    const data = z
+      .object({
+        requestId: z.string().uuid(),
+        reason: z.string().trim().min(1),
+      })
+      .parse(input);
+    /**
+     * ⚠️ `users:invite`, NOT `users:update`. Approving a seat is letting
+     * somebody INTO the workspace, which is exactly what the invite
+     * permission is for. `users:update` is for changing somebody who is
+     * already in, and an admin trusted to edit a job title is not
+     * necessarily trusted to add a person and a line to the bill.
+     */
+    const ctx = await requirePermission("users:invite");
+
+    await withTenant(ctx.tenant.id, async (tx) => {
+      await declinePendingSeat(tx, {
+        tenantId: ctx.tenant.id,
+        requestId: data.requestId,
+        declinedByUserId: ctx.user.id,
+        reason: data.reason,
+      });
+
+      await writeAudit(ctx, {
+        action: "update",
+        resourceType: "seat_request",
+        resourceId: data.requestId,
+        newValue: { resolution: "declined" },
+        reason: data.reason.trim(),
+        severity: "notice",
+      });
+    });
+
+    revalidatePath("/settings/team");
+    return {
+      ok: true,
+      data: {
+        note: "Declined, with your reason recorded. They can see that they are not being given a seat.",
+      },
+    };
+  } catch (err) {
+    if (err instanceof SeatApprovalRefusal) return fail(err.message);
+    return toActionError(err);
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* WAVE 9 — WHAT A ROLE ACTUALLY GRANTS                                */
+/* ------------------------------------------------------------------ */
+
+export type RolePermissionRow = {
+  readonly role: string;
+  readonly label: string;
+  readonly description: string;
+  readonly grantsEverything: boolean;
+  readonly permissions: readonly { readonly key: string; readonly label: string }[];
+};
+
+/**
+ * ⭐⭐⭐ THE ONLY THING IN THE PRODUCT THAT READS `roles:read`.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 THE PERMISSION EXISTED, `security_admin` HELD IT, NOTHING USED IT
+ * ══════════════════════════════════════════════════════════════════════
+ * `roles:manage` gates `updateUserRole` and has since Phase 8.
+ * `roles:read` — its read counterpart, granted to `security_admin` and
+ * to nobody else outside the wildcard roles — gated nothing, because
+ * there was nothing to gate: the product had no way to see what a role
+ * grants before assigning it. The team screen showed a permission COUNT
+ * per member, which tells an administrator that "manager" has 45 of
+ * something and not which 45.
+ *
+ * That is the gap this closes, and closing it is why the key is now
+ * enforced rather than merely enforceable. An administrator choosing
+ * between `manager` and `member` for a new hire is making an
+ * authorisation decision with a number as their only evidence.
+ *
+ * ⚠️ `roles:read` AND NOT `users:read`. Reading the team list is an
+ * everyday operation almost every role can do. Reading the authorisation
+ * model is reconnaissance if the reader is not trusted with it — it is
+ * the map of what each account can reach — which is precisely why the
+ * role template gives it to `security_admin` and withholds it from
+ * `member`, who does hold `users:read`.
+ *
+ * ⚠️ IT RETURNS THE TEMPLATES, NOT ANY INDIVIDUAL'S EFFECTIVE SET. A
+ * user's real permissions are their role plus their overrides, and
+ * showing one person's effective list on a screen about ROLES would
+ * invite the reader to conclude the template says something it does not.
+ */
+export async function getRolePermissionMatrix(): Promise<ActionResult<RolePermissionRow[]>> {
+  try {
+    await requirePermission("roles:read");
+
+    const labels = PERMISSION_CATALOG as Record<string, string>;
+
+    const rows: RolePermissionRow[] = Object.values(ROLE_TEMPLATES)
+      /**
+       * ⚠️ `platform_super_admin` IS EXCLUDED. It is an Ordence staff
+       * role, it is never assignable inside a workspace, and listing it
+       * on a customer's screen tells them a role exists that can see
+       * their data and that they cannot control. That conversation
+       * belongs in the support-access screen, which is built for it.
+       */
+      .filter((template) => template.key !== "platform_super_admin")
+      .map((template) => {
+        const keys = permissionsForRole(template.key as SystemRole);
+        return {
+          role: template.key,
+          label: template.label,
+          description: template.description,
+          grantsEverything: template.permissions === "*",
+          permissions: [...keys]
+            .sort()
+            .map((key) => ({ key, label: labels[key] ?? key })),
+        };
+      });
+
+    return { ok: true, data: rows };
   } catch (err) {
     return toActionError(err);
   }

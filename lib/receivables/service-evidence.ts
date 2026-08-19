@@ -197,9 +197,32 @@ export type NoticeServiceFacts = {
   readonly servedAt: Date | null;
   readonly serviceRecordedAt: Date | null;
   readonly serviceReference: string | null;
+  /**
+   * ⭐ 0111. The clause or section relied on when service is DEEMED
+   * rather than proved. Required for `deemed` by a CHECK, and null on
+   * every other grade — a dispatch does not rest on a legal fiction.
+   */
+  readonly serviceBasis: string | null;
+  /**
+   * ⭐⭐ 0111. The permission key this rung was raised under.
+   *
+   * 🔴 `'legacy_unrecorded'` ON EVERY ROW WRITTEN BEFORE 0111, filled by
+   * the ADD COLUMN's default rather than by an UPDATE — the same trick
+   * 0098 used, for the same reason. It is not "unknown"; it is "this
+   * system never recorded it", which is a different sentence and the one
+   * the person about to cancel needs.
+   */
+  readonly authorisedPermission: string;
   /** 🔴 Legacy only. Present on pre-0098 rows and meaningless. */
   readonly legacySentAt: Date | null;
 };
+
+/**
+ * ⭐ THE VALUE 0111's `ADD COLUMN … DEFAULT` STAMPED ONTO HISTORY.
+ * Exported because three files compare against it and a fourth would
+ * otherwise spell it differently.
+ */
+export const AUTHORITY_NOT_RECORDED = "legacy_unrecorded";
 
 /**
  * ⭐⭐ IS THERE ANYTHING BEHIND THIS ROW AT ALL?
@@ -218,6 +241,21 @@ export function noticeHasService(facts: NoticeServiceFacts): boolean {
   if (grade.word === "human_recorded") {
     return (
       facts.serviceRecordedAt !== null && Boolean(facts.serviceReference?.trim())
+    );
+  }
+  /*
+   * ⚠️ `deemed` IS THE STRONGEST GRADE AND THE ONLY ONE NO MACHINE
+   * TOUCHES, so it is the one to check hardest. A row graded `deemed`
+   * with no stated basis is somebody's conclusion with a badge on it —
+   * exactly the shape of the defect 0098 removed, one grade higher up.
+   * The CHECK in 0111 refuses to store one; this refuses to believe one
+   * that arrived any other way.
+   */
+  if (grade.word === "deemed") {
+    return (
+      facts.servedAt !== null &&
+      facts.serviceRecordedAt !== null &&
+      Boolean(facts.serviceBasis?.trim())
     );
   }
   return facts.servedAt !== null;
@@ -259,6 +297,22 @@ export type ServiceGapFinding = {
   /** Rungs raised with nothing behind them, weakest first. */
   readonly unprovenStages: readonly string[];
   readonly legacyStages: readonly string[];
+  /**
+   * ⭐ 0111. Rungs whose service is DEEMED — served in law without proof
+   * of receipt. Named separately from `clear` on purpose: they satisfy
+   * the gate and they are the rungs the allottee's advocate will test
+   * first, so the person about to cancel is told which ones they are
+   * rather than being shown a single green tick over a mixed file.
+   */
+  readonly deemedStages: readonly string[];
+  /**
+   * 🔴 0111. Rungs raised before this system recorded WHICH RIGHT they
+   * were raised under. Non-blocking on its own — the row may be perfectly
+   * good — but a cancellation warning in this list cannot be shown to
+   * have been authorised by somebody who held the key, and that is the
+   * question a hearing asks about rung four.
+   */
+  readonly unrecordedAuthorityStages: readonly string[];
 };
 
 /**
@@ -295,13 +349,28 @@ export function cancellationServiceFinding(
         "Cancellation and forfeiture normally follow a served ladder of demand notices. There are none on file here, so nothing in this system evidences that the allottee was given a chance to pay.",
       unprovenStages: [],
       legacyStages: [],
+      deemedStages: [],
+      unrecordedAuthorityStages: [],
     };
   }
 
   const unproven: string[] = [];
   const legacy: string[] = [];
+  const deemed: string[] = [];
+  /*
+   * ⭐ 0111. Collected over EVERY rung, served or not. Whether the right
+   * was recorded is a separate question from whether the letter arrived,
+   * and a file can fail one while passing the other.
+   */
+  const unrecordedAuthority: string[] = [];
 
   for (const notice of notices) {
+    if (notice.authorisedPermission === AUTHORITY_NOT_RECORDED) {
+      unrecordedAuthority.push(notice.stage);
+    }
+    if (describeServiceEvidence(notice.serviceEvidence).word === "deemed") {
+      deemed.push(notice.stage);
+    }
     if (noticeHasService(notice)) continue;
     unproven.push(notice.stage);
     if (describeServiceEvidence(notice.serviceEvidence).word === "legacy_unverified") {
@@ -309,15 +378,39 @@ export function cancellationServiceFinding(
     }
   }
 
+  /*
+   * ⚠️ A DEEMED RUNG IS NOT A GAP AND IT IS NOT A CLEAN BILL EITHER. It
+   * clears the gate — it is service in law — and it is the rung the other
+   * side attacks, so it is named in both outcomes below rather than only
+   * in the failing one.
+   */
+  const deemedClause =
+    deemed.length > 0
+      ? ` ⚠️ ${deemed.length} rest on DEEMED service — served in law without proof of receipt (${deemed
+          .map((s) => s.replace(/_/g, " "))
+          .join(", ")}). That is a legal conclusion recorded by a named person under a stated clause, not a delivery this system watched happen, and it is the first thing the allottee's advocate will test.`
+      : "";
+
+  const authorityClause =
+    unrecordedAuthority.length > 0
+      ? ` ⚠️ ${unrecordedAuthority.length} rung(s) predate authority recording (${unrecordedAuthority
+          .map((s) => s.replace(/_/g, " "))
+          .join(", ")}), so this system cannot show which right they were raised under.`
+      : "";
+
   if (unproven.length === 0) {
     return {
       word: "clear",
       blocking: false,
       headline: "Every demand notice on this booking has service behind it.",
       detail:
-        "Each rung was either dispatched by the system with a provider message id, or recorded as served by a named colleague with a reference.",
+        "Each rung was either dispatched by the system with a provider message id, or recorded as served by a named colleague with a reference." +
+        deemedClause +
+        authorityClause,
       unprovenStages: [],
       legacyStages: [],
+      deemedStages: deemed,
+      unrecordedAuthorityStages: unrecordedAuthority,
     };
   }
 
@@ -332,10 +425,12 @@ export function cancellationServiceFinding(
     blocking: true,
     headline: `${unproven.length} demand notice(s) were raised but never proven to have been served.`,
     detail:
-      `Raised without service: ${named}. Cancelling or forfeiting on this file means relying on notices this system cannot show were ever sent to the allottee.${legacyClause}` +
+      `Raised without service: ${named}. Cancelling or forfeiting on this file means relying on notices this system cannot show were ever sent to the allottee.${legacyClause}${deemedClause}${authorityClause}` +
       " Dispatch them, or record the postal or hand delivery with its reference, before you post.",
     unprovenStages: unproven,
     legacyStages: legacy,
+    deemedStages: deemed,
+    unrecordedAuthorityStages: unrecordedAuthority,
   };
 }
 
@@ -389,4 +484,116 @@ export function validatePostalServiceClaim(
     };
   }
   return { ok: true, reference };
+}
+
+/* ------------------------------------------------------------------ */
+/* ⭐⭐⭐ SERVICE THAT NOBODY WATCHED HAPPEN, AND THE LAW SAYS COUNTS    */
+/* ------------------------------------------------------------------ */
+
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 `deemed` HAS BEEN IN THIS FILE SINCE 0098 AND NOTHING WROTE IT
+ * ══════════════════════════════════════════════════════════════════════
+ * It was declared in `SERVICE_EVIDENCE_GRADES`, described in
+ * `DESCRIPTIONS` with `strength: 3` — the STRONGEST grade in the product
+ * — allowed by the CHECK in 0098, and granted `supportsEnforcement:
+ * true`, which means `noticeHasService` would have cleared a cancellation
+ * on it. No code path anywhere could produce one. A grade that clears the
+ * gate before a forfeiture and has no writer is this codebase's own
+ * recurring defect standing in the most expensive room in the product.
+ *
+ * ⚠️ THE ANSWER IS TO WIRE IT, NOT TO DELETE IT, and the reason is
+ * ordinary rather than theoretical. An allottee REFUSES the registered
+ * post. The cover comes back endorsed "refused". Under the agreement's
+ * service clause — and under s.27 of the General Clauses Act, 1897 for a
+ * properly addressed, prepaid registered letter — that is good service,
+ * and it is the single most common way a real chase ends. Without this
+ * grade the only two things a person could record are a `human_recorded`
+ * claim that the letter was DELIVERED, which is false, or nothing, which
+ * loses the developer a case they should win.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * ⭐ WHAT MAKES IT SAFE IS THAT IT IS THE HARDEST CLAIM TO MAKE
+ * ══════════════════════════════════════════════════════════════════════
+ *   ① A different key. `receivables:warn_cancellation`, not
+ *      `receivables:dun` — see `lib/receivables/notice-authority.ts`.
+ *      Deeming service is a conclusion in law, and the accountant who
+ *      chases the money is not the person who draws it.
+ *   ② A BASIS IN WORDS. The clause or section relied on, stored on the
+ *      row, required by a CHECK in 0111 and printed beside the grade.
+ *      "Deemed" with no basis is a tick box wearing the top badge.
+ *   ③ A reference. The returned cover's consignment number or the
+ *      postal endorsement — something somebody can look up.
+ *   ④ Never on a channel the machine can drive. An email that the outbox
+ *      can dispatch has `system_dispatch` available to it, which is
+ *      proved rather than argued; deeming service on it would be
+ *      choosing the weaker evidence and calling it the stronger.
+ *   ⑤ Never on a row that was dispatched. The CHECK
+ *      `dunning_events_human_record_is_not_a_dispatch` in 0098 already
+ *      refuses it, and this refuses it first with a sentence.
+ */
+export type DeemedServiceClaim = {
+  readonly channel: string;
+  /**
+   * ⚠️ NAMED `alreadyDispatchedAt` AND NOT `dispatchedAt`, WHICH LOOKS
+   * FUSSY AND IS NOT. `dunning-service-evidence.test.ts` asserts that
+   * nothing in the write path ever puts a value on the right-hand side of
+   * a `dispatchedAt:` other than a read of an existing row — the guard
+   * that stops the send path claiming a dispatch again. A field on an
+   * INPUT type spelt the same way sits inside that guard's blast radius
+   * for no reason. This name also says what it means: it is a question
+   * about the row that already exists, never a value being written.
+   */
+  readonly alreadyDispatchedAt: Date | null;
+  readonly reference: string;
+  /** The clause of the agreement, or the section, being relied on. */
+  readonly basis: string;
+  readonly recordedBy: string | null;
+};
+
+export type DeemedServiceVerdict =
+  | { readonly ok: true; readonly reference: string; readonly basis: string }
+  | { readonly ok: false; readonly error: string };
+
+export function validateDeemedServiceClaim(
+  claim: DeemedServiceClaim,
+): DeemedServiceVerdict {
+  if (channelCanBeMachineDispatched(claim.channel)) {
+    return {
+      ok: false,
+      error:
+        "This notice goes by a channel the system can dispatch itself, so a provider message id is available for it. Deeming service where dispatch can be proved swaps evidence somebody can check for an argument somebody has to win. Let it send.",
+    };
+  }
+  if (claim.alreadyDispatchedAt !== null) {
+    return {
+      ok: false,
+      error:
+        "This notice was already dispatched and carries a provider message id. That is the stronger record and it cannot be replaced by a deeming.",
+    };
+  }
+  const reference = claim.reference.trim();
+  if (reference.length < 4) {
+    return {
+      ok: false,
+      error:
+        "Give the consignment number of the cover that came back, or the postal endorsement reference. Deemed service is still service by post — there is a piece of paper, and without it nobody can look anything up.",
+    };
+  }
+  const basis = claim.basis.trim();
+  if (basis.length < 20) {
+    return {
+      ok: false,
+      error:
+        "State the clause of the agreement, or the section, that makes this good service — in the words you would use at a hearing. Deemed service is a conclusion in law rather than an event, and a conclusion with no stated basis is a tick box at the top of the evidence scale.",
+    };
+  }
+  if (!claim.recordedBy) {
+    return {
+      ok: false,
+      error:
+        "Deeming service names the person who drew the conclusion. There is no signed-in user on this request.",
+    };
+  }
+  return { ok: true, reference, basis };
 }

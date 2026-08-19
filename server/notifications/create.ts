@@ -214,14 +214,36 @@ export async function createNotification(input: {
 
       const subject = `[${severity.toUpperCase()}] ${input.title}`;
 
+      /*
+       * ══════════════════════════════════════════════════════════════
+       * 🔴 THIS CHECK WAS UNREACHABLE. It read:
+       *
+       *     const failed = results.filter((r) => r.status === "rejected").length;
+       *
+       * `sendEmail` is typed `Promise<boolean>` and catches everything, so
+       * it can never REJECT. `failed` was provably always 0 and the
+       * console.error below could not execute. Zero notification emails
+       * could go out — no API key, unverified domain, provider rate limit
+       * — and the one line that would have said so was dead code.
+       *
+       * ⭐ The settled VALUE is what carries the answer, not the settled
+       * STATE. `allSettled` is still right: one bad recipient must not
+       * stop the rest.
+       * ══════════════════════════════════════════════════════════════
+       */
       const results = await Promise.allSettled(
         created.recipients.map((to) => sendEmail({ to, subject, html, text })),
       );
 
-      const failed = results.filter((r) => r.status === "rejected").length;
+      const failed = results.filter(
+        (r) => r.status === "rejected" || r.value === false,
+      ).length;
+
       if (failed > 0) {
         console.error(
-          `[notifications] ${failed}/${created.recipients.length} notification emails failed for tenant ${input.tenantId}.`,
+          `[notifications] ${failed}/${created.recipients.length} notification emails were NOT delivered for tenant ${input.tenantId}. ` +
+            `The in-app notification was still created, so the recipient will see it on their next visit, ` +
+            `but nothing reached their inbox.`,
         );
       }
     }

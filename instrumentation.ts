@@ -69,6 +69,55 @@ export async function register() {
   if (process.env.NEXT_RUNTIME === "nodejs") {
     const { assertBootEnv } = await import("@/lib/env-boot");
     assertBootEnv();
+
+    /**
+     * ══════════════════════════════════════════════════════════════════
+     * ⭐⭐⭐ WAVE 8 — THE RATE LIMITER GETS A COUNTER THAT COUNTS
+     * ══════════════════════════════════════════════════════════════════
+     * `lib/security/rate-limit.ts` has said this since Phase 20:
+     *
+     *     "Per-instance memory counters are a speed bump, not a control:
+     *      on a serverless deployment the effective limit is
+     *      (limit × instances)."
+     *
+     * That was this deployment. `UPSTASH_REDIS_REST_*` is not set, so the
+     * auth limit of 10/minute was 10 × however many instances Railway was
+     * running — a number nobody controls and nobody knows.
+     *
+     * ⚠️ REGISTERED HERE AND NOT AT A MODULE TOP LEVEL. An import-time
+     * side effect runs in whatever bundle pulls the module in, including
+     * the edge one, where `node:crypto` and the database client do not
+     * exist. `register()` runs once per Node process, which is exactly
+     * the scope a process-wide registration wants.
+     *
+     * 🔴 IT ALSO WIRES `onRateLimitDegraded`, WHICH HAD NO CALLER
+     * ANYWHERE. The `rate_limit.degraded` security event has existed
+     * since Phase 20 with a severity, a label and a SIEM mapping, and had
+     * never fired once.
+     */
+    const { installDurableRateLimiter } = await import(
+      "@/server/security/rate-limit-durable"
+    );
+    installDurableRateLimiter();
+
+    /**
+     * ══════════════════════════════════════════════════════════════════
+     * ⭐⭐⭐ WAVE 9 — AND THE SECOND HOOK THAT NOTHING HAD EVER WIRED
+     * ══════════════════════════════════════════════════════════════════
+     * `server/security/record.ts` exports `onSecurityRecordFailure` and
+     * says why:
+     *
+     *     "the failure mode this module must not have is 'the database is
+     *      unreachable during an intrusion, so nothing is recorded and
+     *      nothing is alerted either'."
+     *
+     * 🔴 NOTHING CALLED IT. A failed write of a CRITICAL security event
+     * produced one `console.error` and no alert. Found the same way the
+     * rate limiter's hook was — by grepping registration functions for
+     * their callers.
+     */
+    const { installSecurityAlerting } = await import("@/server/security/alerting");
+    installSecurityAlerting();
   }
 
   if (!SENTRY_ENABLED) return;

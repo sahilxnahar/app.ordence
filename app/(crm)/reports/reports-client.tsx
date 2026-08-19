@@ -228,10 +228,30 @@ function GstReportView({ data }: { data: Record<string, unknown> }) {
     outputTaxByCurrency: Array<{
       currency: string;
       count: number;
+      /** ⚠️ GROSS. What was supplied, before Rule 53. */
       totalTax: LabelledTotal;
       totalValue: LabelledTotal;
+      creditNotes: {
+        count: number;
+        nettedCount: number;
+        timeBarredCount: number;
+        windowUnverifiedCount: number;
+        timeBarredTax: LabelledTotal;
+        reducedTax: { total: LabelledTotal };
+      };
+      /** ⭐ What Rule 53 leaves payable, head by head. Never negative. */
+      liability: {
+        cgst: LabelledTotal;
+        sgst: LabelledTotal;
+        igst: LabelledTotal;
+        total: LabelledTotal;
+      };
+      carriedForward: { total: LabelledTotal };
+      hasNegativePeriod: boolean;
+      tiesToDocument: { agrees: boolean; differenceMinor: string };
     }>;
     outputTaxCurrencies: string[];
+    outputTaxExcludesCreditNotes: boolean;
     inputTax: { count: number; totalItc: LabelledTotal };
     pendingFilings: number;
     nextFilingDue: string | null;
@@ -252,12 +272,19 @@ function GstReportView({ data }: { data: Record<string, unknown> }) {
   const singleOutput =
     d.outputTaxByCurrency.length === 1 ? (d.outputTaxByCurrency[0] ?? null) : null;
   const netComparable =
-    singleOutput !== null && singleOutput.totalTax.currency === d.inputTax.totalItc.currency;
+    singleOutput !== null && singleOutput.liability.total.currency === d.inputTax.totalItc.currency;
+  /**
+   * ⭐ THE OUTPUT SIDE OF THIS SUBTRACTION IS THE RULE 53 LIABILITY, NOT
+   * THE GROSS TAX. It used to be the gross figure, so every workspace
+   * that had ever issued a credit note was shown a net liability that was
+   * too high by the whole tax on every return it had ever taken.
+   */
   const net: LabelledTotal | null = netComparable && singleOutput
     ? {
-        currency: singleOutput.totalTax.currency,
+        currency: singleOutput.liability.total.currency,
         amountMinor: (
-          BigInt(singleOutput.totalTax.amountMinor) - BigInt(d.inputTax.totalItc.amountMinor)
+          BigInt(singleOutput.liability.total.amountMinor) -
+          BigInt(d.inputTax.totalItc.amountMinor)
         ).toString(),
         formatted: "",
         currencyAssumed: singleOutput.totalTax.currencyAssumed,
@@ -268,15 +295,35 @@ function GstReportView({ data }: { data: Record<string, unknown> }) {
     <div className="space-y-4">
       <div className="grid grid-cols-2 gap-4">
         <div className="rounded-md border border-border p-4">
-          <p className="text-xs text-muted-foreground">Output tax (open invoices)</p>
+          {/*
+            ⭐ THE LABEL NAMES THE DOCUMENTS. This tile used to read "open
+            invoices" over figures taken from Ordence's own subscription
+            billing, and nothing on the screen said which invoices they
+            were — which is precisely why nobody noticed.
+          */}
+          <p className="text-xs text-muted-foreground">
+            Output tax — your issued sales invoices
+          </p>
           {d.outputTaxByCurrency.length === 0 ? (
             <p className="mt-1 text-2xl font-bold">—</p>
           ) : (
             d.outputTaxByCurrency.map((row) => (
               <div key={row.currency} className="mt-1">
-                <p className="text-2xl font-bold">{formatTotal(row.totalTax)}</p>
+                {/*
+                  ⭐ THE HEADLINE IS THE LIABILITY, NOT THE GROSS TAX.
+                  The gross figure is kept underneath it, because an
+                  accountant reconciling to the sales register needs to
+                  see both and the difference between them.
+                */}
+                <p className="text-2xl font-bold">{formatTotal(row.liability.total)}</p>
                 <p className="mt-0.5 text-xs text-muted-foreground">
-                  {row.count} invoices · taxable value {formatTotal(row.totalValue)}
+                  {row.count} invoices · gross {formatTotal(row.totalTax)} · less credit notes{" "}
+                  {formatTotal(row.creditNotes.reducedTax.total)} · taxable value{" "}
+                  {formatTotal(row.totalValue)}
+                </p>
+                <p className="mt-0.5 text-xs text-muted-foreground">
+                  CGST {formatTotal(row.liability.cgst)} · SGST/UTGST{" "}
+                  {formatTotal(row.liability.sgst)} · IGST {formatTotal(row.liability.igst)}
                 </p>
               </div>
             ))
@@ -306,6 +353,62 @@ function GstReportView({ data }: { data: Record<string, unknown> }) {
         currency={d.inputTax.totalItc.currency}
         show={d.inputTax.totalItc.currencyAssumed}
       />
+      {d.outputTaxExcludesCreditNotes && (
+        <p className="rounded-md border border-amber-300 bg-amber-50 p-2 text-xs text-amber-800">
+          ⚠️ Output tax above is gross of credit notes. A Rule 53 credit note reduces an outward
+          supply and is not subtracted here, so a period with returns in it reads high. Check the
+          credit notes before you file.
+        </p>
+      )}
+      {/*
+        ⭐ THE THREE FACTS A NETTED FIGURE CANNOT BE READ WITHOUT: what
+        was subtracted, what was refused as out of time, and what could
+        not be used this period and is carrying forward. A single netted
+        number with none of them is a figure nobody can defend.
+      */}
+      {d.outputTaxByCurrency.map((row) =>
+        row.creditNotes.count === 0 ? null : (
+          <div
+            key={`cn-${row.currency}`}
+            className="rounded-md border border-border p-3 text-xs text-muted-foreground"
+          >
+            <p>
+              Rule 53 · {row.currency}: {row.creditNotes.nettedCount} of{" "}
+              {row.creditNotes.count} credit note(s) reduced output tax by{" "}
+              {formatTotal(row.creditNotes.reducedTax.total)}.
+            </p>
+            {row.creditNotes.timeBarredCount > 0 && (
+              <p className="mt-1 text-amber-800">
+                ⚠️ {row.creditNotes.timeBarredCount} note(s) carrying{" "}
+                {formatTotal(row.creditNotes.timeBarredTax)} fall after the section 34(2)
+                deadline — 30 November following the end of the year of the supply. The credit is
+                commercial; the output tax stays.
+              </p>
+            )}
+            {row.creditNotes.windowUnverifiedCount > 0 && (
+              <p className="mt-1 text-amber-800">
+                ⚠️ {row.creditNotes.windowUnverifiedCount} note(s) name no original supply date,
+                so the section 34(2) window could not be checked. They were deducted; confirm
+                before filing.
+              </p>
+            )}
+            {BigInt(row.carriedForward.total.amountMinor) !== 0n && (
+              <p className="mt-1">
+                {formatTotal(row.carriedForward.total)} of reduction exceeded the supplies of the
+                period it was declared in and is carrying forward. It is not zero and it is not
+                lost.
+              </p>
+            )}
+            {!row.tiesToDocument.agrees && (
+              <p className="mt-1 text-red-700">
+                🔴 Document totals and line totals differ by {row.tiesToDocument.differenceMinor}{" "}
+                minor units on these invoices. The return files the document totals; this report&apos;s
+                gross figure sums the lines. Fix the documents before filing.
+              </p>
+            )}
+          </div>
+        ),
+      )}
       {d.pendingFilings > 0 && (
         <div className="rounded-md border border-amber-300 bg-amber-50 p-3 text-sm text-amber-700">
           ⏰ {d.pendingFilings} GST filing(s) pending{d.nextFilingDue ? ` · next due ${d.nextFilingDue}` : ""}

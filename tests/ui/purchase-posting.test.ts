@@ -2,6 +2,7 @@
  * Purchases → the double-entry ledger, and the seventh gate.
  */
 import { describe, expect, it } from "vitest";
+import { POSTING_MODULES, POSTING_ROLE_REGISTRY } from "@/lib/accounting/sales-posting";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
@@ -308,8 +309,20 @@ describe("🔴 purchases now reach the ledger", () => {
   it("the backlog and the setup screen both know about purchases", () => {
     expect(read("server/actions/sales-posting.ts")).toContain('kind: "purchase" as const');
     expect(read("app/(crm)/accounting/posting/page.tsx")).toContain("Vendor bill");
-    /** ⚠️ Asserts the MECHANISM — that the form splits by side — not the
-     *  heading text, which is prose somebody will reword. */
-    expect(read("components/invoices/posting-setup.tsx")).toContain("r.side === side");
+    /**
+     * ⚠️ Asserts the MECHANISM — that the form splits by module — not the
+     * heading text, which is prose somebody will reword.
+     *
+     * ⚠️ THIS USED TO ASSERT `r.side === side`, and it was a good instinct
+     * pinned to the wrong noun. `side` was one of four values chosen by a
+     * precedence chain, and Batch 0108 replaced it with the list of every
+     * module that needs a role — which is what let the screen show the
+     * twenty-seven roles it previously could not. The property is that the
+     * form is grouped at all, and that purchases are one of the groups.
+     */
+    const form = read("components/invoices/posting-setup.tsx");
+    expect(form).toContain("moduleStatus");
+    expect(form).toMatch(/r\.modules\.includes\(mod\.key\)/);
+    expect(POSTING_MODULES.purchase).toBeDefined();
   });
 });

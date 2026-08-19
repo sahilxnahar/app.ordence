@@ -38,7 +38,11 @@
 
 import "server-only";
 
-import { chatCompletion, type ChatMessage } from "@/lib/ai/client";
+import type {
+  ChatMessage,
+  ChatRequest,
+  ChatResponse,
+} from "@/lib/ai/client";
 import {
   ACTION_TYPES,
   CONDITION_OPERATORS,
@@ -161,6 +165,22 @@ Output ONLY the JSON object. No markdown fences, no commentary.`;
 export type GoalPlannerRequest = {
   goal: string;
   tenantId: string;
+  /**
+   * ⭐⭐ 0105 · THE COMPLETION IS INJECTED, AND IT IS REQUIRED.
+   *
+   * ⚠️ THIS FILE IS IN `lib/` AND MUST STAY THERE. It is pure planning —
+   * it builds a prompt and validates the JSON that comes back. Reaching
+   * a workspace's own provider key means reading the database and
+   * opening the vault, and `npm run check:boundaries` would correctly
+   * refuse an `@/db` import from here.
+   *
+   * 🔴 REQUIRED RATHER THAN DEFAULTING TO `chatCompletion`. A default
+   * would mean a caller who forgets it silently falls back to Ordence's
+   * key while believing it is using the customer's — the exact shape of
+   * "declared, displayed, and wired to nothing" that this codebase keeps
+   * producing. There is one caller, and TypeScript makes it supply this.
+   */
+  chat: (request: ChatRequest) => Promise<ChatResponse>;
 };
 
 export async function planGoal(request: GoalPlannerRequest): Promise<GoalPlanResult> {
@@ -189,7 +209,13 @@ export async function planGoal(request: GoalPlannerRequest): Promise<GoalPlanRes
     { role: "user", content: goal },
   ];
 
-  const response = await chatCompletion({
+  /**
+   * ⚠️ `sensitivity: "tenant"` IS UNCHANGED. A goal describes what the
+   * workspace wants automated and routinely names its own customers,
+   * projects and money. The injected completion changes whose key pays;
+   * it does not change which lane may be asked.
+   */
+  const response = await request.chat({
     messages,
     temperature: 0.2,
     sensitivity: "tenant",

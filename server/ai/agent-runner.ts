@@ -58,7 +58,9 @@ import {
   type BusinessAgent,
 } from "@/lib/ai/agents/registry";
 import { MCP_TOOLS, toolInputSchema, describeForModel } from "@/lib/mcp/registry";
-import { chatCompletion, type ChatMessage, type ChatTool } from "@/lib/ai/client";
+import { type ChatMessage, type ChatTool } from "@/lib/ai/client";
+// ⭐ 0105 · the workspace's own provider keys, where it has supplied any.
+import { tenantChatCompletion } from "@/server/ai/chat";
 import { dispatchTool, type McpSession } from "@/server/mcp/dispatch";
 import { getTenantPatterns } from "@/lib/ai/patterns";
 
@@ -173,7 +175,13 @@ export async function runAgent(
   for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
     rounds = round + 1;
 
-    const response = await chatCompletion({
+    /**
+     * ⚠️ `agent.sensitivity` IS PASSED THROUGH UNTOUCHED. The tenant's
+     * own key changes whose budget is spent, never which lane may be
+     * asked. See `laneForCredential()` in `lib/ai/credentials.ts`.
+     */
+    const response = await tenantChatCompletion({
+      tenantId: session.tenantId,
       messages,
       tools: tools.length > 0 ? tools : undefined,
       sensitivity: agent.sensitivity,

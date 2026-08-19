@@ -47,6 +47,7 @@ import {
 } from "@/db/schema/inventory";
 import { requirePermission, writeAudit } from "@/server/audit";
 import { toSalesActionError } from "@/server/sales/guards";
+import { requireFeature } from "@/server/entitlements";
 import { postStockCount } from "@/server/accounting/post-sales";
 import {
   assessCount,
@@ -57,6 +58,18 @@ import {
   type CountLine,
 } from "@/lib/inventory/counting";
 import type { ActionResult } from "@/lib/validators/crm";
+
+/**
+ * ⭐ THE ENTITLEMENT — Batch 0109. See `server/actions/batches.ts` for the
+ * argument; "cycle counts with variance postings" is this file.
+ *
+ * ⚠️ ONLY `openCount` CARRIES IT. Recording lines against a count that is
+ * already open, and posting the variance that closes it, are refused by
+ * nothing — for the same reason `approvePayrollRun` is not gated. A plan
+ * change on a Tuesday must not strand a warehouse mid-count with stock
+ * counted, unposted and invisible to the ledger.
+ */
+const TRACEABILITY = "inventory.traceability" as const;
 
 /**
  * 🔴 TWO PERMISSIONS, NOT ONE, AND THAT IS THE CONTROL.
@@ -102,6 +115,7 @@ export async function openCount(
   input: unknown,
 ): Promise<ActionResult<{ countId: string; countNo: string; lines: number }>> {
   try {
+    await requireFeature(TRACEABILITY);
     const data = openSchema.parse(input);
     const ctx = await requirePermission(COUNT);
     const now = new Date();

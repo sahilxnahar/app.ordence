@@ -466,7 +466,28 @@ export type PurchasePostingRole =
   | "tds_payable"
   /** ⚠️ s.16 MSMED interest. Mandatory, compounding, never deductible. */
   | "msme_interest"
-  | "payment_round_off";
+  | "payment_round_off"
+  /**
+   * ⭐⭐ BANK CHARGES, AND IT IS THE SAME ROLE THE SALES SIDE DECLARES.
+   *
+   * 🔴 IT IS HERE BECAUSE THE INPUT CREDIT ON A BANK CHARGE IS A PURCHASE
+   *    POSTING WITH AN EXPENSE ON THE CREDIT SIDE. The four input tax
+   *    heads live in this role set; `bank_charges` lives in `PostingRole`.
+   *    Brief F named exactly this and stopped: "the two role sets have to
+   *    meet somewhere. That is a decision for whoever owns that file."
+   *
+   * ⭐ THIS IS THAT DECISION, AND IT COSTS NOTHING. `buildRegistry()`
+   *    below keys on the role NAME and the first family to declare it owns
+   *    the label and help — `POSTING_ROLE_META` already declares
+   *    `bank_charges`, so this adds "purchase" to that entry's module list
+   *    and nothing else. One role, one ledger, two modules that need it.
+   *
+   * ⚠️ THE ALTERNATIVE WAS TO CREDIT `expense`. It would have compiled and
+   *    balanced and been wrong: `expense` is Purchases, and crediting it
+   *    would take the tax back out of the wrong account and leave Bank
+   *    Charges overstated by exactly the credit that was claimed.
+   */
+  | "bank_charges";
 
 export type PurchaseLeg = {
   role: PurchasePostingRole;
@@ -605,6 +626,102 @@ export function buildPurchasePosting(args: {
  * would be a second source of truth for something the header never
  * claimed to know. One RCM input role, one RCM payable role.
  */
+/* ================================================================== */
+/* ⭐⭐⭐ THE INPUT CREDIT ON A BANK CHARGE — 0112                       */
+/* ================================================================== */
+
+/**
+ * ⭐⭐⭐ MOVE THE TAX OUT OF BANK CHARGES AND INTO THE INPUT HEADS.
+ *
+ *     Dr  Input CGST      x
+ *     Dr  Input SGST      x
+ *         Cr  Bank Charges     2x
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 WHAT WAS HAPPENING WITHOUT THIS, AND IT WAS SILENT
+ * ══════════════════════════════════════════════════════════════════════
+ * `0102` posts a bank charge GROSS, which is correct at that moment: the
+ * statement line has no GSTIN, no invoice number and no rate on it, and
+ * s.16(2)(a) CGST Act gives no credit without the invoice in hand. `0110`
+ * then built the register that records the credit is owed, the refusals
+ * that stop a rate being guessed, and the screen that transcribes the
+ * bank's invoice when it arrives.
+ *
+ * And there it stopped. `0110`'s report says so plainly: *"Until it
+ * exists, `invoice_recorded` is a worklist state, not a posted credit."*
+ * A customer could enter the invoice, watch the arithmetic foot against
+ * the money that left the account, and the tax stayed inside Bank
+ * Charges in the trial balance. The register knew. The ledger did not.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * ⚠️ THE CREDIT SIDE IS AN EXPENSE, AND THAT IS NOT A MISTAKE
+ * ══════════════════════════════════════════════════════════════════════
+ * Every other purchase posting credits a liability or an asset. This one
+ * credits `bank_charges` because the expense was OVERSTATED: the gross
+ * went to expense when part of it was recoverable tax. Nothing new is
+ * spent here and no money moves. A cost is reclassified as an asset —
+ * a receivable from the Government — which is what an input credit is.
+ *
+ * ⭐ NO ROUND-OFF LEG, AND THERE CANNOT BE ONE. The credit is the exact
+ *    sum of the four heads, so debits equal credits by construction.
+ *    A round-off leg here would be a place for a transcription error to
+ *    hide, and `bank_charge_itc_deferrals_invoice_foots` in 0110 already
+ *    refuses a split that does not foot to the gross.
+ *
+ * 🔴 THE FIGURES ARE TRANSCRIBED, NEVER DERIVED. This function computes
+ *    no rate and applies no percentage. It is given four numbers that
+ *    were read off a tax invoice and it arranges them. The whole argument
+ *    for why is in `lib/banking/bank-charge-itc.ts`; the short version is
+ *    that a derived 18% has no supplier invoice number, so it can never
+ *    be matched in GSTR-2B and would sit in GSTR-3B as an unsupported
+ *    claim.
+ */
+export function buildBankChargeItcPosting(args: {
+  cgstMinor: bigint;
+  sgstMinor: bigint;
+  igstMinor: bigint;
+  cessMinor: bigint;
+  narration: string;
+}): PurchaseLeg[] {
+  const credit =
+    args.cgstMinor + args.sgstMinor + args.igstMinor + args.cessMinor;
+
+  if (credit <= 0n) {
+    throw new PostingImbalance(
+      "A bank charge input credit of zero is not a journal. A charge that carried no recoverable tax is marked not claimable with a reason, which is a different fact from a posting of nothing.",
+    );
+  }
+
+  /**
+   * 🔴 REFUSED, NOT NETTED. A negative head is a transcription error and
+   * netting it against another would produce a balanced journal that
+   * claims a credit nobody was invoiced for.
+   */
+  if (
+    args.cgstMinor < 0n ||
+    args.sgstMinor < 0n ||
+    args.igstMinor < 0n ||
+    args.cessMinor < 0n
+  ) {
+    throw new PostingImbalance(
+      "A tax head on a bank charge invoice cannot be negative. A credit note from the bank is a separate document and reverses through its own entry.",
+    );
+  }
+
+  const description = args.narration.replace(/\s+/g, " ").trim().slice(0, 300);
+
+  const legs: PurchaseLeg[] = [
+    ...pleg("input_cgst", "debit", args.cgstMinor, description),
+    ...pleg("input_sgst", "debit", args.sgstMinor, description),
+    ...pleg("input_igst", "debit", args.igstMinor, description),
+    ...pleg("input_cess", "debit", args.cessMinor, description),
+    ...pleg("bank_charges", "credit", credit, description),
+  ];
+
+  assertPurchaseBalances(legs);
+  return legs;
+}
+
 export function buildRcmPosting(args: {
   rcmTaxMinor: bigint;
   invoiceNumber: string;
@@ -751,6 +868,21 @@ export const PURCHASE_ROLE_META: Record<
     tallyGroup: "Indirect Expenses",
     accountType: "expense",
     help: "Rounding on a vendor payment.",
+  },
+  /**
+   * ⚠️ THE LABEL AND HELP HERE ARE NEVER SHOWN. `buildRegistry()` gives the
+   * entry to the first family that declares a role and `POSTING_ROLE_META`
+   * declares `bank_charges` above. It is repeated because
+   * `Record<PurchasePostingRole, ...>` requires every member — and that
+   * requirement is the point: a purchase role with no meta cannot exist,
+   * so no purchase builder can emit a role the posting-accounts screen
+   * has never heard of.
+   */
+  bank_charges: {
+    label: "Bank Charges",
+    tallyGroup: "Indirect Expenses",
+    accountType: "expense",
+    help: "What the bank took. Credited — not debited — by the input-credit posting, which moves the tax out of this account and into the input tax heads once the bank's own invoice is in hand.",
   },
   payable: {
     label: "Sundry Creditors",
@@ -2764,3 +2896,213 @@ export const FX_ROLE_META: Record<
     help: "⚠️ The fallback for a foreign-currency bank or cash balance. Normally the account's own ledger is used, because a bank reconciliation compares this balance with a statement.",
   },
 };
+
+/* ================================================================== */
+/* ⭐⭐⭐ THE POSTING-ROLE REGISTRY — Batch 0108                        */
+/* ================================================================== */
+
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴🔴 TWENTY-SEVEN ROLES WERE REFUSED BY A SCREEN THAT EXISTS
+ * ══════════════════════════════════════════════════════════════════════
+ * The brief for this batch said the posting-accounts screen "does not
+ * exist". Measured against the tree, that is not quite the defect. The
+ * screen is at `/accounting/posting`, it is registered in
+ * `lib/modules/registry.ts` under `money`, and it has worked since v0.99.
+ *
+ * What it could not do was reach five of the nine role families. Its list
+ * came from an `ALL_ROLE_META` in `server/actions/sales-posting.ts` built
+ * as `{...POSTING, ...PURCHASE, ...CONSTRUCTION, ...PROPERTY}` — four of
+ * the nine. `METERING`, `PAYROLL`, `RETURN`, `FIXED_ASSET` and `FX` were
+ * never in it.
+ *
+ * 🔴 AND THE WRITE PATH WAS BUILT FROM THE SAME OBJECT.
+ * `setSalesPostingAccount` validates with
+ * `z.enum(Object.keys(ALL_ROLE_META))`, so `fx_gain` was not merely absent
+ * from the form — it was REFUSED BY THE SERVER ACTION. The loop had no
+ * exit:
+ *
+ *   • `server/fx/revaluation-service.ts` refuses a revaluation with "no
+ *     ledger is mapped for fx_gain. Map them on the posting-accounts
+ *     screen and post the run."
+ *   • the operator opens the posting-accounts screen
+ *   • `fx_gain` is not on it, and could not have been saved if it were
+ *
+ * The same for `depreciation_expense` — `fixedAssetAccountsNeeded()` in
+ * `server/actions/fixed-assets.ts` computes exactly which fixed-asset
+ * roles are unmapped, renders the list, and had nowhere to send anybody.
+ * 0100 shipped a depreciation engine that no navigation reached for four
+ * batches; this is the same defect one level down. The engine is reachable
+ * now and the accounts it needs were not mappable.
+ *
+ * ⭐ SO THE LIST OF ROLES BECOMES ONE DECLARED THING, HERE, BESIDE THE
+ * BUILDERS THAT EMIT THEM, and both the form and the validator read it.
+ * Adding a role family to this file without adding it to the registry is
+ * still possible; `tests/ui/posting-accounts.test.ts` fails when it
+ * happens, which is the cheapest place to catch it.
+ *
+ * ⚠️ `modules` IS A LIST AND NOT A SINGLE `side`. The old screen computed
+ * `role in PROPERTY ? "property" : role in CONSTRUCTION ? ...`, a
+ * precedence chain that gives one answer where the truth is several:
+ * `bank` is needed by sales receipts AND vendor payments, `tds_payable` by
+ * purchases, construction AND property, `output_cgst` by every sales
+ * document AND the monthly return. Telling an operator that `bank` is "a
+ * sales role" is why nobody maps it before running payroll.
+ */
+export type PostingModuleKey =
+  | "sales"
+  | "purchase"
+  | "construction"
+  | "property"
+  | "metering"
+  | "payroll"
+  | "gst_return"
+  | "fixed_assets"
+  | "fx";
+
+export const POSTING_MODULES: Record<
+  PostingModuleKey,
+  { readonly label: string; readonly needs: string }
+> = {
+  sales: {
+    label: "Sales & receipts",
+    needs: "Invoices, credit notes and customer receipts cannot reach the P&L until these are mapped.",
+  },
+  purchase: {
+    label: "Purchases & vendor payments",
+    needs: "Vendor bills, reverse charge and TDS on payment.",
+  },
+  construction: {
+    label: "Contracting & RA bills",
+    needs: "Work certified, retention held back, BOCW cess and contractor recoveries.",
+  },
+  property: {
+    label: "Property & bookings",
+    needs: "Demand notices, booking receipts, possession, cancellation and brokerage.",
+  },
+  metering: {
+    label: "Utility metering",
+    needs: "Energy recovered from consumers, and the electricity duty collected for the State.",
+  },
+  payroll: {
+    label: "Payroll",
+    needs: "The gross wage bill and every statutory deduction held on an employee's behalf.",
+  },
+  gst_return: {
+    label: "Monthly GST return",
+    needs: "The set-off of a month's output tax against its credit, and what is paid in cash.",
+  },
+  fixed_assets: {
+    label: "Fixed assets & depreciation",
+    needs: "🔴 The depreciation run refuses outright until these are mapped — see the fixed-assets screen.",
+  },
+  fx: {
+    label: "Foreign exchange",
+    needs: "🔴 The revaluation refuses outright until fx_gain and fx_loss are mapped, and says so.",
+  },
+};
+
+export type PostingRoleEntry = {
+  readonly role: string;
+  /** Every module whose builder emits this role. Never just one. */
+  readonly modules: readonly PostingModuleKey[];
+  readonly label: string;
+  readonly tallyGroup: string;
+  readonly accountType: string;
+  readonly help: string;
+};
+
+/**
+ * ⚠️ BUILT FROM THE NINE META OBJECTS RATHER THAN RETYPED. A hand-written
+ * list would be a tenth copy of the same fact, and the drift would be
+ * silent: a role present in a builder and missing from the list is exactly
+ * the state this registry exists to end.
+ *
+ * ⚠️ THE FIRST FAMILY TO DECLARE A ROLE OWNS ITS LABEL AND HELP TEXT.
+ * `output_cgst` appears in both `POSTING_ROLE_META` and
+ * `RETURN_ROLE_META`; the sales wording is the one an operator mapping a
+ * chart of accounts wants, and both modules are listed against it either
+ * way.
+ */
+const ROLE_FAMILIES: ReadonlyArray<
+  readonly [PostingModuleKey, Record<string, { label: string; tallyGroup: string; accountType: string; help: string }>]
+> = [
+  ["sales", POSTING_ROLE_META],
+  ["purchase", PURCHASE_ROLE_META],
+  ["construction", CONSTRUCTION_ROLE_META],
+  ["property", PROPERTY_ROLE_META],
+  ["metering", METERING_ROLE_META],
+  ["payroll", PAYROLL_ROLE_META],
+  ["gst_return", RETURN_ROLE_META],
+  ["fixed_assets", FIXED_ASSET_ROLE_META],
+  ["fx", FX_ROLE_META],
+];
+
+function buildRegistry(): readonly PostingRoleEntry[] {
+  const byRole = new Map<string, { entry: Omit<PostingRoleEntry, "modules">; modules: PostingModuleKey[] }>();
+
+  for (const [moduleKey, meta] of ROLE_FAMILIES) {
+    for (const [role, m] of Object.entries(meta)) {
+      const existing = byRole.get(role);
+      if (existing) {
+        if (!existing.modules.includes(moduleKey)) existing.modules.push(moduleKey);
+        continue;
+      }
+      byRole.set(role, {
+        entry: { role, label: m.label, tallyGroup: m.tallyGroup, accountType: m.accountType, help: m.help },
+        modules: [moduleKey],
+      });
+    }
+  }
+
+  return [...byRole.values()].map(({ entry, modules }) => ({ ...entry, modules }));
+}
+
+/** ⭐ Every role any posting builder in this file can emit. */
+export const POSTING_ROLE_REGISTRY: readonly PostingRoleEntry[] = buildRegistry();
+
+/** The same, keyed, for the validator and the resolver. */
+export const POSTING_ROLE_KEYS: readonly string[] = POSTING_ROLE_REGISTRY.map((r) => r.role);
+
+/**
+ * ⭐ Which modules cannot post at all until this role is mapped, for the
+ * refusal messages that used to point at nothing.
+ */
+export function modulesNeeding(role: string): readonly PostingModuleKey[] {
+  return POSTING_ROLE_REGISTRY.find((r) => r.role === role)?.modules ?? [];
+}
+
+/**
+ * ⭐⭐ WHERE A ROLE IS MAPPED. One string, in one place.
+ *
+ * 🔴 THREE REFUSAL MESSAGES IN THIS PRODUCT END WITH SOME VERSION OF "map
+ * them on the posting-accounts screen" AND NONE OF THEM CARRIES THE
+ * ADDRESS:
+ *
+ *   • `server/fx/revaluation-service.ts` — "Map them on the
+ *     posting-accounts screen and post the run."
+ *   • `server/actions/fx.ts` — "Map them on the posting-accounts screen,
+ *     then post the run."
+ *   • `server/actions/banking.ts` — "Map them on the posting accounts
+ *     screen" (no hyphen, which is its own small evidence that three
+ *     people wrote the same sentence from memory).
+ *
+ * A refusal that names a screen without naming its address is a refusal
+ * the reader has to go and hunt from. This function is the address, and
+ * it deep-links to the module's own section so the operator lands on the
+ * four rows they need rather than the top of sixty-six.
+ *
+ * ⚠️ THE THREE MESSAGES ABOVE ARE NOT ALL EDITED BY THIS BATCH.
+ * `server/fx/*` belongs to another stream in this wave and
+ * `server/actions/banking.ts` to a third. The destination and this helper
+ * are what Batch 0108 could deliver; the one-line change at each call site
+ * is listed in the batch report rather than made across an ownership line.
+ */
+export function postingAccountsHref(module?: PostingModuleKey): string {
+  return module ? `/accounting/posting#module-${module}` : "/accounting/posting";
+}
+
+/** The sentence, with the address in it. */
+export function mapAccountsSentence(module: PostingModuleKey): string {
+  return `Map them on the posting accounts screen at ${postingAccountsHref(module)}.`;
+}

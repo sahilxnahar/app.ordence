@@ -771,5 +771,162 @@ export async function settleForeignSalesInvoice(
   };
 }
 
+/**
+ * ⭐⭐⭐ THE REALISED DIFFERENCE WHEN A FOREIGN-CURRENCY PURCHASE INVOICE
+ * IS SETTLED — the payables half of moment ③, over `0101`'s columns.
+ *
+ * 🔴 MEASURED AGAINST THE CARRYING AMOUNT, FOR THE REASON GIVEN ON THE
+ * SALES FUNCTION ABOVE AND NOT REPEATED HERE: `fx_carried_functional_
+ * minor` is what the outstanding balance is worth in the books the
+ * instant before the money leaves, and measuring against `fx_rate`
+ * instead re-books a difference a previous year's P&L already took.
+ *
+ * ⚠️ THE SIGN IS NOT DECIDED HERE. `buildFxSettlementPosting` folds
+ * `trade_payable` the other way — a liability that costs more of our own
+ * money is a LOSS — so this function passes the kind and lets the one
+ * place that knows about liabilities decide. Copying the sales sign is
+ * the mistake, and it produces a journal that still balances.
+ *
+ * ⚠️ IT IS SYMMETRIC WITH `settleForeignSalesInvoice`, INCLUDING IN NOT
+ * BEING CALLED FROM `payVendor` YET. `vendor_payments` carries no
+ * currency of its own, so which currency a payment was made in is not a
+ * fact the schema holds; inventing it at the call site would be the
+ * guess this whole batch exists to avoid.
+ */
+export async function settleForeignPurchaseInvoice(
+  tx: Tx,
+  args: {
+    tenantId: string;
+    userId: string;
+    invoiceId: string;
+    /** The vendor payment that settled it. The idempotency key. */
+    settlementId: string;
+    settlementDate: string;
+    /** How much of the bill's own currency was settled. */
+    foreignSettledMinor: bigint;
+    functionalCurrency: string;
+  },
+): Promise<{ realisedMinor: bigint; posted: boolean; reason: string | null } | null> {
+  const functionalCurrency = normaliseCurrencyCode(args.functionalCurrency);
+
+  const [invoice] = await tx
+    .select({
+      id: purchaseInvoices.id,
+      invoiceNumber: purchaseInvoices.invoiceNumber,
+      currency: purchaseInvoices.currency,
+      totalMinor: purchaseInvoices.totalMinor,
+      functionalTotalMinor: purchaseInvoices.functionalTotalMinor,
+      carried: purchaseInvoices.fxCarriedFunctionalMinor,
+    })
+    .from(purchaseInvoices)
+    .where(
+      and(eq(purchaseInvoices.tenantId, args.tenantId), eq(purchaseInvoices.id, args.invoiceId)),
+    )
+    .limit(1);
+
+  if (!invoice) return null;
+  if (normaliseCurrencyCode(invoice.currency) === functionalCurrency) return null;
+
+  const wholeCarried = invoice.carried ?? invoice.functionalTotalMinor;
+  if (wholeCarried === null || wholeCarried === undefined) {
+    /**
+     * ⚠️ A BILL WITH NO FUNCTIONAL FIGURE PREDATES `0101`. Nothing is
+     * invented against it — said out loud rather than defaulted to zero,
+     * which would read as "there was no difference".
+     */
+    return {
+      realisedMinor: 0n,
+      posted: false,
+      reason:
+        `${invoice.invoiceNumber} is in ${invoice.currency} but carries no ` +
+        `${functionalCurrency} equivalent, so it was recorded before purchase-side initial ` +
+        `recognition existed. No realised exchange difference has been computed — there is ` +
+        `nothing to measure the settlement rate against.`,
+    };
+  }
+
+  const carriedForSettled = carriedForPart({
+    carriedFunctionalMinor: wholeCarried,
+    foreignTotalMinor: invoice.totalMinor,
+    foreignPartMinor: args.foreignSettledMinor,
+  });
+
+  const quote = await resolveQuote(tx, {
+    tenantId: args.tenantId,
+    from: invoice.currency,
+    to: functionalCurrency,
+    on: args.settlementDate,
+    policy: CLOSING_RATE_WINDOW,
+  });
+  if (!quote) {
+    return {
+      realisedMinor: 0n,
+      posted: false,
+      reason:
+        `No exchange rate is on file for ${invoice.currency} to ${functionalCurrency} on ` +
+        `${args.settlementDate}, so the realised exchange difference on ` +
+        `${invoice.invoiceNumber} has NOT been computed or posted.`,
+    };
+  }
+
+  const difference = settlementDifference({
+    foreignSettledMinor: args.foreignSettledMinor,
+    foreignCurrency: invoice.currency,
+    functionalCurrency,
+    carriedFunctionalMinor: carriedForSettled,
+    settlementQuote: quote,
+    settlementDate: args.settlementDate,
+    policy: CLOSING_RATE_WINDOW,
+  });
+
+  if (difference.realisedDifferenceMinor === 0n) {
+    return { realisedMinor: 0n, posted: false, reason: null };
+  }
+
+  const legs = buildFxSettlementPosting({
+    kind: "trade_payable",
+    realisedDifferenceMinor: difference.realisedDifferenceMinor,
+    contraLedgerId: null,
+    documentReference: invoice.invoiceNumber,
+    settlementDate: args.settlementDate,
+  });
+
+  const outcome = await postFxSettlement(tx, {
+    tenantId: args.tenantId,
+    userId: args.userId,
+    settlementId: args.settlementId,
+    settlementDate: args.settlementDate,
+    documentReference: invoice.invoiceNumber,
+    functionalCurrency,
+    legs,
+  });
+
+  /**
+   * ⭐ THE CARRYING AMOUNT FALLS BY WHAT WAS SETTLED. The balance left
+   * stays carried at its own restated rate, which is what the next
+   * revaluation and the next payment both measure against.
+   */
+  await tx
+    .update(purchaseInvoices)
+    .set({
+      fxCarriedFunctionalMinor: sql`coalesce(${purchaseInvoices.fxCarriedFunctionalMinor}, ${purchaseInvoices.functionalTotalMinor}, 0) - ${carriedForSettled.toString()}`,
+    })
+    .where(
+      and(eq(purchaseInvoices.tenantId, args.tenantId), eq(purchaseInvoices.id, args.invoiceId)),
+    );
+
+  return {
+    realisedMinor: difference.realisedDifferenceMinor,
+    posted: outcome.posted,
+    reason: outcome.posted
+      ? null
+      : outcome.reason === "unmapped_roles"
+        ? `The realised exchange difference has been computed but NOT posted: no ledger is mapped for ${outcome.missing.join(", ")}.`
+        : outcome.reason === "period_closed"
+          ? `Not posted: ${args.settlementDate} falls in ${outcome.period}, which is closed.`
+          : "Not posted.",
+  };
+}
+
 /** The three places a monetary item can live today. Used by the UI filter. */
 export const REVALUATION_ITEM_TABLES = ["sales_invoices", "purchase_invoices", "ledgers"] as const;

@@ -26,6 +26,7 @@
  */
 
 import { z } from "zod";
+import { parseMajorToMinor, formatMinorPlain } from "@/lib/fx/currency";
 
 /* ------------------------------------------------------------------ */
 /* EXACT MONEY ARITHMETIC                                              */
@@ -60,11 +61,29 @@ export function fromMinorUnits(minor: bigint): string {
 
 const uuidSchema = z.string().uuid("Invalid identifier.");
 
+/**
+ * ⭐ UP TO FOUR DECIMALS AT THE SHAPE LEVEL, AND THE CURRENCY DECIDES THE
+ *    REAL LIMIT. Batch 0108.
+ *
+ * 🔴 THIS REGEX USED TO BE `\d{1,2}` DECIMALS AND THAT MADE A DINAR
+ *    MANUAL JOURNAL UNENTERABLE. A Kuwaiti user typing 1.234 — a perfectly
+ *    ordinary amount, 1234 fils — was told "Enter a positive amount with
+ *    at most 2 decimals", which is not true of their currency and which no
+ *    amount of retyping would satisfy.
+ *
+ * ⚠️ THE LEG DOES NOT KNOW ITS CURRENCY; the transaction does. So this
+ *    check only rules out shapes that are wrong for EVERY currency (ISO
+ *    4217 defines no exponent above 4), and `postTransactionSchema`'s
+ *    superRefine below applies the real, per-currency limit through
+ *    `parseMajorToMinor`, which names the currency and its decimal count
+ *    in the refusal. A two-stage check, with the precise one where the
+ *    information actually is.
+ */
 const amountSchema = z
   .string()
   .trim()
-  .regex(/^\d{1,15}(\.\d{1,2})?$/, "Enter a positive amount with at most 2 decimals.")
-  .refine((v) => toMinorUnits(v) > 0n, "Amount must be greater than zero.");
+  .regex(/^\d{1,15}(\.\d{1,4})?$/, "Enter a positive amount with at most 4 decimals.")
+  .refine((v) => Number(v) > 0, "Amount must be greater than zero.");
 
 export const journalLegSchema = z.object({
   ledgerId: uuidSchema,
@@ -114,16 +133,43 @@ export const postTransactionSchema = z
     // be bypassed). Any one of them could be removed by a future commit;
     // all three would have to be removed to corrupt the ledger.
     // ════════════════════════════════════════════════════════════════
+    //
+    // ⭐ AND IT IS DONE IN THE TRANSACTION'S OWN CURRENCY. Batch 0108.
+    // `parseMajorToMinor` reads the exponent per currency, so "1.234" is
+    // 1234 fils in KWD and is REFUSED, by name, in INR. `toMinorUnits`
+    // multiplied everything by a hardcoded hundred and rejected a third
+    // decimal outright.
     let debits = 0n;
     let credits = 0n;
     for (const leg of val.legs) {
-      const minor = toMinorUnits(leg.amount);
+      let minor: bigint;
+      try {
+        minor = parseMajorToMinor(leg.amount, val.currency);
+      } catch (err) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["legs"],
+          message: err instanceof Error ? err.message : `"${leg.amount}" is not a valid amount.`,
+        });
+        return;
+      }
+      if (minor <= 0n) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["legs"],
+          message: "Amount must be greater than zero.",
+        });
+        return;
+      }
       if (leg.entryType === "debit") debits += minor;
       else credits += minor;
     }
 
     if (debits !== credits) {
-      const difference = fromMinorUnits(debits > credits ? debits - credits : credits - debits);
+      const difference = formatMinorPlain(
+        debits > credits ? debits - credits : credits - debits,
+        val.currency,
+      );
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
         path: ["legs"],

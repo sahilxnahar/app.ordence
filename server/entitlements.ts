@@ -48,6 +48,7 @@ import { db, withTenant } from "@/db";
 import { subscriptions, plans, grantsAccess } from "@/db/schema";
 import { platformTenantFlags } from "@/db/schema/platform";
 import { ENTITLEMENT_OVERRIDE_PREFIX } from "@/lib/entitlements/overrides";
+import { refusalFor, type BillingStanding } from "@/lib/entitlements/upgrade";
 import { requireTenantContext, type TenantContext } from "@/server/tenant-context";
 import {
   evaluateFeature,
@@ -73,8 +74,32 @@ import type { PermissionKey } from "@/db/schema/auth";
  * both would guarantee the wrong message eventually.
  */
 export class FeatureLockedError extends Error {
-  constructor(readonly decision: EntitlementDecision) {
-    super(decision.message);
+  /**
+   * ⭐ THE REMEDY, AS DATA — Batch 0109.
+   *
+   * ⚠️ `message` IS `refusal.sentence`, NOT `decision.message`.
+   *
+   * Everything that catches this flattens it to a string: every
+   * `toSalesActionError` in the product returns `salesFail(err.message)`,
+   * and that string is the entire refusal a customer ever sees. So the
+   * string has to be the one that names the plan — or the remedy is
+   * computed carefully in `lib/entitlements/upgrade.ts` and then thrown
+   * away one line later at every single call site.
+   *
+   * `decision.message` remains available on `decision` for anything that
+   * wants the shorter form, and `refusalFor(err.decision, null)` rebuilds
+   * the structured remedy in one line for anything that wants that.
+   *
+   * ⚠️ THE STRUCTURE IS DELIBERATELY NOT KEPT AS A FIELD. Nothing reads
+   * it — every catch site in the product uses `err.message` — and a field
+   * that is populated and read by nothing is the precise defect this
+   * batch was sent to remove. It is one call away when somebody needs it.
+   */
+  constructor(
+    readonly decision: EntitlementDecision,
+    standing?: BillingStanding | null,
+  ) {
+    super(refusalFor(decision, standing).sentence);
     this.name = "FeatureLockedError";
   }
 
@@ -284,8 +309,46 @@ export async function requireFeature(
   ctx?: TenantContext,
 ): Promise<EntitlementDecision> {
   const decision = await checkFeature(feature, ctx);
-  if (!decision.allowed) throw new FeatureLockedError(decision);
+  if (!decision.allowed) {
+    throw new FeatureLockedError(decision, await billingStanding(ctx));
+  }
   return decision;
+}
+
+/**
+ * ⭐ THE STANDING THAT SHAPES THE REFUSAL — Batch 0109.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * ⚠️ ONLY ON THE REFUSAL PATH, AND ONLY BEHIND A `catch`
+ * ══════════════════════════════════════════════════════════════════════
+ * Two properties matter here and both are easy to lose:
+ *
+ *   • It costs nothing on the ordinary path. `requireFeature` returns
+ *     before reaching this line whenever the answer is yes, which is
+ *     almost every call. And on the path that DOES reach it,
+ *     `getAccessDecision` is wrapped in React `cache()` — a write site
+ *     calls `requireAccess()` first (see `guardSalesWrite`), so the
+ *     query has already been made and this is a map lookup.
+ *
+ *   • 🔴 IT CANNOT TURN A PAYWALL INTO A 500. `getAccessDecision` already
+ *     fails open on its own errors, but it still needs a tenant context
+ *     and there are call sites — a background worker, a route that
+ *     resolved the tenant some other way — where that could throw. A
+ *     refusal that fails while explaining itself would replace a clear
+ *     "your plan does not include this" with an error page, which is the
+ *     worse of the two outcomes by a distance. So the standing is
+ *     OPTIONAL and its absence costs one clause of one sentence.
+ */
+async function billingStanding(
+  ctx?: TenantContext,
+): Promise<BillingStanding | null> {
+  try {
+    const { getAccessDecision } = await import("@/server/billing/access");
+    const decision = await getAccessDecision(ctx);
+    return { level: decision.level, daysRemaining: decision.daysRemaining };
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -393,3 +456,113 @@ export async function requireFeatureAndPermission(
   const { requirePermission } = await import("@/server/audit");
   return requirePermission(permission);
 }
+
+/* ------------------------------------------------------------------ */
+/* ⭐ THE NON-BROWSER PATH — Batch 0109                                 */
+/* ------------------------------------------------------------------ */
+
+/**
+ * ⭐⭐ ENTITLEMENT FOR A CALLER THAT HAS NO CLERK SESSION.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 THE HOLE THIS CLOSES, AND IT IS THE SAME ONE `access.ts` CLOSED
+ * ══════════════════════════════════════════════════════════════════════
+ * Everything above resolves the tenant through `requireTenantContext()`,
+ * which reads a Clerk session. The MCP surface has none: it authenticates
+ * a BEARER TOKEN and carries only `session.tenantId`.
+ *
+ * `server/billing/access.ts` hit exactly this and grew
+ * `getAccessDecisionForTenant` for it, with the note that without it "an
+ * AI agent holding a read_write token could keep writing to a past_due
+ * workspace". The entitlement gate had the identical gap and nobody had
+ * written the second half: an MCP client could reach the whole tool
+ * surface on a plan that includes no AI at all, because the only gate
+ * that could have said otherwise needed a cookie.
+ *
+ * ⚠️ NOT WRAPPED IN React `cache()`, and deliberately. `cache()`
+ * deduplicates within one React render pass, which an MCP request is not
+ * — the memo would either never hit or, worse, be shared across requests
+ * if the runtime ever changed shape. One indexed query per tool call is
+ * the honest cost.
+ *
+ * ⚠️ FAILS CLOSED, unlike its neighbour in `access.ts`, and the asymmetry
+ * is deliberate. That gate can refuse EVERYTHING, so a billing outage
+ * failing it closed would take a customer's whole workspace away. This
+ * one refuses ONE capability, so the blast radius of failing closed is a
+ * feature being unavailable for the length of an outage — against the
+ * alternative, which is handing out a paid module whenever a query is
+ * slow. Same reasoning as `evaluateFeature`'s unknown-key branch.
+ */
+export async function checkFeatureForTenant(
+  tenantId: string,
+  feature: FeatureKey,
+): Promise<EntitlementDecision> {
+  const [row, flagRows] = await withTenant(tenantId, (tx) =>
+    Promise.all([
+      tx
+        .select({ status: subscriptions.status, tier: plans.tier })
+        .from(subscriptions)
+        .innerJoin(plans, eq(plans.id, subscriptions.planId))
+        .where(
+          and(
+            eq(subscriptions.tenantId, tenantId),
+            sql`${subscriptions.deletedAt} IS NULL`,
+            sql`${subscriptions.status} IN ('trialing','active','past_due','unpaid','paused')`,
+          ),
+        )
+        .limit(1)
+        .then((rows) => rows[0]),
+      tx
+        .select({
+          flagKey: platformTenantFlags.flagKey,
+          enabled: platformTenantFlags.enabled,
+        })
+        .from(platformTenantFlags)
+        .where(
+          and(
+            eq(platformTenantFlags.tenantId, tenantId),
+            sql`${platformTenantFlags.flagKey} LIKE ${ENTITLEMENT_OVERRIDE_PREFIX + "%"}`,
+            sql`(${platformTenantFlags.expiresAt} IS NULL OR ${platformTenantFlags.expiresAt} > now())`,
+          ),
+        ),
+    ]),
+  );
+
+  const overrides: Record<string, boolean> = {};
+  for (const flag of flagRows) {
+    overrides[flag.flagKey.slice(ENTITLEMENT_OVERRIDE_PREFIX.length)] = flag.enabled;
+  }
+
+  /**
+   * ⚠️ NO SUBSCRIPTION ROW MEANS NO ANSWER, AND NO ANSWER MEANS NO.
+   *
+   * The browser path falls back to `tenants.plan_tier` here, because a
+   * workspace mid-signup has a real person in front of it who would
+   * otherwise see a broken product. A token-authenticated agent is not
+   * mid-signup: an MCP grant is issued from inside a workspace that
+   * already exists. Reading the denormalised cache on this path would
+   * mean a stale column decides what an automated caller may reach.
+   */
+  const planTier = row?.tier ?? "trial";
+  const subscriptionGrantsAccess = row ? grantsAccess(row.status) : false;
+
+  return evaluateFeature(feature, {
+    planTier,
+    subscriptionGrantsAccess,
+    overrides,
+  });
+}
+
+/**
+ * ⚠️ THERE IS NO `requireFeatureForTenant`, AND ITS ABSENCE IS A DECISION.
+ *
+ * One was written for this batch and deleted before it shipped, because
+ * nothing called it. `server/mcp/dispatch.ts` uses the non-throwing form:
+ * every refusal on that surface has to come back as a JSON-RPC result
+ * carrying a sentence the agent can relay, not as an exception the
+ * dispatcher would have to catch and unwrap one line later.
+ *
+ * A throwing variant is four lines whenever a caller genuinely needs one.
+ * Shipping it now would have been a helper declared and called by
+ * nothing, which is the shape this batch exists to remove.
+ */

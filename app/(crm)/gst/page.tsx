@@ -30,7 +30,27 @@
 
 import { Suspense } from "react";
 import Link from "next/link";
-import { getRegistrations, getUnratedCodes, getHsnSacCodes } from "@/server/actions/gst";
+/**
+ * ⭐⭐⭐ THE THREE WRITERS ADDED AS CALLERS — wave two.
+ *
+ * 🔴 `createRegistration`, `createHsnSacCode` and `addRatePeriod` are the
+ * only inserts into `gst_registrations`, `hsn_sac_codes` and
+ * `hsn_sac_rates`, and nothing called any of them. The empty state below
+ * explained, correctly and permanently, why the product could not decide
+ * IGST versus CGST+SGST — and offered no way to fix it.
+ */
+import {
+  getRegistrations,
+  getUnratedCodes,
+  getHsnSacCodes,
+  createRegistration,
+  createHsnSacCode,
+  addRatePeriod,
+} from "@/server/actions/gst";
+import {
+  GstRegistrationForm,
+  HsnSacForms,
+} from "@/components/gst/setup-forms";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 
@@ -109,6 +129,7 @@ async function GstBody() {
           <CardTitle>Our GST registrations</CardTitle>
         </CardHeader>
         <CardContent className="p-0">
+          <GstRegistrationForm createAction={createRegistration} />
           {!registrations.ok ? (
             <p className="p-6 text-sm text-muted-foreground">{registrations.error}</p>
           ) : registrations.data.rows.length === 0 ? (
@@ -175,6 +196,15 @@ async function GstBody() {
           <CardTitle>HSN / SAC codes</CardTitle>
         </CardHeader>
         <CardContent className="p-0">
+          <HsnSacForms
+            codes={codeRows.map((c) => ({
+              id: String(c.id),
+              code: String(c.code),
+              description: String(c.description ?? ""),
+            }))}
+            createCodeAction={createHsnSacCode}
+            addRateAction={addRatePeriod}
+          />
           {codeRows.length === 0 ? (
             <p className="p-6 text-sm text-muted-foreground">
               No codes yet. Each one carries dated rate periods, so a rate change

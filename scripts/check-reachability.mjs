@@ -58,6 +58,44 @@ const SEARCH_DIRS = ["server", "lib", "app", "components", "db/queries"];
 /** Directories that are never source. */
 const SKIP = new Set(["node_modules", ".next", ".git", "dist", "coverage"]);
 
+/**
+ * 🔴🔴 FILES THAT NAME EVERY TABLE AND REACH NONE OF THEM.
+ *
+ * `lib/dpdp/classification.ts` is the DPDPA personal-data inventory: one
+ * entry per table in the schema, each carrying the table's name as a
+ * string literal. It is a catalogue, not a caller — reading it tells you
+ * nothing about whether any code path touches `powers_of_attorney`.
+ *
+ * ⚠️ WHEN IT LANDED THIS GATE IMMEDIATELY REPORTED TWENTY ORPHANS
+ * "REACHED SINCE THE BASELINE", INCLUDING `powers_of_attorney`,
+ * `welfare_logs`, `site_photos` AND `vault_consents` — every one of which
+ * is exactly as unreachable as it was the day before. Accepting that
+ * improvement would have emptied the orphan baseline and permanently
+ * disabled the check, and the output would have looked like progress.
+ *
+ * ⭐ THE GENERAL RULE, WORTH MORE THAN THE FIX: a file that enumerates
+ * the schema is invisible to a census OF the schema, and anything else
+ * added later with the same shape — a documentation generator, a
+ * fixture factory, a migration linter — belongs on this list too.
+ */
+const CATALOGUE_DIRS = [join(ROOT, "lib", "dpdp")];
+
+/**
+ * ⚠️ THE WHOLE `lib/dpdp/` DIRECTORY, NOT ONLY THE INVENTORY FILE.
+ *
+ * Excluding `classification.ts` alone left three tables still falsely
+ * reached — `powers_of_attorney`, `vault_consents` and
+ * `deployment_releases` — because `detector.ts` and `retention.ts`
+ * discuss them in PROSE while explaining why a rule exists. A comment is
+ * not a caller, and this gate greps text on purpose (its own header
+ * explains why demanding an import would be worse).
+ *
+ * ⭐ Every file under `lib/dpdp/` is pure and opens no connection; the
+ * code that actually queries these tables lives in `server/dpdp/` and is
+ * NOT excluded, so a genuine reach still counts.
+ */
+const isCatalogue = (file) => CATALOGUE_DIRS.some((d) => file.startsWith(d));
+
 /* ------------------------------------------------------------------ */
 /* ① EVERY TABLE THE SCHEMA DECLARES                                   */
 /* ------------------------------------------------------------------ */
@@ -116,6 +154,7 @@ function sourceCorpus() {
   // ⚠️ The schema layer is excluded on purpose. See SEARCH_DIRS.
   return files
     .filter((f) => !f.startsWith(SCHEMA_DIR))
+    .filter((f) => !isCatalogue(f))
     .map((f) => readFileSync(f, "utf8"))
     .join("\n");
 }

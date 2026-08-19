@@ -184,8 +184,9 @@ export async function createFinancialPeriod(
 export type ClosePeriodResult = {
   period: FinancialPeriod;
   entriesLocked: number;
-  totalDebits: string;
-  totalCredits: string;
+  /** ⭐ Minor units, as digit strings. Batch 0108; was a rupee string. */
+  totalDebitsMinor: string;
+  totalCreditsMinor: string;
   wasBalanced: boolean;
 };
 
@@ -282,9 +283,22 @@ export async function closeFinancialPeriod(
     const totals = await withTenant(ctx.tenant.id, (tx) =>
       tx
         .select({
-          totalDebits: sql<string>`COALESCE(SUM(CASE WHEN ${journalEntries.entryType} = 'debit'  THEN ${journalEntries.amount} ELSE 0 END), 0)::text`,
-          totalCredits: sql<string>`COALESCE(SUM(CASE WHEN ${journalEntries.entryType} = 'credit' THEN ${journalEntries.amount} ELSE 0 END), 0)::text`,
+          /**
+           * ⭐ SUMMED IN MINOR UNITS. Batch 0108.
+           *
+           * 🔴 THE COMPARISON BELOW USED TO BE A FLOAT ONE. This query
+           * summed `numeric(18,2)`, the consumer did `Number(...)`, and the
+           * gate that decides whether a period may be SEALED read
+           * `Math.abs(debits - credits) < 0.005`. An epsilon comparison on
+           * IEEE-754 doubles, guarding the statement an auditor is given.
+           * Two integers are either equal or they are not.
+           */
+          totalDebitsMinor: sql<string>`COALESCE(SUM(CASE WHEN ${journalEntries.entryType} = 'debit'  THEN ${journalEntries.amountMinor} ELSE 0 END), 0)::text`,
+          totalCreditsMinor: sql<string>`COALESCE(SUM(CASE WHEN ${journalEntries.entryType} = 'credit' THEN ${journalEntries.amountMinor} ELSE 0 END), 0)::text`,
           entryCount: sql<number>`COUNT(*)::int`,
+          /** ⚠️ SUM() skips NULLs; an unscaled leg would make the books
+           *  appear to balance by being absent from both sides. */
+          unscaledLegs: sql<number>`COUNT(*) FILTER (WHERE ${journalEntries.amountMinor} IS NULL)::int`,
         })
         .from(journalEntries)
         .innerJoin(transactions, eq(transactions.id, journalEntries.transactionId))
@@ -298,16 +312,29 @@ export async function closeFinancialPeriod(
     );
 
     const summary = totals[0];
-    const debits = Number(summary?.totalDebits ?? 0);
-    const credits = Number(summary?.totalCredits ?? 0);
+
+    if ((summary?.unscaledLegs ?? 0) > 0) {
+      return fail(
+        `Cannot close: ${summary?.unscaledLegs} journal line(s) in this period have no ` +
+          `amount in minor units, so whether the period balances cannot be established. ` +
+          `Run the census in SQL-FILES/0108 to see which currency is unscaled.`,
+      );
+    }
+
+    const debitsMinor = BigInt(summary?.totalDebitsMinor ?? "0");
+    const creditsMinor = BigInt(summary?.totalCreditsMinor ?? "0");
     const entryCount = summary?.entryCount ?? 0;
-    const wasBalanced = Math.abs(debits - credits) < 0.005;
+    /**
+     * ⭐ EXACT. Batch 0108. Two integers are equal or they are not; there
+     * is no epsilon and there is nothing to tune.
+     */
+    const wasBalanced = debitsMinor === creditsMinor;
 
     // Sealing books that do not balance makes the seal meaningless.
     if (!wasBalanced && !data.forceUnbalanced) {
       return fail(
         `Cannot close: the period does not balance. ` +
-          `Debits ${debits.toFixed(2)} vs credits ${credits.toFixed(2)}. ` +
+          `Debits ${debitsMinor} vs credits ${creditsMinor} (in minor units). ` +
           `Find the discrepancy first, or close with an explicit override.`,
       );
     }
@@ -334,8 +361,17 @@ export async function closeFinancialPeriod(
           closedBy: ctx.user.id,
           closingNotes: data.closingNotes ?? null,
           closingBalances: {
-            totalDebits: debits.toFixed(2),
-            totalCredits: credits.toFixed(2),
+            /**
+             * ⭐ MINOR UNITS, AND THE KEY SAYS SO. Batch 0108.
+             *
+             * ⚠️ THE OLD KEYS `totalDebits` / `totalCredits` HELD A
+             * `.toFixed(2)` RUPEE STRING and are deliberately not reused
+             * for a different unit. A sealed snapshot whose numbers
+             * silently changed meaning between releases is unreadable
+             * afterwards, and this blob is the thing an auditor is shown.
+             */
+            totalDebitsMinor: debitsMinor.toString(),
+            totalCreditsMinor: creditsMinor.toString(),
             entryCount,
             ledgerBalances: ledgerRows.map((l) => ({
               ledgerId: l.ledgerId,
@@ -366,8 +402,8 @@ export async function closeFinancialPeriod(
         periodName: closed.name,
         startDate: closed.startDate,
         endDate: closed.endDate,
-        totalDebits: debits.toFixed(2),
-        totalCredits: credits.toFixed(2),
+        totalDebitsMinor: debitsMinor.toString(),
+        totalCreditsMinor: creditsMinor.toString(),
         entriesLocked: entryCount,
         wasBalanced,
         forcedUnbalanced: !wasBalanced && data.forceUnbalanced,
@@ -401,8 +437,8 @@ export async function closeFinancialPeriod(
       data: {
         period: closed,
         entriesLocked: entryCount,
-        totalDebits: debits.toFixed(2),
-        totalCredits: credits.toFixed(2),
+        totalDebitsMinor: debitsMinor.toString(),
+        totalCreditsMinor: creditsMinor.toString(),
         wasBalanced,
       },
     };

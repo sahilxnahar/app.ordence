@@ -64,7 +64,17 @@ function code(rel: string): string {
 /** The raw file, for the places where the SQL itself is the guarantee. */
 const DISPATCHER = read("server/email/outbox.ts");
 const DISPATCHER_CODE = code("server/email/outbox.ts");
-const SWEEP_CODE = code("server/actions/credit.ts");
+/**
+ * ⚠️ THE SWEEP MOVED OUT OF `server/actions/credit.ts` IN v1.66.0-alpha.
+ *
+ * These assertions were about the SWEEP and were pinned to the file it
+ * happened to live in. It moved because nothing called it: a `"use
+ * server"` export may not take a tenant id, so no schedule could reach
+ * it, so no `credit_dunning_log` row was ever written and this
+ * dispatcher, correct and tested, had nothing to drain. The properties
+ * asserted below are unchanged; only the path is.
+ */
+const SWEEP_CODE = code("server/credit/dunning-sweep.ts");
 const WEBHOOK = read("app/api/webhooks/resend/_webhook.ts");
 const WEBHOOK_CODE = code("app/api/webhooks/resend/_webhook.ts");
 const MIGRATION = read("SQL-FILES/0097_email_outbox_and_suppressions.sql");
@@ -459,19 +469,14 @@ describe("🔴 the dunning sweep queues a letter and something drains it", () =>
 
   it("still records the letter as queued, never as sent", () => {
     const sweep = SWEEP_CODE.slice(
-      SWEEP_CODE.indexOf("export async function runDunningSweep"),
-      SWEEP_CODE.indexOf("THE BOARD"),
+      SWEEP_CODE.indexOf("export async function sweepDunningForTenant"),
     );
     /*
      * Nothing in the sweep may write a delivery of `sent` or a `sentAt`.
      * Only the dispatcher may, and only against a provider message id.
      */
-    const sweepRaw = read("server/actions/credit.ts");
-    const sweepBody = sweepRaw.slice(
-      sweepRaw.indexOf("export async function runDunningSweep"),
-      sweepRaw.indexOf("THE BOARD"),
-    );
-    expect(sweepBody).not.toMatch(/delivery:\s*"sent"/);
+    const sweepRaw = read("server/credit/dunning-sweep.ts");
+    expect(sweepRaw).not.toMatch(/delivery:\s*"sent"/);
     expect(sweep).not.toMatch(/sentAt:/);
   });
 
@@ -482,7 +487,7 @@ describe("🔴 the dunning sweep queues a letter and something drains it", () =>
      * surrounding assertions are on stripped code, which is where a
      * comment could otherwise pass for an implementation.
      */
-    const sweepRaw = read("server/actions/credit.ts");
+    const sweepRaw = read("server/credit/dunning-sweep.ts");
     expect(sweepRaw).toMatch(/action\.channel !== "email"/);
     expect(SWEEP_CODE).toMatch(/!action\.recipientEmail/);
   });
@@ -500,6 +505,18 @@ describe("🔴 the dunning sweep queues a letter and something drains it", () =>
      */
     const worker = code("app/api/workers/route.ts");
     expect(worker).toContain("dispatchTenantOutbox");
+    /*
+     * ⭐ AND SOMETHING CALLS IT ON A SCHEDULE THE OPERATOR CAN SET —
+     * v1.66.0-alpha. The nightly `{"mode":"cron"}` sweep drained the
+     * outbox as a side effect of enqueuing expiry scans, so the mail
+     * cadence was whatever the expiry cadence happened to be. It is now
+     * a job of its own, because this is the only thing that RETRIES a
+     * failed send: nightly means a bounced-then-retried letter waits
+     * twenty four hours per attempt.
+     */
+    expect(code("server/scheduling/registry.ts")).toContain("dispatchTenantOutbox");
+    /* ⚠️ RAW: `code()` blanks string literals, and the id IS a literal. */
+    expect(read("server/scheduling/registry.ts")).toMatch(/id: "mail_drain"/);
   });
 });
 

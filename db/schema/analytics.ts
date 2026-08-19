@@ -40,7 +40,18 @@
  * one tenant saw 6 tenants through a naive view and 1 through a
  * `security_invoker` view.
  *
- * The definitions live in `SQL-FILES/0008_phase10_analytics.sql` because
+ * ══════════════════════════════════════════════════════════════════════
+ * ⭐ AND SINCE 0104, EVERY VIEW CARRIES THE CURRENCY IT SUMMED
+ * ══════════════════════════════════════════════════════════════════════
+ * `assets`, `contracts` and `transactions` all carry a `currency` column and
+ * all three views ignored it until `0104_analytics_views_carry_currency.sql`.
+ * A `sum()` over a mixed-currency set is not a wrong ROW anybody notices — it
+ * is a plausible number in the units of nothing. The `currency` column added
+ * to each view below is a GROUPING KEY: the consumer reports one labelled
+ * figure per currency and never adds across them.
+ *
+ * The definitions live in `SQL-FILES/0008_phase10_analytics.sql`, as amended
+ * by `SQL-FILES/0104_analytics_views_carry_currency.sql`, because
  * `pgView(...).existing()` below only DESCRIBES the shape for Drizzle's
  * type system — it does not create anything, and it cannot express the
  * `security_invoker` option. Declaring the views here with `.as(...)` would
@@ -78,6 +89,19 @@ export const vAssetPortfolio = pgView("v_asset_portfolio", {
   totalValue: numeric("total_value", { precision: 20, scale: 2 }).notNull(),
   totalArea: numeric("total_area", { precision: 20, scale: 2 }).notNull(),
   totalQuantity: bigint("total_quantity", { mode: "number" }).notNull(),
+  /**
+   * ⭐ ADDED BY `0104_analytics_views_carry_currency.sql`, AND IT IS A
+   * GROUPING KEY, NOT A DECORATION.
+   *
+   * `assets.currency` has existed since the table did. The view ignored it
+   * until 0104, so `total_value` was `sum(value_amount)` over rupee land and
+   * dollar plant together — a number in the units of nothing, printed on a
+   * dashboard tile as though it were money.
+   *
+   * ⚠️ NEVER ADD `totalValue` ACROSS ROWS THAT DIFFER HERE. The counts and
+   * the area may be added; the value may not.
+   */
+  currency: varchar("currency", { length: 3 }).notNull(),
 }).existing();
 
 /* ------------------------------------------------------------------ */
@@ -102,6 +126,18 @@ export const vLedgerDaily = pgView("v_ledger_daily", {
   /** Signed: debits − credits. Computed in SQL so rounding happens once. */
   netMovement: numeric("net_movement", { precision: 20, scale: 2 }).notNull(),
   transactionCount: integer("transaction_count").notNull(),
+  /**
+   * ⭐ ADDED BY `0104_analytics_views_carry_currency.sql`.
+   *
+   * 🔴 IT COMES FROM `transactions.currency`, NOT FROM THE JOURNAL LINE.
+   * `journal_entries` has no currency column of its own; every entry belongs
+   * to exactly one transaction and inherits that transaction's currency.
+   *
+   * ⚠️ SO THE SPINE IS 30 ROWS PER (TENANT, CURRENCY), not 30 per tenant. A
+   * consumer that expects exactly 30 rows is making an assumption that holds
+   * only for a single-currency workspace.
+   */
+  currency: varchar("currency", { length: 3 }).notNull(),
 }).existing();
 
 /* ------------------------------------------------------------------ */
@@ -118,6 +154,14 @@ export const vContractPipeline = pgView("v_contract_pipeline", {
   onHoldCount: integer("on_hold_count").notNull(),
   /** Expiring within 30 days — the number that should prompt an action. */
   expiringSoonCount: integer("expiring_soon_count").notNull(),
+  /**
+   * ⭐ ADDED BY `0104_analytics_views_carry_currency.sql`. `contracts.currency`
+   * was always there and the pipeline total always ignored it.
+   *
+   * ⚠️ The COUNTS may be summed across currency groups — "17 contracts, 3
+   * expiring" is true in any currency. `totalValue` may not.
+   */
+  currency: varchar("currency", { length: 3 }).notNull(),
 }).existing();
 
 /* ------------------------------------------------------------------ */

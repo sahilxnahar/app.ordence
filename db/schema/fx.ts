@@ -147,6 +147,22 @@ export const fxReferenceRates = pgTable(
 
     /** 'rbi_reference' | 'provider'. Never 'manual' — that is tenant data. */
     source: varchar("source", { length: 20 }).notNull(),
+    /**
+     * ⭐⭐ WHICH SIDE OF THE SPREAD — SQL 0106. A member of
+     * `FX_RATE_TYPES` in `lib/fx/rates.ts`: 'mid', 'tt_buying',
+     * 'tt_selling' or 'unstated'.
+     *
+     * 🔴 ORTHOGONAL TO `source` AND NEVER DERIVED FROM IT. `source` says
+     * who published the number; this says which of that publisher's three
+     * daily numbers it is. Rule 26 names the TT buying rate for TDS on
+     * income payable in foreign currency, and a mid rate used in its place
+     * mis-states the chargeable base by the half-spread.
+     *
+     * ⚠️ EVERY ROW WRITTEN BEFORE 0106 IS 'unstated', filled by the ADD
+     * COLUMN default and then the default dropped so a new row must say.
+     * 'unstated' is not 'mid' — see `FX_RATE_TYPES` for that argument.
+     */
+    rateType: varchar("rate_type", { length: 12 }).notNull(),
     /** Circular number, provider tick id, the URL the number came from. */
     sourceReference: text("source_reference"),
 
@@ -160,15 +176,31 @@ export const fxReferenceRates = pgTable(
      * fourth decimal. Collapsing them onto one row would make "which rate
      * did we use" unanswerable, which is the question an auditor asks.
      */
-    pairDayUnique: uniqueIndex("fx_reference_rates_pair_day_key").on(
+    /**
+     * ⚠️ AND SO IS THE RATE TYPE, SINCE 0106. The State Bank's TT buying
+     * rate and the RBI's reference rate for the same pair on the same day
+     * are two published facts, not two versions of one — a key that could
+     * hold only one of them would make the second overwrite the first and
+     * a s.195 deduction would silently start using whichever was loaded
+     * last. `fx_reference_rates_pair_day_key` (without the type) is
+     * DROPPED by 0106 for exactly this reason.
+     */
+    pairDayTypeUnique: uniqueIndex("fx_reference_rates_pair_day_type_key").on(
       t.baseCurrency,
       t.quoteCurrency,
       t.rateDate,
       t.source,
+      t.rateType,
     ),
     lookupIdx: index("fx_reference_rates_lookup_idx").on(
       t.baseCurrency,
       t.quoteCurrency,
+      t.rateDate,
+    ),
+    typeLookupIdx: index("fx_reference_rates_type_lookup_idx").on(
+      t.baseCurrency,
+      t.quoteCurrency,
+      t.rateType,
       t.rateDate,
     ),
   }),
@@ -213,6 +245,17 @@ export const fxRates = pgTable(
 
     /** 'manual' | 'provider'. A tenant may load its own provider feed. */
     source: varchar("source", { length: 20 }).default("manual").notNull(),
+    /**
+     * ⭐⭐ WHICH SIDE OF THE SPREAD — SQL 0106. See the same column on
+     * `fx_reference_rates` above for the full argument.
+     *
+     * 🔴 THIS IS THE COLUMN THAT MAKES A s.195 DEDUCTION DEFENSIBLE. A
+     * remittance advice from the tenant's own bank quotes a TT buying
+     * rate; the feed on the next screen quotes a mid. Before 0106 both
+     * arrived here as a bare `rate` and nothing downstream could tell them
+     * apart.
+     */
+    rateType: varchar("rate_type", { length: 12 }).notNull(),
     sourceReference: text("source_reference"),
     note: text("note"),
 
@@ -223,17 +266,33 @@ export const fxRates = pgTable(
   },
   (t) => ({
     tenantIdTenantKey: uniqueIndex("fx_rates_id_tenant_key").on(t.id, t.tenantId),
-    /** One rate per pair per day per workspace. */
-    pairDayUnique: uniqueIndex("fx_rates_pair_day_key").on(
+    /**
+     * ⭐ ONE RATE PER PAIR PER DAY PER SIDE OF THE SPREAD, PER WORKSPACE.
+     *
+     * ⚠️ THE RATE TYPE JOINED THIS KEY IN 0106 AND `fx_rates_pair_day_key`
+     * WAS DROPPED. A workspace that remits dollars and receives dollars
+     * has a TT buying rate AND a TT selling rate for the same day, both
+     * off the same advice; the old key let one evict the other, and the
+     * eviction is invisible because `recordTenantRate` upserts.
+     */
+    pairDayTypeUnique: uniqueIndex("fx_rates_pair_day_type_key").on(
       t.tenantId,
       t.baseCurrency,
       t.quoteCurrency,
       t.rateDate,
+      t.rateType,
     ),
     lookupIdx: index("fx_rates_lookup_idx").on(
       t.tenantId,
       t.baseCurrency,
       t.quoteCurrency,
+      t.rateDate,
+    ),
+    typeLookupIdx: index("fx_rates_type_lookup_idx").on(
+      t.tenantId,
+      t.baseCurrency,
+      t.quoteCurrency,
+      t.rateType,
       t.rateDate,
     ),
   }),

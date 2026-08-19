@@ -87,7 +87,17 @@ export default async function CustomerStatementPage({
   return (
     <main className="mx-auto w-full max-w-5xl space-y-6 p-6">
       <div>
-        <Link href={`/companies/${id}`} className="text-sm text-muted-foreground hover:underline">
+        {/*
+          ⭐ WAVE 10 — THIS POINTED AT `/companies/:id`, WHICH DOES NOT
+          EXIST. A company has an edit screen and a statement, and no
+          overview between them; the breadcrumb was written for a page
+          that was never built. It goes to the edit screen, which is the
+          only screen about this company there is.
+        */}
+        <Link
+          href={`/companies/${id}/edit`}
+          className="text-sm text-muted-foreground hover:underline"
+        >
           ← Back to the customer
         </Link>
         <h1 className="mt-1 text-2xl font-semibold">Statement of account</h1>

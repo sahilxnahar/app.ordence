@@ -39,8 +39,9 @@ import {
   customObjectDefinitions,
   customFieldDefinitions,
 } from "@/db/schema";
-import { requireTenantContext, TenantAccessError } from "@/server/tenant-context";
+import { TenantAccessError } from "@/server/tenant-context";
 import { requirePermission } from "@/server/audit";
+import { requireFeature, FeatureLockedError } from "@/server/entitlements";
 import {
   createAssetSchema,
   buildDynamicSchema,
@@ -59,6 +60,15 @@ function fail(error: string, fieldErrors?: Record<string, string[]>): ActionResu
 
 function toActionError(err: unknown): ActionResult<never> {
   if (err instanceof TenantAccessError) return fail(err.message);
+  /**
+   * 🔴 WITHOUT THIS LINE THE GATE ABOVE IS AN OUTAGE — Batch 0109.
+   *
+   * The message already names the plan and the remedy. Falling through
+   * to "Something went wrong. Please try again." tells somebody whose
+   * workspace had this module switched off that the product is broken,
+   * and their next move is to press the button again.
+   */
+  if (err instanceof FeatureLockedError) return fail(err.message);
   if (err instanceof z.ZodError) {
     return fail("Validation failed.", err.flatten().fieldErrors as Record<string, string[]>);
   }
@@ -81,9 +91,38 @@ function toActionError(err: unknown): ActionResult<never> {
  * Returned to a client component, so it contains nothing sensitive: labels,
  * types and option lists only.
  */
+/**
+ * ⭐⭐ WAVE 9 — `assets:read` WAS DECLARED, GRANTED TO EVERY ROLE
+ * TEMPLATE, CITED IN TWO OTHER MODULES' REASONING, AND CHECKED NOWHERE.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * WHY THIS IS NOT COSMETIC EVEN THOUGH EVERY BUILT-IN ROLE HOLDS IT
+ * ══════════════════════════════════════════════════════════════════════
+ * All nine role templates grant `assets:read`, so switching these reads
+ * from `requireTenantContext()` to `requirePermission("assets:read")`
+ * locks out nobody who exists today. It matters anyway, for two reasons:
+ *
+ *   1. ROLES ARE CUSTOMISABLE. A workspace that builds a restricted role
+ *      without `assets:read` currently gets a role that reads assets
+ *      perfectly well, because the key it withheld was never consulted.
+ *      A permission a customer can remove and that has no effect is
+ *      worse than one that does not exist — it is a control they believe
+ *      they applied.
+ *
+ *   2. TWO MODULES ALREADY REASON AS IF IT WERE ENFORCED.
+ *      `lib/views/access.ts` and `server/views/guards.ts` both describe
+ *      "an external contractor with `assets:read` and nothing else" when
+ *      explaining what a saved view may expose. That sentence was only
+ *      true of the views layer; on the assets surface itself the "and
+ *      nothing else" part did no work.
+ *
+ * ⚠️ THE FILE HEADER'S CLAIM STANDS: this was never tenant-unsafe. The
+ * tenant has always come from the session. This is the per-role half,
+ * finished — Phase 50 gated the writes and left the reads.
+ */
 export async function getAssetFieldSpecs(): Promise<ActionResult<DynamicFieldSpec[]>> {
   try {
-    const ctx = await requireTenantContext();
+    const ctx = await requirePermission("assets:read");
 
     const definition = await withTenant(ctx.tenant.id, (tx) =>
       tx.query.customObjectDefinitions.findFirst({
@@ -150,6 +189,7 @@ export async function getAssetFieldSpecs(): Promise<ActionResult<DynamicFieldSpe
  */
 export async function createAsset(input: CreateAssetInput): Promise<ActionResult<Asset>> {
   try {
+    await requireFeature("assets.catalog");
     const ctx = await requirePermission("assets:create");
 
     // 1. The fixed half.
@@ -218,7 +258,8 @@ export async function createAsset(input: CreateAssetInput): Promise<ActionResult
 
 export async function getAsset(id: string): Promise<ActionResult<Asset>> {
   try {
-    const ctx = await requireTenantContext();
+    /** ⭐ Wave 9 — see the note above `getAssetFieldSpecs`. */
+    const ctx = await requirePermission("assets:read", { type: "asset", id });
     const parsedId = z.string().uuid("Invalid identifier.").parse(id);
 
     const row = await withTenant(ctx.tenant.id, (tx) =>
@@ -242,7 +283,8 @@ export async function getAsset(id: string): Promise<ActionResult<Asset>> {
 
 export async function getRecentAssets(limit = 20): Promise<ActionResult<Asset[]>> {
   try {
-    const ctx = await requireTenantContext();
+    /** ⭐ Wave 9 — see the note above `getAssetFieldSpecs`. */
+    const ctx = await requirePermission("assets:read");
     const capped = Math.min(Math.max(1, limit), 100);
 
     const rows = await withTenant(ctx.tenant.id, (tx) =>

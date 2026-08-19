@@ -38,7 +38,16 @@ import { revalidatePath } from "next/cache";
 import { and, eq, isNull, desc } from "drizzle-orm";
 import { deleteStoredObject, isStorageConfigured, STORAGE_UNCONFIGURED_MESSAGE } from "@/lib/storage/r2";
 import { db } from "@/db";
-import { documents, contracts, assets, deals, contacts, companies } from "@/db/schema";
+import {
+  documents,
+  contracts,
+  assets,
+  deals,
+  contacts,
+  companies,
+  /* ⭐ Wave 7 — the parent of a drawing revision's file. */
+  drawings,
+} from "@/db/schema";
 import { requirePermission } from "@/server/audit";
 import { requireTenantContext, TenantAccessError } from "@/server/tenant-context";
 import {
@@ -180,6 +189,31 @@ async function parentBelongsToTenant(
       );
       return Boolean(row);
     }
+    /**
+     * ⭐⭐ WAVE 7. A drawing revision's file.
+     *
+     * 🔴 THIS BRANCH EXISTS BECAUSE THE EXHAUSTIVENESS GUARD BELOW
+     * REFUSED THE WAVE WITHOUT IT — which is precisely what it was
+     * written for. Adding `drawing` to the enum and to the upload
+     * allowlist compiled the intent everywhere except here, and without
+     * this case a caller could have attached a file to ANY uuid and
+     * claimed it was a drawing, with no check that the parent exists in
+     * their workspace at all.
+     *
+     * ⚠️ NO SOFT-DELETE COLUMN ON `drawings`, deliberately: a drawing is
+     * withdrawn by marking it `void`, which keeps it in the register
+     * where the site can still see what was superseded. So the existence
+     * check has no `deletedAt` clause and is not missing one.
+     */
+    case "drawing": {
+      const row = await withTenant(tenantId, (tx) =>
+        tx.query.drawings.findFirst({
+          where: and(eq(drawings.id, entityId), eq(drawings.tenantId, tenantId)),
+          columns: { id: true },
+        })
+      );
+      return Boolean(row);
+    }
     default: {
       // Exhaustiveness guard. If a member is added to the enum and this
       // switch is not updated, TypeScript fails the build here rather than
@@ -198,6 +232,7 @@ function pathForEntity(entityType: DocumentEntityTypeInput, entityId: string): s
     case "deal": return `/deals/${entityId}`;
     case "contact": return `/contacts/${entityId}`;
     case "company": return `/companies/${entityId}`;
+    case "drawing": return `/drawings/${entityId}`;
     default: return "/dashboard";
   }
 }

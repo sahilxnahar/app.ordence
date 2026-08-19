@@ -282,15 +282,60 @@ describe("null-tenant rows behave exactly like payment_events", () => {
     expect(fingerprints).toContain(FP_ORPHAN);
   });
 
-  it("platform scope sees ONLY unattributed rows, never a tenant's", async () => {
-    // This is the property that makes the NULL allowance safe rather than
-    // a super-admin backdoor: no tenant context does NOT mean "all rows".
-    const rows = await asPlatform(async (c) => {
+  it("⭐ platform scope sees attributed rows TOO — and that is 0079, not a leak", async () => {
+    // ══════════════════════════════════════════════════════════════════
+    // ⚠️ THIS TEST USED TO ASSERT THE OPPOSITE. It read:
+    //
+    //     expect(rows.every((r) => r.tenant_id === null)).toBe(true);
+    //
+    // and it was right when it was written, and wrong from 0079 onwards.
+    //
+    // 0079_rls_opt_in_and_telemetry.sql found that `error_events`,
+    // `web_vital_events` and `security_events` had been DISCARDING every
+    // row that names a tenant. The writers run under `withPlatformScope`,
+    // where the session tenant is null, and stamp a real tenant id on the
+    // row when the caller is signed in. Null session tenant plus non-null
+    // row tenant satisfied neither branch of the old policy, so Postgres
+    // raised 42501, and all three call sites caught it and moved on , by
+    // design, because telemetry must never break the request it describes.
+    //
+    // So those tables held anonymous pre-auth rows and nothing else. Every
+    // error from a signed-in user and every security event attributed to a
+    // workspace went on the floor, silently, for the life of the product.
+    //
+    // 0079 added `OR app_platform_scope()` to both halves. These rows are
+    // the PLATFORM'S observations ABOUT a workspace , the workspace is the
+    // subject, not the author , so the platform branch is the honest fix.
+    //
+    // ══════════════════════════════════════════════════════════════════
+    // ⭐ WHAT KEEPS THAT FROM BEING A SUPER-ADMIN BACKDOOR
+    // ══════════════════════════════════════════════════════════════════
+    // Not the policy. `app_platform_scope()` is false unless something
+    // deliberately set `app.platform_scope`, which only `withPlatformScope`
+    // does and only with a stated reason. The properties that matter are
+    // therefore the three asserted below and, above all, the fail-closed
+    // default in the next test: NO context sees ZERO rows, not all of them.
+    const platformRows = await asPlatform(async (c) => {
       const r = await c.query("SELECT tenant_id FROM error_events");
       return r.rows as { tenant_id: string | null }[];
     });
-    expect(rows.every((r) => r.tenant_id === null)).toBe(true);
-    expect(rows.length).toBeGreaterThan(0);
+
+    // (1) It still sees the unattributed rows.
+    expect(platformRows.some((r) => r.tenant_id === null)).toBe(true);
+
+    // (2) It ALSO sees attributed ones. If this ever goes back to false,
+    //     0079 has been reverted and telemetry is silently on the floor
+    //     again , which is invisible from the application, because every
+    //     writer swallows the 42501.
+    expect(platformRows.some((r) => r.tenant_id !== null)).toBe(true);
+
+    // (3) A TENANT session is unaffected: it still sees only its own.
+    const tenantRows = await asTenant(fx.tenantA, async (c) => {
+      const r = await c.query("SELECT tenant_id FROM error_events");
+      return r.rows as { tenant_id: string | null }[];
+    });
+    expect(tenantRows.length).toBeGreaterThan(0);
+    expect(tenantRows.every((r) => r.tenant_id === fx.tenantA)).toBe(true);
   });
 
   it("the same holds for web_vital_events", async () => {
@@ -300,11 +345,17 @@ describe("null-tenant rows behave exactly like payment_events", () => {
     });
     expect(tenantView).toHaveLength(0);
 
-    const platformView = await withoutTenant(async (c) => {
+    // ⚠️ `withoutTenant` is NOT platform scope. It is a session with no
+    // tenant and no platform flag, which is the fail-closed case: it may
+    // see the unattributed rows and nothing else. Contrast the test above,
+    // which uses `asPlatform`. The distinction is the whole control, and
+    // this test previously conflated the two by asserting the same thing
+    // of both.
+    const noContextView = await withoutTenant(async (c) => {
       const r = await c.query("SELECT tenant_id FROM web_vital_events");
       return r.rows as { tenant_id: string | null }[];
     });
-    expect(platformView.every((r) => r.tenant_id === null)).toBe(true);
+    expect(noContextView.every((r) => r.tenant_id === null)).toBe(true);
   });
 
   it("no context means ZERO rows, never ALL rows — the fail-closed default", async () => {

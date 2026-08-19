@@ -59,6 +59,11 @@ function notice(over: Partial<NoticeServiceFacts> = {}): NoticeServiceFacts {
     servedAt: null,
     serviceRecordedAt: null,
     serviceReference: null,
+    // ⭐ 0111. Added to the fixture, not defaulted in the type: a screen
+    // or a rule that can be written without knowing which right a rung
+    // was raised under is one that will be.
+    serviceBasis: null,
+    authorisedPermission: "receivables:dun",
     legacySentAt: null,
     ...over,
   };

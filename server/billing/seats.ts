@@ -42,7 +42,7 @@ import "server-only";
 
 import { and, eq, sql } from "drizzle-orm";
 import { db, withTenant } from "@/db";
-import { users, subscriptions, plans } from "@/db/schema";
+import { users, subscriptions, plans, seatGrants } from "@/db/schema";
 import {
   canTakeSeats,
   computeSeatState,
@@ -52,6 +52,7 @@ import {
   SEAT_CONSUMING_STATUSES,
   type SeatState,
   type SeatVerdict,
+  grantedSeats,
 } from "@/lib/billing/seats";
 
 /* ------------------------------------------------------------------ */
@@ -160,6 +161,56 @@ export async function countSeatsPurchased(
   return Math.max(row.seatsPurchased, row.includedSeats, 0);
 }
 
+/**
+ * ⭐⭐⭐ CAPACITY GRANTED ON TOP OF WHAT WAS BOUGHT — 0114.
+ *
+ * 🔴 THIS IS THE ONLY WAY A WORKSPACE EXCEEDS ITS PURCHASED SEATS, and
+ * every row behind it carries a reason of at least ten characters and the
+ * name of whoever gave it. A CHECK constraint enforces the reason, so a
+ * concession cannot be made silently and then found by an accountant
+ * asking why revenue per workspace does not foot.
+ *
+ * ⚠️ EXPIRED AND REVOKED GRANTS ARE FILTERED IN SQL AND AGAIN IN
+ * `grantedSeats()`. That looks redundant and is not: the pure function is
+ * what the team screen uses to explain the number, and if the two ever
+ * disagreed the screen would show a figure the server would not honour.
+ * The test asserts they agree.
+ */
+export async function countGrantedSeats(tenantId: string): Promise<number> {
+  const rows = await withTenant(tenantId, (tx) =>
+    tx
+      .select({
+        seats: seatGrants.seats,
+        expiresAt: seatGrants.expiresAt,
+        revokedAt: seatGrants.revokedAt,
+      })
+      .from(seatGrants)
+      .where(
+        and(
+          eq(seatGrants.tenantId, tenantId),
+          sql`${seatGrants.revokedAt} IS NULL`,
+          sql`(${seatGrants.expiresAt} IS NULL OR ${seatGrants.expiresAt} > now())`,
+        ),
+      ),
+  );
+  return grantedSeats(rows);
+}
+
+/**
+ * ⭐ What the workspace may actually use. Every gate below asks this, not
+ * `countSeatsPurchased`, so a grant is honoured everywhere or nowhere.
+ */
+export async function countEffectiveSeats(
+  tenantId: string,
+  fallbackSeatLimit: number,
+): Promise<number> {
+  const [purchased, granted] = await Promise.all([
+    countSeatsPurchased(tenantId, fallbackSeatLimit),
+    countGrantedSeats(tenantId),
+  ]);
+  return purchased + granted;
+}
+
 /* ------------------------------------------------------------------ */
 /* THE GATE                                                            */
 /* ------------------------------------------------------------------ */
@@ -170,7 +221,8 @@ export async function getSeatState(
 ): Promise<SeatState> {
   const [used, purchased] = await Promise.all([
     countSeatsInUse(tenantId),
-    countSeatsPurchased(tenantId, fallbackSeatLimit),
+    /** ⭐ 0114: bought PLUS granted. See `countEffectiveSeats`. */
+    countEffectiveSeats(tenantId, fallbackSeatLimit),
   ]);
   return computeSeatState(used, purchased);
 }
@@ -183,7 +235,8 @@ export async function checkSeatAvailability(
 ): Promise<SeatVerdict> {
   const [used, purchased] = await Promise.all([
     countSeatsInUse(tenantId),
-    countSeatsPurchased(tenantId, fallbackSeatLimit),
+    /** ⭐ 0114: bought PLUS granted. */
+    countEffectiveSeats(tenantId, fallbackSeatLimit),
   ]);
   return canTakeSeats(used, purchased, count);
 }

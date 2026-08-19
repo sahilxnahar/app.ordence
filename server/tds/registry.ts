@@ -158,7 +158,33 @@ export function toCertificateFacts(
   };
 }
 
-/** Base already paid under a certificate, for its cap. */
+/**
+ * Base already paid under a certificate, for its cap.
+ *
+ * ⚠️ BATCH 0104 — CHECKED AND DELIBERATELY LEFT AS A BARE `bigint`.
+ *
+ * `tds_deductions` has no `currency` column, so this `sum()` cannot be
+ * adding two currencies. More to the point, the number NEVER REACHES A
+ * SCREEN: it is compared against `tds_lower_deduction_certificates.
+ * cap_base_minor` by `resolveTdsRate()` and discarded. Both sides come
+ * from the same single-currency pair of tables, so the comparison is sound
+ * and a currency label would be decoration on an intermediate.
+ *
+ * 🔴 THE REAL CURRENCY GAP UNDER SECTION 195 WAS NEVER HERE, AND BATCH
+ * 0106 CLOSED IT. A payment to a non-resident is frequently made in
+ * foreign currency and the TDS is computed on the rupee equivalent at the
+ * Rule 26 telegraphic-transfer buying rate on the date the tax was
+ * required to be deducted. That conversion now happens in exactly one
+ * place — `lib/tds/foreign-payments.ts#foreignPaymentBase`, over a quote
+ * `server/fx/rate-service.ts#requireStatutoryQuote` will only return if it
+ * is the TT buying rate for that very day — and the rate, its date, its
+ * type and its publisher are copied onto the deduction row, where the
+ * CHECK `tds_deductions_rule_26_complete` refuses anything else.
+ *
+ * ⚠️ THIS SUM IS STILL A BARE `bigint` AND STILL CORRECTLY SO. Every
+ * `chargeable_base_minor` it adds is already in rupees, whatever currency
+ * the payment was made in, because Rule 26 measures it there.
+ */
 export async function certificateConsumedBaseMinor(
   tenantId: string,
   certificateId: string,

@@ -33,6 +33,7 @@ import { z } from "zod";
 import { withTenant } from "@/db";
 import { agentDefinitions, agentRuns, agentTriggers } from "@/db/schema/agents";
 import { requirePermission, writeAudit } from "@/server/audit";
+import { requireFeature } from "@/server/entitlements";
 import { toSalesActionError } from "@/server/sales/guards";
 import {
   CATALOGUE_BY_KEY,
@@ -44,6 +45,18 @@ import { MCP_TOOLS } from "@/lib/mcp/registry";
 import type { ActionResult } from "@/lib/validators/crm";
 
 const MANAGE = "settings:update" as const;
+
+/**
+ * ⭐ THE ENTITLEMENT — Batch 0109.
+ *
+ * ⚠️ `ai.copilot` sits at the `ai` tier in the price list and, until
+ * this batch, was refused by nothing anywhere in the product. Installing,
+ * editing and arming an agent are the three writes that CREATE the thing
+ * the tier is sold for, so the gate is on those and not on
+ * `getAgentShelf` or `getAgentRuns` — a workspace that drops off the AI
+ * tier keeps reading what its agents did, because that record is theirs.
+ */
+const AI_FEATURE = "ai.copilot" as const;
 
 /* ------------------------------------------------------------------ */
 /* THE SHELF                                                           */
@@ -163,6 +176,7 @@ export async function installAgent(
   input: unknown,
 ): Promise<ActionResult<{ id: string; name: string }>> {
   try {
+    await requireFeature(AI_FEATURE);
     const { catalogueKey } = z
       .object({ catalogueKey: z.string().min(1).max(80) })
       .parse(input);
@@ -253,6 +267,7 @@ export async function editAgent(
   input: unknown,
 ): Promise<ActionResult<{ sensitivity: string; laneChanged: boolean }>> {
   try {
+    await requireFeature(AI_FEATURE);
     const data = editSchema.parse(input);
     const ctx = await requirePermission(MANAGE);
 
@@ -358,6 +373,7 @@ export async function bindAgentTrigger(
   input: unknown,
 ): Promise<ActionResult<{ bound: true; note: string }>> {
   try {
+    await requireFeature(AI_FEATURE);
     const data = bindSchema.parse(input);
     const ctx = await requirePermission(MANAGE);
 

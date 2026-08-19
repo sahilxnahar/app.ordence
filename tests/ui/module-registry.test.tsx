@@ -151,8 +151,27 @@ describe("registry completeness", () => {
     // total read from a module that has its own gate, so a locked module
     // contributes nothing to it. Making it free gives away no data that
     // was not already free.
+    //
+    // ⭐⭐ `assistant` LEFT THIS LIST IN v1.68.0-alpha (Batch 0109), AND
+    // IT IS THE ONLY ENTRY THAT LEFT BECAUSE IT WAS NEVER FREE.
+    //
+    // 🔴 `ai.copilot` has sat at the `ai` tier in `FEATURE_CATALOG` since
+    // Phase 51. `feature: null` here meant the menu advertised a paid
+    // module to every plan including the free one, and
+    // `app/api/assistant/route.ts` answered every one of them — each call
+    // forwarding tokens we pay a third party for.
+    //
+    // ⚠️ THIS LINE IS THE MENU, NOT THE GATE. Removing a nav entry hides
+    // nothing from anybody holding a session cookie; the refusal is in
+    // the route. What this changes is that we stop showing a door we
+    // intend to keep shut.
+    //
+    // ⚠️ IT IS THE OPPOSITE CASE FROM `statutory_due` AND `today`, and
+    // the contrast is the argument. Those are free because a lapsed
+    // customer still owes the Government and the deadline is not ours to
+    // hold. Nobody's provident fund is late because they could not ask an
+    // assistant about it.
     expect(free).toEqual([
-      "assistant",
       "billing",
       "connections",
       "dashboard",

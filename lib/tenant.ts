@@ -94,6 +94,68 @@ function normaliseHost(rawHost: string | null | undefined): string {
   return host;
 }
 
+/* ------------------------------------------------------------------ */
+/* ONE LABEL UNDER A BASE — THE SUFFIX RULE, WRITTEN ONCE               */
+/* ------------------------------------------------------------------ */
+
+/**
+ * ⭐ THE SUFFIX TEST, EXTRACTED SO THERE IS EXACTLY ONE OF IT.
+ *
+ * `host` is one DNS label beneath `base` → the label. Anything else →
+ * `null`. Both inputs are already normalised by `normaliseHost`.
+ *
+ * 🔴 THE MATCH IS A SUFFIX ON A LABEL BOUNDARY, NEVER A SUBSTRING, AND
+ *    THE DIFFERENCE IS THE WHOLE SECURITY VALUE. `endsWith(zone)` alone
+ *    accepts `notordence.com` and `evil-ordence.com` for the zone
+ *    `ordence.com`, because both genuinely end with that string. The
+ *    leading dot in the comparison is what makes the boundary a boundary.
+ *
+ * ⚠️ A DEEPER NAME IS NOT ONE LABEL. `a.b.ordence.com` returns null,
+ *    because `label.includes(".")`. This is the same rule the tenant
+ *    resolver has always applied, and it is what the wildcard certificate
+ *    `*.ordence.com` covers — exactly one label, never two.
+ */
+export function labelUnder(
+  rawHost: string | null | undefined,
+  rawBase: string | null | undefined,
+): string | null {
+  const host = normaliseHost(rawHost);
+  const base = normaliseHost(rawBase);
+  if (!host || !base) return null;
+  if (!host.endsWith(`.${base}`)) return null;
+  const label = host.slice(0, -(base.length + 1));
+  if (!label || label.includes(".")) return null;
+  return label;
+}
+
+/**
+ * Is `rawHost` a hostname this deployment serves under `rawZone`?
+ *
+ * True for the zone apex itself and for any SINGLE label beneath it —
+ * `ordence.com`, `app.ordence.com`, `admin.ordence.com`,
+ * `acme.ordence.com`. False for `notordence.com`, `evil-ordence.com`,
+ * `ordence.com.evil.net` and `a.b.ordence.com`.
+ *
+ * ⚠️ PORT-INSENSITIVE, BECAUSE `normaliseHost` STRIPS THE PORT, AND THAT
+ *    IS DELIBERATE RATHER THAN AN OVERSIGHT. The thing this predicate
+ *    protects is a cookie-carrying request, and cookies are not
+ *    port-scoped: an attacker who can serve `acme.ordence.com:8443`
+ *    already controls `acme.ordence.com` for every purpose that matters
+ *    here. Requiring the ports to match would buy nothing and would break
+ *    `acme.localhost:3000` in development, where the zone carries a port
+ *    and the origin does too.
+ */
+export function isHostInZone(
+  rawHost: string | null | undefined,
+  rawZone: string | null | undefined,
+): boolean {
+  const host = normaliseHost(rawHost);
+  const zone = normaliseHost(rawZone);
+  if (!host || !zone) return false;
+  if (host === zone) return true;
+  return labelUnder(host, zone) !== null;
+}
+
 /**
  * Work out which tenant a request is addressed to, from the Host header alone.
  *
@@ -172,9 +234,11 @@ export function resolveTenantFromHost(
   if (host === root || host === `www.${root}`) return { kind: "root" };
 
   if (host.endsWith(`.${root}`)) {
-    const label = host.slice(0, -(root.length + 1));
-    // Only a single label counts (a.b.root is not a tenant).
-    if (!label || label.includes(".")) return { kind: "root" };
+    // Only a single label counts (a.b.root is not a tenant). `labelUnder`
+    // is that rule, shared with `isHostInZone` above so the host set the
+    // CSRF check trusts and the host set that resolves are the same shape.
+    const label = labelUnder(host, root);
+    if (label === null) return { kind: "root" };
     if (!isValidSlug(label)) return { kind: "root" };
     return { kind: "subdomain", slug: label };
   }
@@ -189,8 +253,8 @@ export function resolveTenantFromHost(
    * customer.
    */
   if (zone && host.endsWith(`.${zone}`)) {
-    const label = host.slice(0, -(zone.length + 1));
-    if (!label || label.includes(".")) return { kind: "root" };
+    const label = labelUnder(host, zone);
+    if (label === null) return { kind: "root" };
     if (!isValidSlug(label)) return { kind: "root" };
     return { kind: "subdomain", slug: label };
   }

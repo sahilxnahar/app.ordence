@@ -47,6 +47,12 @@ import {
   vaultReadiness,
 } from "./crypto";
 import type { VaultKind } from "@/db/schema/vault";
+// ⚠️ Type-and-constant import only: two frozen strings naming where an AI
+// provider key sits in the vault. It pulls in no client.
+import {
+  AI_CREDENTIAL_OWNER_KIND,
+  AI_CREDENTIAL_SECRET_LABEL,
+} from "@/db/schema/ai-credentials";
 
 /**
  * The Drizzle transaction handle from `withTenant`. Typed loosely on
@@ -378,6 +384,78 @@ export async function readForPerson(args: {
   try {
     return { ok: true, value: openSecret(row) };
   } catch (e) {
+    return {
+      ok: false,
+      error: e instanceof Error ? e.message : "The credential could not be read.",
+    };
+  }
+}
+
+/**
+ * 🔴 AN AI PROVIDER KEY, READ TO BE PUT IN AN AUTHORIZATION HEADER.
+ * NOT LOGGED PER READ, AND THAT IS THE DESIGN.
+ *
+ * ⚠️ THIS FILE'S OWN RULE IS THAT A DECRYPTION WITH NO RECORD ANYWHERE
+ * IS WHAT 0037 EXISTS TO MAKE IMPOSSIBLE. It is not being relaxed here;
+ * it is being satisfied the same way `readForRunner` satisfies it.
+ *
+ * The argument in this file's header is that a connection polling every
+ * six minutes reads its key 240 times a day, and 240 access-log rows a
+ * day would bury the handful where a PERSON opened a credential — so
+ * the runner's read is accounted for by its `sync_runs` row instead.
+ *
+ * ⭐ AN AI CALL IS THE SAME ANIMAL AND MORE SO. One assistant
+ * conversation can make a dozen provider calls, and the six background
+ * monitors run on a schedule. `ai_provider_credentials.last_used_at`,
+ * `.use_count` and the `.last_failure_*` triple are this credential's
+ * `sync_runs`: a standing record, on a row the customer can see, of the
+ * fact that the key is being read, how often, and how it went. 0105
+ * says so in the column comment.
+ *
+ * ⚠️ `credentialId` IS REQUIRED FOR EXACTLY THAT REASON. It is the id of
+ * the row that does the accounting, so a read with no id is the case
+ * where nothing anywhere would record it — the single case this module
+ * must not allow. Same shape as `readForRunner`'s `syncRunId`.
+ *
+ * ⚠️ THE RETURN VALUE IS A CREDENTIAL. It must not be logged, must not
+ * reach an error message, and must not be attached to a Sentry event. It
+ * goes into an Authorization header and nowhere else.
+ */
+export async function readForAiProvider(args: {
+  readonly tx: Tx;
+  readonly tenantId: string;
+  /** The `ai_provider_credentials.id` this key belongs to. Not optional. */
+  readonly credentialId: string;
+}): Promise<ReadSecretResult> {
+  if (!args.credentialId) {
+    return {
+      ok: false,
+      error:
+        "An AI provider key may not be read without the credential row that accounts for the read.",
+    };
+  }
+
+  const row = await loadRow(
+    args.tx,
+    args.tenantId,
+    AI_CREDENTIAL_OWNER_KIND,
+    args.credentialId,
+    AI_CREDENTIAL_SECRET_LABEL,
+  );
+  if (!row) {
+    return {
+      ok: false,
+      error:
+        "No key is stored for this AI provider. Enter one on the AI assistant settings screen.",
+    };
+  }
+
+  try {
+    return { ok: true, value: openSecret(row) };
+  } catch (e) {
+    // ⚠️ `openSecret`'s message is already customer-safe and says nothing
+    // about the value or the key. It names the two real causes: the
+    // encryption key changed, or the stored value was altered.
     return {
       ok: false,
       error: e instanceof Error ? e.message : "The credential could not be read.",

@@ -89,6 +89,33 @@ const KNOWN_GAPS = new Map([
    * log that cannot be replayed from scratch.
    */
   [76, "retired — 0076_mass_deployment_backup.sql superseded, number not reused"],
+  /**
+   * ⭐ 0107 WAS RESERVED AND NEVER WRITTEN. A different shape from the
+   * three above, and the first of its kind here.
+   *
+   * ══════════════════════════════════════════════════════════════════
+   * 🔴 FIVE BRIEFS WERE NUMBERED IN PARALLEL AND THE MAIN LINE HELD TWO
+   * ══════════════════════════════════════════════════════════════════
+   * The main line kept 0106 and 0107 while five parallel streams took
+   * 0108 through 0112. 0106 shipped as the TDS Rule 26 migration. 0107
+   * never became anything: the work it was held for turned out to need
+   * tables that 0110 creates, so it had to be numbered ABOVE the
+   * streams rather than below them, and it went out as 0112 instead.
+   *
+   * ⚠️ AND THE CASE FOR *NOT* PUTTING IT HERE WAS ARGUED FIRST, in
+   * `OPTIONAL-migration-reservations.md`, which said plainly: do not
+   * close this gap with KNOWN_GAPS, because that list means "never
+   * written" and these files exist. That was right about 0106, which
+   * does exist. It was wrong about 0107 only because the prediction
+   * behind it — that the main line would write one — did not come true.
+   * "Never written, and never will be" is now simply what happened.
+   *
+   * 🔴 DO NOT REUSE 0107. The same rule as the three retired numbers
+   * above, for a different reason: not because a script once held the
+   * position, but because four delivered batches, five reports and
+   * every comment in them describe a sequence in which 0107 is absent.
+   */
+  [107, "reserved by the main line during the five-stream wave and never written — the work it was held for became 0112, which had to run after 0110"],
 ]);
 
 /* ------------------------------------------------------------------ */

@@ -255,8 +255,21 @@ async function processLedgerAggregation(
           ledgerName: ledgers.name,
           ledgerType: ledgers.type,
           accountType: ledgers.accountType,
-          totalDebit: sql<string>`COALESCE(SUM(CASE WHEN ${journalEntries.entryType} = 'debit'  THEN ${journalEntries.amount} ELSE 0 END), 0)`,
-          totalCredit: sql<string>`COALESCE(SUM(CASE WHEN ${journalEntries.entryType} = 'credit' THEN ${journalEntries.amount} ELSE 0 END), 0)`,
+          /**
+           * ⭐ SUMMED IN MINOR UNITS. Batch 0108.
+           *
+           * 🔴 `isBalanced` BELOW USED TO BE A FLOAT COMPARISON — the
+           * totals went through `Number()` and the verdict was
+           * `Math.abs(d - c) < 0.01`. The comment beside it said "if this
+           * is ever false, the double-entry guarantee has been violated",
+           * which is a strong claim to rest on an epsilon. Two integers
+           * are equal or they are not.
+           */
+          totalDebitMinor: sql<string>`COALESCE(SUM(CASE WHEN ${journalEntries.entryType} = 'debit'  THEN ${journalEntries.amountMinor} ELSE 0 END), 0)::text`,
+          totalCreditMinor: sql<string>`COALESCE(SUM(CASE WHEN ${journalEntries.entryType} = 'credit' THEN ${journalEntries.amountMinor} ELSE 0 END), 0)::text`,
+          /** ⚠️ SUM() skips NULLs; an unscaled leg would make an
+           *  out-of-balance book look balanced by being absent from both. */
+          unscaledLegs: sql<number>`COUNT(*) FILTER (WHERE ${journalEntries.amountMinor} IS NULL)::int`,
         })
         .from(ledgers)
         .leftJoin(
@@ -269,16 +282,28 @@ async function processLedgerAggregation(
         .where(and(eq(ledgers.tenantId, data.tenantId), isNull(ledgers.deletedAt)))
         .groupBy(ledgers.id, ledgers.code, ledgers.name, ledgers.type, ledgers.accountType);
 
-      const totalDebits = rows.reduce((sum, r) => sum + Number(r.totalDebit), 0);
-      const totalCredits = rows.reduce((sum, r) => sum + Number(r.totalCredit), 0);
+      const unscaled = rows.reduce((n, r) => n + r.unscaledLegs, 0);
+      if (unscaled > 0) {
+        throw new Error(
+          `${unscaled} journal line(s) have no amount in minor units, so this trial ` +
+            `balance cannot be produced. Run the census in SQL-FILES/0108 to see which ` +
+            `currency is unscaled.`,
+        );
+      }
+
+      const totalDebitsMinor = rows.reduce((sum, r) => sum + BigInt(r.totalDebitMinor), 0n);
+      const totalCreditsMinor = rows.reduce((sum, r) => sum + BigInt(r.totalCreditMinor), 0n);
 
       return {
         reportType: "trial_balance",
         ledgerCount: rows.length,
-        totalDebits: totalDebits.toFixed(2),
-        totalCredits: totalCredits.toFixed(2),
-        // If this is ever false, the double-entry guarantee has been violated.
-        isBalanced: Math.abs(totalDebits - totalCredits) < 0.01,
+        totalDebitsMinor: totalDebitsMinor.toString(),
+        totalCreditsMinor: totalCreditsMinor.toString(),
+        /**
+         * ⭐ EXACT. Batch 0108. The claim this flag makes — that the
+         * double-entry guarantee holds — is now worth what it says.
+         */
+        isBalanced: totalDebitsMinor === totalCreditsMinor,
         rows,
       };
     }
@@ -288,7 +313,21 @@ async function processLedgerAggregation(
         .select({
           id: journalEntries.id,
           entryType: journalEntries.entryType,
-          amount: journalEntries.amount,
+          /**
+           * ⭐ THE STATEMENT LINE, IN MINOR UNITS. Batch 0108.
+           *
+           * ⚠️ `balanceAfter` IS STILL `numeric(18,2)` AND IS A KNOWN GAP.
+           * It is maintained by the pre-existing `update_ledger_balance`
+           * trigger from `ledgers.current_balance`, itself a
+           * `numeric(20,2)` cache, so neither can hold fils. The
+           * AUTHORITATIVE running balance is a cumulative sum of
+           * `amount_minor`, which is what `ledgerBalanceAt()` in
+           * server/banking/reconciliation-service.ts computes. Giving
+           * `ledgers.current_balance` its own `_minor` column is a
+           * separate batch; it is written down in Batch 0108's report
+           * rather than half-built here.
+           */
+          amountMinor: journalEntries.amountMinor,
           description: journalEntries.description,
           balanceAfter: journalEntries.balanceAfter,
           counterpartyName: journalEntries.counterpartyName,

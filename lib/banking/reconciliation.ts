@@ -160,6 +160,51 @@ export function categoryFor(side: ItemSide, amountMinor: Minor): ReconciliationC
 /* THE STATEMENT                                                       */
 /* ------------------------------------------------------------------ */
 
+/**
+ * ⭐⭐⭐ THE UNEXPLAINED REMAINDER OF SOMETHING THAT IS PARTLY MATCHED —
+ *    0110.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 THE HOLE THIS CLOSES
+ * ══════════════════════════════════════════════════════════════════════
+ * Until 0110 a bank line was matched or it was not, so `unmatchedInBank`
+ * was the whole of the outstanding bank side. 0110 lets one receipt pay
+ * three invoices, and the moment allocation exists a line can be PARTLY
+ * explained.
+ *
+ * ⚠️ A ₹10,000 line carrying ₹6,000 of allocations is not unmatched, so
+ * it would drop out of `unmatchedInBank` — and ₹4,000 would leave the
+ * statement entirely and reappear at the bottom as an unexplained
+ * difference with nothing saying which line it came from.
+ *
+ * ⭐ SO THE RESIDUE IS AN ITEM, BY NAME, WITH ITS OWN AMOUNT. Every
+ * paisa of every line and every document is either allocated to
+ * something or printed on this statement as outstanding. There is no
+ * third place for money to go, and that is what makes a false balance
+ * impossible rather than merely unlikely.
+ *
+ * 🔴 THE FIELD IS REQUIRED, NOT OPTIONAL. An optional array defaults to
+ * empty, and a caller who forgets it gets a statement that silently
+ * drops every partial residue — the exact defect, reintroduced by the
+ * convenience of not having to think about it. Required means `tsc`
+ * refuses the caller who has not decided.
+ */
+export interface ResidualItem {
+  /** `bank_statement_lines.id`, or the document id for a book item. */
+  readonly sourceId: string;
+  /** Null for a bank line, the candidate kind for a book item. */
+  readonly sourceKind: string | null;
+  readonly side: ItemSide;
+  readonly occurredOn: string;
+  /**
+   * 🔴 SIGNED, and it is what is LEFT, not what was allocated. Positive
+   * is money in, as everywhere else. See `residueOf` in
+   * `lib/banking/allocation.ts`, which is the one place it is computed.
+   */
+  readonly residueMinor: Minor;
+  readonly description: string;
+}
+
 export interface BrsInput {
   /** What the bank says the account holds at `asAt`. */
   readonly bankBalanceMinor: Minor;
@@ -167,6 +212,11 @@ export interface BrsInput {
   readonly bookBalanceMinor: Minor;
   readonly unmatchedInBank: readonly StatementLine[];
   readonly unmatchedInLedger: readonly LedgerCandidate[];
+  /**
+   * 🔴 PARTLY EXPLAINED THINGS, BANK SIDE AND BOOK SIDE TOGETHER — 0110.
+   * Required. See `ResidualItem`.
+   */
+  readonly partlyExplained: readonly ResidualItem[];
   /**
    * 🔴 EXPLICIT, PER-ACCOUNT, AND ZERO BY DEFAULT. See the header. A
    * negative value is treated as zero rather than refused, because this
@@ -274,6 +324,35 @@ export function buildBrs(input: BrsInput): Brs {
   }
 
   /**
+   * ⭐⭐ THE RESIDUES OF PARTLY EXPLAINED THINGS — 0110.
+   *
+   * ⚠️ THEY GO THROUGH `categoryFor` LIKE EVERYTHING ELSE. A residue is
+   * not a fifth category: ₹4,000 still outstanding on a bank line that
+   * brought money in is a direct credit not in the books, exactly as the
+   * whole line would have been. Giving it its own category would put it
+   * in a row an auditor does not recognise and would need its own sign
+   * rule, which is a second place for the sign to be wrong.
+   *
+   * 🔴 A ZERO RESIDUE IS SKIPPED. It means the thing is fully explained,
+   * and `bank_reconciliation_items` has a CHECK forbidding an item of
+   * nothing — a zero here would make `freezeReconciliation` fail at
+   * sign-off with a constraint error instead of simply not printing a
+   * line that says nothing.
+   */
+  for (const residual of input.partlyExplained) {
+    if (residual.residueMinor === 0n) continue;
+    items.push({
+      category: categoryFor(residual.side, residual.residueMinor),
+      side: residual.side,
+      sourceId: residual.sourceId,
+      sourceKind: residual.sourceKind,
+      occurredOn: residual.occurredOn,
+      amountMinor: residual.residueMinor,
+      description: residual.description.replace(/\s+/g, " ").trim().slice(0, 400),
+    });
+  }
+
+  /**
    * ⚠️ MAGNITUDES. `-x` on a bigint is exact; there is no float here and
    * `Math.abs` must never be reached for money.
    */
@@ -332,6 +411,25 @@ export function buildBrs(input: BrsInput): Brs {
   if (totals.bankChargesMinor > 0n || totals.directCreditsMinor > 0n) {
     notes.push(
       "Some of the items below are in the bank and not in the books: charges, interest, direct debits. These are real journal entries the books do not have yet, and they were discovered here, so post them from here.",
+    );
+  }
+
+  /**
+   * ⭐ PARTIALS ARE CALLED OUT SEPARATELY — 0110.
+   *
+   * ⚠️ A wholly unmatched line and a line with ₹4,000 left on it look
+   * identical once both are amounts in a category total, and they mean
+   * different things: the first is a document nobody has entered, the
+   * second is a document that was entered for less than the bank moved.
+   * The second is usually a short payment, a bank charge deducted from a
+   * remittance, or a fourth invoice nobody thought to look for.
+   */
+  const partialsWithResidue = input.partlyExplained.filter(
+    (r) => r.residueMinor !== 0n,
+  ).length;
+  if (partialsWithResidue > 0) {
+    notes.push(
+      `${partialsWithResidue} of the items below ${partialsWithResidue === 1 ? "is what is left" : "are what is left"} of something that has been partly explained: one receipt against several invoices, or a payment that did not cover the whole bill. The remainder is outstanding in its own right and is listed as such. It has not been folded into the difference at the bottom, because a residue that reaches the difference has lost the name of the line it came from.`,
     );
   }
 

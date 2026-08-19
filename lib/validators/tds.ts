@@ -297,7 +297,55 @@ export type UpsertLowerDeductionCertificateInput = z.infer<
  * computed from the register, because a caller who could supply them
  * could supply the wrong ones and nothing downstream would know.
  */
-export const assessDeductionSchema = z.object({
+/**
+ * ⭐⭐ A PAYMENT MADE IN A CURRENCY THAT IS NOT THE RUPEE — RULE 26.
+ *
+ * ⚠️ THE AMOUNT CROSSES AS MINOR UNITS OF ITS OWN CURRENCY, NOT AS
+ * "125000.00". `moneyString` above encodes the two-decimal assumption
+ * that `lib/fx/currency.ts` exists to destroy: JPY has no minor unit at
+ * all and KWD has three, so "1.234" is a valid dinar amount that
+ * `moneyString` rejects and "1234" JPY is 1,234 yen and not 12.34.
+ * Minor units are exact, exponent-free at the boundary, and are scaled
+ * by the currency's own exponent inside `convertMinor`.
+ *
+ * ⚠️ AND IT CARRIES BOTH DATES RATHER THAN A DEDUCTION DATE. Which of
+ * them fixes the deduction is a statutory question — s.195(1)'s
+ * "whichever is earlier" — answered by
+ * `lib/tds/foreign-payments.ts#deductionDateFor` on the server. A form
+ * that posted the answer could post the payment date, which is the
+ * commonest wrong one.
+ */
+export const foreignPaymentSchema = z
+  .object({
+    currency: z
+      .string()
+      .trim()
+      .toUpperCase()
+      .regex(/^[A-Z]{3}$/, "A currency is a three-letter ISO-4217 code, like USD."),
+    /** Minor units of `currency`. Digits only. */
+    amountMinor: z
+      .string()
+      .trim()
+      .regex(/^\d+$/, "Enter the amount in the currency's own minor units, digits only."),
+    /** When the sum was credited to the payee's account in our books. */
+    creditDate: civilDaySchema.nullish(),
+    /** When the money left the bank. */
+    paymentDate: civilDaySchema.nullish(),
+  })
+  .refine((v) => Boolean(v.creditDate) || Boolean(v.paymentDate), {
+    message:
+      "Record the date the sum was credited to the payee's account, or the date it was " +
+      "paid. s.195(1) charges the deduction on the earlier of the two, and under Rule 26 " +
+      "that same date fixes the telegraphic transfer buying rate the payment is measured " +
+      "at — so with neither date there is no deduction date and no rate.",
+  });
+
+/**
+ * ⚠️ THE SHAPE, WITHOUT THE CROSS-FIELD RULE. Both schemas below apply
+ * `exactlyOneBase` to it — restating the rule twice is how two forms end
+ * up disagreeing about which of them is authoritative.
+ */
+const deductionInputShape = z.object({
   deducteeId: uuid,
   section: tdsSectionSchema,
   /**
@@ -306,8 +354,24 @@ export const assessDeductionSchema = z.object({
    * alone. Phase 33 already computed this as
    * `purchase_invoices.tds_base_minor`.
    */
-  paymentBaseMinor: moneyString,
-  /** Date of credit or of payment, WHICHEVER IS EARLIER. */
+  paymentBaseMinor: moneyString.nullish(),
+  /**
+   * ⭐⭐ RULE 26. Present INSTEAD OF `paymentBaseMinor` when the payment
+   * was made in a currency other than the rupee: the rupee base is then
+   * COMPUTED from this at the telegraphic transfer buying rate on the
+   * deduction date, and a caller-supplied rupee figure is refused rather
+   * than accepted alongside it. A figure somebody typed and a figure the
+   * rule produces are two different numbers, and accepting both would
+   * mean silently choosing one.
+   */
+  foreignPayment: foreignPaymentSchema.nullish(),
+  /**
+   * Date of credit or of payment, WHICHEVER IS EARLIER.
+   *
+   * ⚠️ ON A FOREIGN-CURRENCY PAYMENT THIS IS CHECKED, NOT TRUSTED. The
+   * server derives the date from `foreignPayment`'s two dates and refuses
+   * a row where the two disagree — see `server/actions/tds.ts`.
+   */
   deductionDate: civilDaySchema,
   purchaseInvoiceId: uuid.nullish(),
   vendorId: uuid.nullish(),
@@ -316,6 +380,29 @@ export const assessDeductionSchema = z.object({
   referenceNumber: z.string().trim().max(80).nullish(),
   description: z.string().trim().max(4000).nullish(),
 });
+
+/**
+ * 🔴 EXACTLY ONE BASE. A rupee figure supplied alongside a foreign amount
+ * is a second answer to the same question, and the one that would be
+ * discarded is the one Rule 26 computes.
+ */
+const EXACTLY_ONE_BASE = {
+  message:
+    "Give either a rupee payment base or a foreign-currency payment, and not both. " +
+    "Where the payment is in foreign currency the rupee base is not typed — it is the " +
+    "amount converted at the telegraphic transfer buying rate on the date the tax is " +
+    "required to be deducted, as Rule 26 of the Income-tax Rules 1962 requires.",
+} as const;
+
+const exactlyOneBase = (v: {
+  paymentBaseMinor?: string | null;
+  foreignPayment?: unknown;
+}): boolean => Boolean(v.paymentBaseMinor) !== Boolean(v.foreignPayment);
+
+export const assessDeductionSchema = deductionInputShape.refine(
+  exactlyOneBase,
+  EXACTLY_ONE_BASE,
+);
 
 export type AssessDeductionInput = z.infer<typeof assessDeductionSchema>;
 
@@ -328,7 +415,7 @@ export type AssessDeductionInput = z.infer<typeof assessDeductionSchema>;
  * deduction under a 2% section, posted from a browser, is
  * indistinguishable in the register from a lawful Section 197 one.
  */
-export const recordDeductionSchema = assessDeductionSchema.extend({
+const recordDeductionShape = deductionInputShape.extend({
   /**
    * ⚠️ 192 AND 195 ONLY. The engine refuses to invent those rates, so a
    * person supplies one with their working — and the row records that a
@@ -339,6 +426,11 @@ export const recordDeductionSchema = assessDeductionSchema.extend({
   surchargeMinor: moneyString.nullish(),
   cessMinor: moneyString.nullish(),
 });
+
+export const recordDeductionSchema = recordDeductionShape.refine(
+  exactlyOneBase,
+  EXACTLY_ONE_BASE,
+);
 
 export type RecordDeductionInput = z.infer<typeof recordDeductionSchema>;
 

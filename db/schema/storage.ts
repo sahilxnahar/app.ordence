@@ -68,6 +68,17 @@ export const documentEntityTypeEnum = pgEnum("document_entity_type", [
   "deal",
   "contact",
   "company",
+  /**
+   * ⭐ WAVE 7 · SQL 0118. A drawing revision's file goes through the same
+   * three-step upload as every other file in the product.
+   *
+   * ⚠️ AND THIS IS EXACTLY THE "CORRECT AMOUNT OF FRICTION" THE HEADER
+   * ABOVE DESCRIBES — `tsc` refused the wave until the enum, the
+   * validator's list and the SQL `ALTER TYPE` all agreed. Adding it to
+   * the validator alone compiled the intent and would have failed at the
+   * insert.
+   */
+  "drawing",
 ]);
 
 /* ------------------------------------------------------------------ */

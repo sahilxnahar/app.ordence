@@ -65,7 +65,36 @@ config({ path: ENV_TEST_PATH, override: true });
 /* ------------------------------------------------------------------ */
 
 const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;
-const PRODUCTION_DATABASE_URL = process.env.DATABASE_URL;
+
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 INFRA WAVE 12 — THE AMBIENT `DATABASE_URL` IS CAPTURED ONCE PER
+ *    PROCESS, NOT ONCE PER FILE
+ * ══════════════════════════════════════════════════════════════════════
+ * Check 5 below asks: is `TEST_DATABASE_URL` the same string as the
+ * `DATABASE_URL` the developer has in their shell? That question has one
+ * correct answer per PROCESS, and this file runs once per test FILE.
+ *
+ * The setup aliases `DATABASE_URL` to the test database further down, so
+ * the application code under test can open connections. On file 2, that
+ * alias is still in `process.env` — same fork — and check 5 compared the
+ * test URL against the alias it had itself installed, found them equal,
+ * and aborted the whole run.
+ *
+ * ⚠️ `singleFork: true` IS WHAT MAKES THIS POSSIBLE AND IT IS NOT
+ * NEGOTIABLE: the RLS guarantee depends on it. So the fix is to remember
+ * the ORIGINAL value across the module-registry reset, which `globalThis`
+ * survives and a module-level `const` does not.
+ *
+ * ⚠️ `Symbol.for`, NOT `Symbol()`. A fresh symbol per evaluation is a
+ * different key every file, which is the same bug wearing a hat.
+ */
+const AMBIENT_KEY = Symbol.for("ordence.tests.ambient-database-url");
+const ambient = globalThis as Record<symbol, unknown>;
+if (!(AMBIENT_KEY in ambient)) {
+  ambient[AMBIENT_KEY] = process.env.DATABASE_URL ?? null;
+}
+const PRODUCTION_DATABASE_URL = ambient[AMBIENT_KEY] as string | null;
 
 /** Hostname fragments that indicate a managed/production database. */
 const PRODUCTION_MARKERS = [
@@ -167,6 +196,41 @@ if (process.env.ALLOW_DESTRUCTIVE_TESTS !== "true") {
 }
 
 /* ------------------------------------------------------------------ */
+/* ⭐⭐⭐ AFTER THE GUARD, AND ONLY AFTER IT: POINT THE APPLICATION AT   */
+/*        THE TEST DATABASE                                            */
+/* ------------------------------------------------------------------ */
+
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 WHY THIS IS SET HERE AND MUST NOT BE SET IN `.env.test`
+ * ══════════════════════════════════════════════════════════════════════
+ * Roughly half this suite drives the REAL application path on purpose:
+ * `getAccessDecisionForTenant`, the Clerk webhook handler, the lockout.
+ * Those call `getServerEnv()`, which validates the whole schema, and they
+ * open their own connections through `DATABASE_URL`.
+ *
+ * Putting `DATABASE_URL` in `.env.test` makes it equal to
+ * `TEST_DATABASE_URL` — and CHECK 5 ABOVE REFUSES EXACTLY THAT, correctly,
+ * because it cannot tell a deliberate test alias from somebody pasting
+ * their production string into the wrong variable. That check is worth
+ * more than the convenience of one line in a file.
+ *
+ * ⭐ SO THE ALIAS IS MADE HERE, AFTER ALL SIX CHECKS HAVE PASSED. The
+ * guard still compares a genuinely ambient `DATABASE_URL` — a developer
+ * with production in their shell — against `TEST_DATABASE_URL`, and still
+ * refuses if they match. Nothing is weakened; the alias simply happens on
+ * the far side of the gate rather than in front of it.
+ *
+ * ⚠️ INFRA WAVE 12 FOUND THIS THE HARD WAY. Without it, `.env.test` had
+ * no `DATABASE_URL`, `getServerEnv()` threw, and `server/billing/access.ts`
+ * FAILED OPEN — so every billing-gate assertion that a restricted
+ * workspace is refused saw a permissive decision. The suite did not error.
+ * It reported the gate as broken while proving nothing about it.
+ */
+process.env.DATABASE_URL = TEST_DATABASE_URL;
+process.env.DATABASE_URL_UNPOOLED ??= TEST_DATABASE_URL;
+
+/* ------------------------------------------------------------------ */
 /* CONFIRMATION BANNER                                                 */
 /* ------------------------------------------------------------------ */
 
@@ -218,6 +282,40 @@ async function installNeonHttpShim() {
   const { Pool } = pkg;
 
   const port = 54321;
+
+  /**
+   * ══════════════════════════════════════════════════════════════════
+   * 🔴 WHERE THE REAL POSTGRES ACTUALLY IS
+   * ══════════════════════════════════════════════════════════════════
+   * The WebSocket bridge below used to open its TCP socket with a
+   * hard-coded `createConnection(5432, "127.0.0.1")`. Every developer
+   * whose test database is not on 5432 — which is anyone who runs it
+   * beside a real one — got ECONNREFUSED, `wsClose()` swallowed the
+   * error, and the neon Pool surfaced it as the generic
+   * "Connection terminated unexpectedly".
+   *
+   * ⚠️ AND THE SUITE DID NOT FAIL. `server/billing/access.ts` FAILS
+   * OPEN on its own errors, deliberately and correctly — an outage in
+   * our billing tables must never become an outage in a customer's
+   * business. So the gate answered `level: "full", canWrite: true` for
+   * every workspace, and five of the ten tests in billing-gate.test.ts
+   * PASSED, including "leaves a healthy workspace completely alone".
+   * They were asserting the behaviour of a gate that never ran.
+   *
+   * The five that failed are the only reason anybody found out.
+   */
+  const PG_TARGET = (() => {
+    try {
+      const u = new URL(TEST_DATABASE_URL!);
+      return {
+        host: u.hostname || "127.0.0.1",
+        port: u.port ? Number(u.port) : 5432,
+      };
+    } catch {
+      return { host: "127.0.0.1", port: 5432 };
+    }
+  })();
+
   const server = http.createServer(async (req, res) => {
     if (process.env.LOG_SHIM === "1") {
       console.error("[shim] incoming:", req.method, req.url, "upgrade:", req.headers.upgrade);
@@ -305,14 +403,50 @@ async function installNeonHttpShim() {
     });
   });
 
-  await new Promise<void>((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(port, "127.0.0.1", () => {
-      server.off("error", reject);
-      resolve();
+  /**
+   * ══════════════════════════════════════════════════════════════════
+   * 🔴 INFRA WAVE 12 — THE FIRST TIME THIS SUITE WAS RUN OUTSIDE CI, 46
+   *    OF ITS 47 FILES FAILED TO LOAD WITH `EADDRINUSE`
+   * ══════════════════════════════════════════════════════════════════
+   * `singleFork: true` puts every file in ONE process, which is what the
+   * RLS guarantee needs. It does NOT put them in one module registry:
+   * vitest isolates each file, so this setup file runs again per file,
+   * and the second run tries to bind a port the first run is still
+   * listening on.
+   *
+   * ⚠️ A MODULE-LEVEL `let` CANNOT SEE THAT. `__neonShimHandle` is reset
+   * with the registry, so every file believes it is the first.
+   *
+   * ⭐ `globalThis` SURVIVES THE REGISTRY RESET AND NOT THE PROCESS. That
+   * is exactly the right lifetime: one shim per fork, torn down when the
+   * fork exits, and no leakage between runs.
+   *
+   * ⚠️ THE SYMBOL IS `Symbol.for`, NOT `Symbol()`. A fresh symbol per
+   * module evaluation would be a different key every file, which is the
+   * same bug wearing a hat.
+   */
+  const SHIM_KEY = Symbol.for("ordence.tests.neon-http-shim");
+  const existing = (globalThis as Record<symbol, unknown>)[SHIM_KEY];
+
+  if (existing) {
+    /**
+     * Another file in this fork already started it. Close the server we
+     * just built — it is not listening, so this is cheap — and adopt the
+     * running one so the teardown below still has a handle.
+     */
+    server.close();
+    __neonShimHandle = existing as import("node:http").Server;
+  } else {
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(port, "127.0.0.1", () => {
+        server.off("error", reject);
+        resolve();
+      });
     });
-  });
-  __neonShimHandle = server;
+    __neonShimHandle = server;
+    (globalThis as Record<symbol, unknown>)[SHIM_KEY] = server;
+  }
 
   // Point the Neon HTTP driver at the shim — whatever URL neon() was given,
   // the transport goes through our loopback translator. The neon driver reads
@@ -543,10 +677,21 @@ async function installNeonHttpShim() {
                   wsClose();
                   return;
                 }
-                const pgConn = netMod.createConnection(5432, "127.0.0.1");
+                const pgConn = netMod.createConnection(PG_TARGET.port, PG_TARGET.host);
                 pg = pgConn;
                 pgConn.on("data", (d) => sendWs(d));
-                pgConn.on("error", () => wsClose());
+                pgConn.on("error", (err) => {
+                  // ⚠️ NEVER SILENT. A swallowed ECONNREFUSED here is
+                  // indistinguishable, from the test's point of view, from a
+                  // gate that decided to allow the write.
+                  console.error(
+                    `[shim] the WebSocket bridge could not reach PostgreSQL at ` +
+                      `${PG_TARGET.host}:${PG_TARGET.port} — ${err.message}. ` +
+                      `Every query on the Pool path will now fail, and any code ` +
+                      `that fails OPEN on a database error will look like it passed.`,
+                  );
+                  wsClose();
+                });
                 pgConn.on("end", () => wsClose());
                 pgConn.on("close", () => wsClose());
                 pgConn.on("connect", () => {
@@ -682,6 +827,7 @@ export async function asTenant<T>(
   fn: (client: import("pg").PoolClient) => Promise<T>,
 ): Promise<T> {
   const client = await testPool.connect();
+  let poisoned = false;
   try {
     await client.query("BEGIN");
     await client.query("SELECT set_config('app.current_tenant_id', $1, true)", [tenantId]);
@@ -689,10 +835,19 @@ export async function asTenant<T>(
     await client.query("COMMIT");
     return result;
   } catch (err) {
-    await client.query("ROLLBACK").catch(() => {});
+    // ⚠️ IF THE ROLLBACK ITSELF FAILS, DESTROY THE CONNECTION.
+    // `release(true)` closes it instead of putting it back in the pool. A
+    // connection returned while still inside an aborted transaction makes the
+    // NEXT borrower's BEGIN die with "current transaction is aborted, commands
+    // ignored until end of transaction block" — an error naming neither the
+    // test that poisoned it nor the statement that failed. Three accounting
+    // tests failed that way, for a reason none of them contained.
+    await client.query("ROLLBACK").catch(() => {
+      poisoned = true;
+    });
     throw err;
   } finally {
-    client.release();
+    client.release(poisoned);
   }
 }
 
@@ -704,16 +859,26 @@ export async function withoutTenant<T>(
   fn: (client: import("pg").PoolClient) => Promise<T>,
 ): Promise<T> {
   const client = await testPool.connect();
+  let poisoned = false;
   try {
     await client.query("BEGIN");
     const result = await fn(client);
     await client.query("COMMIT");
     return result;
   } catch (err) {
-    await client.query("ROLLBACK").catch(() => {});
+    // ⚠️ IF THE ROLLBACK ITSELF FAILS, DESTROY THE CONNECTION.
+    // `release(true)` closes it instead of putting it back in the pool. A
+    // connection returned while still inside an aborted transaction makes the
+    // NEXT borrower's BEGIN die with "current transaction is aborted, commands
+    // ignored until end of transaction block" — an error naming neither the
+    // test that poisoned it nor the statement that failed. Three accounting
+    // tests failed that way, for a reason none of them contained.
+    await client.query("ROLLBACK").catch(() => {
+      poisoned = true;
+    });
     throw err;
   } finally {
-    client.release();
+    client.release(poisoned);
   }
 }
 
@@ -734,6 +899,7 @@ export async function asPlatform<T>(
   fn: (client: import("pg").PoolClient) => Promise<T>,
 ): Promise<T> {
   const client = await testPool.connect();
+  let poisoned = false;
   try {
     await client.query("BEGIN");
     await client.query("SELECT set_config('app.platform_scope', 'on', true)");
@@ -741,10 +907,68 @@ export async function asPlatform<T>(
     await client.query("COMMIT");
     return result;
   } catch (err) {
-    await client.query("ROLLBACK").catch(() => {});
+    // ⚠️ IF THE ROLLBACK ITSELF FAILS, DESTROY THE CONNECTION.
+    // `release(true)` closes it instead of putting it back in the pool. A
+    // connection returned while still inside an aborted transaction makes the
+    // NEXT borrower's BEGIN die with "current transaction is aborted, commands
+    // ignored until end of transaction block" — an error naming neither the
+    // test that poisoned it nor the statement that failed. Three accounting
+    // tests failed that way, for a reason none of them contained.
+    await client.query("ROLLBACK").catch(() => {
+      poisoned = true;
+    });
     throw err;
   } finally {
-    client.release();
+    client.release(poisoned);
+  }
+}
+
+/**
+ * ⭐ Borrow a raw pooled connection with the rollback guaranteed.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 WHY THIS EXISTS RATHER THAN `testPool.connect()` IN A TEST
+ * ══════════════════════════════════════════════════════════════════════
+ * A test that needs to control BEGIN/COMMIT itself — to prove a trigger
+ * refuses at INSERT rather than at COMMIT, for instance — cannot use
+ * `asTenant`, which owns the transaction. So it borrowed a client
+ * directly and wrote:
+ *
+ *     try {
+ *       await client.query("BEGIN");
+ *       await client.query(<the statement under test>);   // ← throws here
+ *       ...
+ *       await client.query("ROLLBACK");                   // ← never reached
+ *     } finally {
+ *       client.release();                                 // ← still returned
+ *     }
+ *
+ * The throw jumped straight past the ROLLBACK to the `finally`, and the
+ * connection went back into the pool inside an aborted transaction. The
+ * NEXT test to borrow it failed on `BEGIN` with "current transaction is
+ * aborted", naming neither the test that poisoned the connection nor the
+ * statement that failed. It looked like a bug in an unrelated DELETE.
+ *
+ * ⚠️ POOLED CONNECTIONS ARE SHARED STATE. Anything a test leaves on one —
+ * an open transaction, a `set_config(..., false)` that is not
+ * transaction-local, an advisory lock — is inherited by whatever borrows
+ * it next, which is usually a different test file.
+ *
+ * This helper always rolls back and always destroys the connection
+ * afterwards, so nothing can be inherited at all.
+ */
+export async function withRawClient<T>(
+  fn: (client: import("pg").PoolClient) => Promise<T>,
+): Promise<T> {
+  const client = await testPool.connect();
+  try {
+    return await fn(client);
+  } finally {
+    await client.query("ROLLBACK").catch(() => {});
+    // `true` destroys rather than returns. A raw client has by definition
+    // been used in a way this file cannot reason about; the pool is better
+    // off opening a fresh one.
+    client.release(true);
   }
 }
 

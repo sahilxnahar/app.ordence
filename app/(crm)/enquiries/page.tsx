@@ -201,7 +201,15 @@ export default async function EnquiriesPage() {
                 {leads.map((l) => (
                   <tr key={l.id} className="border-b last:border-0">
                     <td className="py-2 pr-3">
-                      <Link href={`/leads/${l.id}`} className="underline">
+                      {/*
+                        ⭐ WAVE 10 — THIS POINTED AT `/leads/:id`, WHICH
+                        HAS NEVER EXISTED. The lead detail screen lives at
+                        `/sales/leads/:id` and always has; the enquiries
+                        table was written against a route that was planned
+                        and then built somewhere else, and every reference
+                        number in this list 404'd.
+                      */}
+                      <Link href={`/sales/leads/${l.id}`} className="underline">
                         {l.reference}
                       </Link>
                     </td>

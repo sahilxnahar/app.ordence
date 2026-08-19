@@ -34,7 +34,9 @@ import {
   bankAccounts,
   salesPostingAccounts,
 } from "@/db/schema";
-import { requireTenantContext, requireRole, TenantAccessError } from "@/server/tenant-context";
+import { requireRole, TenantAccessError } from "@/server/tenant-context";
+import { requirePermission } from "@/server/audit";
+import { PermissionDeniedError } from "@/lib/permissions";
 import { requireFeature, FeatureLockedError } from "@/server/entitlements";
 import { requireAccess, AccessRestrictedError } from "@/server/billing/access";
 import type { ActionResult } from "@/lib/validators/crm";
@@ -44,6 +46,7 @@ import {
   fromMinorUnits,
 } from "@/lib/validators/accounting";
 import type { PostTransactionInput } from "@/lib/validators/accounting";
+import { formatMinorPlain, isKnownCurrency, parseMajorToMinor } from "@/lib/fx/currency";
 import { resolveStatementPeriod, previousDay } from "@/lib/accounting/periods";
 import type { StatementPeriodInput, StatementPeriod } from "@/lib/accounting/periods";
 import {
@@ -109,6 +112,14 @@ function toActionError(err: unknown): ActionResult<never> {
   // on "upgrade to Advanced" and cannot act on a generic error.
   if (err instanceof FeatureLockedError) return fail(err.message);
   if (err instanceof TenantAccessError) return fail(err.message);
+  /**
+   * ⭐ WAVE 9 — ADDED WITH THE READ GATES. Without this branch a
+   * `manager` opening the trial balance would be told "Something went
+   * wrong. Please try again." and would try again, forever. A refusal
+   * that names itself is the difference between a support ticket and a
+   * conversation with their administrator.
+   */
+  if (err instanceof PermissionDeniedError) return fail(err.message);
   if (err instanceof z.ZodError) {
     return fail("Validation failed.", err.flatten().fieldErrors as Record<string, string[]>);
   }
@@ -288,7 +299,13 @@ export async function postTransaction(
           transactionId: txn.id,
           ledgerId: leg.ledgerId,
           entryType: leg.entryType,
-          amount: leg.amount,
+          /**
+           * ⭐ PARSED WITH THE TRANSACTION'S OWN CURRENCY. Batch 0108.
+           * `parseMajorToMinor("1.234", "KWD")` is 1234n; the same string
+           * is REFUSED for INR, by name. The schema has already run this
+           * exact parse to check the legs balance, so it cannot throw here.
+           */
+          amountMinor: parseMajorToMinor(leg.amount, data.currency),
           description: leg.description ?? data.description,
           referenceType: data.referenceType,
           referenceId: data.referenceId ?? null,
@@ -376,11 +393,27 @@ export async function reverseTransaction(
     if (original.status === "void") return fail("This transaction is void.");
 
     const entries = (original as unknown as { entries: Array<{
-      ledgerId: string; entryType: "debit" | "credit"; amount: string;
+      ledgerId: string; entryType: "debit" | "credit";
+      /** ⭐ The authority. Batch 0108. Nullable only on unscaled history. */
+      amountMinor: bigint | null;
       counterpartyType: string | null; counterpartyId: string | null; counterpartyName: string | null;
     }> }).entries;
 
     if (entries.length === 0) return fail("Transaction has no entries to reverse.");
+
+    /**
+     * 🔴 REFUSED, NOT ROUNDED. Batch 0108. A leg the migration could not
+     * scale has no integer to negate, and reversing it from the
+     * two-decimal mirror would leave a residue in a real account. The
+     * remedy is to scale the leg, not to approximate the reversal.
+     */
+    const unscaled = entries.filter((e) => e.amountMinor === null).length;
+    if (unscaled > 0) {
+      return fail(
+        `Cannot reverse: ${unscaled} of this transaction's legs have no amount in minor ` +
+          `units. Run the census in SQL-FILES/0108 to see which currency is unscaled.`,
+      );
+    }
 
     const reversalId = await withTenant(ctx.tenant.id, async (tx) => {
       const [reversal] = await tx
@@ -411,7 +444,16 @@ export async function reverseTransaction(
           transactionId: reversal.id,
           ledgerId: entry.ledgerId,
           entryType: entry.entryType === "debit" ? ("credit" as const) : ("debit" as const),
-          amount: entry.amount,
+          /**
+           * ⭐ THE ORIGINAL'S INTEGER, COPIED. Batch 0108.
+           *
+           * ⚠️ NOT RE-PARSED FROM `amount`. A reversal must be the exact
+           * negation of what was posted, and re-deriving it from the
+           * two-decimal mirror would leave a dinar reversal short by up to
+           * 9 fils per leg — a residue in an account somebody eventually
+           * has to explain.
+           */
+          amountMinor: entry.amountMinor as bigint,
           description: `Reversal: ${data.reason}`,
           referenceType: original.referenceType,
           referenceId: original.referenceId,
@@ -670,8 +712,26 @@ async function ledgerBalances(
         // ⭐ 0101. Selected so the aggregate can be told whether it spans
         // currencies. See the comment on `TrialBalanceRow.currency`.
         currency: ledgers.currency,
-        totalDebit: sql<string>`COALESCE(SUM(CASE WHEN ${transactions.id} IS NOT NULL AND ${journalEntries.entryType} = 'debit'  THEN ${journalEntries.amount} ELSE 0 END), 0)::text`,
-        totalCredit: sql<string>`COALESCE(SUM(CASE WHEN ${transactions.id} IS NOT NULL AND ${journalEntries.entryType} = 'credit' THEN ${journalEntries.amount} ELSE 0 END), 0)::text`,
+        /**
+         * ⭐ SUMMED IN MINOR UNITS. Batch 0108.
+         *
+         * ⚠️ THIS USED TO SUM `journal_entries.amount` and hand the decimal
+         * string to `toMinorUnits()`, whose arithmetic is
+         * `BigInt(whole) * 100n + BigInt(fraction)` and whose regex is
+         * `\d{1,15}(\.\d{1,2})?` — a hardcoded two decimal places, which
+         * REJECTS a three-decimal dinar outright rather than rounding it.
+         * The trial balance of a Kuwaiti book did not merely come out
+         * wrong; it threw.
+         */
+        totalDebitMinor: sql<string>`COALESCE(SUM(CASE WHEN ${transactions.id} IS NOT NULL AND ${journalEntries.entryType} = 'debit'  THEN ${journalEntries.amountMinor} ELSE 0 END), 0)::text`,
+        totalCreditMinor: sql<string>`COALESCE(SUM(CASE WHEN ${transactions.id} IS NOT NULL AND ${journalEntries.entryType} = 'credit' THEN ${journalEntries.amountMinor} ELSE 0 END), 0)::text`,
+        /**
+         * ⚠️ COUNTED, NOT IGNORED. `SUM()` skips NULLs, so a leg 0108 could
+         * not scale would quietly shrink this total instead of failing it.
+         * A trial balance that is short by a real amount and still foots is
+         * the single most dangerous output this file can produce.
+         */
+        unscaledLegs: sql<number>`COUNT(*) FILTER (WHERE ${transactions.id} IS NOT NULL AND ${journalEntries.amountMinor} IS NULL)::int`,
       })
       .from(ledgers)
       .leftJoin(
@@ -702,15 +762,44 @@ async function ledgerBalances(
      * an exact 2-decimal string; putting a float in the middle of it can
      * only lose information, and money is never a float here.
      */
-    const debitMinor = toMinorUnits(r.totalDebit);
-    const creditMinor = toMinorUnits(r.totalCredit);
+    if (r.unscaledLegs > 0) {
+      throw new Error(
+        `${r.unscaledLegs} journal line(s) in ledger ${r.code} have no amount in minor ` +
+          `units, so this trial balance cannot be trusted. Run the census in ` +
+          `SQL-FILES/0108 to see which currency is unscaled. Nothing has been computed.`,
+      );
+    }
+
+    const debitMinor = BigInt(r.totalDebitMinor);
+    const creditMinor = BigInt(r.totalCreditMinor);
+
+    /**
+     * ⭐ FORMATTED WITH THE LEDGER'S OWN EXPONENT. Batch 0108.
+     *
+     * ⚠️ THIS WAS `fromMinorUnits()`, which divides by a hardcoded 100n.
+     * It printed a Kuwaiti dinar balance of 1234 fils as "12.34" — a
+     * figure ten times too small, on the report an accountant checks
+     * before signing anything. `formatMinorPlain` reads the exponent per
+     * currency: "1.234" for KWD, "1234" for JPY, "12.34" for INR.
+     *
+     * ⚠️ AN UNRECOGNISED CODE FALLS BACK TO THE RAW INTEGER RATHER THAN
+     * GUESSING TWO DECIMALS. `ledgers.currency` is a free varchar(3) with
+     * a default and nothing has ever validated it, so this cannot throw on
+     * a report; but a wrong number of decimals is a wrong number, and an
+     * unpunctuated integer is visibly odd rather than quietly wrong.
+     */
+    const show = (minor: bigint): string =>
+      isKnownCurrency(r.currency) ? formatMinorPlain(minor, r.currency) : minor.toString();
+
+    const { unscaledLegs: _unscaled, totalDebitMinor: _d, totalCreditMinor: _c, ...rest } = r;
+
     return {
-      ...r,
+      ...rest,
       debitMinor,
       creditMinor,
-      totalDebit: fromMinorUnits(debitMinor),
-      totalCredit: fromMinorUnits(creditMinor),
-      balance: fromMinorUnits(debitMinor - creditMinor),
+      totalDebit: show(debitMinor),
+      totalCredit: show(creditMinor),
+      balance: show(debitMinor - creditMinor),
     };
   });
 }
@@ -806,11 +895,42 @@ function netResultMinor(list: readonly LedgerBalance[]): bigint {
  * The Phase 12 brief calls this "graceful degradation, never a hard
  * crash", and this is what that means in practice.
  *
- * ⚠️ `requireTenantContext()` IS STILL THE GUARD, AND IS NOT OPTIONAL.
- * Every `"use server"` export is a URL the browser can POST to. Without
- * it this is an unauthenticated endpoint that returns a company's
- * complete financial position. The same applies to `getProfitAndLoss`
- * and `getBalanceSheet` below.
+ * ⚠️ AN AUTHENTICATION GUARD IS STILL NOT OPTIONAL. Every `"use server"`
+ * export is a URL the browser can POST to. Without one this is an
+ * unauthenticated endpoint that returns a company's complete financial
+ * position. The same applies to `getProfitAndLoss` and `getBalanceSheet`
+ * below.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 WAVE 9 — AND `requireTenantContext()` ALONE WAS NOT ENOUGH
+ * ══════════════════════════════════════════════════════════════════════
+ * The sentence above considered ONE attacker: somebody with no session
+ * at all. It did not consider the one the role model exists for —
+ * somebody with a perfectly good session and the wrong role.
+ *
+ * `ledgers:read` and `transactions:read` are held by `billing_admin`,
+ * `read_only`, and the three wildcard roles. `manager` and `member` do
+ * NOT hold either, and that is a deliberate line: accounting is a
+ * finance function, and a sales manager is not in it.
+ *
+ * Neither key was checked anywhere. So every member of every workspace
+ * could read the trial balance, the P&L, the balance sheet, the cash
+ * flow statement, the chart of accounts and the last two hundred
+ * transactions — the complete financial position the note above is about
+ * — while the role screen told the owner they could not.
+ *
+ * ⚠️ THIS CHANGES BEHAVIOUR FOR `manager` AND `member`, and it is the
+ * only change in wave 9 that takes something away from an existing user.
+ * The alternative was to grant those two roles `ledgers:read`, which
+ * would have made the code right by rewriting the customer's security
+ * model to match it. When the model and the code disagree about who may
+ * see a general ledger, the model wins.
+ *
+ * ⚠️ `ledgers:read` AND NOT `reports:trial_balance` FOR THE STATEMENTS.
+ * `read_only` holds the first and not the second, and an auditor-shaped
+ * role that cannot open a balance sheet is not read-only, it is blind.
+ * `reports:trial_balance` gates the report EXPORT, which is a
+ * disclosure, and that distinction is why both keys exist.
  */
 export async function getTrialBalance(input?: StatementPeriodInput): Promise<
   ActionResult<{
@@ -832,7 +952,7 @@ export async function getTrialBalance(input?: StatementPeriodInput): Promise<
   }>
 > {
   try {
-    const ctx = await requireTenantContext();
+    const ctx = await requirePermission("ledgers:read");
     const period = resolveStatementPeriod(input);
 
     // Movement between two dates — a trial balance for a period, which is
@@ -896,7 +1016,7 @@ export async function getProfitAndLoss(input?: StatementPeriodInput): Promise<
   }>
 > {
   try {
-    const ctx = await requireTenantContext();
+    const ctx = await requirePermission("ledgers:read");
     const period = resolveStatementPeriod(input);
 
     const balances = await ledgerBalances(ctx.tenant.id, {
@@ -963,7 +1083,7 @@ export async function getBalanceSheet(input?: StatementPeriodInput): Promise<
   }>
 > {
   try {
-    const ctx = await requireTenantContext();
+    const ctx = await requirePermission("ledgers:read");
     const period = resolveStatementPeriod(input);
 
     const balances = await ledgerBalances(ctx.tenant.id, {
@@ -1160,15 +1280,21 @@ async function cashLedgersFor(tenantId: string): Promise<CashLedger[]> {
  * ⚠️ NOT GATED BY `requireFeature`, for the same reason as the other
  * statements: this is a READ of the customer's own records, and refusing
  * to show them at the moment we are asking to be paid is not graceful
- * degradation. `requireTenantContext()` is still the guard and is not
- * optional — every `"use server"` export is a URL the browser can POST
- * to, and an unguarded one here returns a company's bank balances.
+ * degradation. A guard is still not optional — every `"use server"`
+ * export is a URL the browser can POST to, and an unguarded one here
+ * returns a company's bank balances.
+ *
+ * ⭐ WAVE 9 — that guard is now `requirePermission("ledgers:read")`
+ * rather than `requireTenantContext()`. See the long note above
+ * `getTrialBalance`: a session was being treated as sufficient for the
+ * whole of accounting, and the role model has said otherwise since
+ * Phase 8.
  */
 export async function getCashFlowStatement(
   input?: StatementPeriodInput,
 ): Promise<ActionResult<CashFlowResult>> {
   try {
-    const ctx = await requireTenantContext();
+    const ctx = await requirePermission("ledgers:read");
     const period = resolveStatementPeriod(input);
     const openingAsAt = previousDay(period.from);
 
@@ -1268,7 +1394,7 @@ export async function getCashFlowStatement(
 
 export async function getLedgers(): Promise<ActionResult<Ledger[]>> {
   try {
-    const ctx = await requireTenantContext();
+    const ctx = await requirePermission("ledgers:read");
     const rows = await withTenant(ctx.tenant.id, (tx) =>
       tx
         .select()
@@ -1286,7 +1412,7 @@ export async function getRecentTransactions(
   limit = 50,
 ): Promise<ActionResult<Transaction[]>> {
   try {
-    const ctx = await requireTenantContext();
+    const ctx = await requirePermission("transactions:read");
     const capped = Math.min(Math.max(1, limit), 200);
     const rows = await withTenant(ctx.tenant.id, (tx) =>
       tx

@@ -32,7 +32,39 @@
 
 import { Suspense } from "react";
 import Link from "next/link";
-import { getVendors, getPurchaseInvoices, getItcRegister } from "@/server/actions/purchases";
+/**
+ * ⭐⭐⭐ `upsertVendor` ADDED AS A CALLER — wave two.
+ *
+ * 🔴 It is the only insert into `vendors` in this product and nothing
+ * called it. Seventeen reachable actions read that table. "No vendors
+ * yet" below was not an empty state; it was the only state.
+ */
+import {
+  getVendors,
+  getPurchaseInvoices,
+  getItcRegister,
+  upsertVendor,
+  recordPurchaseInvoice,
+  /**
+   * ⭐⭐ WAVE 10 — THE VENDOR-MONEY HALF, WHICH HAD NO CALLER.
+   *
+   * 🔴 This page could create a vendor and record an invoice against
+   * them, and could not show what any vendor was owed. `getVendorBalances`
+   * answers the first question anybody asks about a purchase ledger and
+   * had never been called; `buildItcForPeriod` and `determineItc` are the
+   * two halves of the ITC decision and were in the same state.
+   */
+  getVendorBalances,
+  buildItcForPeriod,
+  determineItc,
+  setPurchaseInvoiceStatus,
+} from "@/server/actions/purchases";
+import { VendorBalances } from "@/components/purchases/vendor-balances";
+import { ItcPeriodPanel } from "@/components/purchases/itc-period-panel";
+import { InvoiceStatusControl } from "@/components/purchases/invoice-status-control";
+import { getRegistrations } from "@/server/actions/gst";
+import { VendorForm } from "@/components/purchases/vendor-form";
+import { RecordPurchaseInvoiceForm } from "@/components/purchases/record-invoice-form";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 
@@ -61,10 +93,13 @@ function sumPaise(values: Array<string | null | undefined>): string {
 }
 
 async function PurchasesBody() {
-  const [vendors, invoices, itc] = await Promise.all([
+  const [vendors, invoices, itc, registrations, balances] = await Promise.all([
     getVendors(true),
     getPurchaseInvoices(),
     getItcRegister(),
+    getRegistrations(),
+    /* ⭐ Wave 10 — what every vendor is owed. */
+    getVendorBalances(),
   ]);
 
   const vendorRows = vendors.ok ? vendors.data.rows : [];
@@ -200,6 +235,32 @@ async function PurchasesBody() {
           <CardTitle>Purchase invoices</CardTitle>
         </CardHeader>
         <CardContent className="p-0">
+          {/**
+            * ⭐⭐⭐ `recordPurchaseInvoice` ADDED AS A CALLER — wave two.
+            * It is the only insert into `purchase_invoices` and nothing
+            * called it, so this module was five read screens over a table
+            * that could not receive a row.
+            */}
+          <RecordPurchaseInvoiceForm
+            vendors={vendorRows
+              .filter((v) => v.isActive)
+              .map((v) => ({
+                id: v.id,
+                code: v.code,
+                legalName: v.legalName,
+                tdsApplicable: v.tdsApplicable,
+                defaultTdsSection: v.defaultTdsSection,
+              }))}
+            registrations={
+              registrations.ok
+                ? registrations.data.rows.map((r) => ({
+                    id: r.id,
+                    gstin: r.gstin,
+                  }))
+                : []
+            }
+            recordAction={recordPurchaseInvoice}
+          />
           {invoiceRows.length === 0 ? (
             <p className="p-6 text-sm text-muted-foreground">
               No purchase invoices yet.
@@ -221,8 +282,28 @@ async function PurchasesBody() {
                 <tbody className="divide-y">
                   {invoiceRows.map((r) => (
                     <tr key={r.id} className="hover:bg-muted/30">
-                      <td className="p-3 font-mono text-xs">{r.invoiceNumber}</td>
-                      <td className="p-3">{vendorName.get(r.vendorId) ?? "—"}</td>
+                      <td className="p-3 font-mono text-xs">
+                        {/*
+                          ⭐ WAVE 10 — the invoice number now leads to the
+                          line-by-line ITC verdict. `getPurchaseInvoice`
+                          returns it and had no caller, so "ITC blocked
+                          ₹40,000" could not say which line.
+                        */}
+                        <Link
+                          href={`/purchases/invoices/${r.id}`}
+                          className="underline underline-offset-2"
+                        >
+                          {r.invoiceNumber}
+                        </Link>
+                      </td>
+                      <td className="p-3">
+                        <Link
+                          href={`/purchases/vendors/${r.vendorId}`}
+                          className="underline underline-offset-2"
+                        >
+                          {vendorName.get(r.vendorId) ?? "—"}
+                        </Link>
+                      </td>
                       <td className="p-3 text-xs text-muted-foreground">{r.invoiceDate}</td>
                       <td className="p-3 text-right tabular-nums">
                         {inr(r.taxableValueMinor)}
@@ -244,9 +325,18 @@ async function PurchasesBody() {
                           {r.isTdsDeductible && (
                             <Badge variant="outline" className="text-[10px]">TDS</Badge>
                           )}
-                          <Badge variant="secondary" className="text-[10px]">
-                            {r.status}
-                          </Badge>
+                          {/*
+                            ⭐ WAVE 10 — the status was a read-only badge
+                            and `setPurchaseInvoiceStatus` had no caller,
+                            so an invoice stayed at whatever status it was
+                            recorded with, forever. `approved` in
+                            particular is what lets money leave.
+                          */}
+                          <InvoiceStatusControl
+                            invoiceId={r.id}
+                            status={r.status}
+                            setStatus={setPurchaseInvoiceStatus}
+                          />
                         </div>
                       </td>
                     </tr>
@@ -258,11 +348,43 @@ async function PurchasesBody() {
         </CardContent>
       </Card>
 
+      {/*
+        ⭐⭐ WAVE 10 — WHAT IS OWED, BEFORE THE VENDOR LIST.
+        A purchase ledger's first question is "who are we behind on", not
+        "who are our vendors", and the answer was computed by an action
+        nothing called.
+      */}
+      {balances.ok && balances.data.rows.length > 0 && (
+        <VendorBalances
+          rows={balances.data.rows}
+          currency={balances.data.currency}
+          currencyAssumed={balances.data.currencyAssumed}
+          currencyNote={balances.data.currencyNote}
+        />
+      )}
+
+      {/*
+        ⭐⭐ WAVE 10 — THE ITC PERIOD BUILDER AND THE ELIGIBILITY CHECKER.
+        `buildItcForPeriod` turns a month's recorded invoices into register
+        movements; `determineItc` answers "may we claim this at all?"
+        against Section 17(5). Both existed with no way to run them.
+      */}
+      <ItcPeriodPanel
+        registrations={
+          registrations.ok
+            ? registrations.data.rows.map((r) => ({ id: r.id, label: r.gstin }))
+            : []
+        }
+        build={buildItcForPeriod}
+        determine={determineItc}
+      />
+
       <Card>
         <CardHeader>
           <CardTitle>Vendors</CardTitle>
         </CardHeader>
         <CardContent className="p-0">
+          <VendorForm createAction={upsertVendor} />
           {vendorRows.length === 0 ? (
             <p className="p-6 text-sm text-muted-foreground">
               No vendors yet. A vendor carries its GSTIN, PAN, MSME status and
@@ -285,7 +407,15 @@ async function PurchasesBody() {
                 <tbody className="divide-y">
                   {vendorRows.map((v) => (
                     <tr key={v.id} className="hover:bg-muted/30">
-                      <td className="p-3 font-mono text-xs">{v.code}</td>
+                      <td className="p-3 font-mono text-xs">
+                        {/* ⭐ Wave 10 — the row now leads somewhere. */}
+                        <Link
+                          href={`/purchases/vendors/${v.id}`}
+                          className="underline underline-offset-2"
+                        >
+                          {v.code}
+                        </Link>
+                      </td>
                       <td className="p-3">
                         {v.tradeName ?? v.legalName}
                         {v.tradeName ? (

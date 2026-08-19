@@ -69,15 +69,42 @@ describe("check:links", () => {
    * number somebody reads and moves on from. "the New lead button, a
    * trial's first click" is a decision.
    */
-  it("says what each dead link costs, not just that it is dead", () => {
-    // ⚠️ THIS ASSERTION MOVED WHEN THE BUDGET RATCHETED, which is the
-    // mechanism behaving correctly. "a trial's first click" described
-    // `/sales/leads/new`, and that entry is gone because the page was
-    // built. Pinning a specific entry makes the test fail every time the
-    // backlog shrinks, so it now pins the PROPERTY the entries must have:
-    // each says where a customer meets it, not just that it is dead.
+  /**
+   * ══════════════════════════════════════════════════════════════════
+   * ⭐⭐⭐ WAVE 10 — THE BACKLOG REACHED ZERO AND THIS TEST CHANGED
+   *      SHAPE FOR THE LAST TIME
+   * ══════════════════════════════════════════════════════════════════
+   * It used to pin a specific entry, then , when that entry was fixed ,
+   * the PROPERTY the entries must have: each says where a customer meets
+   * it, not just that it is dead.
+   *
+   * There are no entries left. All eight were built, removed or
+   * repointed, so the property is vacuously true and asserting it proves
+   * nothing. What is worth asserting instead is the terminal state:
+   *
+   *   • the allowance is zero, so ANY dead link now fails the build
+   *   • the list is empty
+   *   • the record of what the eight were, and what each cost a
+   *     customer who clicked it, survives in the file rather than
+   *     disappearing with the entries
+   *
+   * ⚠️ THE THIRD ONE MATTERS MOST. A gate that reaches zero and then
+   * deletes its own history is a gate that will accumulate the same
+   * eight again with nobody able to say they had been there before.
+   */
+  it("has reached zero, and any dead link now fails the build", () => {
+    expect(GATE).toContain("const KNOWN_DEAD_MAX = 0;");
+    expect(GATE).toContain("const KNOWN_DEAD = new Map([]);");
+    expect(GATE).toContain("if (dead.length > KNOWN_DEAD_MAX)");
+  });
+
+  it("keeps the record of what the eight were", () => {
+    // The recycle bin's entry is the one worth keeping verbatim: it is
+    // the only one that described a feature as broken rather than absent.
     expect(GATE).toContain("Soft delete works; undelete does not");
-    expect(GATE).toContain("Company statement");
+    expect(GATE).toContain("/sales/bookings/:id");
+    expect(GATE).toContain("/land/:id");
+    expect(GATE).toContain("REPOINTED");
   });
 
   /**

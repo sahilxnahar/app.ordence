@@ -43,7 +43,7 @@ import {
   RETURN_ROLE_META,
   returnRolesUsed,
 } from "@/lib/accounting/sales-posting";
-import { periodWindow, rupeeStringToMinor } from "@/server/returns/assemble";
+import { periodWindow } from "@/server/returns/assemble";
 
 const read = (p: string) => readFileSync(join(process.cwd(), p), "utf8");
 
@@ -483,11 +483,28 @@ describe("reading figures out of the ledger", () => {
   it("⚠️ converts rupee strings to paise EXACTLY, never through a float", () => {
     // `Math.round(Number(s) * 100)` is fine until the number is big. At
     // a few crore the float has already lost the paise.
-    expect(rupeeStringToMinor("1234.56")).toBe(123456n);
-    expect(rupeeStringToMinor("0.05")).toBe(5n);
-    expect(rupeeStringToMinor("-99.99")).toBe(-9999n);
-    expect(rupeeStringToMinor("123456789012.34")).toBe(12345678901234n);
-    expect(rupeeStringToMinor("100")).toBe(10000n);
+    /**
+     * ⭐ Batch 0108 deleted `rupeeStringToMinor` and this assertion with it.
+     *
+     * 🔴 THE INVARIANT THE OLD TEST WAS REACHING FOR was "the total that
+     * reaches the return is in minor units". It asserted that by pinning
+     * five conversions of a helper — which is a SHAPE, and which passed
+     * happily while the helper multiplied every currency by a hardcoded
+     * hundred. The property is that NOTHING between the ledger and the
+     * return converts at all, because the ledger already stores minor
+     * units. That is assertable directly, and a re-introduced hundred
+     * would fail it.
+     */
+    const assemble = read("server/returns/assemble.ts")
+      // 🔴 COMMENTS OUT FIRST. The comment beside the fix names the helper
+      // it deleted, and a negative assertion that reads prose tests the
+      // documentation rather than the code. This assertion failed on its
+      // first run for exactly that reason.
+      .replace(/\/\*[\s\S]*?\*\//g, "")
+      .replace(/(^|[^:])\/\/.*$/gm, "$1");
+    expect(assemble).not.toContain("rupeeStringToMinor");
+    expect(assemble).toMatch(/journalEntries\.amountMinor/);
+    expect(assemble).not.toMatch(/\*\s*100n/);
   });
 
   it("⚠️ uses a HALF-OPEN window, so the last day of the month is included", () => {

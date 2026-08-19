@@ -30,7 +30,17 @@ export type { CoercionResult } from "./values";
 export { normaliseHeader, mapHeaders, describeMissingHeaders } from "./mapping";
 export type { HeaderMapping } from "./mapping";
 
-export { planImport, MAX_IMPORT_ROWS, MAX_IMPORT_BYTES } from "./plan";
+export {
+  planImport,
+  /**
+   * ⭐ WAVE 6. The same planner, from a record stream rather than text —
+   * which is how Excel, JSON and Tally XML reach it without a second
+   * importer. See `lib/import/sources/`.
+   */
+  planImportRecords,
+  MAX_IMPORT_ROWS,
+  MAX_IMPORT_BYTES,
+} from "./plan";
 
 export {
   buildReport,

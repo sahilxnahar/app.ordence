@@ -34,7 +34,21 @@
 
 import { Suspense } from "react";
 import Link from "next/link";
-import { getStockPosition, reconcileStockLedger } from "@/server/actions/inventory";
+/**
+ * ⭐⭐⭐ `saveWarehouse` AND `saveStockItem` ADDED AS CALLERS — wave two.
+ *
+ * 🔴 They are the only inserts into `warehouses` and `stock_items`, and
+ * nothing called either — while the empty state below instructed the
+ * operator to "add a store and a stock item". Twenty reachable actions
+ * read one of those two tables.
+ */
+import {
+  getStockPosition,
+  reconcileStockLedger,
+  saveStockItem,
+  saveWarehouse,
+} from "@/server/actions/inventory";
+import { InventorySetupForms } from "@/components/inventory/setup-forms";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 
@@ -267,6 +281,10 @@ async function InventoryBody() {
           <CardTitle>Stock position</CardTitle>
         </CardHeader>
         <CardContent className="p-0">
+          <InventorySetupForms
+            saveWarehouseAction={saveWarehouse}
+            saveStockItemAction={saveStockItem}
+          />
           {rows.length === 0 ? (
             <p className="px-4 py-8 text-center text-sm text-muted-foreground">
               No stock recorded yet. Add a store and a stock item, then post an

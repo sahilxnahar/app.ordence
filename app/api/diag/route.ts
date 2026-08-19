@@ -1,6 +1,8 @@
 import { NextResponse } from "next/server";
+import { headers } from "next/headers";
 import { ENV_CATEGORIES as CATEGORIES } from "@/lib/platform/env-catalog";
 import { interpretRlsPosture } from "@/lib/platform/rls-posture";
+import { checkRateLimit, ipRateLimitKey } from "@/lib/security/rate-limit";
 
 /**
  * Ordence — Deployment diagnostic
@@ -56,7 +58,59 @@ function readRuntimeEnv(name: string): string | undefined {
 const REQUIRED = CATEGORIES.flatMap((c) => c.required);
 const OPTIONAL = CATEGORIES.flatMap((c) => c.optional);
 
+/**
+ * ⭐⭐⭐ WAVE 9 — THE ONE EDGE-EXEMPT ROUTE WITH NOTHING IN FRONT OF IT.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 WHY THIS ROUTE, AND WHY IT HAD NO LIMIT AT ALL
+ * ══════════════════════════════════════════════════════════════════════
+ * `lib/edge/budgets.ts` exempts `/api/diag` from the per-plan ceiling,
+ * correctly: this response belongs to no workspace, so counting it
+ * against one makes no sense. But the exemption list also covers health
+ * and readiness (cheap, static), webhooks (own limiter) and cron and
+ * workers (shared secret). Diag was the only member with NONE of those:
+ * no session, no secret, no limiter, and a body that enumerates every
+ * configuration name the deployment knows and whether each is set.
+ *
+ * That is a reconnaissance surface. Polled, it reports the exact moment a
+ * secret rotation lands and which optional integrations are configured,
+ * to anybody, for free.
+ *
+ * ⚠️ IP-KEYED, NOT TENANT-KEYED. There is no tenant here by construction.
+ *
+ * ⚠️ A LIMITER FAILURE ALLOWS THE REQUEST, WHICH IS THE OPPOSITE OF THIS
+ * CODEBASE'S DEFAULT. Every other limit in the product fails closed, and
+ * that is right for every other limit. This route exists to answer "what
+ * is broken?" during an outage — and an outage is precisely when the
+ * limiter's own backend is a candidate. A diag endpoint that returns 500
+ * because the rate limiter is unwell has failed at the one job it has.
+ * The cost of failing open here is bounded: the body carries no values,
+ * no session and no tenant data.
+ */
+async function diagLimitAllows(): Promise<boolean> {
+  try {
+    const h = await headers();
+    const ip = h.get("x-forwarded-for")?.split(",")[0]?.trim() ?? h.get("x-real-ip") ?? null;
+    const decision = await checkRateLimit("api", ipRateLimitKey(ip));
+    return decision.allowed;
+  } catch {
+    return true;
+  }
+}
+
 export async function GET() {
+  if (!(await diagLimitAllows())) {
+    /**
+     * ⚠️ A PLAIN 429 WITH NO BODY DETAIL. Everything this route would
+     * otherwise say is the thing being rate-limited; saying a fraction of
+     * it in the refusal would defeat the refusal.
+     */
+    return NextResponse.json(
+      { error: "Too many diagnostic requests. Try again shortly." },
+      { status: 429, headers: { "retry-after": "60" } },
+    );
+  }
+
   /**
    * ══════════════════════════════════════════════════════════════════
    * 🔴 PRESENCE ONLY. THE LENGTH FIELD IS GONE.

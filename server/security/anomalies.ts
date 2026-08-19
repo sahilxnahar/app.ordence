@@ -51,7 +51,28 @@ import { db, withPlatformScope } from "@/db";
 import { securityEvents } from "@/db/schema/secops";
 import { permissionDenials } from "@/db/schema";
 import { recordSecurityEvent } from "./record";
-import type { SecuritySeverity } from "@/lib/security/events";
+import {
+  BULK_EXPORT_RECORDS,
+  isOffHoursIst,
+  istHour,
+  OFF_HOURS_END_HOUR_IST,
+  OFF_HOURS_START_HOUR_IST,
+} from "@/lib/security/hours";
+import type { SecuritySeverity, SecurityEventType } from "@/lib/security/events";
+
+/**
+ * ⭐ WAVE 9 — RE-EXPORTED, NOT REDEFINED.
+ *
+ * `istHour` and `isOffHoursIst` were defined in this file and used only
+ * here, because nothing else had any reason to know when "out of hours"
+ * was. `server/export/log.ts` now does — it decides at the moment of an
+ * export whether to emit `export.off_hours` — so the definition moved to
+ * the pure `lib/security/hours.ts` and both sides import it.
+ *
+ * They stay exported from here so the existing tests, and any reader who
+ * looks for them where they have always been, still find them.
+ */
+export { istHour, isOffHoursIst };
 
 /* ------------------------------------------------------------------ */
 /* OBSERVATIONS                                                        */
@@ -147,11 +168,16 @@ export const ANOMALY_THRESHOLDS = {
    * 500 records exported in one action, or ANY export in the off-hours
    * window, are separately interesting; both together are the classic
    * departing-employee signature.
+   *
+   * ⚠️ WAVE 9 — THESE THREE ARE NO LONGER DEFINED HERE. They are imported
+   * from `lib/security/hours.ts` because `server/export/log.ts` now
+   * applies them at emission time, and a threshold applied in one module
+   * and re-typed in another is a guarantee of eventual disagreement whose
+   * only symptom would be findings quietly not appearing.
    */
-  bulkExportRecords: 500,
-  /** IST. 22:00–06:00 is outside every working pattern this product serves. */
-  offHoursStartHourIst: 22,
-  offHoursEndHourIst: 6,
+  bulkExportRecords: BULK_EXPORT_RECORDS,
+  offHoursStartHourIst: OFF_HOURS_START_HOUR_IST,
+  offHoursEndHourIst: OFF_HOURS_END_HOUR_IST,
 
   /**
    * 40 rate-limit trips from one network in 15 minutes.
@@ -169,28 +195,6 @@ export const ANOMALY_THRESHOLDS = {
 
 function withinWindow(at: Date, nowMs: number, windowMinutes: number): boolean {
   return nowMs - at.getTime() <= windowMinutes * 60_000;
-}
-
-/**
- * The hour of a timestamp in Asia/Kolkata.
- *
- * Computed by offset rather than by `Intl` because this runs on the Edge and
- * in Node and in a test, and `Intl` timezone data is not guaranteed present
- * in every one of those. IST is UTC+05:30 and has no daylight saving — the
- * one timezone where fixed-offset arithmetic is actually correct.
- */
-export function istHour(at: Date): number {
-  const istMs = at.getTime() + (5 * 60 + 30) * 60_000;
-  return new Date(istMs).getUTCHours();
-}
-
-/** True when the moment falls in the off-hours window (22:00–06:00 IST). */
-export function isOffHoursIst(at: Date): boolean {
-  const hour = istHour(at);
-  return (
-    hour >= ANOMALY_THRESHOLDS.offHoursStartHourIst ||
-    hour < ANOMALY_THRESHOLDS.offHoursEndHourIst
-  );
 }
 
 /** Group observations by a key, skipping those with no key. */
@@ -364,9 +368,43 @@ export function detectPortalTokenSharing(
  * ⚠️ THIS RULE DESCRIBES A PERSON, WHICH MAKES IT THE MOST DANGEROUS ONE
  * HERE. "Employee downloaded the client list at 2am" is an accusation, and it
  * is also a perfectly normal thing for an operations lead in a different
- * timezone to do. So it is `notice`, never `critical`, it never triggers an
- * automatic block, and the finding records the volume and the hour rather
- * than an interpretation. It is a prompt to go and ask, not a verdict.
+ * timezone to do. So it never triggers an automatic block, and the finding
+ * records the volume and the hour rather than an interpretation. It is a
+ * prompt to go and ask, not a verdict.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 WAVE 9 — THIS RULE WAS WRONG IN TWO WAYS AND COULD NEVER FIRE
+ * ══════════════════════════════════════════════════════════════════════
+ *   1. IT READ AN EVENT TYPE NOTHING EMITTED. It filtered on
+ *      `eventType.startsWith("export.")`, and no code path in the product
+ *      had ever written an `export.*` security event — not before wave 5
+ *      built the export engine, and not after. Every sweep since Phase 20
+ *      examined zero rows and reported nothing.
+ *
+ *   2. IT COMPARED THE RECORD COUNT AGAINST `occurrenceCount`, which is
+ *      the RECORDER'S COALESCING COUNTER, not a record count. Had
+ *      anything ever emitted an export event, this comparison would have
+ *      been inverted: one export of fifty thousand rows scores 1 and
+ *      never fires, while five hundred trivial exports inside the
+ *      coalescing window do. The more data taken, the less it looked
+ *      like anything — which is the same inversion `detectFailedLoginBurst`
+ *      documents avoiding, applied backwards.
+ *
+ * ⭐ BOTH FACTS NOW ARRIVE AS FACTS. `server/export/log.ts` applies the
+ * size threshold where the real row count is in hand and emits
+ * `export.bulk`; it emits `export.off_hours` when the clock says so. This
+ * rule's only remaining job is the CORRELATION — large AND out of hours,
+ * the departing-employee signature — which is the one thing neither
+ * event can say on its own.
+ *
+ * ⚠️ SEVERITY IS `warning`, AND IT WAS NEVER ANYTHING ELSE. The previous
+ * version declared `notice` and explained why at length. It was silently
+ * raised to `warning` on every write, because `resolveSeverity` takes the
+ * higher of the finding's value and the catalogue default, and the
+ * catalogue default for both `anomaly.detected` and `export.off_hours` is
+ * `warning`. A caller may escalate and may not demote — that rule is
+ * correct and stays. The comment claiming otherwise was the part that was
+ * false, so it is gone rather than the behaviour.
  */
 export function detectOffHoursBulkExport(
   observations: Observation[],
@@ -375,27 +413,34 @@ export function detectOffHoursBulkExport(
   const findings: AnomalyFinding[] = [];
 
   const relevant = observations.filter(
-    (o) => o.eventType.startsWith("export.") && withinWindow(o.occurredAt, nowMs, 24 * 60),
+    (o) => o.eventType === "export.bulk" && withinWindow(o.occurredAt, nowMs, 24 * 60),
   );
 
   for (const row of relevant) {
     if (!isOffHoursIst(row.occurredAt)) continue;
-    if (row.occurrenceCount < ANOMALY_THRESHOLDS.bulkExportRecords) continue;
 
     findings.push({
       ruleId: "export.off_hours_bulk",
       title: "Large export outside working hours",
-      severity: "notice",
+      severity: "warning",
       tenantId: row.tenantId,
       subjectType: "export",
       subjectId: row.subjectId,
+      /**
+       * ⚠️ `count` IS THE NUMBER OF EXPORTS, NOT THE NUMBER OF RECORDS,
+       * and it is named honestly here for that reason. The record count
+       * lives in the emitting event's `detail.rowCount`; a reviewer
+       * following `subjectId` finds it there. Putting a number in this
+       * field that means something different from what it means in every
+       * other rule is how the previous version went wrong.
+       */
       count: row.occurrenceCount,
       windowMinutes: 24 * 60,
       detail: {
         rule: "export.off_hours_bulk",
         istHour: istHour(row.occurredAt),
-        recordCount: row.occurrenceCount,
-        threshold: ANOMALY_THRESHOLDS.bulkExportRecords,
+        exportCount: row.occurrenceCount,
+        bulkThreshold: ANOMALY_THRESHOLDS.bulkExportRecords,
       },
     });
   }
@@ -449,6 +494,61 @@ export function detectRateLimitPressure(
   }
 
   return findings;
+}
+
+/* ------------------------------------------------------------------ */
+/* WAVE 9 — A FINDING'S RULE DECIDES ITS EVENT TYPE                    */
+/* ------------------------------------------------------------------ */
+
+/**
+ * ⭐⭐⭐ WHICH `security_events.event_type` EACH RULE PRODUCES.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 EVERY FINDING USED TO BE WRITTEN AS `anomaly.detected`
+ * ══════════════════════════════════════════════════════════════════════
+ * All five rules — brute force, denial spike, portal link sharing,
+ * off-hours bulk export, sustained limiter pressure — collapsed into one
+ * event type, with the rule name buried in `detail.ruleId`.
+ *
+ * `lib/security/events.ts` meanwhile declares a specific type for four of
+ * them, each with its own default severity and its own SIEM mapping.
+ * `auth.brute_force_suspected` is the only `critical` in the
+ * authentication group and exists precisely so a correlation rule can
+ * page on it. IT HAD NEVER BEEN WRITTEN, so that rule would have sat
+ * green through a credential-stuffing run while the row it needed was
+ * filed under a `warning`-by-default catch-all.
+ *
+ * ⚠️ SEVERITY IS STILL THE FINDING'S, AND STILL A FLOOR. `resolveSeverity`
+ * takes the higher of the finding's value and the type's default, so
+ * mapping a rule onto a more specific type can RAISE its severity and can
+ * never lower it. That is why the brute-force rule now reaches `critical`
+ * — the type says so — and why nothing here can quietly demote an alarm.
+ *
+ * ⚠️ `rate_limit.sustained_pressure` HAS NO SPECIFIC TYPE and keeps
+ * `anomaly.detected`. `rate_limit.exceeded` is the individual trip and
+ * would be wrong: this finding says the SHAPE of the trips changed, which
+ * is exactly what `anomaly.detected` is for. Inventing a type to make the
+ * table look symmetrical would put a member in a closed security
+ * vocabulary for the sake of tidiness.
+ */
+const RULE_EVENT_TYPE: Readonly<Record<string, SecurityEventType>> = {
+  "auth.failed_login_burst": "auth.brute_force_suspected",
+  "authz.denial_spike": "authz.denial_spike",
+  "portal.token_shared": "portal.token_shared_suspected",
+  "export.off_hours_bulk": "export.off_hours",
+};
+
+/**
+ * ⚠️ FALLS BACK TO `anomaly.detected` RATHER THAN THROWING. A new rule
+ * whose author forgets this table still produces a recorded, severity-
+ * carrying row; it simply lands in the generic bucket. The alternative —
+ * a throw — would mean one unmapped rule silently ends the whole sweep in
+ * the runner's catch block, losing the findings of every rule that ran
+ * before it. `scripts/check-security-events.mjs` is what makes the
+ * omission visible, at build time, where it costs nothing.
+ */
+export function eventTypeForRule(ruleId: string): SecurityEventType {
+  return RULE_EVENT_TYPE[ruleId] ?? "anomaly.detected";
 }
 
 /* ------------------------------------------------------------------ */
@@ -594,7 +694,7 @@ export async function runAnomalyDetection(options: {
     for (const finding of findings) {
       await recordSecurityEvent(
         {
-          type: "anomaly.detected",
+          type: eventTypeForRule(finding.ruleId),
           severity: finding.severity,
           tenantId: finding.tenantId,
           source: "anomaly-detector",

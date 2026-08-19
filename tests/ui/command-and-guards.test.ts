@@ -389,11 +389,44 @@ describe("check:guards passes, and keeps its own bugs fixed", () => {
     }
   });
 
-  it("runs in preflight, second, before the expensive checks", () => {
+  it("runs before the expensive checks, and the manifest is what says so", async () => {
+    // ══════════════════════════════════════════════════════════════════
+    // ⭐ ORDER IS NOW A PROPERTY OF THE MANIFEST, NOT OF preflight.mjs.
+    // ══════════════════════════════════════════════════════════════════
+    // This used to compare two `indexOf` positions inside
+    // `scripts/preflight.mjs`. Infra wave 12 replaced that hand-written
+    // list with `gatesInTier("static")`, so neither filename appears in
+    // the file any more and the comparison compared -1 with -1.
+    //
+    // The property worth keeping is the one the original was reaching
+    // for: a gate that reads the tree in milliseconds must run before a
+    // gate that needs a database or minutes of compilation, so a
+    // developer learns about a cheap failure first.
+    const { GATES, gatesInTier } = await import("../../scripts/gates.mjs");
+
+    const guards = GATES.find((g: { id: string }) => g.id === "guards");
+    expect(guards, "check:guards is not in the manifest, so nothing runs it").toBeDefined();
+    expect(guards!.tier).toBe("static");
+
+    const staticIds = gatesInTier("static").map((g: { id: string }) => g.id);
+    const dbIds = gatesInTier("database").map((g: { id: string }) => g.id);
+
+    expect(staticIds).toContain("guards");
+    expect(dbIds).not.toContain("guards");
+
+    // preflight runs every static gate before it reaches the slow ones.
+    // ⚠️ Anchored on the CHECKS array, not on the whole file: "typecheck"
+    // appears in the header prose long before it appears as a step, and a
+    // naive indexOf over the file compares a comment with an entry.
     const pre = read("scripts/preflight.mjs");
-    expect(pre).toContain("check-action-guards.mjs");
-    expect(pre.indexOf("check-action-guards.mjs")).toBeLessThan(
-      pre.indexOf("check-sql-completeness.mjs"),
+    const checks = pre.slice(pre.indexOf("const CHECKS = ["));
+    expect(checks).toContain('gatesInTier("static")');
+    expect(checks.indexOf('gatesInTier("static")')).toBeLessThan(
+      checks.indexOf('name: "typecheck"'),
+    );
+    // and the database tier comes after the compiler, because it needs one.
+    expect(checks.indexOf('name: "typecheck"')).toBeLessThan(
+      checks.indexOf('gatesInTier("database")'),
     );
   });
 });
@@ -487,8 +520,35 @@ describe("the morning summary is reachable and reads rather than computes", () =
   it("assembles from the engines that already own the numbers", () => {
     const sweep = read("server/command/sweep.ts");
     expect(sweep).toContain("@/lib/compliance/statutory-due");
-    expect(sweep).toContain("@/server/returns/assemble");
     expect(sweep).toContain("THIS FILE COMPUTES NOTHING");
+    /**
+     * ⚠️ THIS USED TO ASSERT `toContain("@/server/returns/assemble")` and
+     * Batch 0108 broke it by DELETING an import — `rupeeStringToMinor`,
+     * the x100 helper that stood between the journal and this summary.
+     * The import was a SHAPE; the property is that the summary reads
+     * totals the ledger already holds and does no arithmetic of its own.
+     * Naming a module that happened to export a helper pinned the wrong
+     * thing, which is why a correct deletion failed a passing test.
+     */
+    expect(sweep).toMatch(/journalEntries\.amountMinor/);
+    /**
+     * ⚠️ SCOPED TO THE LEDGER READ. `sweep.ts` also carries a rupee display
+     * formatter that legitimately divides by 100n; asserting "no 100n
+     * anywhere in the file" would ban a correct thing to catch an
+     * incorrect one, which is how a gate gets deleted.
+     */
+    const bare = sweep
+      // 🔴 COMMENTS OUT FIRST — the comment beside the fix quotes the
+      // `* 100n` it removed, and a negative assertion that reads prose
+      // tests the documentation rather than the code.
+      .replace(/\/\*[\s\S]*?\*\//g, "")
+      .replace(/(^|[^:])\/\/.*$/gm, "$1");
+    const ledgerRead = bare.slice(
+      bare.indexOf("salesPostingAccounts.role"),
+      bare.indexOf("salesPostingAccounts.role") + 2000,
+    );
+    expect(ledgerRead).not.toMatch(/\*\s*100n/);
+    expect(ledgerRead).not.toMatch(/rupeeStringToMinor/);
   });
 
   /**

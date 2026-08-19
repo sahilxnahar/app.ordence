@@ -34,7 +34,7 @@
  * bigint, so every amount returned here goes through `serializeAmount`.
  */
 
-import { and, eq } from "drizzle-orm";
+import { and, asc, eq, isNull } from "drizzle-orm";
 import { revalidatePath } from "next/cache";
 import { withTenant } from "@/db";
 import {
@@ -45,6 +45,10 @@ import {
   tallyReconciliationItems,
   type TallyVoucherType,
 } from "@/db/schema/tally";
+/** ⭐ Wave 10 — the three tables a mapping's `sourceId` can point at. */
+import { ledgers } from "@/db/schema/accounting";
+import { vendors } from "@/db/schema/purchases";
+import { companies } from "@/db/schema/crm";
 import { requirePermission, writeAudit } from "@/server/audit";
 import { guardTallyWrite, tallyFail, toTallyActionError } from "@/server/tally/guards";
 import {
@@ -1130,5 +1134,121 @@ export async function resolveTallyReconciliationItem(
     return { ok: true, data: { id: row.id } };
   } catch (err) {
     return toTallyActionError(err, "resolveTallyReconciliationItem");
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* ⭐⭐ WAVE 10 — WHAT A MAPPING CAN POINT AT                          */
+/* ------------------------------------------------------------------ */
+
+export type TallyMappableSource = {
+  readonly kind: "ledger" | "vendor" | "customer";
+  readonly id: string;
+  readonly label: string;
+  /** A second line the picker shows: a code, a GSTIN, a trade name. */
+  readonly hint: string | null;
+};
+
+/**
+ * ⭐⭐⭐ THE LIST A MAPPING EDITOR NEEDS, UNDER THE TALLY PERMISSION.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 WHY THIS IS NOT THREE CALLS TO THREE EXISTING ACTIONS
+ * ══════════════════════════════════════════════════════════════════════
+ * A ledger mapping's `sourceId` points at `ledgers`, `vendors` or
+ * `companies` depending on `sourceKind`. The obvious way to fill a picker
+ * is to call the existing read action for each — and each of those asks
+ * for a DIFFERENT permission: `ledgers:read`, a purchases key, a CRM key.
+ *
+ * That would mean the Tally screen only works for somebody who holds
+ * accounting AND purchasing AND CRM read rights, which is not who
+ * maintains a Tally mapping. It is the accounts person who reconciles
+ * with the CA. `tally:read` is the permission that describes them, and
+ * this is the module's own door onto exactly the three columns a mapping
+ * needs and nothing else.
+ *
+ * ⚠️ NAME AND IDENTIFIER ONLY. No balances, no addresses, no contact
+ * details, no PAN. Widening a read because it was convenient is how a
+ * narrow permission quietly becomes a broad one, and the picker needs a
+ * label and an id.
+ *
+ * ⚠️ NO `tax_head` HERE. A tax head has no row — it is a key from the
+ * closed set `getTallyTaxHeads` returns. Mixing the two into one list
+ * would invite a mapping carrying both an id and a key, which the
+ * validator and the database both refuse for good reason.
+ *
+ * ⚠️ CAPPED AT 500 PER KIND. A picker is not a report. A workspace past
+ * that has an import problem rather than a mapping problem, and the cap
+ * is stated in the response so the screen can say so rather than
+ * silently showing the first few hundred.
+ */
+export async function getTallyMappableSources(): Promise<
+  ActionResult<{ rows: TallyMappableSource[]; truncated: boolean }>
+> {
+  try {
+    const ctx = await requirePermission("tally:read");
+    const LIMIT = 500;
+
+    const [ledgerRows, vendorRows, customerRows] = await withTenant(
+      ctx.tenant.id,
+      async (tx) => {
+        const l = await tx
+          .select({ id: ledgers.id, name: ledgers.name, code: ledgers.code })
+          .from(ledgers)
+          .where(and(eq(ledgers.tenantId, ctx.tenant.id), isNull(ledgers.deletedAt)))
+          .orderBy(asc(ledgers.code))
+          .limit(LIMIT + 1);
+
+        const v = await tx
+          .select({
+            id: vendors.id,
+            legalName: vendors.legalName,
+            tradeName: vendors.tradeName,
+            code: vendors.code,
+          })
+          .from(vendors)
+          .where(and(eq(vendors.tenantId, ctx.tenant.id), eq(vendors.isActive, true)))
+          .orderBy(asc(vendors.legalName))
+          .limit(LIMIT + 1);
+
+        const c = await tx
+          .select({ id: companies.id, name: companies.name })
+          .from(companies)
+          .where(and(eq(companies.tenantId, ctx.tenant.id), isNull(companies.deletedAt)))
+          .orderBy(asc(companies.name))
+          .limit(LIMIT + 1);
+
+        return [l, v, c] as const;
+      },
+    );
+
+    const truncated =
+      ledgerRows.length > LIMIT || vendorRows.length > LIMIT || customerRows.length > LIMIT;
+
+    const rows: TallyMappableSource[] = [
+      ...ledgerRows.slice(0, LIMIT).map((r) => ({
+        kind: "ledger" as const,
+        id: r.id,
+        label: r.name,
+        hint: r.code,
+      })),
+      ...vendorRows.slice(0, LIMIT).map((r) => ({
+        kind: "vendor" as const,
+        id: r.id,
+        label: r.legalName,
+        /** The trade name is what the invoice says and the ledger is usually named after. */
+        hint: r.tradeName ?? r.code,
+      })),
+      ...customerRows.slice(0, LIMIT).map((r) => ({
+        kind: "customer" as const,
+        id: r.id,
+        label: r.name,
+        hint: null,
+      })),
+    ];
+
+    return { ok: true, data: { rows, truncated } };
+  } catch (err) {
+    return toTallyActionError(err, "getTallyMappableSources");
   }
 }

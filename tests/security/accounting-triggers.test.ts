@@ -137,8 +137,22 @@ describe("Double-entry balance enforcement", () => {
 
     expect(err, "An unbalanced transaction must be rejected").not.toBeNull();
     expect(err!.message).toContain("does not balance");
-    expect(err!.message).toContain("100.00");
-    expect(err!.message).toContain("60.00");
+
+    // ⚠️ MINOR UNITS, NOT "100.00". 0108 moved the ledger to bigint minor
+    // units and the trigger reports what it actually summed:
+    //
+    //   "Debits = 10000, Credits = 6000, difference = 4000 (minor units)."
+    //
+    // It must NOT format those as 100.00 / 60.00, because a database
+    // trigger does not know the transaction's currency exponent and two
+    // decimals is not universal — JPY has 0, KWD, BHD, OMR, JOD, TND, LYD
+    // and IQD have 3. A trigger that printed "100.00" for ¥10000 would be
+    // stating a figure a hundred times too small in an error message an
+    // accountant is meant to act on.
+    expect(err!.message).toContain("minor units");
+    expect(err!.message).toContain("Debits = 10000");
+    expect(err!.message).toContain("Credits = 6000");
+    expect(err!.message).toContain("difference = 4000");
   });
 
   it("ACCEPTS a balanced transaction (proves the test is meaningful)", async () => {
@@ -294,33 +308,57 @@ describe("Financial period close enforcement (SEC-012)", () => {
     expect(txnId).toBeTruthy();
   });
 
-  it("the period lock is IMMEDIATE — the write never lands, unlike the balance check", async () => {
-    // The two triggers deliberately differ in timing. This asserts that
-    // difference rather than assuming it.
-    const client = await (await import("../setup")).testPool.connect();
-    let insertThrew = false;
-    try {
+  it("⭐ the period lock is IMMEDIATE, and it now refuses the HEADER, not the leg", async () => {
+    // ══════════════════════════════════════════════════════════════════
+    // The two guards deliberately differ in timing, and this asserts the
+    // difference rather than assuming it. The balance check is a
+    // CONSTRAINT TRIGGER: it cannot fire until the last leg is in, so an
+    // unbalanced transaction is refused at COMMIT. The period lock is a
+    // plain BEFORE-ROW trigger: it decides on a fact already known, so it
+    // refuses on the statement.
+    //
+    // ⚠️ THIS TEST USED TO PROBE THE `journal_entries` INSERT and expect
+    // the `transactions` INSERT above it to succeed. It does not any more:
+    // `ordence_guard_closed_period()` now refuses the transaction HEADER
+    // on its `transaction_date`, which is strictly better — the refusal
+    // arrives one statement earlier, on the row that actually carries the
+    // date, and no orphan header is created.
+    //
+    // ⚠️ AND THE OLD VERSION LEAKED. Its `ROLLBACK` sat after the inner
+    // try/catch, so when the header INSERT started throwing, control
+    // jumped to `finally { client.release() }` and returned a connection
+    // that was still inside an aborted transaction. The next test to
+    // borrow it died on BEGIN with "current transaction is aborted" and
+    // was blamed for it. `withRawClient` cannot do that.
+    // ══════════════════════════════════════════════════════════════════
+    const { withRawClient } = await import("../setup");
+
+    let headerError: { message: string; code?: string } | null = null;
+
+    await withRawClient(async (client) => {
       await client.query("BEGIN");
       await client.query("SELECT set_config('app.current_tenant_id', $1, true)", [F.tenant]);
-      const txn = await client.query(
-        `INSERT INTO transactions (tenant_id, description, transaction_date, currency)
-         VALUES ($1, 'Period lock probe', '2026-02-20', 'INR') RETURNING id`,
-        [F.tenant],
-      );
       try {
         await client.query(
-          `INSERT INTO journal_entries (tenant_id, transaction_id, ledger_id, entry_type, amount)
-           VALUES ($1, $2, $3, 'debit', 99.00)`,
-          [F.tenant, txn.rows[0].id, F.ledgerCash],
+          `INSERT INTO transactions (tenant_id, description, transaction_date, currency)
+           VALUES ($1, 'Period lock probe', '2026-02-20', 'INR') RETURNING id`,
+          [F.tenant],
         );
-      } catch {
-        insertThrew = true;
+      } catch (err) {
+        const e = err as { message?: string; code?: string };
+        headerError = { message: e.message ?? String(err), code: e.code };
       }
-      await client.query("ROLLBACK");
-    } finally {
-      client.release();
-    }
-    expect(insertThrew, "The period lock must reject on INSERT, not at COMMIT").toBe(true);
+    });
+
+    expect(
+      headerError,
+      "a transaction dated inside a CLOSED period was accepted — the lock did " +
+        "not fire on the statement, so the write landed and only COMMIT could " +
+        "still refuse it",
+    ).not.toBeNull();
+    expect(headerError!.message).toMatch(/closed accounting period/i);
+    // 23514 = check_violation. Refused by the guard, not by a missing GRANT.
+    expect(headerError!.code).toBe("23514");
   });
 
   it("BLOCKS deleting an entry out of a closed period", async () => {

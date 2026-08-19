@@ -32,6 +32,7 @@
 
 import { auth } from "@clerk/nextjs/server";
 import { CreateOrganization } from "@clerk/nextjs";
+import { ClaimWorkspace } from "@/components/signup/claim-workspace";
 import { and, eq, isNull } from "drizzle-orm";
 import { AlertTriangle } from "lucide-react";
 import { db, withPlatformScope } from "@/db";
@@ -126,10 +127,55 @@ export default async function OnboardingPage() {
     );
   }
 
+  /*
+   * ══════════════════════════════════════════════════════════════════
+   * ⭐ NO ORGANISATION AT ALL — THE SELF-SERVE FUNNEL OWNS THIS SCREEN
+   * ══════════════════════════════════════════════════════════════════
+   * `middleware.ts` sends every session without an active organisation
+   * here, so this is where a brand-new customer lands after signing up.
+   * It used to render Clerk's `<CreateOrganization>`, which asks for a
+   * company name and NEVER ASKS FOR AN ADDRESS — provisioning then
+   * derived one from the name, and the product's central promise, "your
+   * own subdomain", was something the customer was never offered.
+   *
+   * ⚠️ RENDERED, NOT REDIRECTED TO `/claim`, AND THE DIFFERENCE MATTERS.
+   *    A redirect from the one destination middleware sends no-org
+   *    sessions to is a loop waiting for its first bad day: anything that
+   *    bounces the visitor back here — an expired `setActive`, a stale
+   *    tab — bounces them straight out again. Rendering the same
+   *    component keeps `/claim` and `/onboarding` as two doors into one
+   *    room, with no cycle between them.
+   *
+   * ⚠️ `<ClaimWorkspace>` RESUMES RATHER THAN DUPLICATES. If this person
+   *    already created an organisation and only failed to activate it,
+   *    the component finds the membership and carries on, instead of
+   *    offering to make a second workspace with a second trial and a
+   *    second hostname.
+   */
+  if (!orgId) {
+    return (
+      <main className="mx-auto flex min-h-screen w-full max-w-lg flex-col justify-center gap-6 px-4 py-10">
+        <header className="space-y-2">
+          <h1 className="text-2xl font-bold tracking-tight">Create your workspace</h1>
+          <p className="text-sm text-muted-foreground">
+            Every company gets its own isolated workspace at its own web address.
+          </p>
+        </header>
+        <ClaimWorkspace />
+      </main>
+    );
+  }
+
+  /*
+   * ⚠️ AN ORGANISATION EXISTS AND SO DOES ITS WORKSPACE — this is somebody
+   *    deliberately adding a SECOND one. Clerk's own form is right here:
+   *    the address for it is derived by the webhook exactly as it always
+   *    was, and the self-serve address step is a first-workspace flow.
+   */
   return (
     <main className="flex min-h-screen flex-col items-center justify-center gap-6 p-6">
       <div className="text-center">
-        <h1 className="text-2xl font-bold">Create your workspace</h1>
+        <h1 className="text-2xl font-bold">Create another workspace</h1>
         <p className="mt-2 text-sm text-muted-foreground">
           Every company gets its own isolated workspace.
         </p>

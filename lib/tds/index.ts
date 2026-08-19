@@ -31,3 +31,4 @@ export * from "./challans";
 export * from "./certificates";
 export * from "./returns";
 export * from "./register";
+export * from "./foreign-payments";
