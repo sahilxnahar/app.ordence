@@ -1085,7 +1085,7 @@ export async function recordMappingDecision(
  */
 export async function beginImportRun(
   input: unknown,
-): Promise<ActionResult<{ runId: string; chunkSize: number }>> {
+): Promise<ActionResult<{ runId: string; chunkSize: number; resumed: boolean; note: string | null }>> {
   try {
     const params = z
       .object({
@@ -1095,6 +1095,29 @@ export async function beginImportRun(
         sourceSheet: z.string().max(120).optional(),
         duplicateMode: z.enum(["skip", "update", "fail"]),
         expectedRows: z.number().int().positive(),
+        /**
+         * ⭐⭐⭐ PHASE 2 · RUN-LEVEL IDEMPOTENCY. `sha256:<64 lower-case hex>`
+         * over the BYTES of the file, computed in the browser with WebCrypto
+         * — the server never receives them.
+         *
+         * 🔴 REQUIRED. Without it two browser tabs start two runs over one
+         * file, and in `update` mode the second captures the FIRST run's
+         * values as the prior: undoing run 2 restores the migration, undoing
+         * run 1 afterwards destroys what run 2 put back. There is no order in
+         * which the customer can be told what will happen.
+         *
+         * ⚠️ VALIDATED IN THREE PLACES ON PURPOSE — here (names the caller),
+         * in `startImportRun` (names the mechanism) and by
+         * `import_runs_fingerprint_shape` (makes it unavoidable). A
+         * fingerprint that is the file NAME creates a claim that never
+         * collides, which is idempotency that is present and inert.
+         */
+        sourceFingerprint: z.string().regex(/^sha256:[0-9a-f]{64}$/, {
+          message:
+            "The file could not be fingerprinted in your browser. Nothing has been started — " +
+            "without it, starting the same file twice would create two migrations that cannot " +
+            "both be undone.",
+        }),
       })
       .parse(input);
 
@@ -1106,7 +1129,7 @@ export async function beginImportRun(
     /** ⚠️ The same four gates the one-shot import passes. */
     const ctx = await guardImport(entity, params.duplicateMode);
 
-    const runId = await startImportRun({
+    const run = await startImportRun({
       tenantId: ctx.tenant.id,
       startedBy: ctx.user.id,
       entityKey: entity.key,
@@ -1115,9 +1138,25 @@ export async function beginImportRun(
       sourceSheet: params.sourceSheet ?? null,
       duplicateMode: params.duplicateMode,
       expectedRows: params.expectedRows,
+      sourceFingerprint: params.sourceFingerprint,
     });
 
-    return { ok: true, data: { runId, chunkSize: MAX_IMPORT_ROWS } };
+    /**
+     * ⚠️ `resumed` AND `note` REACH THE WIZARD, they are not swallowed here.
+     * "Starting" and "picking up where the last attempt stopped, the rows
+     * already here will be recognised rather than duplicated" are different
+     * sentences, and a customer shown the first when the second is true will
+     * wonder why the progress bar starts at 60%.
+     */
+    return {
+      ok: true,
+      data: {
+        runId: run.runId,
+        chunkSize: MAX_IMPORT_ROWS,
+        resumed: run.resumed,
+        note: run.note,
+      },
+    };
   } catch (err) {
     return toImportActionError(err, "begin run");
   }

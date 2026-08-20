@@ -39,6 +39,7 @@ import { requirePermission } from "@/server/audit";
 import { PermissionDeniedError } from "@/lib/permissions";
 import { requireFeature, FeatureLockedError } from "@/server/entitlements";
 import { requireAccess, AccessRestrictedError } from "@/server/billing/access";
+import { createLedgerSchema } from "@/lib/validators/accounting";
 import type { ActionResult } from "@/lib/validators/crm";
 import {
   postTransactionSchema,
@@ -69,24 +70,14 @@ const uuidSchema = z.string().uuid("Invalid identifier.");
 
 export type { PostTransactionInput };
 
-const createLedgerSchema = z.object({
-  name: z.string().trim().min(1).max(200),
-  code: z.string().trim().min(1).max(40).regex(/^[A-Za-z0-9._-]+$/, "Use letters, numbers, dot, dash or underscore."),
-  description: z.string().trim().max(1_000).optional(),
-  type: z.enum(["operating", "trust", "escrow", "retention", "suspense"]).default("operating"),
-  accountType: z.enum(["asset", "liability", "equity", "revenue", "expense"]),
-  currency: z.string().length(3).default("INR"),
-  requiresReconciliation: z.boolean().default(false),
-  bankDetails: z
-    .object({
-      bankName: z.string().trim().max(200).optional(),
-      accountNumber: z.string().trim().max(40).optional(),
-      ifsc: z.string().trim().max(20).optional(),
-      branch: z.string().trim().max(200).optional(),
-      accountHolder: z.string().trim().max(200).optional(),
-    })
-    .default({}),
-});
+/*
+ * ⭐⭐ PHASE 8 , `createLedgerSchema` MOVED TO `lib/validators/accounting.ts`.
+ *
+ * ⚠️ IT WAS DECLARED HERE AND COULD NOT BE EXPORTED, for the reason the top
+ * of this file gives about `"use server"`. That made the rule deciding what
+ * a ledger is unreachable by anything but this file , and the
+ * chart-of-accounts importer needs THE SAME OBJECT, not a copy of it.
+ */
 
 export type CreateLedgerInput = z.input<typeof createLedgerSchema>;
 

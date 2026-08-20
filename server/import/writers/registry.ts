@@ -61,6 +61,31 @@ import { stockMovementsWriter } from "./stock-movements";
 import { transactionsWriter } from "./transactions";
 import { vendorLedgerEntriesWriter } from "./vendor-ledger-entries";
 
+/*
+ * ⭐⭐ PHASE 8 , the accounting and master-data destinations. Each lives in
+ * `./accounting/`, Phase 8's own subdirectory; these three lines are the
+ * only Phase-1 surface they touch, which is the whole point of the split.
+ */
+import { costCentresWriter } from "./accounting/cost-centres";
+import { hsnSacCodesWriter } from "./accounting/hsn-sac-codes";
+import { ledgersWriter } from "./accounting/ledgers";
+
+/* ⭐⭐ PHASE 4 , CRM. */
+import { contactsWriter } from "./crm/contacts";
+import { leadsWriter } from "./crm/leads";
+
+/* ⭐⭐ PHASE 7 , inventory. */
+import { stockBatchesWriter } from "./inventory/stock-batches";
+import { stockItemsWriter } from "./inventory/stock-items";
+import { warehousesWriter } from "./inventory/warehouses";
+
+/* ⭐⭐ PHASE 5 , sales. */
+import { customerReceiptsWriter } from "./sales/customer-receipts";
+
+/* ⭐⭐ PHASE 6 , purchases. */
+import { purchaseInvoicesWriter } from "./purchases/purchase-invoices";
+import { vendorsWriter } from "./purchases/vendors";
+
 export const IMPORT_WRITERS: Record<ImportTableKey, ImportWriter> = {
   companies: companiesWriter,
   gst_parties: gstPartiesWriter,
@@ -68,6 +93,17 @@ export const IMPORT_WRITERS: Record<ImportTableKey, ImportWriter> = {
   sales_invoices: salesInvoicesWriter,
   vendor_ledger_entries: vendorLedgerEntriesWriter,
   stock_movements: stockMovementsWriter,
+  ledgers: ledgersWriter,
+  cost_centres: costCentresWriter,
+  hsn_sac_codes: hsnSacCodesWriter,
+  contacts: contactsWriter,
+  leads: leadsWriter,
+  stock_items: stockItemsWriter,
+  warehouses: warehousesWriter,
+  stock_batches: stockBatchesWriter,
+  customer_receipts: customerReceiptsWriter,
+  vendors: vendorsWriter,
+  purchase_invoices: purchaseInvoicesWriter,
 };
 
 /**

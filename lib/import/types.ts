@@ -482,7 +482,51 @@ export type ImportTableKey =
   | "transactions"
   | "sales_invoices"
   | "vendor_ledger_entries"
-  | "stock_movements";
+  | "stock_movements"
+  /**
+   * ⭐⭐ PHASE 8 , THE ACCOUNTING AND MASTER-DATA DESTINATIONS.
+   *
+   * 🔴 `ledgers` IS THE CHART OF ACCOUNTS, AND ADDING IT IS THE SINGLE MOST
+   *    CONSEQUENTIAL LINE IN PHASE 8. Until now the chart of accounts was
+   *    not importable, which is why `opening-trial-balance` declared
+   *    `dependsOn: []` and argued its prerequisite was "a setup step rather
+   *    than another import". That argument was correct and this line ends it.
+   *
+   * ⚠️ `hsn_sac_codes`, NOT `tax_codes`. The brief names `tax_codes`; there
+   * is no such table and there never was , 0 of 312 `pgTable` declarations.
+   * The code and the RATE are deliberately two tables, and only the CODE is
+   * imported.
+   */
+  | "ledgers"
+  | "cost_centres"
+  | "hsn_sac_codes"
+  /**
+   * ⭐⭐ PHASE 4 , CRM. `contacts` finally arrives as a real destination.
+   * It was M1's worked example and was deliberately held out of
+   * `ALL_IMPORT_ENTITIES` because it had no writer; Phase 4 wrote one, so
+   * `PendingImportTableKey` below is now empty of it.
+   */
+  | "contacts"
+  | "leads"
+  /** ⭐⭐ PHASE 7 , inventory. `stock_items` and `warehouses` are what make
+   * `opening-stock`'s two lookups resolve at all. */
+  | "stock_items"
+  | "warehouses"
+  | "stock_batches"
+  /**
+   * ⭐ PHASE 5 , CUSTOMER RECEIPTS. Money received and not yet applied to an
+   * invoice. Written one row at a time and , unlike the single-record action
+   * that writes the same table , posting NOTHING to the general ledger: an
+   * imported receipt is sub-ledger detail beside an opening trial balance
+   * that already carries the bank and the debtors.
+   */
+  | "customer_receipts"
+  /**
+   * ⭐ PHASE 6 , PURCHASES. `vendors` is its own table, not `gst_parties`,
+   * so it does not collide with Phase 5's `customers`.
+   */
+  | "vendors"
+  | "purchase_invoices";
 
 /* ------------------------------------------------------------------ */
 /* LOOKUPS — THINGS A ROW REFERS TO BUT DOES NOT CREATE                */
@@ -777,7 +821,20 @@ export type ContractedImportEntity = ImportEntityDefinition & {
  *    it is an entity that cannot be imported. Adding to it is a way of
  *    saying "not yet"; the goal is for it to be empty.
  */
-export type PendingImportTableKey = "contacts";
+/**
+ * ⚠️ EMPTY AS OF PHASE 4, WHICH WAS ALWAYS THE GOAL.
+ *
+ * This union held `"contacts"` , M1's worked example, complete and
+ * contracted and deliberately unreachable because the write path had no
+ * branch for it. Phase 4 wrote the writer, so `contacts` moved up into
+ * `ImportTableKey` and this became what its own header said it should be:
+ * a debt marker with nothing in it.
+ *
+ * 🔴 `never` RATHER THAN DELETING THE TYPE. The next phase to build an
+ *    entity ahead of its writer needs somewhere honest to say so, and a
+ *    type that has to be re-invented is a type somebody will skip.
+ */
+export type PendingImportTableKey = never;
 
 /**
  * ══════════════════════════════════════════════════════════════════════
@@ -799,6 +856,11 @@ export type PendingImportTableKey = "contacts";
  */
 export type ImportSecondaryTableKey = "journal_entries";
 
+/**
+ * ⚠️ RETAINED WITH NO MEMBERS, for the reason `PendingImportTableKey` is
+ * `never` rather than deleted: the next phase that builds an entity ahead
+ * of its writer needs an honest way to say so.
+ */
 export type PendingImportEntity = Omit<ContractedImportEntity, "table"> & {
   table: PendingImportTableKey;
 };

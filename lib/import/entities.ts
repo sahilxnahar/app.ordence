@@ -41,6 +41,11 @@
 import { COMPANY_SIZES, createCompanySchema } from "@/lib/validators/crm";
 import { upsertPartySchema } from "@/lib/validators/gst";
 import { OPENING_IMPORT_ENTITIES } from "./opening-entities";
+import { ACCOUNTING_IMPORT_ENTITIES } from "./entities-accounting";
+import { CRM_IMPORT_ENTITIES } from "./entities-crm";
+import { PURCHASE_IMPORT_ENTITIES } from "./entities-purchases";
+import { SALES_IMPORT_ENTITIES } from "./entities-sales";
+import { INVENTORY_IMPORT_ENTITIES } from "./entities-inventory";
 import { OPENING_CONTRACTS } from "./contract/opening-policies";
 import type { ContractedImportEntity } from "./types";
 
@@ -294,7 +299,20 @@ const companiesEntity: ContractedImportEntity = {
        * be naming the ones today's template happens to carry.
        */
       capturePriorFields: ["*"],
-      escapes: null,
+      /**
+       * ⚠️ WAS `null`, WHICH WAS A CLAIM AND THE CLAIM WAS FALSE.
+       * `lib/import/types.ts`: "`null` IS A CLAIM, NOT A DEFAULT. It says
+       * the author looked." This table carries a `*_set_updated_at` BEFORE
+       * UPDATE trigger whose entire body is `NEW.updated_at = now()`, so an
+       * undo cannot put that column back.
+       *
+       * 🔴 MEASURED, NOT ARGUED. Phase 2's `import_restore_prior_values()`
+       *    re-reads each row after restoring it and returns every column
+       *    that did not come back:  rows_affected 1 | unrestored {updated_at}
+       *    Gate 29 could never have seen this: it reads declarations.
+       */
+      escapes:
+        "The record's `last updated` timestamp will read the moment of the undo rather than the moment before the import. Every other field comes back exactly as it was; a database trigger rewrites that one on any change.",
       because:
         "This entity offers `update`, so a run can overwrite records that pre-date the migration. Deleting those on undo would destroy customer data the run never created. The prior values are captured at write time because they do not survive to undo time.",
     },
@@ -719,6 +737,21 @@ const openingWithContracts = Object.fromEntries(
 
 export const ALL_IMPORT_ENTITIES = {
   ...IMPORT_ENTITIES,
+  /*
+   * ⭐⭐ PHASE 8 , accounting and master data, declared in
+   * `entities-accounting.ts` because ownership of THIS file is contested by
+   * five phases at once. Five phases each adding one line is five clean
+   * merges; five phases each rewriting it is five conflicts.
+   */
+  ...ACCOUNTING_IMPORT_ENTITIES,
+  /* ⭐⭐ PHASE 4 , CRM. */
+  ...CRM_IMPORT_ENTITIES,
+  /* ⭐⭐ PHASE 5 , sales. */
+  ...SALES_IMPORT_ENTITIES,
+  /* ⭐⭐ PHASE 6 , purchases. */
+  ...PURCHASE_IMPORT_ENTITIES,
+  /* ⭐⭐ PHASE 7 , inventory. */
+  ...INVENTORY_IMPORT_ENTITIES,
   ...openingWithContracts,
 } as const satisfies Record<string, ContractedImportEntity>;
 

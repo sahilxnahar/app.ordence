@@ -42,11 +42,39 @@ import "server-only";
  * and `import_runs_outcomes_within_expected` then fails the whole run for
  * an arithmetic error rather than a data one — which is a support ticket
  * about a migration that actually worked.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * ⭐⭐⭐ PHASE 2 ADDS THE THIRD LAYER, AND IT IS THE FIRST ONE ABOUT TWO RUNS
+ * ══════════════════════════════════════════════════════════════════════
+ * ① and ② are both scoped to ONE RUN. Neither has anything to say about
+ * the same file being started twice, and the measured gap the brief names
+ * is exactly that: *"Two browser tabs, two clicks, one file."*
+ *
+ * ⚠️ AND IT IS THE ORDINARY CASE, NOT AN EDGE CASE. The wizard lives in a
+ * browser and the file lives on the customer's machine. Nothing in that
+ * design stops a second tab, a second click when the first appears to have
+ * done nothing, or a reload after a timeout. Each one called
+ * `startImportRun`, which inserted a row unconditionally.
+ *
+ * 🔴 AND IN `update` MODE THE SECOND RUN IS NOT MERELY UNTIDY. It
+ * overwrites what the first run wrote and CAPTURES THE FIRST RUN'S VALUES
+ * AS THE PRIOR. Undoing run 2 then restores the migration; undoing run 1
+ * afterwards destroys what run 2 put back. There is no order in which the
+ * customer can be told what will happen.
+ *
+ * ⭐ SO THE SAME FILE, FOR THE SAME ENTITY, IN ONE WORKSPACE, IS ONE RUN.
+ * The second click does not fail — it RESUMES and gets back the run id the
+ * first click created. A refusal would be worse than the disease: a
+ * customer whose first tab has closed would be locked out of their own
+ * migration with no way to name the run they cannot see.
  */
+
+import { createHash } from "node:crypto";
 
 import { and, eq, sql } from "drizzle-orm";
 import { withTenant } from "@/db";
 import { importRunChunks, importRuns } from "@/db/schema/import-runs";
+import { ALL_IMPORT_ENTITIES, isImportEntityKey } from "@/lib/import/entities";
 
 export type StartRunArgs = {
   readonly tenantId: string;
@@ -57,7 +85,56 @@ export type StartRunArgs = {
   readonly sourceSheet?: string | null;
   readonly duplicateMode: string;
   readonly expectedRows: number;
+  /**
+   * ⭐⭐⭐ `sha256:<64 lower-case hex>` OVER THE BYTES OF THE FILE.
+   *
+   * ⚠️ REQUIRED, NOT OPTIONAL, AND THE REASON IS THE ONE
+   * `lib/import/types.ts` gives about every member of the import contract:
+   * *"An optional `reversal?:` would be that defect in its purest form: the
+   * six tracks writing entities behind this one would each omit it."* An
+   * optional fingerprint is a run-level idempotency mechanism that exists,
+   * is documented, and protects the first caller who remembers it.
+   *
+   * ⚠️ COMPUTED IN THE BROWSER, and that is forced by the architecture
+   * rather than chosen: `db/schema/import-runs.ts` explains at length that
+   * none of these tables holds the customer's file, and the server never
+   * receives the bytes. `importSourceFingerprint()` below is the same
+   * algorithm for a caller that genuinely has them.
+   */
+  readonly sourceFingerprint: string;
 };
+
+/**
+ * ⭐ WHAT `startImportRun` ANSWERS NOW: a run id, and whether it is a new
+ * run or the one an earlier click already created.
+ *
+ * ⚠️ `resumed` IS NOT A DETAIL FOR THE LOG. The wizard has to say something
+ * different in the two cases — "starting" versus "picking up where the last
+ * attempt stopped, the rows already here will be recognised rather than
+ * duplicated" — and a caller handed a bare string cannot.
+ */
+export type StartRunResult = {
+  readonly runId: string;
+  readonly resumed: boolean;
+  readonly expectedRows: number;
+  readonly note: string | null;
+};
+
+const FINGERPRINT = /^sha256:[0-9a-f]{64}$/;
+
+/**
+ * ⭐ THE SAME ALGORITHM THE WIZARD USES, FOR CALLERS THAT HAVE THE BYTES.
+ *
+ * ⚠️ THE WIZARD DOES NOT CALL THIS — it cannot, because this module is
+ * `server-only` and the file never leaves the browser. It computes
+ * `sha256:` + hex of `crypto.subtle.digest("SHA-256", bytes)`, which is
+ * byte-for-byte the same string. This exists so a test, or a server-side
+ * re-import, produces a fingerprint that COLLIDES with the browser's rather
+ * than one that merely looks like it.
+ */
+export function importSourceFingerprint(bytes: Uint8Array): string {
+  return `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
+}
 
 export class ImportRunError extends Error {
   constructor(message: string) {
@@ -66,14 +143,61 @@ export class ImportRunError extends Error {
   }
 }
 
-export async function startImportRun(args: StartRunArgs): Promise<string> {
+/**
+ * ⭐⭐⭐ START A RUN — OR PICK UP THE ONE THIS FILE ALREADY HAS.
+ *
+ * ⚠️ THE INSERT IS THE CLAIM. Checking for an existing run and inserting
+ * afterwards is a race two browser tabs will lose: both read "no run for
+ * this file", both insert, and there are two. `onConflictDoNothing` against
+ * `import_runs_one_live_per_source` lets the database decide, which is the
+ * only version that is correct without a lock held across the whole run —
+ * the identical argument `recordChunk` makes below for chunks.
+ */
+export async function startImportRun(args: StartRunArgs): Promise<StartRunResult> {
   if (args.expectedRows <= 0) {
     throw new ImportRunError(
       "That file has no rows to import. Nothing has been started.",
     );
   }
+
+  /**
+   * ⚠️ THE SHAPE IS CHECKED HERE AND AGAIN IN THE DATABASE
+   * (`import_runs_fingerprint_shape`, SQL 0207). A caller that passed the
+   * file NAME, or a truncated hash, or upper-case hex, would create a claim
+   * that never collides with the one the second tab computes — run-level
+   * idempotency that is present, declared and inert. Refusing here names the
+   * caller; the CHECK constraint is what makes the refusal unavoidable.
+   */
+  if (!FINGERPRINT.test(args.sourceFingerprint)) {
+    throw new ImportRunError(
+      `The migration could not be started: "${args.sourceFingerprint}" is not a source ` +
+        `fingerprint. It must be "sha256:" followed by 64 lower-case hex digits, computed over ` +
+        `the bytes of the file. Without it two browser tabs would start two runs over one file, ` +
+        `and in \`update\` mode there is no order in which those two runs can then be undone.`,
+    );
+  }
+
+  /**
+   * ⭐⭐ THE PROMISE IS COPIED ONTO THE RUN HERE, AT THE MOMENT IT IS MADE.
+   *
+   * 🔴 `contract.reversal.escapes` is shown to the customer BEFORE the run —
+   * it is the only warning they get that something will survive an undo. The
+   * undo must repeat back THAT sentence and not whatever the registry says
+   * months later: an entity edited in between would otherwise change what the
+   * customer is told survived. Same argument as
+   * `import_row_provenance.reversal_kind`, one member over.
+   *
+   * ⚠️ `null` FOR AN UNRECOGNISED KEY RATHER THAN A THROW. The allowlist is
+   * enforced at the action boundary by `isImportEntityKey`; refusing a second
+   * time here would turn a Phase 1 registration ordering problem into a
+   * migration that cannot be started.
+   */
+  const reversalEscapes = isImportEntityKey(args.entityKey)
+    ? (ALL_IMPORT_ENTITIES[args.entityKey].contract.reversal.escapes ?? null)
+    : null;
+
   return withTenant(args.tenantId, async (tx) => {
-    const [row] = await tx
+    const inserted = await tx
       .insert(importRuns)
       .values({
         tenantId: args.tenantId,
@@ -84,10 +208,94 @@ export async function startImportRun(args: StartRunArgs): Promise<string> {
         sourceSheet: args.sourceSheet?.slice(0, 120) ?? null,
         duplicateMode: args.duplicateMode,
         expectedRows: args.expectedRows,
+        sourceFingerprint: args.sourceFingerprint,
+        reversalEscapes,
       })
+      /** ⚠️ The partial unique index on (tenant, entity, fingerprint) is the guarantee. */
+      .onConflictDoNothing()
       .returning({ id: importRuns.id });
-    if (!row) throw new ImportRunError("The migration could not be started.");
-    return row.id;
+
+    const fresh = inserted[0];
+    if (fresh) {
+      return {
+        runId: fresh.id,
+        resumed: false,
+        expectedRows: args.expectedRows,
+        note: null,
+      };
+    }
+
+    /**
+     * ⭐ THE SECOND CLICK. The database refused a second row, so the first
+     * one is still there and is the run this file belongs to.
+     */
+    const [existing] = await tx
+      .select({
+        id: importRuns.id,
+        duplicateMode: importRuns.duplicateMode,
+        entityKey: importRuns.entityKey,
+        expectedRows: importRuns.expectedRows,
+        rowsWritten: importRuns.rowsWritten,
+        rowsSkipped: importRuns.rowsSkipped,
+        rowsFailed: importRuns.rowsFailed,
+        status: importRuns.status,
+      })
+      .from(importRuns)
+      .where(
+        and(
+          eq(importRuns.tenantId, args.tenantId),
+          eq(importRuns.entityKey, args.entityKey),
+          eq(importRuns.sourceFingerprint, args.sourceFingerprint),
+          sql`${importRuns.supersededAt} IS NULL`,
+          sql`${importRuns.status} <> 'abandoned'`,
+        ),
+      );
+
+    if (!existing) {
+      /**
+       * 🔴 THE INSERT WAS REFUSED AND NOTHING MATCHES THE PREDICATE. That is
+       * not a race this function can resolve — it means the index and this
+       * query disagree about which runs are live — and guessing would either
+       * start a duplicate run or lose the customer's file. Refusing names the
+       * disagreement instead.
+       */
+      throw new ImportRunError(
+        "This file already has a migration run in this workspace, and it could not be read " +
+          "back. Nothing has been started. Nothing has been lost either — the earlier run is " +
+          "still there — but this needs looking at rather than retrying.",
+      );
+    }
+
+    /**
+     * ⚠️ A DIFFERENT DUPLICATE MODE IS A DIFFERENT DECISION ABOUT LIVE DATA
+     * AND MUST NOT BE SILENTLY INHERITED. `skip` and `update` are the choice
+     * the customer makes about records they already have; resuming a `skip`
+     * run under `update` would overwrite rows the first attempt deliberately
+     * left alone, and the run report would name the mode they did not pick.
+     */
+    if (existing.duplicateMode !== args.duplicateMode) {
+      throw new ImportRunError(
+        `This file is already being imported into ${existing.entityKey} with "when a record ` +
+          `already exists" set to "${existing.duplicateMode}", and this attempt asks for ` +
+          `"${args.duplicateMode}". Nothing has been started. Finish or undo the first attempt, ` +
+          `or upload the file again once it has — changing that setting halfway would apply two ` +
+          `different decisions to one file.`,
+      );
+    }
+
+    const accounted =
+      existing.rowsWritten + existing.rowsSkipped + existing.rowsFailed;
+
+    return {
+      runId: existing.id,
+      resumed: true,
+      expectedRows: existing.expectedRows,
+      note:
+        `This file has already been started in this workspace, so it is being picked up rather ` +
+        `than imported a second time. ${accounted.toLocaleString("en-IN")} of ` +
+        `${existing.expectedRows.toLocaleString("en-IN")} row(s) have been accounted for so ` +
+        `far, and the rows already here will be recognised rather than duplicated.`,
+    };
   });
 }
 

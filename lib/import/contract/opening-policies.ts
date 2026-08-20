@@ -42,19 +42,49 @@ import type { ImportContract } from "../types";
 
 const openingTrialBalance: ImportContract = {
   /**
-   * ⚠️ NOTHING. And it is a decision, not an oversight.
+   * ══════════════════════════════════════════════════════════════════
+   * 🔴🔴 CHANGED BY PHASE 8, AND IT IS THE ONE EDIT IN THE MIGRATION
+   *      THAT MOVES EVERY OTHER TRACK'S WAVE NUMBER.
+   * ══════════════════════════════════════════════════════════════════
+   * This member used to be `[]`, and argued: "the chart of accounts is not
+   * imported , it is seeded when the workspace is created and edited in the
+   * product, so expressing it as a dependency on an entity that does not
+   * exist would put a permanent dangling key in the graph."
    *
-   * A trial balance names ACCOUNT CODES, and the chart of accounts is
-   * not imported — it is seeded when the workspace is created and edited
-   * in the product. So the file's prerequisite is a setup step rather
-   * than another import, and expressing it as a dependency on an entity
-   * that does not exist would put a permanent dangling key in the graph.
+   * 🔴 THE LAST CLAUSE IS THE ONE THAT EXPIRED. `chart-of-accounts` is an
+   *    entity as of Phase 8, so the key is no longer dangling , and
+   *    `checkImportContract()` refuses a dangling one by name, which is the
+   *    guard that makes this edit safe to make at all.
    *
-   * ⭐ THE TRIAL BALANCE IS THE FIRST WAVE OF EVERY MIGRATION for exactly
-   * this reason: it is the control total the other three are measured
-   * against, and it depends on nothing.
+   * ⭐ THE COST OF NOT MAKING IT IS NOT COSMETIC. Every line of a trial
+   * balance resolves `ledger_by_code` in the PREVIEW. With both entities in
+   * one wave the planner is free to offer the trial balance first, and a
+   * customer who took that order would see every line of a perfectly
+   * correct file refused with "that account was not found" , which reads as
+   * a problem with their data.
+   *
+   * ⚠️ THE EDGE IS `hard`, NOT `soft`. A soft edge says the rows succeed and
+   * are less complete. These rows do not succeed: they fail, all of them,
+   * one error each.
+   *
+   * ⚠️ AND NOTHING BEHIND IT MOVES, WHICH IS WORTH STATING BECAUSE THE
+   * OBVIOUS EXPECTATION IS WRONG. `opening-customer-invoices` and
+   * `opening-vendor-bills` depend on the trial balance SOFTLY, and only
+   * hard edges constrain the order. Their hard edges are on `companies` and
+   * `gst-parties`, still wave 0, so they stay in wave 1 rather than moving
+   * to wave 2. Phase 8's first draft said wave 2 and the checker caught it.
    */
-  dependsOn: [],
+  dependsOn: [
+    {
+      entity: "chart-of-accounts",
+      strength: "hard",
+      because:
+        "Every line of a trial balance names an account by its code, and a line " +
+        "whose code is not already in your chart of accounts is refused before " +
+        "anything is written. Load your chart of accounts first, or every line " +
+        "comes back saying the account was not found.",
+    },
+  ],
   reversal: {
     kind: "reverse-entry",
     escapes:
@@ -212,12 +242,41 @@ const openingStock: ImportContract = {
     },
   ],
   reversal: {
-    kind: "delete",
+    /**
+     * ══════════════════════════════════════════════════════════════════
+     * 🔴 WAS `delete`. PHASE 2 ASKED THE DATABASE AND THE DATABASE SAID NO.
+     * ══════════════════════════════════════════════════════════════════
+     * `stock_movements` carries `trg_stock_ledger_append_only`, BEFORE
+     * DELETE OR UPDATE, SECURITY DEFINER, with no condition on role or
+     * session. Its first statement raises:
+     *
+     *   "Stock movements cannot be deleted. … To correct it, post a
+     *    REVERSAL for the opposite quantity with reverses_movement_id = %"
+     *
+     * So the declared undo was not risky or lossy , it was REFUSED, every
+     * time, for every role, and had been since the entity was written. The
+     * old `escapes` sentence described in detail the consequences of a
+     * deletion that cannot occur.
+     *
+     * ⚠️ CI GATE 29 PASSED AND ALWAYS WOULD HAVE. `checkImportContract()`
+     * is pure , its header says so twice, and being pure is what lets the
+     * wizard run it in a browser. A pure checker cannot ask `pg_trigger`
+     * anything. The contract was internally coherent and externally false,
+     * and only executing it against a real database could tell.
+     *
+     * ⭐ A SECOND, INDEPENDENT REASON. `trg_refresh_stock_balance` is AFTER
+     * INSERT only, so even with the guard removed, deleting a movement
+     * would leave `stock_balances` holding the opening quantity for ever ,
+     * a balance no movement explains, which is the thing `stock_movements`
+     * exists to make impossible.
+     */
+    kind: "reverse-entry",
     escapes:
-      "Deleting an opening stock movement changes the current quantity on hand for that item. If anything has been sold or received since the import, the resulting balance is correct but the movement history has a gap where the opening sat.",
+      "The reversing movement stays in the stock ledger permanently. Undoing opening stock leaves two movements visible, the opening and its reversal, not none, because a stock history that can be rewritten is a stock history that proves nothing.",
     because:
-      "`stock_movements` rows created by this run did not exist before it. It is not an append-only ledger in the accounting sense — but the escape above is real and the customer is told before the run, not after.",
+      "`stock_movements` is append-only and the database enforces it: `trg_stock_ledger_append_only` refuses every DELETE and every UPDATE, for every role, and its own message names the remedy, post a reversal with `reverses_movement_id`. `delete` was declared here until Phase 2 asked the database; it would have been refused on the first row of every undo.",
   },
+
   provenance: { targets: ["stock_movements"], cardinality: "one-to-one" },
   requiredness: {
     /**

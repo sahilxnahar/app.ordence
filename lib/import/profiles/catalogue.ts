@@ -203,20 +203,34 @@ export const TALLY_PROFILE: SourceProfile = {
       id: "ledger-masters",
       title: "The ledgers themselves, as accounts rather than as a balance",
       destination: {
-        kind: "not-yet-importable",
-        plannedEntity: "chart-of-accounts",
-        because:
-          "Ordence has no chart-of-accounts importer yet. Bring the ledgers across as an opening " +
-          "trial balance instead, which carries the same names and their positions.",
+        /*
+         * ⭐ CLOSED BY INTEGRATION AT PHASE 8. This read
+         * `not-yet-importable` with `plannedEntity: "chart-of-accounts"`,
+         * and Phase 9's own gate refused it the moment Phase 8 registered
+         * that entity: "the phase that built it did not come back. The
+         * customer is being told Ordence cannot take a file it can take."
+         *
+         * ⚠️ THAT REFUSAL IS WHY THE MEMBER IS A DISCRIMINATED UNION rather
+         * than a boolean. Nothing else in the product would have noticed
+         * that a sentence on the customer's screen had become false.
+         */
+        kind: "entity",
+        entity: "chart-of-accounts",
       },
       signature: ["Ledger Name", "Under", "Opening Balance"],
       headers: [
-        { spelling: "Ledger Name", field: "accountName" },
-        { spelling: "Under", field: "parentAccount" },
-        { spelling: "Opening Balance", field: "openingBalanceMinor" },
+        { spelling: "Ledger Name", field: "name" },
       ],
       fileNameHints: ["ledgermaster", "chartofaccounts", "masters"],
-      missingRequired: [],
+      /*
+       * ⚠️ DECLARED, NOT DISCOVERED AT UPLOAD. Phase 8's chart-of-accounts
+       * requires a code and an account type. A Tally ledger-masters export
+       * carries neither , Tally groups ledgers "Under" a parent rather than
+       * classifying them asset/liability/equity/revenue/expense, and it has
+       * no account code at all. Left undeclared, the customer would be told
+       * this export is supported and find out at upload.
+       */
+      missingRequired: ["code", "accountType"],
     },
   ],
 };
@@ -557,18 +571,25 @@ export const ZOHO_BOOKS_PROFILE: SourceProfile = {
       id: "chart-of-accounts",
       title: "Accountant → Chart of Accounts → Export",
       destination: {
-        kind: "not-yet-importable",
-        plannedEntity: "chart-of-accounts",
-        because:
-          "Ordence has no chart-of-accounts importer yet. The account names and codes come " +
-          "across on the opening trial balance instead.",
+        /*
+         * ⭐ CLOSED BY INTEGRATION AT PHASE 8. This read
+         * `not-yet-importable` with `plannedEntity: "chart-of-accounts"`,
+         * and Phase 9's own gate refused it the moment Phase 8 registered
+         * that entity: "the phase that built it did not come back. The
+         * customer is being told Ordence cannot take a file it can take."
+         *
+         * ⚠️ THAT REFUSAL IS WHY THE MEMBER IS A DISCRIMINATED UNION rather
+         * than a boolean. Nothing else in the product would have noticed
+         * that a sentence on the customer's screen had become false.
+         */
+        kind: "entity",
+        entity: "chart-of-accounts",
       },
       signature: ["Account Name", "Account Type", "Account Code"],
       headers: [
-        { spelling: "Account Name", field: "accountName" },
-        { spelling: "Account Code", field: "accountCode" },
+        { spelling: "Account Name", field: "name" },
+        { spelling: "Account Code", field: "code" },
         { spelling: "Account Type", field: "accountType" },
-        { spelling: "Parent Account", field: "parentAccount" },
       ],
       fileNameHints: ["chart_of_accounts", "chartofaccounts", "accounts"],
       missingRequired: [],
@@ -836,16 +857,24 @@ export const XERO_PROFILE: SourceProfile = {
       id: "chart-of-accounts",
       title: "Accounting → Chart of Accounts → Export",
       destination: {
-        kind: "not-yet-importable",
-        plannedEntity: "chart-of-accounts",
-        because:
-          "Ordence has no chart-of-accounts importer yet. The codes and names come across on the " +
-          "opening trial balance instead.",
+        /*
+         * ⭐ CLOSED BY INTEGRATION AT PHASE 8. This read
+         * `not-yet-importable` with `plannedEntity: "chart-of-accounts"`,
+         * and Phase 9's own gate refused it the moment Phase 8 registered
+         * that entity: "the phase that built it did not come back. The
+         * customer is being told Ordence cannot take a file it can take."
+         *
+         * ⚠️ THAT REFUSAL IS WHY THE MEMBER IS A DISCRIMINATED UNION rather
+         * than a boolean. Nothing else in the product would have noticed
+         * that a sentence on the customer's screen had become false.
+         */
+        kind: "entity",
+        entity: "chart-of-accounts",
       },
       signature: ["*Code", "*Name", "*Type"],
       headers: [
-        { spelling: "*Code", field: "accountCode" },
-        { spelling: "*Name", field: "accountName" },
+        { spelling: "*Code", field: "code" },
+        { spelling: "*Name", field: "name" },
         { spelling: "*Type", field: "accountType" },
         { spelling: "Description", field: "description" },
       ],

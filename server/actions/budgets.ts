@@ -133,6 +133,7 @@ import {
   type BudgetTotals,
   type BudgetVsActualRow,
 } from "@/lib/accounting/budget";
+import { costCentreSchema } from "@/lib/validators/budgets";
 import type { ActionResult } from "@/lib/validators/crm";
 
 /* ------------------------------------------------------------------ */
@@ -171,12 +172,14 @@ export type CostCentreRow = {
   displayOrder: number;
 };
 
-const costCentreInput = z.object({
-  code: z.string().trim().min(1).max(40),
-  name: z.string().trim().min(1).max(200),
-  description: z.string().trim().max(1_000).optional(),
-  displayOrder: z.number().int().min(0).max(100_000).default(100),
-});
+/*
+ * ⭐⭐ PHASE 8 , MOVED TO `lib/validators/budgets.ts`.
+ *
+ * ⚠️ IT WAS DECLARED HERE AND COULD NOT BE EXPORTED , this file is
+ * `"use server"`. The cost-centre importer must parse THE SAME OBJECT this
+ * action parses rather than a copy of it; see that file's header.
+ */
+const costCentreInput = costCentreSchema;
 
 /**
  * ⭐ ARCHIVED ONES ARE RETURNED TOO, FLAGGED RATHER THAN OMITTED.

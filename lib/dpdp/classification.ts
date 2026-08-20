@@ -705,6 +705,110 @@ const IMPORT_MAPPING_PROPOSALS: TableClassification = {
 };
 
 /* ================================================================== */
+/* db/schema/import-runs.ts — SQL 0205 to 0210 · PHASE 2              */
+/* ------------------------------------------------------------------ */
+/* ⭐ THE MIGRATION LEDGER: what a run wrote, what the rows said       */
+/* before it, and what an undo could not put back.                     */
+/* ================================================================== */
+
+/**
+ * ⭐ THE SIDECAR. One row per row a migration wrote: which run, which
+ * input line, which destination table and id, and whether the run created
+ * that row or overwrote one that already existed.
+ *
+ * ⚠️ IT HOLDS NO PERSONAL DATA OF ITS OWN — no name, no address, no
+ * value — and it is NOT classified `operational` for the same reason
+ * `import_run_chunks` is not: it is a POINTER at rows that do, in a table
+ * chosen at run time. An erasure planner that treated it as unrelated
+ * would remove a person's `contacts` row and leave behind a record saying
+ * which file and which line it came from, keyed by an id that no longer
+ * resolves — evidence of an erased person, surviving the erasure.
+ *
+ * 🔴 AND `target_id` IS THE PART THAT MATTERS FOR A DATA-PRINCIPAL
+ * EXPORT. "Where did my record come from?" is a question a data principal
+ * may ask, and this table is the only thing in the product that can
+ * answer it.
+ */
+const IMPORT_ROW_PROVENANCE: TableClassification = {
+  table: "import_row_provenance",
+  scope: "tenant",
+  holds: "personal",
+  reaches: [
+    { via: "parent", column: "run_id", table: "import_runs" },
+  ],
+  retention: "companies-act-128-5",
+};
+
+/**
+ * 🔴🔴 THE MOST PERSONAL-DATA-CARRYING TABLE IN THIS BATCH, AND THE
+ *      DETECTOR DOES NOT SEE IT.
+ *
+ * `prior_values` is a VERBATIM COPY of a destination row as it stood
+ * before a migration overwrote it. For the two contracted entities that
+ * declare `restore-prior`, `capturePriorFields` is `["*"]` — so a row
+ * here is a whole `companies` record, address and all, or a whole
+ * `gst_parties` record including its GSTIN and PAN.
+ *
+ * ⚠️ `scripts/check-data-classification.mjs` DID NOT FLAG THIS TABLE.
+ * Its 41 rules match on COLUMN NAMES, and no rule matches `prior_values`
+ * — `freeform-jsonb` looks for `detail`, `details`, `payload`,
+ * `metadata`, `raw` and `lines`. A column that holds an entire copy of
+ * another table under a name the detector has never heard of is invisible
+ * to it. The entry below is written because the table needs it, not
+ * because the gate asked; the gap itself is written up in
+ * PATCH-REQUEST-PHASE-2.md, because the next phase to store a customer
+ * record under an unusual column name will hit it too.
+ *
+ * ⚠️ ERASURE HAS TO REACH IT. Erasing a person from `contacts` while a
+ * verbatim pre-migration copy of their record sits here would be an
+ * erasure that removed the visible copy and kept the hidden one.
+ */
+const IMPORT_ROW_PRIOR_VALUES: TableClassification = {
+  table: "import_row_prior_values",
+  scope: "tenant",
+  holds: "personal",
+  reaches: [
+    { via: "parent", column: "run_id", table: "import_runs" },
+  ],
+  retention: "companies-act-128-5",
+};
+
+/**
+ * ⭐ ONE ATTEMPT TO UNDO ONE MIGRATION. `requested_by` is a person, which
+ * is what the detector matched on; the rest is counts and a sentence.
+ */
+const IMPORT_REVERSALS: TableClassification = {
+  table: "import_reversals",
+  scope: "tenant",
+  holds: "personal",
+  reaches: [
+    { via: "column", column: "requested_by", principal: "user" },
+    { via: "parent", column: "run_id", table: "import_runs" },
+  ],
+  retention: "companies-act-128-5",
+};
+
+/**
+ * ⭐ THE ROWS AN UNDO COULD NOT UNDO, AND WHAT BLOCKED EACH ONE.
+ *
+ * ⚠️ `blocked_by` IS THE DATABASE'S OWN ERROR MESSAGE, AND POSTGRES PUTS
+ * VALUES IN THOSE. A unique-violation detail names the conflicting key; a
+ * check-constraint violation prints the whole failing row. So this column
+ * can and does contain fragments of customer records, and classifying it
+ * `operational` because "it is only an error message" would be exactly
+ * wrong.
+ */
+const IMPORT_REVERSAL_FAILURES: TableClassification = {
+  table: "import_reversal_failures",
+  scope: "tenant",
+  holds: "personal",
+  reaches: [
+    { via: "parent", column: "reversal_id", table: "import_reversals" },
+  ],
+  retention: "companies-act-128-5",
+};
+
+/* ================================================================== */
 /* db/schema/drawings.ts — SQL 0118 · WAVE 7                          */
 /* ------------------------------------------------------------------ */
 /* ⭐ THE DRAWING REGISTER. The DRAWINGS are the customer's technical  */
@@ -4099,6 +4203,10 @@ export const CLASSIFICATION: readonly TableClassification[] = [
   IMPORT_RUNS,
   IMPORT_RUN_CHUNKS,
   IMPORT_MAPPING_PROPOSALS,
+  IMPORT_ROW_PROVENANCE,
+  IMPORT_ROW_PRIOR_VALUES,
+  IMPORT_REVERSALS,
+  IMPORT_REVERSAL_FAILURES,
   DRAWINGS,
   DRAWING_REVISIONS,
   DRAWING_MARKUPS,

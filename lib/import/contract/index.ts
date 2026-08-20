@@ -13,4 +13,3 @@ export type { ImportOrderStep, ImportOrderResult } from "./graph";
 export { checkImportContract } from "./check";
 export type { ContractProblem, ContractCheckResult } from "./check";
 export { OPENING_CONTRACTS } from "./opening-policies";
-export { CONTACTS_WORKED_EXAMPLE } from "./worked-example";

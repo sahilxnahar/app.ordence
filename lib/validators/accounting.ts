@@ -189,3 +189,48 @@ export const postTransactionSchema = z
   });
 
 export type PostTransactionInput = z.input<typeof postTransactionSchema>;
+
+/* ------------------------------------------------------------------ */
+/* ⭐⭐ PHASE 8 , THE CHART OF ACCOUNTS                                  */
+/* ------------------------------------------------------------------ */
+
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 MOVED HERE FROM `server/actions/accounting.ts`. NOT COPIED.
+ * ══════════════════════════════════════════════════════════════════════
+ * It was declared there and could not have been exported, for the reason
+ * that file states at its own top: a `"use server"` file may only export
+ * async functions, and a schema exported from one is compiled into a
+ * public RPC endpoint. So the rule deciding what a ledger is had exactly
+ * one possible caller.
+ *
+ * ⚠️ THE SECOND CALLER IS THE ONE THE IMPORT FRAMEWORK FORBIDS A COPY FOR.
+ * `lib/import/types.ts`: "THE SAME SCHEMA THE SINGLE-RECORD SERVER ACTION
+ * PARSES. NOT A COPY, NOT AN 'IMPORT VARIANT', NOT A LOOSER ONE." An
+ * account is the one record every later number in this product is
+ * classified by.
+ *
+ * 🔴 IT MOVED. The original is deleted rather than left behind: two copies
+ *    starting identical is the only state in which nobody notices there
+ *    are two. No rule changed in the move.
+ */
+export const createLedgerSchema = z.object({
+  name: z.string().trim().min(1).max(200),
+  code: z.string().trim().min(1).max(40).regex(/^[A-Za-z0-9._-]+$/, "Use letters, numbers, dot, dash or underscore."),
+  description: z.string().trim().max(1_000).optional(),
+  type: z.enum(["operating", "trust", "escrow", "retention", "suspense"]).default("operating"),
+  accountType: z.enum(["asset", "liability", "equity", "revenue", "expense"]),
+  currency: z.string().length(3).default("INR"),
+  requiresReconciliation: z.boolean().default(false),
+  bankDetails: z
+    .object({
+      bankName: z.string().trim().max(200).optional(),
+      accountNumber: z.string().trim().max(40).optional(),
+      ifsc: z.string().trim().max(20).optional(),
+      branch: z.string().trim().max(200).optional(),
+      accountHolder: z.string().trim().max(200).optional(),
+    })
+    .default({}),
+});
+
+export type CreateLedgerInput = z.input<typeof createLedgerSchema>;
