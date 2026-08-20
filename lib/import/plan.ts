@@ -62,8 +62,7 @@ import type {
   ImportEntityDefinition,
   ImportPlan,
   ImportRowError,
-  ImportRowPlan,
-} from "./types";
+  ImportRowPlan, ImportNaturalKey } from "./types";
 /*
  * ⚠️ RULE 4 IS NOT BROKEN BY THIS IMPORT, AND THE DISTINCTION IS THE
  * WHOLE DESIGN. `lib/fx/currency.ts` is a pure module — no `server-only`,
@@ -474,8 +473,28 @@ export function planImportRecords(
     const parsedPayload = result.data as Record<string, unknown>;
     const naturalKey = entity.naturalKey(parsedPayload);
 
+    /*
+     * ⭐⭐⭐ WAVE 3A , THE PAIR, NOT THE KEY.
+     *
+     * 🔴 THIS BLOCK USED TO KEY ON `naturalKey` ALONE, AND THAT LOST A
+     *    LINE OFF EVERY MULTI-LINE VOUCHER. For a journal the thing that
+     *    must not be created twice is the VOUCHER, so every leg carries
+     *    the same natural key , and the second leg was refused as a
+     *    duplicate of the first, before the database ever saw it.
+     *
+     * ⭐ `documentKey` separates the two questions. When an entity
+     * declares one, the in-file check keys on the PAIR: two legs on two
+     * accounts are two rows, and two legs on ONE account is still the
+     * mistake it always was. When it does not , which is almost every
+     * entity , the composite is exactly what it was before, so nothing
+     * about the existing eighteen changes by one character.
+     */
+    const documentKey = entity.documentKey?.(parsedPayload) ?? null;
+
     if (naturalKey) {
-      const composite = `${naturalKey.kind}:${naturalKey.value}`;
+      const composite = documentKey
+        ? `${documentKey.kind}:${documentKey.value}||${naturalKey.kind}:${naturalKey.value}`
+        : `${naturalKey.kind}:${naturalKey.value}`;
       const firstAt = seen.get(composite);
       if (firstAt !== undefined) {
         rows.push({
@@ -484,11 +503,23 @@ export function planImportRecords(
           errors: [
             {
               column: null,
-              message:
-                `This is the same ${entity.noun.one} as row ${firstAt} — both have ` +
-                `${naturalKey.label}. Only one row per ${entity.noun.one} can be ` +
-                `imported in a single file; decide which of the two is right and ` +
-                `delete the other.`,
+              /*
+               * ⚠️ TWO SENTENCES, BECAUSE THEY ARE TWO DIFFERENT
+               * MISTAKES. Without a document the customer has the same
+               * thing twice in one file. WITH one, they have the same
+               * line twice inside one voucher , and telling them "only
+               * one row per journal entry can be imported" would send
+               * them to delete a leg their voucher needs.
+               */
+              message: documentKey
+                ? `This is the same line as row ${firstAt}: both are ` +
+                  `${naturalKey.label} within ${documentKey.label}. A document may ` +
+                  `name each of its lines once; decide which of the two is right ` +
+                  `and delete the other.`
+                : `This is the same ${entity.noun.one} as row ${firstAt} , both have ` +
+                  `${naturalKey.label}. Only one row per ${entity.noun.one} can be ` +
+                  `imported in a single file; decide which of the two is right and ` +
+                  `delete the other.`,
             },
           ],
         });
@@ -503,6 +534,7 @@ export function planImportRecords(
       errors: [],
       payload: parsedPayload,
       naturalKey,
+      documentKey,
       label: entity.rowLabel(parsedPayload),
       /*
        * ⭐ BATCH 58. What this row REFERS to — an account code, a
@@ -580,4 +612,57 @@ export function planImportRecords(
     rows: fileFatal ? [] : rows,
     fatal: fileFatal,
   };
+}
+
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * ⭐⭐ WAVE 3A , THE ROWS, GROUPED INTO THE DOCUMENTS THEY BELONG TO
+ * ══════════════════════════════════════════════════════════════════════
+ * A journal file is many documents. The writer cannot post a voucher one
+ * leg at a time , a transaction with one leg does not balance, and the
+ * deferred constraint refuses it at COMMIT , so it needs the legs
+ * together.
+ *
+ * ⚠️ ORDER IS PRESERVED, AND IT IS NOT COSMETIC. Groups come back in the
+ * order their FIRST row appeared, and rows within a group keep their file
+ * order. The failed-rows CSV, the report and the customer's own
+ * spreadsheet all number from the top; a writer that reordered them would
+ * make "row 12" mean two different things on two screens.
+ *
+ * ⚠️ ROWS WITH ERRORS ARE NOT GROUPED. They have no payload, so they have
+ * no document to belong to. Whether one bad leg refuses its whole voucher
+ * is the WRITER's decision, not this function's , and it is the same
+ * question `atomic` answers for a whole file.
+ *
+ * 🔴 AN ENTITY WITH NO `documentKey` RETURNS ONE GROUP PER ROW, which is
+ *    exactly what the write path already does. So a caller can group
+ *    unconditionally and the eighteen existing entities behave as they
+ *    always did.
+ */
+export function groupByDocument(
+  rows: readonly ImportRowPlan[],
+): readonly { key: ImportNaturalKey | null; rows: readonly ImportRowPlan[] }[] {
+  const out: { key: ImportNaturalKey | null; rows: ImportRowPlan[] }[] = [];
+  const index = new Map<string, number>();
+
+  for (const row of rows) {
+    if (row.errors.length > 0 || !row.payload) continue;
+
+    const key = row.documentKey ?? null;
+    if (!key) {
+      out.push({ key: null, rows: [row] });
+      continue;
+    }
+
+    const composite = `${key.kind}:${key.value}`;
+    const at = index.get(composite);
+    if (at === undefined) {
+      index.set(composite, out.length);
+      out.push({ key, rows: [row] });
+    } else {
+      out[at]!.rows.push(row);
+    }
+  }
+
+  return out;
 }

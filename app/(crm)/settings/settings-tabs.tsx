@@ -28,6 +28,15 @@ const TABS = [
   // (a separate "my account" area) would be one screen deep for one
   // control.
   { href: "/settings/appearance", label: "Appearance" },
+  /*
+   * ⭐ WAVE 2E. The WORKSPACE's logo and colour , distinct from
+   * "Appearance" one line above, which is a PERSONAL light/dark choice
+   * stored on the user row. One is what this company looks like to its
+   * customers; the other is what this person's screen looks like. Two
+   * tabs, because merging them would put a setting one person changes
+   * next to a setting that changes what every customer sees.
+   */
+  { href: "/settings/branding", label: "Branding" },
   // ⚠️ THE DEFINITIONS, NOT THE RECORDS. `/objects` is where the records
   // live and is reached from the main navigation; this tab is where the
   // shapes are inspected. Two routes, two questions.

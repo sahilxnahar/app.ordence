@@ -1,6 +1,7 @@
 "use client";
 
 import Link from "next/link";
+import { BrandLogo } from "@/components/branding/brand-logo";
 import { usePathname } from "next/navigation";
 import { Icon } from "./icon";
 import { cn } from "@/lib/utils";
@@ -14,10 +15,13 @@ export function Sidebar({
   sections,
   industryLabel,
   tenantName,
+  logoSrc = null,
 }: {
   sections: NavSection[];
   industryLabel: string;
   tenantName: string;
+  /** Null for a workspace with no logo , the name is shown instead. */
+  logoSrc?: string | null;
 }) {
   const pathname = usePathname();
 
@@ -27,7 +31,13 @@ export function Sidebar({
       className="flex h-full w-60 shrink-0 flex-col border-r border-border bg-card"
     >
       <div className="border-b border-border px-4 py-3">
-        <p className="truncate text-sm font-semibold">{tenantName}</p>
+        {/*
+              ⚠️ THE NAME IS THE FALLBACK AND IS ALWAYS AVAILABLE. This
+              header is how a person knows WHICH WORKSPACE THEY ARE IN; an
+              `<img>` that 404s after a bucket move would otherwise leave
+              an empty box in the one place that answers that question.
+            */}
+            <BrandLogo src={logoSrc} tenantName={tenantName} height={24} />
         <p className="truncate text-xs text-muted-foreground">{industryLabel}</p>
       </div>
 

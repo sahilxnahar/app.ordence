@@ -46,6 +46,10 @@
 import { Suspense } from "react";
 import { LayoutDashboard } from "lucide-react";
 import { requirePageContext } from "@/server/tenant-context";
+import { redirect } from "next/navigation";
+import { BrandWatermark } from "@/components/branding/brand-watermark";
+import { logoSrc } from "@/lib/branding/logo";
+import { shouldPromptBrandingSetup, BRANDING_SETUP_PATH } from "@/lib/branding/first-run";
 import { resolveIndustryTemplate } from "@/lib/industry-templates";
 import {
   HeadlineTiles,
@@ -77,13 +81,40 @@ export default async function DashboardPage() {
   // the session already implies, and the header cannot render without it.
   const ctx = await requirePageContext();
 
+  /*
+   * ⭐ WAVE 2E , THE FIRST RUN, ONCE AND ONLY FOR SOMEBODY WHO CAN ACT.
+   *
+   * The whole rule lives in `shouldPromptBrandingSetup()`, in `lib/`,
+   * where it can be exercised against every combination of role and
+   * stored branding without a browser.
+   *
+   * ⚠️ A MEMBER IS NEVER SENT. They cannot pass `settings:update`, so
+   * they would land on a form they cannot submit , which is worse than
+   * not being asked. And skipping counts as deciding: the prompt does
+   * not come back, because a setup screen that reappears every morning
+   * is a setup screen people learn to dismiss without reading.
+   */
+  if (shouldPromptBrandingSetup({ branding: ctx.tenant.branding, role: ctx.role })) {
+    redirect(BRANDING_SETUP_PATH);
+  }
+
   const settings = (ctx.tenant.settings ?? {}) as Record<string, unknown>;
   const template = resolveIndustryTemplate(settings.industry);
 
   const firstName = ctx.user.firstName?.trim();
 
   return (
-    <main className="space-y-8 p-6">
+    <main className="relative space-y-8 p-6">
+      {/*
+        ⚠️ BEHIND, AND OUT OF THE WAY. Bottom-right, at most 4% opacity,
+        `aria-hidden`, `pointer-events-none`, hidden below `lg`.
+
+        🔴 A WASH UNDER THE METRIC CARDS WOULD REDUCE THE CONTRAST OF THE
+        FIGURES, which is the opposite of what a ledger is for. A
+        watermark that makes a number harder to read has cost more than
+        the branding is worth.
+      */}
+      <BrandWatermark src={logoSrc(ctx.tenant.branding)} />
       {/* ── HEADER ───────────────────────────────────────────────── */}
       <header>
         <p className="flex items-center gap-2 text-xs uppercase tracking-wide text-muted-foreground">

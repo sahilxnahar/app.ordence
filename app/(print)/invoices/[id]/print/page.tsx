@@ -18,6 +18,9 @@
  */
 
 import { notFound } from "next/navigation";
+import { getTenantContext } from "@/server/tenant-context";
+import { BrandLogo } from "@/components/branding/brand-logo";
+import { logoSrc } from "@/lib/branding/logo";
 import Link from "next/link";
 import { getInvoiceForPrint } from "@/server/actions/sales-invoices";
 import { addressLines, formatGstin } from "@/lib/invoicing/print";
@@ -63,6 +66,7 @@ export default async function InvoicePrintPage({
   if (!result.ok) notFound();
 
   const { invoice, supplier, recipient, lines, hsnSummary, copies, gaps } = result.data;
+  const ctx = await getTenantContext();
   const isDraft = invoice.status === "draft";
   const igst = invoice.igstMinor !== "0";
   const stateHead = invoice.isUnionTerritory ? "UTGST" : "SGST";
@@ -107,6 +111,31 @@ export default async function InvoicePrintPage({
           )}
 
           <header className="relative border-b-2 border-black pb-2">
+            {/*
+              ⭐ WAVE 2E , the placement customers care about most.
+
+              ⚠️ A KNOWN AND DELIBERATE LIMITATION. This prints the
+              workspace's CURRENT logo, so reprinting a two-year-old
+              invoice shows today's logo rather than the one that was on
+              the original. Everything else on this page is captured at
+              issue , the supplier registration, the address, the GSTIN ,
+              precisely because it must not drift. Capturing the logo per
+              invoice needs a column on the invoice row, which is a
+              migration nobody has written.
+
+              🔴 THE COLOURS ARE NOT APPLIED TO PAPER AT ALL.
+              `.document-surface` re-pins the palette so a printed
+              document stays legible whatever a workspace's brand is.
+            */}
+            {ctx ? (
+              <div className="absolute left-0 top-0">
+                <BrandLogo
+                  src={logoSrc(ctx.tenant.branding)}
+                  tenantName={ctx.tenant.name}
+                  height={36}
+                />
+              </div>
+            ) : null}
             <p className="text-center text-[13px] font-bold uppercase tracking-wide">
               Tax Invoice
             </p>

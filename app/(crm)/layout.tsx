@@ -44,6 +44,8 @@ import { checkFeatures } from "@/server/entitlements";
 import { requiredFeatureKeys } from "@/lib/modules/registry";
 import { filterNavigationByEntitlement } from "@/lib/modules/nav";
 import { Sidebar } from "@/components/layout/sidebar";
+import { BrandScope } from "@/components/branding/brand-scope";
+import { logoSrc } from "@/lib/branding/logo";
 import { IndustryProvider } from "@/components/layout/industry-provider";
 import { NotificationBell } from "@/components/layout/notification-bell";
 import { CommandBar } from "@/components/layout/command-bar";
@@ -204,6 +206,23 @@ export default async function CrmLayout({
       <CommandBar />
       <SearchTriggerBridge />
 
+      {/*
+        ⭐⭐ WAVE 2E , THE BRANDED SUBTREE, AND ITS BOUNDARY.
+
+        Custom properties inherit, so everything inside this wrapper gets
+        the workspace's accent colours and everything outside keeps the
+        product's own.
+
+        🔴 `app/platform/**` IS OUTSIDE IT, DELIBERATELY. An operator
+        console wearing one customer's colours is a console where somebody
+        does the right thing in the wrong workspace.
+
+        ⚠️ `className="contents"` MATTERS. The wrapper must not become a
+        flex or height boundary of its own; `display: contents` keeps the
+        existing layout geometry byte-identical while still carrying the
+        custom properties down.
+      */}
+      <BrandScope branding={tenant.branding} className="contents">
       <div className="flex h-screen flex-col overflow-hidden">
         {/*
           ⭐⭐⭐ THE CUSTOMER'S OWN SUPPORT-ACCESS NOTICE — Batch 28.
@@ -268,11 +287,13 @@ export default async function CrmLayout({
             sections={sections}
             industryLabel={template.label}
             tenantName={tenant.name}
+            logoSrc={logoSrc(tenant.branding)}
           />
           <MobileSidebar
             sections={sections}
             industryLabel={template.label}
             tenantName={tenant.name}
+            logoSrc={logoSrc(tenant.branding)}
           />
 
           <div className="flex min-w-0 flex-1 flex-col">
@@ -318,6 +339,7 @@ export default async function CrmLayout({
           </div>
         </div>
       </div>
+      </BrandScope>
     </IndustryProvider>
   );
 }

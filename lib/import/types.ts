@@ -750,6 +750,61 @@ export type ImportEntityDefinition = {
   /** See `ImportNaturalKey`. Runs on the PARSED payload, post-Zod. */
   naturalKey: (parsed: Record<string, unknown>) => ImportNaturalKey | null;
 
+  /**
+   * ══════════════════════════════════════════════════════════════════
+   * ⭐⭐⭐ WAVE 3A , MANY DOCUMENTS PER FILE
+   * ══════════════════════════════════════════════════════════════════
+   * 🔴 THE FRAMEWORK HAD EXACTLY TWO SHAPES AND A JOURNAL IS NEITHER.
+   *
+   *   one document per FILE   `writeFile`  , the opening trial balance
+   *   one document per ROW    `writeRow`   , everything else
+   *
+   * A general journal export is **many documents per file**: R lines
+   * across V vouchers, each voucher one balanced transaction. Phase 8
+   * measured what that costs today, by executing the planner:
+   *
+   *     ① two legs of ONE voucher, planned:
+   *        row 2: errors=0
+   *        row 3: errors=1  "This is the same account as row 2 , both have
+   *                          voucher JV-0001. Only one row per account can
+   *                          be imported in a single file."
+   *
+   *    **A two-line voucher loses its second line before it reaches the
+   *    database.**
+   *
+   * ⚠️ AND THE CAUSE IS THAT TWO DIFFERENT QUESTIONS WERE SHARING ONE
+   *    KEY. `naturalKey` answers "what must not be created twice", and
+   *    for a journal that is the VOUCHER , so every leg of one voucher
+   *    carries the same key and the second is refused as a duplicate of
+   *    the first.
+   *
+   * ⭐ SO THE QUESTIONS ARE SEPARATED. `documentKey` is what must not
+   * exist twice; `naturalKey` becomes what identifies this ROW WITHIN
+   * that document. With both present:
+   *
+   *   · the in-file duplicate check keys on the PAIR, so two legs on
+   *     two accounts are two rows and two legs on ONE account is still
+   *     the mistake it always was;
+   *   · `findExisting` keys on `documentKey` alone , "is this voucher
+   *     already in the workspace";
+   *   · the writer receives rows GROUPED, one group per document.
+   *
+   * ⚠️ ABSENT ON ALMOST EVERY ENTITY, AND THAT IS CORRECT. A company is
+   * its own document. Only an entity whose file carries several
+   * documents declares this, and `checkImportContract()` refuses one
+   * that declares `documentKey` without a `naturalKey` , a document with
+   * no way to tell its lines apart is a document that can only ever have
+   * one line.
+   *
+   * 🔴 IT DOES NOT MAKE THE WRITER ATOMIC PER DOCUMENT ON ITS OWN. That
+   *    is `writeFile`'s job for a whole file and is the write path's job
+   *    per group; declaring this member says the rows GROUP, not that
+   *    the grouping is transactional. Whoever builds the grouped writer
+   *    owes that guarantee separately, and a half-written voucher is
+   *    worse than a refused one.
+   */
+  documentKey?: (parsed: Record<string, unknown>) => ImportNaturalKey | null;
+
   /** A short human label for a row in the report — the company's name. */
   rowLabel: (parsed: Record<string, unknown>) => string;
 
@@ -997,6 +1052,11 @@ export type ImportRowPlan = {
   /** Present only when `errors` is empty. */
   payload?: Record<string, unknown>;
   naturalKey?: ImportNaturalKey | null;
+  /**
+   * ⭐ WAVE 3A. Which document this row belongs to, when the entity has
+   * more than one per file. `null` for every entity that does not.
+   */
+  documentKey?: ImportNaturalKey | null;
   label?: string;
   /**
    * ⭐ BATCH 58 — what this row refers to. Computed by the pure layer,

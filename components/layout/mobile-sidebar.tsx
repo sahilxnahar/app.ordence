@@ -1,5 +1,6 @@
 "use client";
 import { useCallback, useEffect, useState } from "react";
+import { BrandLogo } from "@/components/branding/brand-logo";
 import { X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Sidebar } from "./sidebar";
@@ -67,10 +68,13 @@ export function MobileSidebar({
   sections,
   industryLabel,
   tenantName,
+  logoSrc = null,
 }: {
   sections: NavSection[];
   industryLabel: string;
   tenantName: string;
+  /** Null for a workspace with no logo , the name is shown instead. */
+  logoSrc?: string | null;
 }) {
   const [open, setOpen] = useSharedOpen();
 
@@ -109,7 +113,13 @@ export function MobileSidebar({
       <div className="absolute inset-y-0 left-0 flex w-64 animate-in slide-in-from-left duration-200">
         <div className="flex h-full flex-col border-r border-border bg-background">
           <div className="flex items-center justify-between border-b border-border px-3 py-2">
-            <p className="truncate text-sm font-semibold">{tenantName}</p>
+            {/*
+              ⚠️ THE NAME IS THE FALLBACK AND IS ALWAYS AVAILABLE. This
+              header is how a person knows WHICH WORKSPACE THEY ARE IN; an
+              `<img>` that 404s after a bucket move would otherwise leave
+              an empty box in the one place that answers that question.
+            */}
+            <BrandLogo src={logoSrc} tenantName={tenantName} height={24} />
             <Button
               variant="ghost"
               size="icon"

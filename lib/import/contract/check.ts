@@ -229,6 +229,29 @@ export function checkImportContract(
       }
     }
 
+    /* ---- a document must be able to tell its lines apart ---- */
+    /*
+     * 🔴 WAVE 3A. `documentKey` says "this file carries several
+     *    documents"; `naturalKey` says "this is which line". An entity
+     *    with the first and not the second is a document whose lines are
+     *    indistinguishable , so the in-file duplicate check has nothing
+     *    to pair the document with, every leg after the first collapses
+     *    onto the same composite, and the framework loses exactly the
+     *    lines this member was added to save.
+     *
+     * ⚠️ `naturalKey` is a REQUIRED member of the type, so it always
+     * exists as a function , what cannot be checked here is whether it
+     * ever returns non-null, because that needs a row. The gate checks
+     * what a declaration can prove and says so rather than implying more.
+     */
+    if (typeof def.documentKey === "function" && typeof def.naturalKey !== "function") {
+      problems.push({
+        entity: key,
+        member: "documentKey",
+        problem: `declares documentKey but has no naturalKey. documentKey says a file carries several documents; naturalKey says which line this is. Without the second, every line of a document keys the same and all but the first are refused as duplicates , which is the defect documentKey exists to remove.`,
+      });
+    }
+
     /* ---- the recommended duplicate mode is one that is offered ---- */
     if (!modes.includes(c.duplicateDecision.recommended)) {
       problems.push({
