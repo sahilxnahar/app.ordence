@@ -197,78 +197,126 @@
         "lib/import/contract/**"
       ]
     },
-    "M2": {
-      "name": "Import ledger",
+    "PHASE-1": {
+      "name": "Writer registry",
       "sql": [
         200,
-        206
+        204
       ],
       "paths": [
-        "server/import/**",
-        "db/schema/import-runs.ts"
+        "server/actions/import.ts",
+        "server/import/writers/**"
       ],
       "excludes": [
-        "server/import/dryrun.ts"
-      ]
-    },
-    "M3": {
-      "name": "Sales entities",
-      "sql": [
-        207,
-        210
+        "server/import/writers/crm/**",
+        "server/import/writers/sales/**",
+        "server/import/writers/purchases/**",
+        "server/import/writers/inventory/**",
+        "server/import/writers/accounting/**"
       ],
-      "paths": [
-        "lib/import/entities/sales/**"
-      ]
+      "_note": "PHASE-1 owns the registry and the six shipped destination writers. Each entity phase owns its own subdirectory under server/import/writers/, which is what makes five phases able to add writers without touching one file. The excludes above are what the phases map's own _comment asked for and did not encode."
     },
-    "M4": {
-      "name": "Supply entities",
+    "PHASE-2": {
+      "name": "Run ledger, idempotency, reversal",
       "sql": [
-        211,
+        205,
         214
       ],
       "paths": [
-        "lib/import/entities/supply/**"
+        "server/import/runs.ts",
+        "server/import/ledger.ts",
+        "server/import/reversal.ts",
+        "db/schema/import-runs.ts"
       ]
     },
-    "M5": {
-      "name": "People entities",
-      "sql": [
-        215,
-        218
-      ],
-      "paths": [
-        "lib/import/entities/people/**"
-      ]
-    },
-    "M6": {
-      "name": "Source adapters",
-      "sql": null,
-      "paths": [
-        "lib/import/sources/**",
-        "lib/import/dictionaries/**"
-      ]
-    },
-    "M7": {
+    "PHASE-3": {
       "name": "Discovery and dry run",
       "sql": [
-        219,
-        222
+        215,
+        219
       ],
       "paths": [
-        "lib/import/discover/**",
+        "server/import/discovery.ts",
         "server/import/dryrun.ts"
       ]
     },
-    "M8": {
-      "name": "Reconcile and cutover",
+    "PHASE-9": {
+      "name": "Source adapters",
       "sql": [
-        223,
-        226
+        275,
+        284
       ],
       "paths": [
-        "lib/import/reconcile/**",
-        "docs/CUTOVER.md"
+        "lib/import/sources/**",
+        "lib/import/profiles/**"
+      ]
+    },
+    "PHASE-10": {
+      "name": "Reconciliation, cutover, wizard",
+      "sql": [
+        285,
+        299
+      ],
+      "paths": [
+        "server/import/reconcile.ts",
+        "server/import/cutover.ts",
+        "app/(crm)/settings/import/**",
+        "components/settings/import-wizard.tsx"
+      ]
+    },
+    "PHASE-4": {
+      "name": "Entities: crm",
+      "sql": [
+        220,
+        229
+      ],
+      "paths": [
+        "lib/import/entities-crm.ts",
+        "server/import/writers/crm/**"
+      ]
+    },
+    "PHASE-5": {
+      "name": "Entities: sales",
+      "sql": [
+        230,
+        239
+      ],
+      "paths": [
+        "lib/import/entities-sales.ts",
+        "server/import/writers/sales/**"
+      ]
+    },
+    "PHASE-6": {
+      "name": "Entities: purchases",
+      "sql": [
+        240,
+        249
+      ],
+      "paths": [
+        "lib/import/entities-purchases.ts",
+        "server/import/writers/purchases/**"
+      ]
+    },
+    "PHASE-7": {
+      "name": "Entities: inventory",
+      "sql": [
+        250,
+        259
+      ],
+      "paths": [
+        "lib/import/entities-inventory.ts",
+        "server/import/writers/inventory/**"
+      ]
+    },
+    "PHASE-8": {
+      "name": "Entities: accounting",
+      "sql": [
+        260,
+        274
+      ],
+      "paths": [
+        "lib/import/entities-accounting.ts",
+        "server/import/writers/accounting/**"
       ]
     }
   },

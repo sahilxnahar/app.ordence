@@ -63,7 +63,24 @@ const openingTrialBalance: ImportContract = {
       "`transactions` and `journal_entries` are append-only by design; the schema says so where `updatedAt` and `deletedAt` would have been. A posted entry is corrected by reversing it, which is an accounting act with its own date and its own audit trail. Deleting it would be a rewrite of history under a transaction somebody may already have reconciled against.",
   },
   provenance: {
-    targets: ["transactions"],
+    /**
+     * 🔴 TWO TABLES, NOT ONE. PHASE 3'S FINDING 1, AND IT WAS RIGHT.
+     *
+     * This declared `["transactions"]` while `writeOpeningTrialBalance`
+     * inserts into `transactions` AND one `journal_entries` row per
+     * account. Provenance is what decides what a reversal can undo and
+     * what a reconciliation can tie, so an undeclared destination is rows
+     * that no undo will find and no reconciliation will count , while the
+     * contract reads as complete.
+     *
+     * ⚠️ IT WAS NOT CAUGHT BY GATE 29, and that is worth saying. The gate
+     * checks that `targets` includes the entity's own `table`. It cannot
+     * know about a second table the writer reaches, because that is a fact
+     * about code rather than about the declaration. Phase 3's dry-run
+     * corpus found it by MEASURING which tables moved , which is the only
+     * way it could have been found.
+     */
+    targets: ["transactions", "journal_entries"],
     /**
      * ⭐ `whole-file`, AND THIS IS THE MEMBER THAT STOPS TRACK M8 FROM
      * RAISING A FALSE ALARM. An opening trial balance of forty lines

@@ -40,7 +40,44 @@ import { IMPORT_ENTITIES, isImportEntityKey } from "@/lib/import/entities";
 const ROOT = join(__dirname, "..", "..");
 const read = (p: string) => readFileSync(join(ROOT, p), "utf8");
 
-const ACTIONS = read("server/actions/import.ts");
+/**
+ * ⚠️ THE WRITE PATH IS NO LONGER ONE FILE, AND THIS CONSTANT NOW READS ALL
+ * OF IT.
+ *
+ * Phase 1 replaced four `if (entity.table === ...)` chains in
+ * `server/actions/import.ts` with one writer module per destination under
+ * `server/import/writers/`, wired through an exhaustive `Record` so a
+ * destination with no writer fails to compile.
+ *
+ * 🔴 THESE ASSERTIONS DID NOT BECOME WRONG , THEY BECAME MIS-ADDRESSED.
+ *    Every property they pin (writes go through `withTenant`, the tenant
+ *    predicate is written in the WHERE clause even though RLS enforces it
+ *    independently) is still true and still worth pinning. It moved file.
+ *    Concatenating the write path is what keeps the assertion about the
+ *    PROPERTY rather than about a filename.
+ */
+const WRITE_PATH_FILES = [
+  "server/actions/import.ts",
+  "server/import/writers/companies.ts",
+  "server/import/writers/gst-parties.ts",
+  "server/import/writers/transactions.ts",
+  "server/import/writers/sales-invoices.ts",
+  "server/import/writers/vendor-ledger-entries.ts",
+  "server/import/writers/stock-movements.ts",
+  "server/import/writers/shared.ts",
+] as const;
+const ACTIONS = WRITE_PATH_FILES.map((f) => read(f)).join("\n");
+
+/**
+ * ⚠️ AND ONE ASSERTION MUST STAY SCOPED TO THE ACTION FILE ALONE.
+ *
+ * "exports only async functions" is a `"use server"` rule: every export of
+ * a server-action module becomes a callable endpoint, so a non-async
+ * export there is a bug. The writer modules are `import "server-only"`
+ * internals, not actions , they export `const` writers on purpose, and
+ * folding them into that assertion would make it refuse the correct thing.
+ */
+const ACTION_FILE_ONLY = read("server/actions/import.ts");
 const PLAN = read("lib/import/plan.ts");
 const WIZARD = read("components/settings/import-wizard.tsx");
 const PAGE = read("app/(crm)/settings/import/page.tsx");
@@ -826,7 +863,7 @@ describe("the server actions", () => {
 
   /** ⚠️ Nothing but async functions may be exported from a "use server" file. */
   it("exports only async functions", () => {
-    const exported = [...codeOnly(ACTIONS).matchAll(/^export\s+(\w+)/gm)].map((m) => m[1]);
+    const exported = [...codeOnly(ACTION_FILE_ONLY).matchAll(/^export\s+(\w+)/gm)].map((m) => m[1]);
     for (const keyword of exported) {
       expect(["async", "type"]).toContain(keyword);
     }

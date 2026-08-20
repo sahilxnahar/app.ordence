@@ -64,6 +64,23 @@ const HSN = /^\d{4}(\d{2}(\d{2})?)?$/;
 const ISO_DATE = /^\d{4}-\d{2}-\d{2}(?:[T\s].*)?$/;
 /** `19/08/2026`, `19-08-2026`, `19.08.2026`. */
 const CIVIL_DATE = /^\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4}$/;
+/**
+ * ⭐ `1-Apr-2026`, `15 Dec 25`. Tally, Busy and Xero all write it, and it is
+ * what the two systems most Ordence customers are leaving put in their date
+ * columns.
+ *
+ * 🔴 WITHOUT THIS, SUCH A COLUMN HAS NO DOMINANT SHAPE AT ALL. `evidenceFor`
+ * reported `shape: null`, `SHAPE_SUGGESTS` contributed nothing, and
+ * `proposeMapping` never got value evidence for the date column of a Tally
+ * file. Found by Phase 9 gating its date resolver on
+ * `evidence.shape === "civil_date"` and watching it never fire.
+ *
+ * ⚠️ IT MAPS TO `civil_date`, THE SAME SHAPE, so `SHAPE_SUGGESTS` needs no
+ * change , this is a spelling of a thing that already exists, not a new
+ * kind of thing.
+ */
+const MONTH_NAME_DATE =
+  /^\d{1,2}[-/ ](?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*[-/ ]\d{2,4}$/i;
 /** ⚠️ Indian grouping, `1,23,456.78`, as well as the western one. */
 const MONEY = /^-?(?:\d{1,3}(?:,\d{2,3})*|\d+)(?:\.\d{1,4})?$/;
 const INTEGER = /^-?\d{1,15}$/;
@@ -85,6 +102,10 @@ const TESTS: readonly (readonly [ValueShape, RegExp])[] = [
   ["url", URL],
   ["iso_date", ISO_DATE],
   ["civil_date", CIVIL_DATE],
+  /* ⭐ After ISO_DATE and before INTEGER, for the reason this table already
+   * gives: the specific tests run first or every code column looks like a
+   * number. Same shape as the line above, a different spelling of it. */
+  ["civil_date", MONTH_NAME_DATE],
   ["pincode_in", PINCODE_IN],
   ["hsn", HSN],
   ["phone_in", PHONE_IN],

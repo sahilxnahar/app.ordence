@@ -51,7 +51,33 @@ import { PERMISSION_CATALOG } from "@/db/schema/auth";
 const ROOT = join(__dirname, "..", "..");
 const read = (p: string) => readFileSync(join(ROOT, p), "utf8");
 
-const ACTIONS = read("server/actions/import.ts");
+/**
+ * ⚠️ THE WRITE PATH IS NO LONGER ONE FILE, AND THIS CONSTANT NOW READS ALL
+ * OF IT.
+ *
+ * Phase 1 replaced four `if (entity.table === ...)` chains in
+ * `server/actions/import.ts` with one writer module per destination under
+ * `server/import/writers/`, wired through an exhaustive `Record` so a
+ * destination with no writer fails to compile.
+ *
+ * 🔴 THESE ASSERTIONS DID NOT BECOME WRONG , THEY BECAME MIS-ADDRESSED.
+ *    Every property they pin (writes go through `withTenant`, the tenant
+ *    predicate is written in the WHERE clause even though RLS enforces it
+ *    independently) is still true and still worth pinning. It moved file.
+ *    Concatenating the write path is what keeps the assertion about the
+ *    PROPERTY rather than about a filename.
+ */
+const WRITE_PATH_FILES = [
+  "server/actions/import.ts",
+  "server/import/writers/companies.ts",
+  "server/import/writers/gst-parties.ts",
+  "server/import/writers/transactions.ts",
+  "server/import/writers/sales-invoices.ts",
+  "server/import/writers/vendor-ledger-entries.ts",
+  "server/import/writers/stock-movements.ts",
+  "server/import/writers/shared.ts",
+] as const;
+const ACTIONS = WRITE_PATH_FILES.map((f) => read(f)).join("\n");
 const PLAN = read("lib/import/plan.ts");
 const OPENING = read("lib/import/opening.ts");
 const OPENING_ENTITIES = read("lib/import/opening-entities.ts");
@@ -727,7 +753,32 @@ describe("the opening entities are ordinary framework entities", () => {
   it("resolves through the same allowlist as everything else", () => {
     for (const key of OPENING_IMPORT_ENTITY_KEYS) {
       expect(isImportEntityKey(key)).toBe(true);
-      expect(ALL_IMPORT_ENTITIES[key]).toBe(OPENING_IMPORT_ENTITIES[key]);
+
+      /**
+       * ⚠️ NOT `toBe`, AND THE CHANGE IS TRACK M1'S DOING.
+       *
+       * `ALL_IMPORT_ENTITIES` used to spread `OPENING_IMPORT_ENTITIES`
+       * unchanged, so the two held the same object and identity was the
+       * right assertion. M1 made the migration contract required at the
+       * allowlist, and decorates these four with theirs from
+       * `lib/import/contract/opening-policies.ts` , a file that exists
+       * only because `opening-entities.ts` belongs to another track and
+       * asks to be deleted once that track absorbs them.
+       *
+       * 🔴 THE PROPERTY THIS TEST EXISTS FOR IS UNCHANGED AND IS STILL
+       *    ASSERTED: the opening entities are reachable ONLY through the
+       *    one allowlist, and every field of the definition survives the
+       *    decoration. What is no longer true is object identity, which
+       *    was never the point.
+       */
+      const decorated = ALL_IMPORT_ENTITIES[key];
+      const original = OPENING_IMPORT_ENTITIES[key];
+      expect(decorated).toMatchObject(original);
+      expect(decorated.contract).toBeDefined();
+      /** And the decoration added exactly one member, not a rewrite. */
+      expect(
+        Object.keys(decorated).filter((k) => !Object.hasOwn(original, k)),
+      ).toEqual(["contract"]);
     }
     expect(isImportEntityKey("transactions")).toBe(false);
     expect(isImportEntityKey("__proto__")).toBe(false);

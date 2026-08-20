@@ -58,8 +58,36 @@ function reservedNumbers() {
     const map = JSON.parse(readFileSync(join(import.meta.dirname, "track-ownership.json"), "utf8"));
     for (const [letter, t] of Object.entries(map.tracks)) {
       if (!t.sql) continue;
-      for (let n = t.sql[0]; n <= t.sql[1]; n++) {
-        reserved.set(n, `reserved for track ${letter} (${t.name}) during waves 14 to 16`);
+      /**
+       * ══════════════════════════════════════════════════════════════
+       * 🔴 `sqlAlso` TOO, AND OMITTING IT MADE THIS GATE LIE ABOUT THE
+       *    EXACT FAULT IT EXISTS FOR.
+       * ══════════════════════════════════════════════════════════════
+       * A track may hold two ranges. Track H holds 0166,0168 as `sql`
+       * and reserves 0181,0195 as `sqlAlso`. This loop read only the
+       * first, so those fifteen reserved numbers looked like fifteen
+       * MISSING migrations , and because the check is "contiguous", any
+       * file numbered 0196 or above turned the gate red. That is every
+       * one of Phases 1 to 10.
+       *
+       * ⚠️ `scripts/check-track-ownership.mjs` has always read BOTH.
+       * Two readers of one map disagreeing is the defect; the map was
+       * never wrong.
+       *
+       * ⭐ FOUND INDEPENDENTLY BY PHASE 3 AND PHASE 9, from opposite
+       * ends , Phase 3 from a file at 0215, Phase 9 from a file at 0275.
+       * It had been latent since wave 18 because nothing had been
+       * numbered above 0168.
+       *
+       * 🔴 AND IT MUST NOT BE CLOSED WITH `KNOWN_GAPS`. That list means
+       *    "never written and never will be". A reservation is the
+       *    opposite claim, and filing one there would make the gate
+       *    assert something false in order to go quiet.
+       */
+      for (const [lo, hi] of [t.sql, ...(t.sqlAlso ? [t.sqlAlso] : [])]) {
+        for (let n = lo; n <= hi; n++) {
+          reserved.set(n, `reserved for track ${letter} (${t.name}) during waves 14 to 16`);
+        }
       }
     }
   } catch {

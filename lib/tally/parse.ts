@@ -441,7 +441,24 @@ function readVoucher(
   let totalDebitMinor = 0n;
   let totalCreditMinor = 0n;
 
-  for (const entry of findAll(node, "ALLLEDGERENTRIES.LIST")) {
+  /**
+   * 🔴 BOTH ELEMENTS. Tally writes `LEDGERENTRIES.LIST` for some voucher
+   * classes, and reading only `ALLLEDGERENTRIES.LIST` gave those vouchers
+   * `legs: []`, `totalDebitMinor: 0n`, `totalCreditMinor: 0n` , and ZERO
+   * EQUALS ZERO, so they read as perfectly balanced everywhere downstream.
+   *
+   * ⚠️ THAT IS WHY NOTHING CAUGHT IT. A voucher with no legs passes every
+   * balance check there is; the ledger view simply returned a header row
+   * and nothing else for such a file. Found by Phase 9, whose new
+   * allocation views read both elements and could see the discrepancy.
+   *
+   * ⚠️ `findAll` IS A DESCENDANT WALK, so these two names must not nest.
+   * They do not in any export seen. If a future one does, this loop
+   * double-counts, and the answer then is a `seen` set keyed on the node ,
+   * not now, when it would be a guard against nothing.
+   */
+  for (const element of ["ALLLEDGERENTRIES.LIST", "LEDGERENTRIES.LIST"] as const)
+  for (const entry of findAll(node, element)) {
     const ledgerName = childText(entry, "LEDGERNAME");
     const rawAmount = childText(entry, "AMOUNT");
     if (!ledgerName || !rawAmount) continue;

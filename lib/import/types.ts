@@ -366,7 +366,7 @@ export type ImportProvenancePolicy = {
    * is decided by membership in `ALL_IMPORT_ENTITIES`, whose element
    * type pins `table` to `ImportTableKey`.
    */
-  targets: readonly (ImportTableKey | PendingImportTableKey)[];
+  targets: readonly (ImportTableKey | PendingImportTableKey | ImportSecondaryTableKey)[];
   /**
    * ⚠️ WHETHER ONE INPUT ROW PRODUCES ONE OUTPUT ROW.
    *
@@ -778,6 +778,26 @@ export type ContractedImportEntity = ImportEntityDefinition & {
  *    saying "not yet"; the goal is for it to be empty.
  */
 export type PendingImportTableKey = "contacts";
+
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * ⭐ A TABLE A WRITER TOUCHES BUT NO ENTITY TARGETS
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 PHASE 3 FOUND WHY THIS TYPE HAS TO EXIST, BY MEASURING.
+ *
+ * `opening-trial-balance` declares destination `transactions`, and
+ * `writeOpeningTrialBalance` inserts into `transactions` AND one
+ * `journal_entries` row per account. Provenance decides what a reversal
+ * can undo and what a reconciliation can tie, so `journal_entries` has to
+ * be declared , and it must NOT be an `ImportTableKey`, because that
+ * union is what `IMPORT_WRITERS` is exhaustive over. Adding it there
+ * would demand a writer for a table no entity imports into directly.
+ *
+ * ⚠️ SO: DESTINATIONS AND PROVENANCE TARGETS ARE DIFFERENT SETS, and
+ * conflating them is what hid this. A destination is where an entity's
+ * rows go. A provenance target is any table the write touches.
+ */
+export type ImportSecondaryTableKey = "journal_entries";
 
 export type PendingImportEntity = Omit<ContractedImportEntity, "table"> & {
   table: PendingImportTableKey;

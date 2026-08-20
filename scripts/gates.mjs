@@ -112,6 +112,13 @@ export const GATES = Object.freeze([
     why: "an entity registered with no writer, reaching the customer's picker and writing nothing",
   },
   {
+    id: "import-profiles",
+    script: "scripts/check-import-profiles.mjs",
+    tier: "static",
+    wave: 15,
+    why: "a source profile the reader can produce and the import_runs CHECK constraint refuses, which reads a file, writes forty thousand rows and then fails at the run record",
+  },
+  {
     id: "migrations",
     script: "scripts/check-migrations.mjs",
     tier: "static",

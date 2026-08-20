@@ -23,6 +23,15 @@
  */
 
 import { parseCsv, type CsvRecord } from "../csv";
+import { EVIDENCE_SAMPLE_ROWS } from "../shapes";
+import {
+  describeColumnFormats,
+  describeProfileDetection,
+  detectProfile,
+  resolveColumnFormats,
+  type ColumnFormatFinding,
+  type ProfileDetection,
+} from "../profiles";
 import { readJson, JsonReadError } from "./json-read";
 import { readTally, TallyReadError, type TallyView } from "./tally-read";
 import { readXlsx, XlsxReadError } from "./xlsx-read";
@@ -31,7 +40,15 @@ import type { InflateRaw } from "./unzip";
 export { readZip, ZipReadError, type InflateRaw } from "./unzip";
 export { readXlsx, XlsxReadError } from "./xlsx-read";
 export { readJson, JsonReadError } from "./json-read";
-export { readTally, TallyReadError } from "./tally-read";
+export {
+  readTally,
+  TallyReadError,
+  TALLY_VIEWS,
+  TALLY_VIEW_LABELS,
+  isTallyView,
+  type TallyView,
+  type TallyDocument,
+} from "./tally-read";
 
 /**
  * ⚠️ THIS LIST IS CHECKED BY `scripts/check-import-sources.mjs` AGAINST
@@ -130,6 +147,28 @@ export type SourceTable = {
   readonly sheetNames?: readonly string[];
   readonly selectedSheet?: string;
   readonly notes: readonly string[];
+  /**
+   * ══════════════════════════════════════════════════════════════════
+   * ⭐ PHASE 9 · WHICH SYSTEM THIS FILE CAME OUT OF
+   * ══════════════════════════════════════════════════════════════════
+   * ⚠️ ALWAYS PRESENT, AND NEVER `null`. The fallback profile IS an
+   * answer — "Ordence looked and recognised no source system" is a
+   * different and more useful fact than an absent field, which could
+   * equally mean nothing ever looked.
+   *
+   * 🔴 AND NOTHING HERE HAS CHANGED A SINGLE CELL. `records` is what the
+   * reader produced, byte for byte. A profile identifies a file and
+   * raises priors about how to READ it; rewriting the customer's values
+   * on the way past would put a transformation nobody asked for between
+   * the file and the preview that is supposed to show it.
+   */
+  readonly profile: ProfileDetection;
+  /**
+   * Columns where the date order or the negative convention had to be
+   * decided, with what decided it. Empty when there was nothing to
+   * decide, which is the common case.
+   */
+  readonly formats: readonly ColumnFormatFinding[];
 };
 
 export type ReadSourceOptions = {
@@ -169,18 +208,67 @@ export function readSource(bytes: Uint8Array, options: ReadSourceOptions = {}): 
     );
   }
 
+  /**
+   * ══════════════════════════════════════════════════════════════════
+   * ⭐⭐ ONE PLACE WHERE EVERY FORMAT GETS ITS PROFILE
+   * ══════════════════════════════════════════════════════════════════
+   * ⚠️ NOT FOUR COPIES, ONE PER `case`. Four copies is how three of them
+   * get the profile and the fourth quietly does not — the customer
+   * uploads a Zoho CSV and sees the sentence, uploads the same data as
+   * XLSX and sees nothing, and nobody can say why. Every `case` below
+   * returns through here.
+   *
+   * ⚠️ THE SAMPLE IS CAPPED. `EVIDENCE_SAMPLE_ROWS` rows, the same
+   * number `lib/import/shapes.ts` draws its conclusions from, imported
+   * rather than restated: two modules reading the same column to
+   * different depths would eventually disagree about the same file.
+   */
+  const finish = (
+    format: ImportSourceFormat,
+    records: CsvRecord[],
+    extra: readonly string[],
+    rest: { sheetNames?: readonly string[]; selectedSheet?: string } = {},
+  ): SourceTable => {
+    const headerRow = records[0]?.cells ?? [];
+    const profile = detectProfile(headerRow, {
+      ...(options.fileName === undefined ? {} : { fileName: options.fileName }),
+      /**
+       * 🔴 THE BYTES, NOT THE NAME. `detectFormat` recognised a Tally
+       * envelope in the markup itself, which is a stronger statement
+       * about where this file came from than any header row could make.
+       */
+      ...(format === "tally-xml" ? { knownProfile: "tally" } : {}),
+    });
+    const sample = records.slice(1, EVIDENCE_SAMPLE_ROWS + 1).map((r) => r.cells);
+    const formats = resolveColumnFormats(headerRow, sample, profile);
+
+    return {
+      format,
+      records,
+      ...rest,
+      notes: [
+        ...notes,
+        ...extra,
+        ...describeProfileDetection(profile),
+        ...describeColumnFormats(formats),
+      ],
+      profile,
+      formats,
+    };
+  };
+
   switch (detection.format) {
     case "csv": {
       const text = new TextDecoder("utf-8").decode(bytes);
       const parsed = parseCsv(text);
       if (!parsed.ok) throw new SourceReadError(parsed.error);
-      return { format: "csv", records: parsed.records, notes };
+      return finish("csv", parsed.records, []);
     }
 
     case "json": {
       try {
         const document = readJson(new TextDecoder("utf-8").decode(bytes));
-        return { format: "json", records: document.records, notes: [...notes, ...document.notes] };
+        return finish("json", document.records, document.notes);
       } catch (err) {
         if (err instanceof JsonReadError) throw new SourceReadError(err.message);
         throw err;
@@ -193,11 +281,7 @@ export function readSource(bytes: Uint8Array, options: ReadSourceOptions = {}): 
           new TextDecoder("utf-8").decode(bytes),
           options.tallyView ?? "ledger-masters",
         );
-        return {
-          format: "tally-xml",
-          records: document.records,
-          notes: [...notes, ...document.notes],
-        };
+        return finish("tally-xml", document.records, document.notes);
       } catch (err) {
         if (err instanceof TallyReadError) throw new SourceReadError(err.message);
         throw err;
@@ -232,7 +316,7 @@ export function readSource(bytes: Uint8Array, options: ReadSourceOptions = {}): 
         );
       }
 
-      const extra = [...notes, ...document.notes];
+      const extra = [...document.notes];
       if (withRows.length > 1) {
         /**
          * ⚠️ NAMED, NOT SILENTLY IGNORED. A workbook with "Customers",
@@ -246,13 +330,10 @@ export function readSource(bytes: Uint8Array, options: ReadSourceOptions = {}): 
         );
       }
 
-      return {
-        format: "xlsx",
-        records: chosen.records,
+      return finish("xlsx", chosen.records, extra, {
         sheetNames: withRows.map((s) => s.name),
         selectedSheet: chosen.name,
-        notes: extra,
-      };
+      });
     }
   }
 }

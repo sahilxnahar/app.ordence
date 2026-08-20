@@ -67,6 +67,34 @@ export const SCORE = Object.freeze({
   /** Every value is unmistakably this thing. Stronger than a good name. */
   DECISIVE_SHAPE: 0.9,
   /** The header contains the column's words, or vice versa. */
+  /**
+   * ⭐ PHASE 9. A spelling a RECOGNISED SOURCE SYSTEM uses for this column.
+   * Better than two headings sharing a word; strictly worse than every value
+   * in the column being unmistakably this thing, and , the consequence that
+   * matters more , strictly below AUTO_COMMIT_THRESHOLD, so a column mapped
+   * on a profile's say-so always needs a person.
+   *
+   * ⚠️ AND THIS IS WHY PROFILE SPELLINGS ARE NOT MERGED INTO `aliases`.
+   * Phase 9 measured that: one alias is one exposure, and merging the seven
+   * profiles would add 156 spellings at ALIAS (0.95), above the value
+   * evidence, in one commit.
+   */
+  PROFILE_HEADER: 0.85,
+  /**
+   * 🔴 A HEADING THE VALUES REFUTE.
+   *
+   * Phase 9's finding, and the reason it is a finding rather than a nit:
+   * a column headed `GSTIN` that holds PANs used to win at EXACT_HEADER,
+   * which is 1.00, which is AT `AUTO_COMMIT_THRESHOLD`. A workspace with
+   * auto-commit on migrated four hundred parties with their PAN in the
+   * GSTIN column and nothing on screen saying it was a guess.
+   *
+   * ⚠️ THE LADDER IS NOT REORDERED. Whether a good name should outrank
+   * decisive values in general is a real question and a bigger one. What is
+   * NOT a real question is whether a heading whose own column refutes it
+   * should auto-commit. This band is below the threshold, so it cannot.
+   */
+  CONTRADICTED_HEADER: 0.6,
   TOKEN_CONTAINMENT: 0.7,
   /** A model proposed it and nothing contradicts it. */
   MODEL_ONLY: 0.55,
@@ -157,6 +185,7 @@ function canonicalTokens(header: string): Set<string> {
 
 export type ProposalBasis =
   | "exact-header"
+  | "profile-header"
   | "alias"
   | "value-shape"
   | "token-containment"
@@ -204,6 +233,19 @@ export type ProposeOptions = {
   /** Rows under the header, for `lib/import/shapes.ts`. */
   readonly sampleRows?: readonly (readonly string[])[];
   readonly model?: ModelProposal;
+  /**
+   * ⭐ PHASE 9 · `profileHeaderPriors(detection)` from `lib/import/profiles`.
+   *
+   * ⚠️ HANDED IN, NEVER IMPORTED. `lib/import/proposal.ts` must not depend
+   * on the profile registry: the profiles are data about other people's
+   * software and this module is the scorer. A dependency here would make
+   * every profile edit a change to the scoring layer.
+   */
+  readonly profilePriors?: readonly {
+    readonly field: string;
+    readonly spellings: readonly string[];
+    readonly why: string;
+  }[];
 };
 
 function describeShape(evidence: ColumnEvidence): string {
@@ -244,34 +286,85 @@ export function proposeMapping(
       const tokens = tokenisedSources[index]!;
       const shapeEvidence = evidence[index]!;
 
-      if (normalised === canonicalHeader) {
-        out.push({
-          index,
-          confidence: SCORE.EXACT_HEADER,
-          basis: "exact-header",
-          why: `"${sourceHeader}" is exactly this column's name.`,
-        });
-        return;
-      }
-      if (aliasSet.has(normalised)) {
-        out.push({
-          index,
-          confidence: SCORE.ALIAS,
-          basis: "alias",
-          why: `"${sourceHeader}" is a spelling Ordence recognises for this column.`,
-        });
-        return;
-      }
-
       /**
-       * ⭐ ② THE VALUES. This runs even when the header said nothing,
-       * which is the entire reason a file of `F1 F2 F3` is importable.
+       * ⭐ ② THE VALUES, COMPUTED BEFORE THE HEADER IS ANSWERED.
+       *
+       * ⚠️ THIS HOIST IS THE FIX. It used to sit below the two header
+       * branches, both of which `return`, so the values were never looked
+       * at for a column whose name matched. That is how a column headed
+       * `GSTIN` and full of PANs beat a column called `F7` full of real
+       * GSTINs , at 1.00, which is auto-commit.
        */
       const suggests = shapeEvidence.shape ? SHAPE_SUGGESTS[shapeEvidence.shape] : [];
       const shapeMatches =
         suggests.includes(column.field) ||
         suggests.includes(column.kind) ||
         suggests.some((s) => column.field.toLowerCase().includes(s.toLowerCase()));
+
+      /**
+       * 🔴 ONLY AN UNMISTAKABLE SHAPE MAY REFUTE A HEADING.
+       *
+       * ⚠️ NOT EVERY SHAPE. `integer`, `money`, `boolean` and the date
+       * shapes are shared by many fields, so "this column is integers and
+       * this field is not suggested by integers" is not a contradiction ,
+       * it is the ordinary case, and treating it as one would demote most
+       * correctly-named columns in the product.
+       *
+       * These six are different: a GSTIN, a PAN, an email, an IFSC, an HSN
+       * and a URL each have a structure nothing else satisfies. A column
+       * where EVERY value is one of them is that thing, whatever the
+       * heading says, and the heading is then making a claim its own
+       * contents refuse.
+       */
+      const IDENTIFYING: readonly string[] = ["gstin", "pan", "email", "ifsc", "hsn", "url"];
+      const contradicted =
+        shapeEvidence.shape !== null &&
+        IDENTIFYING.includes(shapeEvidence.shape) &&
+        !shapeMatches;
+
+      const headerBasis: "exact-header" | "alias" | null =
+        normalised === canonicalHeader ? "exact-header" : aliasSet.has(normalised) ? "alias" : null;
+
+      if (headerBasis) {
+        if (contradicted) {
+          out.push({
+            index,
+            confidence: SCORE.CONTRADICTED_HEADER,
+            basis: headerBasis,
+            why:
+              `"${sourceHeader}" is named as this column, but ${describeShape(shapeEvidence)}. ` +
+              `The heading and the contents disagree, and the contents are the part that can ` +
+              `be counted , so this needs a person to confirm.`,
+          });
+          return;
+        }
+        out.push({
+          index,
+          confidence: headerBasis === "exact-header" ? SCORE.EXACT_HEADER : SCORE.ALIAS,
+          basis: headerBasis,
+          why:
+            headerBasis === "exact-header"
+              ? `"${sourceHeader}" is exactly this column's name.`
+              : `"${sourceHeader}" is a spelling Ordence recognises for this column.`,
+        });
+        return;
+      }
+
+      /**
+       * ⭐ PHASE 9 , a spelling the recognised source system uses. Checked
+       * after the alias set and before the value shape, and scored below
+       * both the value shape and the auto-commit threshold.
+       */
+      const prior = options.profilePriors?.find((pp) => pp.field === column.field);
+      if (prior?.spellings.some((sp) => normaliseHeader(sp) === normalised)) {
+        out.push({
+          index,
+          confidence: SCORE.PROFILE_HEADER,
+          basis: "profile-header",
+          why: prior.why,
+        });
+        return;
+      }
 
       if (shapeMatches && shapeEvidence.shape) {
         out.push({
