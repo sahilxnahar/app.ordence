@@ -346,18 +346,58 @@ FROM probes;
 
 -- ---------------------------------------------------------------------
 --  SECTION 3 , the 5 migrations that only INSERT rows.
---  Run separately. If this statement errors with "relation does not
---  exist", that is the answer: the table is absent, so the file did not
---  run. See the note in the generator for why it cannot be guarded.
+--
+--  🔴 ONE STATEMENT PER PROBE, AND THAT IS A CORRECTION, NOT A STYLE
+--     CHOICE.
+--
+--  These probes name tables directly, and PostgreSQL resolves table names
+--  at PARSE time. An earlier version of this file put all 5 probes in
+--  one VALUES list , and on a real database it failed whole:
+--
+--      ERROR: relation "public.schema_contract_snapshots" does not exist
+--
+--  One absent table took the answers for the other four with it, and the
+--  one it hid was 0126, the file already known to have half-applied. The
+--  guard to_regclass(...) IS NOT NULL AND EXISTS (SELECT 1 FROM t) does
+--  NOT help: to_regclass is evaluated at run time, but FROM t is
+--  resolved at parse time, so the guard never gets the chance to run.
+--
+--  ⚠️ RUN THESE ONE AT A TIME. An error is an ANSWER, not a failure:
+--     "relation does not exist" means the table is absent, so the file
+--     did not run. Note it as MISSING and run the next one.
 -- ---------------------------------------------------------------------
-WITH probes(num, file_name, looked_for, present) AS (VALUES
-  ('0092', '0092_reserve_clerk_hosts.sql', 'reserved_slugs row added_by=migration:0092', ((to_regclass('public.reserved_slugs') IS NOT NULL AND EXISTS (SELECT 1 FROM public.reserved_slugs WHERE added_by='migration:0092')))),
-  ('0103', '0103_reserve_resend_hosts.sql', 'reserved_slugs row added_by=migration:0103', ((to_regclass('public.reserved_slugs') IS NOT NULL AND EXISTS (SELECT 1 FROM public.reserved_slugs WHERE added_by='migration:0103')))),
-  ('0126', '0126_updated_at_coverage.sql', 'the exclusion registry has been POPULATED, which only happens after the block that the original 0126 aborted on , reported in the data section because naming a table makes the probe fail at PARSE time on a database that lacks it, which would take sections 1 and 2 down with it.', ((to_regclass('public.updated_at_exclusions') IS NOT NULL AND EXISTS (SELECT 1 FROM public.updated_at_exclusions)))),
-  ('0142', '0142_capture_schema_contract.sql', 'a row in schema_contract_snapshots (0142 only CALLS capture_schema_contract, so the row is the artefact) , reported in the data section because naming a table makes the probe fail at PARSE time on a database that lacks it, which would take sections 1 and 2 down with it.', ((to_regclass('public.schema_contract_snapshots') IS NOT NULL AND EXISTS (SELECT 1 FROM public.schema_contract_snapshots)))),
-  ('0167', '0167_impersonation_guard_exemption_record.sql', 'change_log carries Track D''s exemption verdict as a table comment , data section: obj_description() names a table and therefore resolves at parse time.', ((to_regclass('public.change_log') IS NOT NULL AND coalesce(obj_description('public.change_log'::regclass,'pg_class'),'') LIKE '%needs_action%')))
-)
-SELECT jsonb_pretty(jsonb_agg(jsonb_build_object(
-  'num', num, 'status', CASE WHEN present THEN 'PRESENT' ELSE 'MISSING' END,
-  'file_name', file_name, 'looked_for', looked_for) ORDER BY num)) AS section_3_data_rows
-FROM probes;
+
+-- 0092 , 0092_reserve_clerk_hosts.sql
+-- If this errors with "relation does not exist", the answer is MISSING.
+SELECT '0092' AS num,
+       '0092_reserve_clerk_hosts.sql' AS file_name,
+       CASE WHEN ((to_regclass('public.reserved_slugs') IS NOT NULL AND EXISTS (SELECT 1 FROM public.reserved_slugs WHERE added_by='migration:0092'))) THEN 'PRESENT' ELSE 'MISSING' END AS status,
+       'reserved_slugs row added_by=migration:0092' AS looked_for;
+
+-- 0103 , 0103_reserve_resend_hosts.sql
+-- If this errors with "relation does not exist", the answer is MISSING.
+SELECT '0103' AS num,
+       '0103_reserve_resend_hosts.sql' AS file_name,
+       CASE WHEN ((to_regclass('public.reserved_slugs') IS NOT NULL AND EXISTS (SELECT 1 FROM public.reserved_slugs WHERE added_by='migration:0103'))) THEN 'PRESENT' ELSE 'MISSING' END AS status,
+       'reserved_slugs row added_by=migration:0103' AS looked_for;
+
+-- 0126 , 0126_updated_at_coverage.sql
+-- If this errors with "relation does not exist", the answer is MISSING.
+SELECT '0126' AS num,
+       '0126_updated_at_coverage.sql' AS file_name,
+       CASE WHEN ((to_regclass('public.updated_at_exclusions') IS NOT NULL AND EXISTS (SELECT 1 FROM public.updated_at_exclusions))) THEN 'PRESENT' ELSE 'MISSING' END AS status,
+       'the exclusion registry has been POPULATED, which only happens after the block that the original 0126 aborted on , reported in the data section because naming a table makes the probe fail at PARSE time on a database that lacks it, which would take sections 1 and 2 down with it.' AS looked_for;
+
+-- 0142 , 0142_capture_schema_contract.sql
+-- If this errors with "relation does not exist", the answer is MISSING.
+SELECT '0142' AS num,
+       '0142_capture_schema_contract.sql' AS file_name,
+       CASE WHEN ((to_regclass('public.schema_contract_snapshots') IS NOT NULL AND EXISTS (SELECT 1 FROM public.schema_contract_snapshots))) THEN 'PRESENT' ELSE 'MISSING' END AS status,
+       'a row in schema_contract_snapshots (0142 only CALLS capture_schema_contract, so the row is the artefact) , reported in the data section because naming a table makes the probe fail at PARSE time on a database that lacks it, which would take sections 1 and 2 down with it.' AS looked_for;
+
+-- 0167 , 0167_impersonation_guard_exemption_record.sql
+-- If this errors with "relation does not exist", the answer is MISSING.
+SELECT '0167' AS num,
+       '0167_impersonation_guard_exemption_record.sql' AS file_name,
+       CASE WHEN ((to_regclass('public.change_log') IS NOT NULL AND coalesce(obj_description('public.change_log'::regclass,'pg_class'),'') LIKE '%needs_action%')) THEN 'PRESENT' ELSE 'MISSING' END AS status,
+       'change_log carries Track D''s exemption verdict as a table comment , data section: obj_description() names a table and therefore resolves at parse time.' AS looked_for;

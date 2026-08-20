@@ -340,17 +340,37 @@ FROM probes;
 
 -- ---------------------------------------------------------------------
 --  SECTION 3 , the ${dataRows.length} migrations that only INSERT rows.
---  Run separately. If this statement errors with "relation does not
---  exist", that is the answer: the table is absent, so the file did not
---  run. See the note in the generator for why it cannot be guarded.
+--
+--  🔴 ONE STATEMENT PER PROBE, AND THAT IS A CORRECTION, NOT A STYLE
+--     CHOICE.
+--
+--  These probes name tables directly, and PostgreSQL resolves table names
+--  at PARSE time. An earlier version of this file put all ${dataRows.length} probes in
+--  one VALUES list , and on a real database it failed whole:
+--
+--      ERROR: relation "public.schema_contract_snapshots" does not exist
+--
+--  One absent table took the answers for the other four with it, and the
+--  one it hid was 0126, the file already known to have half-applied. The
+--  guard to_regclass(...) IS NOT NULL AND EXISTS (SELECT 1 FROM t) does
+--  NOT help: to_regclass is evaluated at run time, but FROM t is
+--  resolved at parse time, so the guard never gets the chance to run.
+--
+--  ⚠️ RUN THESE ONE AT A TIME. An error is an ANSWER, not a failure:
+--     "relation does not exist" means the table is absent, so the file
+--     did not run. Note it as MISSING and run the next one.
 -- ---------------------------------------------------------------------
-WITH probes(num, file_name, looked_for, present) AS (VALUES
-${dataRows.map((r) => `  ('${r.num}', '${esc(r.file)}', '${esc(r.desc)}', (${r.expr}))`).join(",\n")}
-)
-SELECT jsonb_pretty(jsonb_agg(jsonb_build_object(
-  'num', num, 'status', CASE WHEN present THEN 'PRESENT' ELSE 'MISSING' END,
-  'file_name', file_name, 'looked_for', looked_for) ORDER BY num)) AS section_3_data_rows
-FROM probes;
+${dataRows
+  .map(
+    (r) => `
+-- ${r.num} , ${esc(r.file)}
+-- If this errors with "relation does not exist", the answer is MISSING.
+SELECT '${r.num}' AS num,
+       '${esc(r.file)}' AS file_name,
+       CASE WHEN (${r.expr}) THEN 'PRESENT' ELSE 'MISSING' END AS status,
+       '${esc(r.desc)}' AS looked_for;`,
+  )
+  .join("\n")}
 `;
 
 if (process.argv.includes("--write")) {

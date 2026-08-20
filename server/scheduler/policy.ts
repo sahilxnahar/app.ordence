@@ -39,7 +39,8 @@ import "server-only";
  * operator may one day edit.
  */
 
-import { parseCron, worstGapSeconds } from "@/server/scheduler/cron";
+import { nextSlotAfter, parseCron, worstGapSeconds } from "@/server/scheduler/cron";
+import type { ParsedCron } from "@/server/scheduler/cron";
 
 /**
  * `app`         — executed by the Next.js application over HTTP as the
@@ -353,6 +354,82 @@ export const SILENCE_GRACE_SECONDS = 15 * 60;
 export const MIN_SILENCE_SECONDS = 30 * 60;
 
 /**
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 THE GAP FOR A CRON TOO SPARSE TO ENUMERATE. A PRODUCTION BUILD
+ *    FAILURE, AND THE FIX IS NOT THE ONE THE ERROR MESSAGE SUGGESTS.
+ * ══════════════════════════════════════════════════════════════════════
+ * `worstGapSeconds` enumerates every minute in a 32-day probe. A MONTHLY
+ * cron has at most ONE slot in such a window unless it happens to
+ * straddle two month boundaries , from 20 August the next two runs of
+ * `0 3 1 * *` are 1 September and 1 October, and 1 October is 42 days
+ * out. One slot returns `null`, and `null` made `deriveMaxSilenceSeconds`
+ * throw.
+ *
+ * ⚠️ IT THREW AT MODULE LOAD, so this was never a scheduler failure. It
+ * was a BUILD failure: `next build` collects page data for `/api/workers`,
+ * which imports this module, and the deploy died with
+ *   Job "prune_change_log" has cron "0 3 1 * *", which produces fewer
+ *   than two slots in the next 32 days
+ *
+ * 🔴 AND IT WAS NOT ONE JOB. THREE of the four maintenance jobs are
+ *    monthly: `prune_change_log`, `prune_security_events` and
+ *    `prune_usage_counters`. The build stops at the first, so fixing only
+ *    the job the log names produces three more failed deploys, one per
+ *    attempt. Measured, not assumed.
+ *
+ * ⚠️ WHY NOT SIMPLY WIDEN THE PROBE. Tried first, and refused , by design.
+ * `slotsBetween` throws above 40 days, and its message argues the case:
+ * "a backfill that silently starts 40 days ago is a backfill that
+ * silently skips everything before that." That limit is correct and it is
+ * load-bearing for backfills. A monthly cron needs up to 62 days. The two
+ * cannot be reconciled by moving the number.
+ *
+ * ⚠️ WHY NOT THREE `maxSilenceOverrideSeconds` ENTRIES. That is what the
+ * error message recommends, and for a genuinely exotic cadence it is
+ * right. Monthly is not exotic , it is the most common retention cadence
+ * in this product. Three hand-written overrides would also reintroduce
+ * precisely what `cadenceSeconds` exists to prevent: a window typed in by
+ * hand next to a cron string, which is two declarations of one fact, and
+ * the day they disagree is the day the alarm is wrong.
+ *
+ * ⭐ SO: HOP INSTEAD OF SCANNING. `nextSlotAfter` finds the next slot
+ * without enumerating a range, and each hop of a monthly cron is at most
+ * 31 days, comfortably inside the same 40-day bound. Chaining hops gives
+ * the real gaps without ever asking for a window the scanner refuses.
+ *
+ * ⚠️ AND IT TAKES THE WORST OF SEVERAL HOPS, NOT THE FIRST. The first gap
+ * of a monthly cron is 28, 29, 30 or 31 days depending on when it is
+ * asked. Deriving the alarm from a February hop would leave the window
+ * three days short of a real July-to-August silence, and a watchdog that
+ * is short fires on a healthy system , which is how an alarm gets muted,
+ * which removes the alarm for the case it exists for.
+ *
+ * ⚠️ THIS IS A FALLBACK, NOT A REPLACEMENT. It runs only when the
+ * enumerating probe found fewer than two slots. Every job already in the
+ * catalogue that the probe can see keeps the value it had , verified:
+ * `prune_scheduler_runs` (`40 2 * * 0`) reads 168.0h before and after.
+ */
+const SPARSE_HOPS = 14;
+
+function sparseWorstGapSeconds(parsed: ParsedCron, from: Date): number | null {
+  let cursor = nextSlotAfter(parsed, from);
+  if (!cursor) return null;
+
+  let worst = 0;
+  for (let hop = 0; hop < SPARSE_HOPS; hop += 1) {
+    const next = nextSlotAfter(parsed, cursor);
+    /* A cron with one slot and then nothing reachable is genuinely
+     * underivable. Returning null here is what keeps the override path
+     * meaningful for a quarterly or annual job. */
+    if (!next) break;
+    worst = Math.max(worst, next.getTime() - cursor.getTime());
+    cursor = next;
+  }
+
+  return worst === 0 ? null : Math.round(worst / 1000);
+}
+
+/**
  * Two full cadences plus grace, measured from the job's own cron.
  *
  * ⚠️ TWO, NOT ONE. One cadence means any single missed slot pages. A
@@ -379,12 +456,12 @@ export function deriveMaxSilenceSeconds(
   }
 
   const parsed = parseCron(cronUtc);
-  const worst = worstGapSeconds(parsed, from);
+  const worst = worstGapSeconds(parsed, from) ?? sparseWorstGapSeconds(parsed, from);
 
   if (worst === null) {
     throw new Error(
       `Job "${policy.jobId}" has cron "${cronUtc}", which produces fewer than two slots in ` +
-        `the next 32 days. A watchdog window cannot be derived from it. Either the ` +
+        `any window this function can scan. A watchdog window cannot be derived from it. Either the ` +
         `expression is wrong, or the job runs so rarely that it needs an explicit ` +
         `maxSilenceOverrideSeconds with a written reason.`,
     );
