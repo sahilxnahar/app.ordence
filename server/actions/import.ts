@@ -77,6 +77,7 @@ import { requireFeature, FeatureLockedError } from "@/server/entitlements";
 import { PermissionDeniedError } from "@/lib/permissions";
 import { financialYearOf } from "@/lib/gst/constants";
 import { formatMoneyPlain } from "@/lib/billing/money";
+import { functionalCurrencyFromSettings } from "@/lib/fx/currency";
 import {
   ALL_IMPORT_ENTITIES,
   buildReport,
@@ -84,6 +85,7 @@ import {
   openingBatchKey,
   planImport,
   planImportRecords,
+  type ImportContext,
   type ImportEntityDefinition,
   type ImportLookup,
   type ImportNaturalKey,
@@ -545,9 +547,28 @@ async function runImport(
      * what stops "we support Excel" from becoming a second importer with
      * its own bugs.
      */
+    /*
+     * ⭐⭐⭐ WAVE 2C — THE ONE FACT THE PURE LAYER CANNOT KNOW.
+     *
+     * 🔴 `lib/import/` MUST NOT IMPORT THE DATABASE (rule 4), and the
+     * number of decimal places an amount has is a fact about the
+     * workspace's currency, which is a row in `tenants`. So it is read
+     * HERE — by the same `functionalCurrencyFromSettings()` that
+     * `runFxRevaluation` and every sales posting read — and handed down
+     * as data.
+     *
+     * ⚠️ BOTH RUNS GET THE SAME OBJECT, on the same line, for the same
+     * reason the planner itself is shared: a preview that read INR and a
+     * commit that read KWD would disagree about which rows are valid,
+     * which is constraint 1's failure mode with a new cause.
+     */
+    const planContext: ImportContext = {
+      workspaceCurrency: functionalCurrencyFromSettings(ctx.tenant.settings).code,
+    };
+
     const plan = params.records
-      ? planImportRecords(entity, params.records)
-      : planImport(entity, params.csvText ?? "");
+      ? planImportRecords(entity, params.records, planContext)
+      : planImport(entity, params.csvText ?? "", planContext);
 
     if (plan.fatal) {
       return {

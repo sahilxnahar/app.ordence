@@ -145,6 +145,12 @@ const orDefault = <T>(value: T | null | undefined): T | undefined =>
  */
 const stockItemsEntity: ContractedImportEntity = {
   key: "stock-items",
+  /**
+   * ⭐ WAVE 2C. Amounts in this file are in the workspace's own
+   * currency; there is no currency column. The exponent follows from
+   * that code, so a Kuwaiti workspace reads 1.234 as 1234 fils.
+   */
+  money: { source: "workspace" },
   label: "Stock items",
   noun: { one: "stock item", many: "stock items" },
   description:
@@ -380,6 +386,8 @@ const stockItemsEntity: ContractedImportEntity = {
 
 const warehousesEntity: ContractedImportEntity = {
   key: "warehouses",
+  /** ⭐ WAVE 2C. No money column on this entity. */
+  money: { source: "none" },
   label: "Warehouses",
   noun: { one: "warehouse", many: "warehouses" },
   description:
@@ -578,6 +586,8 @@ const warehousesEntity: ContractedImportEntity = {
  */
 const batchesEntity: ContractedImportEntity = {
   key: "batches",
+  /** ⭐ WAVE 2C. No money column on this entity. */
+  money: { source: "none" },
   label: "Batches",
   noun: { one: "batch", many: "batches" },
   description:

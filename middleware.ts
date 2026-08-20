@@ -142,6 +142,18 @@ const isPublicRoute = createRouteMatcher([
    */
   "/api/ready",
   "/api/webhooks(.*)",
+  /**
+   * ⭐ WAVE 2E. The tenant logo, resolved from the hostname. It is on this
+   * list for the same reason `/sign-in` is: it is rendered ON the sign-in
+   * page, before any session exists.
+   *
+   * ⚠️ WHAT IT MAY SERVE IS ONE OBJECT PER TENANT , the key named by that
+   * tenant's own `branding.logoKey`, re-checked against their storage
+   * prefix before a byte is fetched. There is no key parameter and no
+   * listing. A logo is public by purpose: it is already on that customer's
+   * invoices and their login page.
+   */
+  "/api/branding/logo",
   // ══════════════════════════════════════════════════════════════
   // BACKGROUND WORK (v0.21.0 — Cloudflare)
   //

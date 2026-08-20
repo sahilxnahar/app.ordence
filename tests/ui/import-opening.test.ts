@@ -14,6 +14,15 @@ import { describe, expect, it } from "vitest";
 import { planImport } from "@/lib/import/plan";
 import { OPENING_IMPORT_ENTITIES } from "@/lib/import/opening-entities";
 
+/**
+ * ⭐ WAVE 2C. The planner takes the workspace's currency as data — see
+ * `ImportContext`. These files are all about entities whose amounts are
+ * in rupees, so every call passes the same one; the exponent behaviour
+ * itself is proven in `tests/ui/import-money-exponent.test.ts`.
+ */
+const IMPORT_CONTEXT = { workspaceCurrency: "INR" } as const;
+
+
 const TRIAL_BALANCE = OPENING_IMPORT_ENTITIES["opening-trial-balance"];
 
 describe("hard review: malformed input", () => {
@@ -24,7 +33,7 @@ describe("hard review: malformed input", () => {
       "2100,Sundry Creditors,2026-03-31,,500000.00",
     ].join("\n");
 
-    const plan = planImport(TRIAL_BALANCE, badDateFile);
+    const plan = planImport(TRIAL_BALANCE, badDateFile, IMPORT_CONTEXT);
     
     // The file should have a fatal error or row errors
     if (plan.fatal) {
@@ -44,7 +53,7 @@ describe("hard review: malformed input", () => {
       "2100,Sundry Creditors,2026-03-31,,500000.00",
     ].join("\n");
 
-    const plan = planImport(TRIAL_BALANCE, badAmountFile);
+    const plan = planImport(TRIAL_BALANCE, badAmountFile, IMPORT_CONTEXT);
     
     // The file should have a fatal error or row errors
     if (plan.fatal) {
@@ -53,7 +62,7 @@ describe("hard review: malformed input", () => {
       // If it's a row error, the bad row should have an error
       const badRow = plan.rows[0];
       expect(badRow.errors.length).toBeGreaterThan(0);
-      expect(badRow.errors[0].message).toContain("not an amount");
+      expect(badRow.errors[0].message).toContain("not a valid amount in INR");
     }
   });
 });
@@ -67,7 +76,7 @@ describe("hard review: unbalanced entry refusal", () => {
       "3100,Capital,2026-03-31,,100000.00", // Total credit is 400,000, debit is 500,000
     ].join("\n");
 
-    const plan = planImport(TRIAL_BALANCE, unbalancedFile);
+    const plan = planImport(TRIAL_BALANCE, unbalancedFile, IMPORT_CONTEXT);
     
     // An unbalanced trial balance must be refused
     expect(plan.fatal).not.toBeNull();
@@ -83,7 +92,7 @@ describe("hard review: unbalanced entry refusal", () => {
       "3100,Capital,2026-03-31,,200000.00", // Total credit is 500,000, debit is 500,000
     ].join("\n");
 
-    const plan = planImport(TRIAL_BALANCE, balancedFile);
+    const plan = planImport(TRIAL_BALANCE, balancedFile, IMPORT_CONTEXT);
     
     // A balanced trial balance must be accepted
     expect(plan.fatal).toBeNull();
@@ -100,7 +109,7 @@ describe("hard review: double-apply refusal", () => {
       "3100,Capital,2026-03-31,,200000.00",
     ].join("\n");
 
-    const plan = planImport(TRIAL_BALANCE, balancedFile);
+    const plan = planImport(TRIAL_BALANCE, balancedFile, IMPORT_CONTEXT);
     
     // The batch key should be generated based on the as-at date
     const key = TRIAL_BALANCE.batchKey?.(plan.rows);
@@ -125,8 +134,8 @@ describe("hard review: double-apply refusal", () => {
       "3100,Capital,2026-04-01,,200000.00",
     ].join("\n");
 
-    const plan1 = planImport(TRIAL_BALANCE, balancedFile1);
-    const plan2 = planImport(TRIAL_BALANCE, balancedFile2);
+    const plan1 = planImport(TRIAL_BALANCE, balancedFile1, IMPORT_CONTEXT);
+    const plan2 = planImport(TRIAL_BALANCE, balancedFile2, IMPORT_CONTEXT);
     
     const key1 = TRIAL_BALANCE.batchKey?.(plan1.rows);
     const key2 = TRIAL_BALANCE.batchKey?.(plan2.rows);

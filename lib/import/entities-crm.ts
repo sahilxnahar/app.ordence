@@ -91,6 +91,8 @@ import type { ContractedImportEntity } from "./types";
  */
 const contacts: ContractedImportEntity = {
   key: "contacts",
+  /** ⭐ WAVE 2C. No money column on this entity. */
+  money: { source: "none" },
   label: "Contacts",
   noun: { one: "contact", many: "contacts" },
   description:
@@ -443,6 +445,12 @@ const contacts: ContractedImportEntity = {
  */
 const leads: ContractedImportEntity = {
   key: "leads",
+  /**
+   * ⭐ WAVE 2C. Amounts in this file are in the workspace's own
+   * currency; there is no currency column. The exponent follows from
+   * that code, so a Kuwaiti workspace reads 1.234 as 1234 fils.
+   */
+  money: { source: "workspace" },
   label: "Leads",
   noun: { one: "lead", many: "leads" },
   description:

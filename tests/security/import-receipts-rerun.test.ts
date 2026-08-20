@@ -35,6 +35,15 @@ import { drizzle } from "drizzle-orm/node-postgres";
 import { asSuperuser, asTenant, testPool } from "../setup";
 
 /**
+ * ⭐ WAVE 2C. The planner takes the workspace's currency as data — see
+ * `ImportContext`. These files are all about entities whose amounts are
+ * in rupees, so every call passes the same one; the exponent behaviour
+ * itself is proven in `tests/ui/import-money-exponent.test.ts`.
+ */
+const IMPORT_CONTEXT = { workspaceCurrency: "INR" } as const;
+
+
+/**
  * ⚠️ MOCKED BEFORE THE WRITER IS IMPORTED, because the writer imports
  * `withTenant` at module load. The replacement is `db/index.ts`'s own
  * body over `drizzle-orm/node-postgres` and the suite's pool: the tenant
@@ -142,7 +151,7 @@ const companyIdFor = (name: string) =>
  * a row the commit does not land.
  */
 async function runImport(): Promise<{ created: number; skipped: number }> {
-  const plan = planImportRecords(SALES_IMPORT_ENTITIES.receipts, FILE);
+  const plan = planImportRecords(SALES_IMPORT_ENTITIES.receipts, FILE, IMPORT_CONTEXT);
   expect(plan.fatal).toBeNull();
   expect(plan.rows.every((r) => r.errors.length === 0)).toBe(true);
 

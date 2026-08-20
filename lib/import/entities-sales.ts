@@ -107,6 +107,8 @@ function fold(value: unknown): string {
  */
 const customersEntity: ContractedImportEntity = {
   key: "customers",
+  /** ⭐ WAVE 2C. No money column on this entity. */
+  money: { source: "none" },
   label: "Customers",
   noun: { one: "customer", many: "customers" },
   description:
@@ -472,6 +474,12 @@ const customersEntity: ContractedImportEntity = {
  */
 const receiptsEntity: ContractedImportEntity = {
   key: "receipts",
+  /**
+   * ⭐ WAVE 2C. Amounts in this file are in the workspace's own
+   * currency; there is no currency column. The exponent follows from
+   * that code, so a Kuwaiti workspace reads 1.234 as 1234 fils.
+   */
+  money: { source: "workspace" },
   label: "Customer receipts",
   noun: { one: "receipt", many: "receipts" },
   description:

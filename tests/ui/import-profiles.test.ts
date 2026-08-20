@@ -382,12 +382,12 @@ describe("⭐ how a negative is written is a per-profile fact, resolved against 
      * rupee sign in would produce `-₹1,23,456.78`, which reaches
      * `coerceMoneyMinor`'s pattern with a symbol in the middle.
      */
-    expect(coerceMoneyMinor(parsed.value)).toEqual({ ok: true, value: "-12345678" });
+    expect(coerceMoneyMinor(parsed.value, 2)).toEqual({ ok: true, value: "-12345678" });
   });
 
   it("⚠️ and a bracketed amount read by anything that strips punctuation is a POSITIVE", () => {
     /** Which is why this module exists at all. */
-    expect(coerceMoneyMinor("(1,234.00)".replace(/[()]/g, ""))).toEqual({
+    expect(coerceMoneyMinor("(1,234.00)".replace(/[()]/g, ""), 2)).toEqual({
       ok: true,
       value: "123400",
     });

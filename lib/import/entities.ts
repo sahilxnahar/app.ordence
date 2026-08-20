@@ -55,6 +55,8 @@ import type { ContractedImportEntity } from "./types";
 
 const companiesEntity: ContractedImportEntity = {
   key: "companies",
+  /** ⭐ WAVE 2C. No money column on this entity. */
+  money: { source: "none" },
   label: "Companies",
   noun: { one: "company", many: "companies" },
   description:
@@ -369,6 +371,8 @@ const companiesEntity: ContractedImportEntity = {
  */
 const gstPartiesEntity: ContractedImportEntity = {
   key: "gst-parties",
+  /** ⭐ WAVE 2C. No money column on this entity. */
+  money: { source: "none" },
   label: "GST parties",
   noun: { one: "party", many: "parties" },
   description:

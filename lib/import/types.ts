@@ -585,6 +585,113 @@ export type ImportLookup = {
   missing: string;
 };
 
+/* ------------------------------------------------------------------ */
+/* ⭐⭐⭐ WAVE 2C — WHERE A MONEY COLUMN'S EXPONENT COMES FROM          */
+/* ------------------------------------------------------------------ */
+
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 TWO DECIMAL PLACES CANNOT REPRESENT A DINAR
+ * ══════════════════════════════════════════════════════════════════════
+ * Rule 6 of the import contract, `db/schema/accounting.ts`'s
+ * `amount_minor` and `lib/fx/currency.ts` all say the same thing: the
+ * number of decimal places money has is a fact about the CURRENCY, not a
+ * constant. JPY has 0, the seven Gulf dinars have 3, CLF and UYW have 4.
+ *
+ * Until this wave `lib/import/plan.ts` called `coerceMoneyMinor(raw)`
+ * with no exponent, so every money column in the product was coerced at
+ * two places. `1.234` — an ordinary 1,234-fils amount in Kuwait — was
+ * refused as malformed, and `1234` in a JPY column became `123400`.
+ *
+ * ⚠️ THE EXPONENT IS NOT A CONSTANT ON THE COLUMN EITHER. One file can
+ * carry invoices in two currencies, so the exponent is a fact about the
+ * ROW. What the ENTITY can say is where in the row to look.
+ *
+ * 🔴 AND IT IS NOT OPTIONAL WITH A DEFAULT OF 2. That is exactly the
+ * present behaviour wearing a member: every entity written after this one
+ * would omit it and silently get the defect back. Same argument the
+ * header of this file makes about `reversal` — "there is no such thing as
+ * an entity with no reversal policy; there are only entities whose policy
+ * nobody wrote down." There is no such thing as a money column with no
+ * currency.
+ */
+export type ImportMoneyContract =
+  /**
+   * 🔴 THIS ENTITY HAS NO MONEY COLUMN AT ALL, and saying so is an
+   * ANSWER rather than an omission. Declaring `none` while carrying a
+   * `kind: "money"` column is refused — by `planImportRecords` at the
+   * top of every run, and by `checkImportContract()` (CI gate 29) over
+   * the whole allowlist. So `none` cannot be used as a way of not
+   * deciding.
+   */
+  | { readonly source: "none" }
+  /**
+   * The file carries no currency column, so every amount in it is in the
+   * workspace's own functional currency.
+   *
+   * ⚠️ WHICH THE PURE LAYER DOES NOT KNOW. It lives in
+   * `tenants.settings.currency` and is read by
+   * `functionalCurrencyFromSettings()`; the caller supplies it in
+   * `ImportContext`. See the boundary note on `ImportContext`.
+   */
+  | { readonly source: "workspace" }
+  /**
+   * A column in the file names the currency per row. `field` is the
+   * PAYLOAD FIELD of that column (`ImportColumn.field`), not its header —
+   * headers have aliases and the mapper resolves them.
+   *
+   * ⚠️ `whenBlank` IS REQUIRED FOR THE SAME REASON THE WHOLE MEMBER IS.
+   * A currency column with an empty cell is common (an export that only
+   * fills it for foreign invoices), and "assume the workspace currency"
+   * and "refuse the row" are both defensible — so the entity says which,
+   * rather than the framework guessing.
+   */
+  | {
+      readonly source: "column";
+      readonly field: string;
+      readonly whenBlank: "workspace" | "refuse";
+    };
+
+/**
+ * ⭐ WHAT THE CALLER KNOWS AND THE PURE LAYER CANNOT.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 RULE 4: `lib/import/` MUST NOT IMPORT THE DATABASE
+ * ══════════════════════════════════════════════════════════════════════
+ * That purity is what lets the browser build a blank template and what
+ * makes the decision layer testable without Postgres, so the workspace's
+ * functional currency — a row in `tenants` — arrives as DATA, in this
+ * object, from the one caller that has a session.
+ *
+ * ⚠️ AND THE EXPONENT TABLE DOES NOT. It would have been easy to make
+ * this object carry `exponents: ReadonlyMap<string, number>` too and
+ * call that "taking the exponent as data". It would also have created a
+ * THIRD copy of a fact that already exists twice —
+ * `lib/fx/currency.ts` and the `currency_units` table — with no checker
+ * over the third. The two that exist are compared by
+ * `server/fx/rate-service.ts#verifyCurrencyUnits()`, which is the whole
+ * reason that function exists.
+ *
+ * So `lib/import/plan.ts` resolves code → exponent through
+ * `minorUnitExponent()` in `lib/fx/currency.ts`. That module is pure —
+ * no `server-only`, no database, no clock, its own header says so — and
+ * `npm run check:boundaries` (gate 8) is what fires if that ever stops
+ * being true. What the caller supplies is the CURRENCY, which is tenant
+ * state; not the arithmetic, which is a published ISO fact.
+ */
+export type ImportContext = {
+  /**
+   * ISO-4217 code the workspace keeps its books in, from
+   * `functionalCurrencyFromSettings(tenant.settings).code`.
+   *
+   * ⚠️ NOT OPTIONAL AND NOT DEFAULTED TO "INR". `lib/fx/currency.ts`
+   * already owns that decision and names it
+   * (`DEFAULT_FUNCTIONAL_CURRENCY`); a second silent default here is how
+   * the two drift.
+   */
+  readonly workspaceCurrency: string;
+};
+
 export type ImportEntityDefinition = {
   key: string;
   label: string;
@@ -607,6 +714,13 @@ export type ImportEntityDefinition = {
   updatePermission: PermissionKey;
 
   columns: readonly ImportColumn[];
+
+  /**
+   * 🔴 WHERE THE EXPONENT OF THIS ENTITY'S MONEY COLUMNS COMES FROM.
+   * REQUIRED, INCLUDING `{ source: "none" }` FOR AN ENTITY THAT HAS NO
+   * MONEY COLUMN. See `ImportMoneyContract`.
+   */
+  money: ImportMoneyContract;
 
   /**
    * Turn coerced cell values into the object the entity's EXISTING

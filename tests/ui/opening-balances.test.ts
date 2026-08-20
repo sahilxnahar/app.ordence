@@ -48,6 +48,15 @@ import {
 } from "@/lib/import/opening";
 import { PERMISSION_CATALOG } from "@/db/schema/auth";
 
+/**
+ * ⭐ WAVE 2C. The planner takes the workspace's currency as data — see
+ * `ImportContext`. These files are all about entities whose amounts are
+ * in rupees, so every call passes the same one; the exponent behaviour
+ * itself is proven in `tests/ui/import-money-exponent.test.ts`.
+ */
+const IMPORT_CONTEXT = { workspaceCurrency: "INR" } as const;
+
+
 const ROOT = join(__dirname, "..", "..");
 const read = (p: string) => readFileSync(join(ROOT, p), "utf8");
 
@@ -145,7 +154,7 @@ describe("an opening trial balance that does not balance", () => {
    * balances is wrong, and the account it is wrong on is a real one.
    */
   it("is refused outright rather than imported", () => {
-    const plan = planImport(TRIAL_BALANCE, OUT_BY_FIFTY_PAISE);
+    const plan = planImport(TRIAL_BALANCE, OUT_BY_FIFTY_PAISE, IMPORT_CONTEXT);
     expect(plan.fatal).not.toBeNull();
     // Nothing may be written: the server writes only rows, and there are none.
     expect(plan.rows).toHaveLength(0);
@@ -157,7 +166,7 @@ describe("an opening trial balance that does not balance", () => {
    * short is the whole of what is needed to find it.
    */
   it("says how much it is out by and which side is short", () => {
-    const plan = planImport(TRIAL_BALANCE, OUT_BY_FIFTY_PAISE);
+    const plan = planImport(TRIAL_BALANCE, OUT_BY_FIFTY_PAISE, IMPORT_CONTEXT);
     expect(plan.fatal).toContain("0.50");
     expect(plan.fatal).toContain("debit");
     expect(plan.fatal).toContain("500000.00");
@@ -209,7 +218,7 @@ describe("an opening trial balance that does not balance", () => {
         "Account code,As at,Debit,Credit",
         "1100,2026-03-31,0.00,",
         "2100,2026-03-31,,0.00",
-      ].join("\n"),
+      ].join("\n"), IMPORT_CONTEXT,
     );
     for (const row of plan.rows) expect(row.errors.length).toBeGreaterThan(0);
   });
@@ -233,7 +242,7 @@ describe("an opening trial balance that does not balance", () => {
         "Account code,As at,Debit,Credit",
         "1100,2026-03-31,500000.00,",
         "3100,2026-04-01,,500000.00",
-      ].join("\n"),
+      ].join("\n"), IMPORT_CONTEXT,
     );
     expect(plan.fatal).toContain("2026-03-31");
     expect(plan.fatal).toContain("2026-04-01");
@@ -242,7 +251,7 @@ describe("an opening trial balance that does not balance", () => {
 
 describe("a trial balance that does balance", () => {
   it("plans every line with no errors", () => {
-    const plan = planImport(TRIAL_BALANCE, BALANCED);
+    const plan = planImport(TRIAL_BALANCE, BALANCED, IMPORT_CONTEXT);
     expect(plan.fatal).toBeNull();
     expect(plan.rows).toHaveLength(3);
     for (const row of plan.rows) expect(row.errors).toEqual([]);
@@ -259,7 +268,7 @@ describe("a trial balance that does balance", () => {
       "1100,2026-03-31,999999999999999.99,",
       "3100,2026-03-31,,999999999999999.99",
     ].join("\n");
-    const plan = planImport(TRIAL_BALANCE, huge);
+    const plan = planImport(TRIAL_BALANCE, huge, IMPORT_CONTEXT);
     expect(plan.fatal).toBeNull();
 
     const totals = totalTrialBalance(plan.rows);
@@ -368,7 +377,7 @@ describe("re-running an opening balance import", () => {
     expect(openingBatchKey("trial_balance", "2026-03-31")).toBe("OPENING:TB:2026-03-31");
     expect(openingBatchKey("stock", "2026-03-31")).toBe("OPENING:STK:2026-03-31");
 
-    const plan = planImport(TRIAL_BALANCE, BALANCED);
+    const plan = planImport(TRIAL_BALANCE, BALANCED, IMPORT_CONTEXT);
     const key = TRIAL_BALANCE.batchKey?.(plan.rows);
     expect(key?.value).toBe("OPENING:TB:2026-03-31");
     expect(key?.label).toContain("2026-03-31");
@@ -469,7 +478,7 @@ describe("a trial balance with a row that cannot be read", () => {
    * ledger that does not balance.
    */
   it("imports none of it, including the rows that were fine", () => {
-    const plan = planImport(TRIAL_BALANCE, ONE_BAD_ROW);
+    const plan = planImport(TRIAL_BALANCE, ONE_BAD_ROW, IMPORT_CONTEXT);
     expect(plan.rows).toHaveLength(3);
     for (const row of plan.rows) {
       expect(row.errors.length).toBeGreaterThan(0);
@@ -480,7 +489,7 @@ describe("a trial balance with a row that cannot be read", () => {
 
   /** ⚠️ And the clean rows say so, rather than showing a blank reason. */
   it("tells a clean row that it was fine and still was not imported", () => {
-    const plan = planImport(TRIAL_BALANCE, ONE_BAD_ROW);
+    const plan = planImport(TRIAL_BALANCE, ONE_BAD_ROW, IMPORT_CONTEXT);
     const clean = plan.rows[1];
     expect(clean?.errors[0]?.message).toContain("which is fine");
     expect(clean?.errors[0]?.message).toContain("upload the whole file again");
@@ -493,7 +502,7 @@ describe("a trial balance with a row that cannot be read", () => {
    * that was wrong.
    */
   it("still hands every row back as a re-uploadable CSV", () => {
-    const plan = planImport(TRIAL_BALANCE, ONE_BAD_ROW);
+    const plan = planImport(TRIAL_BALANCE, ONE_BAD_ROW, IMPORT_CONTEXT);
     const report = buildReport(TRIAL_BALANCE, plan, {
       mode: "preview",
       duplicateMode: "skip",
@@ -552,7 +561,7 @@ describe("outstanding invoices and bills carry their own dates", () => {
   ].join("\n");
 
   it("reads the invoice's own date, to the paisa", () => {
-    const plan = planImport(INVOICES, INVOICE_FILE);
+    const plan = planImport(INVOICES, INVOICE_FILE, IMPORT_CONTEXT);
     expect(plan.fatal).toBeNull();
     const row = plan.rows[0];
     expect(row?.errors).toEqual([]);
@@ -581,7 +590,7 @@ describe("outstanding invoices and bills carry their own dates", () => {
       [
         "Customer,Invoice number,Invoice date,Amount outstanding",
         "Acme Traders,AH/2025/0100,,125000.50",
-      ].join("\n"),
+      ].join("\n"), IMPORT_CONTEXT,
     );
     expect(plan.rows[0]?.errors.length).toBeGreaterThan(0);
     expect(plan.rows[0]?.errors[0]?.message).not.toContain("received null");
@@ -594,7 +603,7 @@ describe("outstanding invoices and bills carry their own dates", () => {
       [
         "Customer,Invoice number,Invoice date,Due date,Amount outstanding",
         "Acme Traders,AH/2025/0100,2025-11-14,2025-01-01,1000.00",
-      ].join("\n"),
+      ].join("\n"), IMPORT_CONTEXT,
     );
     expect(plan.rows[0]?.errors[0]?.message).toContain("before the invoice date");
   });
@@ -705,7 +714,7 @@ describe("preview and commit stay one path", () => {
      */
     const modeReads = [...code.matchAll(/mode === "commit"/g)].map((m) => m.index ?? 0);
     expect(modeReads).toHaveLength(3);
-    const plannerAt = code.indexOf("planImportRecords(entity, params.records)");
+    const plannerAt = code.indexOf("planImportRecords(entity, params.records, planContext)");
     expect(plannerAt).toBeGreaterThan(0);
     for (const at of modeReads) expect(at).toBeGreaterThan(plannerAt);
 
@@ -739,7 +748,7 @@ describe("preview and commit stay one path", () => {
   /** ⚠️ The planner still takes a file and an entity, and nothing else. */
   it("keeps the planner free of any run-mode argument", () => {
     expect(commentsOnly(PLAN)).toContain(
-      "export function planImport(\n  entity: ImportEntityDefinition,\n  csvText: string,\n): ImportPlan",
+      "export function planImport(\n  entity: ImportEntityDefinition,\n  csvText: string,\n  context: ImportContext,\n): ImportPlan",
     );
   });
 });

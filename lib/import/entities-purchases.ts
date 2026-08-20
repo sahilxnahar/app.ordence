@@ -162,6 +162,8 @@ function rupeesOrZero(value: unknown): string {
  */
 const vendorsEntity: ContractedImportEntity = {
   key: "vendors",
+  /** ⭐ WAVE 2C. No money column on this entity. */
+  money: { source: "none" },
   label: "Vendors",
   noun: { one: "vendor", many: "vendors" },
   description:
@@ -740,6 +742,12 @@ export const importPurchaseBillSchema = z
  */
 const purchaseBillsEntity: ContractedImportEntity = {
   key: "purchase-bills",
+  /**
+   * ⭐ WAVE 2C. Amounts in this file are in the workspace's own
+   * currency; there is no currency column. The exponent follows from
+   * that code, so a Kuwaiti workspace reads 1.234 as 1234 fils.
+   */
+  money: { source: "workspace" },
   label: "Purchase bills",
   noun: { one: "bill", many: "bills" },
   description:

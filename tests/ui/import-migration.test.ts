@@ -30,6 +30,15 @@ import { MAX_IMPORT_ROWS, planImportRecords } from "@/lib/import";
 import { IMPORT_ENTITIES } from "@/lib/import/entities";
 import type { CsvRecord } from "@/lib/import/csv";
 
+/**
+ * ⭐ WAVE 2C. The planner takes the workspace's currency as data — see
+ * `ImportContext`. These files are all about entities whose amounts are
+ * in rupees, so every call passes the same one; the exponent behaviour
+ * itself is proven in `tests/ui/import-money-exponent.test.ts`.
+ */
+const IMPORT_CONTEXT = { workspaceCurrency: "INR" } as const;
+
+
 const ROOT = process.cwd();
 const read = (p: string) => readFileSync(join(ROOT, p), "utf8");
 const codeOnly = (source: string) =>
@@ -50,7 +59,7 @@ describe("⭐ the same planner, from a record stream", () => {
       { recordNumber: 2, cells: ["Acme Ltd", "acme.example"] },
       { recordNumber: 3, cells: ["Beta Ltd", "beta.example"] },
     ];
-    const plan = planImportRecords(entity, records);
+    const plan = planImportRecords(entity, records, IMPORT_CONTEXT);
     expect(plan.fatal).toBeNull();
     expect(plan.rows).toHaveLength(2);
     expect(plan.rows.every((r) => r.errors.length === 0)).toBe(true);
@@ -59,7 +68,7 @@ describe("⭐ the same planner, from a record stream", () => {
   it("refuses a header row with nothing under it, in the same words", () => {
     const plan = planImportRecords(IMPORT_ENTITIES.companies, [
       { recordNumber: 1, cells: ["Name"] },
-    ]);
+    ], IMPORT_CONTEXT);
     expect(plan.fatal).toMatch(/header row and no data rows/);
   });
 
@@ -72,7 +81,7 @@ describe("⭐ the same planner, from a record stream", () => {
     for (let i = 0; i < MAX_IMPORT_ROWS + 1; i += 1) {
       rows.push({ recordNumber: i + 2, cells: [`Company ${i}`] });
     }
-    const plan = planImportRecords(IMPORT_ENTITIES.companies, rows);
+    const plan = planImportRecords(IMPORT_ENTITIES.companies, rows, IMPORT_CONTEXT);
     expect(plan.fatal).toMatch(new RegExp(String(MAX_IMPORT_ROWS)));
   });
 });

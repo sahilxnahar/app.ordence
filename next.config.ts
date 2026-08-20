@@ -18,6 +18,46 @@ import { SECURITY_HEADERS, PORTAL_OVERRIDE_HEADERS } from "@/lib/edge/security-h
 const securityHeaders = SECURITY_HEADERS;
 
 const nextConfig: NextConfig = {
+  /**
+   * ══════════════════════════════════════════════════════════════════════
+   * 🔴 WAVE 0 , THE BUILD RAN OUT OF HEAP, AND IT WAS SIZE AND NOTHING ELSE
+   * ══════════════════════════════════════════════════════════════════════
+   * v1.88.0-alpha failed on Railway with:
+   *
+   *     FatalProcessOutOfMemory
+   *     process "sh -c npm run build" did not complete successfully: exit 134
+   *
+   * ⚠️ EXIT 134 IS A HEAP ABORT, NOT A COMPILE FAILURE. `tsc --noEmit` was
+   * clean and all 29 gates passed on the same tree. v1.84.1 built in three
+   * minutes; nothing about v1.88.0 is special except how much of it there is.
+   *
+   * Measured on the tree that failed:
+   *
+   *     routes (page.tsx)                                    218
+   *     TypeScript files                                   1,377
+   *     schema files                                          70
+   *     modules importing the whole `@/db/schema` barrel      108
+   *
+   * 🔴 THE LAST NUMBER IS THE CAUSE. Next builds each of 218 routes, and
+   *    108 modules pull all 70 schema files in transitively, so peak heap
+   *    during "Collecting page data" grows with the PRODUCT of the two.
+   *
+   * ⚠️ THIS FLAG IS THE SMALLER HALF OF THE FIX AND IS NOT A CURE. It tells
+   * webpack to release the module graph between compilations, which lowers
+   * the peak; it does not stop the peak growing. The real repair is to split
+   * the schema barrel so a route that imports `companies` stops importing
+   * payroll, and that is a change across 108 files , a wave of its own.
+   *
+   * ⭐ THE OTHER HALF IS `NODE_OPTIONS=--max-old-space-size` on the BUILD,
+   * in `railway.json`. Neither alone was trusted to be enough, and the one
+   * that can be verified locally is the one in `railway.json` , this one
+   * cannot be, because `next build` OOMs in the 8 GB container this repo is
+   * assembled in and always has.
+   */
+  experimental: {
+    webpackMemoryOptimizations: true,
+  },
+
   reactStrictMode: true,
   poweredByHeader: false,
   // Never ship source maps to the browser in production (IP protection).

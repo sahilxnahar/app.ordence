@@ -91,6 +91,57 @@ export function checkImportContract(
       }
     }
 
+    /* ---- ⭐⭐⭐ WAVE 2C — every money column has a currency ---- */
+
+    /*
+     * 🔴 `money: { source: "none" }` IS THE ONLY VARIANT THAT COULD BE
+     * USED AS A WAY OF NOT DECIDING, so it is the one this gate exists
+     * for. An entity that declares it while carrying a `kind: "money"`
+     * column would have every amount coerced at whatever exponent the
+     * framework fell back to — which is how "two decimal places" became
+     * true of the whole product in the first place.
+     *
+     * ⚠️ AND THE CONVERSE. An entity with NO money column that declares
+     * a currency source is not harmless: it is a member that reads as
+     * enforced and enforces nothing, and the next person adds an amount
+     * column believing the currency question was already answered for
+     * it. Both directions are refused.
+     */
+    const moneyColumns = def.columns.filter((col) => col.kind === "money");
+
+    if (def.money.source === "none" && moneyColumns.length > 0) {
+      problems.push({
+        entity: key,
+        member: "money",
+        problem: `declares money: { source: "none" } but has ${moneyColumns.length} money column(s): ${moneyColumns.map((col) => col.header).join(", ")}. An amount cannot be read without knowing how many decimal places its currency has — two is wrong by a factor of ten for the Gulf dinars and a hundred for the yen.`,
+      });
+    }
+
+    if (def.money.source !== "none" && moneyColumns.length === 0) {
+      problems.push({
+        entity: key,
+        member: "money",
+        problem: `declares a currency source ("${def.money.source}") but has no money column. The member reads as enforced and enforces nothing; declare money: { source: "none" } until it has an amount.`,
+      });
+    }
+
+    if (def.money.source === "column") {
+      const carrier = def.columns.find((col) => col.field === (def.money as { field: string }).field);
+      if (!carrier) {
+        problems.push({
+          entity: key,
+          member: "money.field",
+          problem: `says the currency is carried by field "${(def.money as { field: string }).field}", which is not one of its columns. Nothing in the file would ever supply it, so every row would silently fall back to the workspace currency or be refused.`,
+        });
+      } else if (carrier.kind !== "text" && carrier.kind !== "enum") {
+        problems.push({
+          entity: key,
+          member: "money.field",
+          problem: `names "${carrier.header}" as its currency column, but that column is a ${carrier.kind}. A currency code is text.`,
+        });
+      }
+    }
+
     /* ---- provenance covers the destination ---- */
     if (c.provenance.targets.length === 0) {
       problems.push({

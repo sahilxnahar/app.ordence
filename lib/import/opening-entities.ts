@@ -92,6 +92,12 @@ function fold(value: unknown): string {
 
 const openingTrialBalanceEntity: ImportEntityDefinition = {
   key: "opening-trial-balance",
+  /**
+   * ⭐ WAVE 2C. Amounts in this file are in the workspace's own
+   * currency; there is no currency column. The exponent follows from
+   * that code, so a Kuwaiti workspace reads 1.234 as 1234 fils.
+   */
+  money: { source: "workspace" },
   label: "Opening trial balance",
   noun: { one: "opening balance", many: "opening balances" },
   description:
@@ -302,6 +308,12 @@ const openingTrialBalanceEntity: ImportEntityDefinition = {
 
 const openingCustomerInvoicesEntity: ImportEntityDefinition = {
   key: "opening-customer-invoices",
+  /**
+   * ⭐ WAVE 2C. Amounts in this file are in the workspace's own
+   * currency; there is no currency column. The exponent follows from
+   * that code, so a Kuwaiti workspace reads 1.234 as 1234 fils.
+   */
+  money: { source: "workspace" },
   label: "Unpaid customer invoices",
   noun: { one: "opening invoice", many: "opening invoices" },
   description:
@@ -471,6 +483,12 @@ const openingCustomerInvoicesEntity: ImportEntityDefinition = {
 
 const openingVendorBillsEntity: ImportEntityDefinition = {
   key: "opening-vendor-bills",
+  /**
+   * ⭐ WAVE 2C. Amounts in this file are in the workspace's own
+   * currency; there is no currency column. The exponent follows from
+   * that code, so a Kuwaiti workspace reads 1.234 as 1234 fils.
+   */
+  money: { source: "workspace" },
   label: "Unpaid vendor bills",
   noun: { one: "opening bill", many: "opening bills" },
   description:
@@ -608,6 +626,12 @@ const openingVendorBillsEntity: ImportEntityDefinition = {
 
 const openingStockEntity: ImportEntityDefinition = {
   key: "opening-stock",
+  /**
+   * ⭐ WAVE 2C. Amounts in this file are in the workspace's own
+   * currency; there is no currency column. The exponent follows from
+   * that code, so a Kuwaiti workspace reads 1.234 as 1234 fils.
+   */
+  money: { source: "workspace" },
   label: "Stock on hand",
   noun: { one: "opening stock line", many: "opening stock lines" },
   description:

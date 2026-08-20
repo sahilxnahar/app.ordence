@@ -34,6 +34,50 @@ export type DocumentEntityTypeInput = (typeof DOCUMENT_ENTITY_TYPES)[number];
 
 /**
  * ══════════════════════════════════════════════════════════════════════
+ * ⭐⭐ WHAT MAY BE UPLOADED IS A LONGER LIST THAN WHAT IS A DOCUMENT
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 WAVE 2E ASKED FOR `"branding"` TO JOIN `DOCUMENT_ENTITY_TYPES`, AND
+ *    THAT WOULD HAVE BROKEN THE BUILD IN A WAY WORTH RECORDING.
+ *
+ * `DOCUMENT_ENTITY_TYPES` is not merely a TypeScript list: it mirrors
+ * `document_entity_type`, a DATABASE ENUM (`db/schema/storage.ts`). Adding
+ * a member here and not there makes the two disagree, and TypeScript says
+ * so immediately , `Type '"branding"' is not assignable to type 'never'`
+ * at the exhaustiveness guard in `server/actions/storage.ts`, and again at
+ * the `documents` insert.
+ *
+ * ⚠️ THE FIX IS NOT A MIGRATION. Wave 2E's own report is right that a logo
+ * is NOT a document: no `documents` row is written for it, it is not in
+ * the vault, the recycle bin or retention. Adding it to the database enum
+ * would make it one, and every retention sweep and DPDPA erasure path
+ * would then have to learn that this particular document is not really a
+ * document.
+ *
+ * ⭐ SO THE TWO IDEAS ARE SEPARATED HERE. What may pass through the signed
+ * upload ticket is a SUPERSET of what may become a document row. The
+ * ticket path, the tenant-prefixed key, the content-type pin, the byte
+ * ceiling, the rate limit and the magic-byte sniff all still apply,
+ * because they are properties of the TICKET and not of the document.
+ *
+ * 🔴 `saveDocumentSchema` DELIBERATELY KEEPS THE NARROWER LIST. A caller
+ *    that uploads a logo and then tries to record it as a document is
+ *    refused by the schema, which is the property that keeps the database
+ *    enum honest.
+ */
+export const UPLOAD_ENTITY_TYPES = [
+  ...DOCUMENT_ENTITY_TYPES,
+  /**
+   * ⚠️ THE ENTITY ID IS THE TENANT ID. Every other entity type names a
+   * record inside the workspace; branding names the workspace itself,
+   * which is the only id that exists before any record does.
+   */
+  "branding",
+] as const;
+
+export type UploadEntityTypeInput = (typeof UPLOAD_ENTITY_TYPES)[number];
+
+/**
+ * ══════════════════════════════════════════════════════════════════════
  * WHY THERE IS AN ALLOWLIST AND NOT A BLOCKLIST
  * ══════════════════════════════════════════════════════════════════════
  * A blocklist ("no .exe, no .sh") loses to the first extension nobody
@@ -136,7 +180,8 @@ export const VERCEL_BODY_LIMIT_BYTES = 4.5 * 1024 * 1024;
  * friendly the component that produced it.
  */
 export const uploadClientPayloadSchema = z.object({
-  entityType: z.enum(DOCUMENT_ENTITY_TYPES),
+  /** ⭐ The WIDER list , see `UPLOAD_ENTITY_TYPES`. A logo is uploadable and is not a document. */
+  entityType: z.enum(UPLOAD_ENTITY_TYPES),
   entityId: z.string().uuid("Invalid record identifier."),
   fileName: z.string().trim().min(1).max(400),
   sizeBytes: z.number().int().min(1).max(MAX_FILE_BYTES),

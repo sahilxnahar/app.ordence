@@ -22,6 +22,62 @@
     --input: 40 20% 90%;
     --ring: 38 45% 46%;
     --radius: 0.6rem;
+
+    /* ══════════════════════════════════════════════════════════════════
+       ⭐⭐⭐ WAVE 2D — THE SIX MEANINGS. ONE COLOUR EACH, AND NOTHING ELSE.
+       ══════════════════════════════════════════════════════════════════
+       🔴 THESE ARE NOT A PALETTE. THEY ARE A VOCABULARY.
+
+         --ord-chrome     structural navy. Not a state. Never on a figure.
+         --ord-action     the thing you can click. Not "primary", not
+                          "brand", not "information".
+         --ord-ties       THIS TIES. Two figures that must agree, agree.
+                          It is NOT "good", NOT "success", NOT "saved".
+         --ord-check      A PERSON MUST LOOK. It is NOT "warning" and it
+                          is NOT a failure — an e-invoice awaiting its IRN
+                          at 11pm is entirely normal and wears this.
+         --ord-blocks     THIS BLOCKS THE CUTOVER. It is NOT "error" and
+                          it is NEVER a negative number (see below).
+         --ord-statutory  a duty owed to the State with a date on it.
+
+       🔴 THE MOMENT GREEN MEANS BOTH "RECONCILED" AND "SAVED", A CUSTOMER
+       STOPS READING IT. A toast that saved a draft does not get
+       `--ord-ties`; it gets `--ord-action` or no colour at all. This is
+       the whole reason the tokens are named for MEANINGS and not for
+       hues — `--ord-green` would have been used for "saved" within a
+       week, by somebody who never read this comment, and would have been
+       right to, because that is what the name would have said.
+
+       ⚠️ THESE SIT BESIDE THE SHADCN TOKENS, THEY DO NOT REPLACE THEM.
+       `--primary` is still the product's gold and still dresses buttons.
+       A status is a different axis from a brand, and collapsing the two
+       is how "destructive" ends up meaning "overdue".
+
+       ⚠️ NOT IN `tailwind.config.ts`, DELIBERATELY. That file belongs to
+       nobody this wave and editing it would collide. Every consumer
+       reaches these as `text-[hsl(var(--ord-ties))]`, which needs no
+       config entry and no build change. If a later wave wants
+       `text-ord-ties`, adding the mapping is additive and breaks none of
+       the call sites written now.
+
+       Source: the `:root` block of ORDENCE-ERP-UI.html, converted to the
+       HSL triplet form every other token in this file uses. The hex each
+       one came from is in the comment, so the conversion is checkable. */
+    --ord-chrome: 213.3 55.6% 15.9%;           /* #12263f */
+    --ord-action: 214.4 81.4% 46.3%;           /* #1668d6 */
+    --ord-ties: 150.8 78.1% 26.9%;             /* #0f7a46 */
+    --ord-check: 35.5 100% 30.2%;              /* #9a5b00 */
+    --ord-blocks: 3.4 62.8% 44.3%;             /* #b8322a */
+    --ord-statutory: 254.2 48.4% 47.8%;        /* #5b3fb5 */
+
+    /* The tinted grounds the pills sit on. Deliberately near-white: a
+       status pill is read at a glance in a column of forty rows, and a
+       saturated chip in every row is a column nobody can scan. */
+    --ord-action-bg: 216 78.9% 96.3%;          /* #eef4fd */
+    --ord-ties-bg: 147.7 44.8% 94.3%;          /* #eaf7f0 */
+    --ord-check-bg: 40.9 84.6% 94.9%;          /* #fdf6e7 */
+    --ord-blocks-bg: 4.6 68.4% 96.3%;          /* #fcf0ef */
+    --ord-statutory-bg: 253.8 68.4% 96.3%;     /* #f2effc */
   }
   .dark {
     --background: 0 0% 7%;
@@ -41,6 +97,30 @@
     --border: 0 0% 20%;
     --input: 0 0% 20%;
     --ring: 38 45% 55%;
+
+    /* ⚠️ WAVE 2D — THE SIX MEANINGS, RE-CUT FOR A DARK GROUND.
+       The MEANINGS do not change and the hues barely move; the
+       lightnesses invert, because #0f7a46 on a #121212 ground is a
+       smudge and #b8322a is unreadable. A status that cannot be read in
+       dark mode is a status that is not there — and the one screen where
+       that matters most, a 3B with a deadline, is exactly the screen
+       somebody opens at 11pm with the lights off.
+
+       ⚠️ THE BACKGROUNDS ARE DARK-TINTED, NOT THE LIGHT ONES DIMMED.
+       Reusing #eaf7f0 here would put near-white behind text that is now
+       light green. */
+    --ord-chrome: 213.3 30% 12%;
+    --ord-action: 214.4 90% 66%;
+    --ord-ties: 150.8 55% 52%;
+    --ord-check: 35.5 85% 58%;
+    --ord-blocks: 3.4 75% 63%;
+    --ord-statutory: 254.2 70% 72%;
+
+    --ord-action-bg: 214.4 45% 18%;
+    --ord-ties-bg: 150.8 40% 14%;
+    --ord-check-bg: 35.5 45% 15%;
+    --ord-blocks-bg: 3.4 45% 17%;
+    --ord-statutory-bg: 254.2 40% 19%;
   }
   /* ══════════════════════════════════════════════════════════════════
      ⭐ DOCUMENT SURFACES STAY BRIGHT IN DARK MODE — Batch 142
@@ -90,10 +170,68 @@
     --border: 40 20% 90%;
     --input: 40 20% 90%;
     --ring: 38 45% 46%;
+
+    /* 🔴 THE SIX MEANINGS ARE RE-DECLARED LIGHT HERE FOR THE SAME REASON
+       EVERY TOKEN ABOVE THEM IS. A GSTR-3B summary, an invoice and a
+       payslip are PAPER. The `--ord-blocks` red on a 3B that is due
+       today has to survive being printed and being photographed and
+       WhatsApped to an accountant — and the dark cut above, chosen to be
+       readable on #121212, is a pale pink on white.
+
+       ⚠️ THIS BLOCK IS WHY THE DARK OVERRIDES ARE SAFE TO HAVE AT ALL.
+       Without it, adding dark values would have silently changed every
+       printed document for any user whose theme happened to be dark. */
+    --ord-chrome: 213.3 55.6% 15.9%;
+    --ord-action: 214.4 81.4% 46.3%;
+    --ord-ties: 150.8 78.1% 26.9%;
+    --ord-check: 35.5 100% 30.2%;
+    --ord-blocks: 3.4 62.8% 44.3%;
+    --ord-statutory: 254.2 48.4% 47.8%;
+    --ord-action-bg: 216 78.9% 96.3%;
+    --ord-ties-bg: 147.7 44.8% 94.3%;
+    --ord-check-bg: 40.9 84.6% 94.9%;
+    --ord-blocks-bg: 4.6 68.4% 96.3%;
+    --ord-statutory-bg: 253.8 68.4% 96.3%;
   }
 
   * { @apply border-border; }
   body { @apply bg-background text-foreground antialiased; }
+
+  /* ══════════════════════════════════════════════════════════════════
+     ⭐⭐⭐ WAVE 2D — TABULAR FIGURES, AS A BASE RULE AND NOT AS A HABIT
+     ══════════════════════════════════════════════════════════════════
+     🔴 ONE CSS LINE, AND IT IS THE DIFFERENCE BETWEEN A LEDGER AND A WEB
+     PAGE. Without `tabular-nums` the digits are proportionally spaced —
+     a `1` is narrower than a `0` — so the units column of row 3 sits
+     under the tens column of row 4. A person checking a total against
+     their own has to read every row twice, and the reason they have to
+     is invisible: the numbers are all correct.
+
+     ⚠️ IT IS A BASE RULE ON `table`, NOT A CLASS EACH SCREEN REMEMBERS.
+     A `.num` class is a rule that holds until the next person writes a
+     table, which is the same as not holding. There are 218 routes; the
+     one that forgets is the one an accountant opens. Scoping it to
+     `table` is deliberate — this makes every existing ledger in the
+     product line up without a single screen being edited, which is what
+     lets this wave ship without touching Wave 2A's files.
+
+     ⚠️ `lnum` IS PART OF IT AND IS NOT REDUNDANT. Some faces ship
+     old-style (text) figures by default, where 3, 4, 5, 7 and 9 drop
+     below the baseline. Charming in a book; in a debit column it reads
+     as a smudge and it defeats the alignment `tnum` just bought.
+
+     ⭐ `.ord-num` IS FOR FIGURES THAT ARE NOT IN A TABLE — the metric
+     cards, an account code in a header, a GSTIN. The primitives in
+     `components/ui/` apply it themselves; nothing else has to know. */
+  table {
+    font-variant-numeric: tabular-nums lining-nums;
+    font-feature-settings: "tnum" 1, "lnum" 1;
+  }
+
+  .ord-num {
+    font-variant-numeric: tabular-nums lining-nums;
+    font-feature-settings: "tnum" 1, "lnum" 1;
+  }
 }
 
 /* ══════════════════════════════════════════════════════════════════════

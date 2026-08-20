@@ -29,7 +29,7 @@
  */
 
 import Link from "next/link";
-import { UploadCloud } from "lucide-react";
+import { ClipboardCheck, ListOrdered, UploadCloud } from "lucide-react";
 import { ImportWizard } from "@/components/settings/import-wizard";
 import { ImportRunsPanel } from "./import-runs-panel";
 import {
@@ -76,6 +76,51 @@ export default function ImportPage() {
           have seen a dry run of exactly what will happen.
         </p>
       </header>
+
+      {/*
+        ⭐⭐⭐ WAVE 2A — THE TWO SCREENS EITHER SIDE OF THIS ONE.
+
+        🔴 A MIGRATION IS THREE ACTS AND ONLY THE MIDDLE ONE WAS EVER
+        BUILT A SCREEN. Deciding what to load and in what order comes
+        first; proving the result ties comes last; this page is the part
+        in between. A customer who only ever finds this page loads their
+        invoices before their customers and switches their old system off
+        without footing anything.
+
+        ⚠️ LINKED FROM HERE RATHER THAN ONLY FROM THE SETTINGS TABS,
+        because "import" is the word somebody migrating has in mind and
+        this is the page that word brings them to.
+      */}
+      <div className="grid gap-3 sm:grid-cols-2">
+        <Link
+          href="/settings/import/plan"
+          className="rounded-lg border bg-card p-4 hover:border-primary"
+        >
+          <span className="flex items-center gap-2 text-sm font-medium">
+            <ListOrdered className="h-4 w-4" aria-hidden="true" />
+            Before you start: what to load, and in what order
+          </span>
+          <span className="mt-1 block text-sm text-muted-foreground">
+            Eighteen kinds of record in two groups, with a reason on every line.
+            Load them in the wrong order and perfectly good files come back full of
+            errors about records that are not in yet.
+          </span>
+        </Link>
+        <Link
+          href="/settings/import/cutover"
+          className="rounded-lg border bg-card p-4 hover:border-primary"
+        >
+          <span className="flex items-center gap-2 text-sm font-medium">
+            <ClipboardCheck className="h-4 w-4" aria-hidden="true" />
+            When you are done: does it tie?
+          </span>
+          <span className="mt-1 block text-sm text-muted-foreground">
+            Two numbers and the distance between them, for every migration you have
+            run — and a plain statement of what has not been checked yet. Read this
+            before you switch the old system off.
+          </span>
+        </Link>
+      </div>
 
       {/*
         ⭐ THE TWO PROMISES, ABOVE THE FORM, BECAUSE THEY ARE WHAT MAKES

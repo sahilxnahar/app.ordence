@@ -34,6 +34,15 @@ import { ALL_IMPORT_ENTITIES } from "@/lib/import/entities";
 import type { CsvRecord } from "@/lib/import/csv";
 import type { ContractedImportEntity } from "@/lib/import/types";
 
+/**
+ * ⭐ WAVE 2C. The planner takes the workspace's currency as data — see
+ * `ImportContext`. These files are all about entities whose amounts are
+ * in rupees, so every call passes the same one; the exponent behaviour
+ * itself is proven in `tests/ui/import-money-exponent.test.ts`.
+ */
+const IMPORT_CONTEXT = { workspaceCurrency: "INR" } as const;
+
+
 const ROOT = process.cwd();
 const read = (p: string) => readFileSync(join(ROOT, p), "utf8");
 
@@ -63,7 +72,7 @@ describe("⭐ customers — the same tax rules as the form, not a copy of them",
   it("accepts a registered customer and fixes the party type itself", () => {
     const plan = planImportRecords(customers, customerFile(
       ["Acme Cements Ltd", "27AAACR5055K1Z7", "regular", "", "2024-04-01"],
-    ));
+    ), IMPORT_CONTEXT);
 
     expect(plan.fatal).toBeNull();
     expect(plan.rows[0]?.errors).toEqual([]);
@@ -85,7 +94,7 @@ describe("⭐ customers — the same tax rules as the form, not a copy of them",
   it("refuses a regular customer with no GSTIN, in the schema's own words", () => {
     const plan = planImportRecords(customers, customerFile(
       ["Beta Traders", "", "regular", "27", "2024-04-01"],
-    ));
+    ), IMPORT_CONTEXT);
     const messages = plan.rows[0]?.errors.map((e) => e.message).join(" ") ?? "";
     expect(plan.rows[0]?.errors.length).toBeGreaterThan(0);
     expect(messages.toLowerCase()).toContain("gstin");
@@ -94,7 +103,7 @@ describe("⭐ customers — the same tax rules as the form, not a copy of them",
   it("refuses a state code that disagrees with the GSTIN's first two digits", () => {
     const plan = planImportRecords(customers, customerFile(
       ["Gamma Steel Pvt Ltd", "27AAACR5055K1Z7", "regular", "29", "2024-04-01"],
-    ));
+    ), IMPORT_CONTEXT);
     expect(plan.rows[0]?.errors.length).toBeGreaterThan(0);
   });
 
@@ -114,7 +123,7 @@ describe("⭐ customers — the same tax rules as the form, not a copy of them",
         recordNumber: 2,
         cells: ["Delta Supplies", "vendor", "27AAACR5055K1Z7", "regular", "2024-04-01"],
       },
-    ]);
+    ], IMPORT_CONTEXT);
 
     expect(plan.unrecognisedHeaders).toContain("Customer or vendor");
     expect(plan.rows[0]?.payload?.partyType).toBe("customer");
@@ -126,7 +135,7 @@ describe("⭐ customers — the same tax rules as the form, not a copy of them",
   it("falls back to the name for an unregistered customer, and labels it weak", () => {
     const plan = planImportRecords(customers, customerFile(
       ["  Epsilon   Hardware  ", "", "unregistered", "", "2024-04-01"],
-    ));
+    ), IMPORT_CONTEXT);
     expect(plan.rows[0]?.errors).toEqual([]);
     expect(plan.rows[0]?.naturalKey).toEqual({
       kind: "legalName",
@@ -138,7 +147,7 @@ describe("⭐ customers — the same tax rules as the form, not a copy of them",
   it("omits the address entirely when every part is blank, so an update cannot erase one", () => {
     const plan = planImportRecords(customers, customerFile(
       ["Zeta Ltd", "27AAACR5055K1Z7", "regular", "", "2024-04-01"],
-    ));
+    ), IMPORT_CONTEXT);
     expect(Object.hasOwn(plan.rows[0]?.payload ?? {}, "address")).toBe(false);
   });
 });
@@ -148,7 +157,7 @@ describe("⭐ receipts — the form's schema, applied in two steps", () => {
   it("plans a referenced receipt, coerces the money to paise, and asks for the customer", () => {
     const plan = planImportRecords(receipts, receiptFile(
       ["Acme Cements Ltd", "2026-03-14", "1,25,000.50", "neft", "UTR9931", "2500"],
-    ));
+    ), IMPORT_CONTEXT);
 
     expect(plan.fatal).toBeNull();
     expect(plan.rows[0]?.errors).toEqual([]);
@@ -182,7 +191,7 @@ describe("⭐ receipts — the form's schema, applied in two steps", () => {
   it("keeps the customer's name through the schema — it is not stripped", () => {
     const plan = planImportRecords(receipts, receiptFile(
       ["Acme Cements Ltd", "2026-03-14", "1000", "upi", "", ""],
-    ));
+    ), IMPORT_CONTEXT);
     expect(plan.rows[0]?.payload?.customerName).toBe("Acme Cements Ltd");
     expect(plan.rows[0]?.naturalKey).not.toBeNull();
     expect(plan.rows[0]?.lookups?.length).toBe(1);
@@ -191,7 +200,7 @@ describe("⭐ receipts — the form's schema, applied in two steps", () => {
   it("refuses a receipt with no customer on it, in the preview, with the sentence written for it", () => {
     const plan = planImportRecords(receipts, receiptFile(
       ["", "2026-03-14", "1000", "cash", "", ""],
-    ));
+    ), IMPORT_CONTEXT);
     const messages = plan.rows[0]?.errors.map((e) => e.message) ?? [];
     expect(messages).toContain(
       "Name the customer exactly as their company record is named in Ordence.",
@@ -202,7 +211,7 @@ describe("⭐ receipts — the form's schema, applied in two steps", () => {
   it("falls back to a weak key when no reference is given, and says so in the label", () => {
     const plan = planImportRecords(receipts, receiptFile(
       ["Acme Cements Ltd", "2026-03-14", "5000", "cash", "", ""],
-    ));
+    ), IMPORT_CONTEXT);
     expect(plan.rows[0]?.naturalKey?.kind).toBe("unreferenced");
     expect(plan.rows[0]?.naturalKey?.value).toBe("acme cements ltd|2026-03-14|500000|cash");
     expect(plan.rows[0]?.naturalKey?.label).toContain("weak match");
@@ -211,7 +220,7 @@ describe("⭐ receipts — the form's schema, applied in two steps", () => {
   it("refuses a method the database's enum does not have", () => {
     const plan = planImportRecords(receipts, receiptFile(
       ["Acme Cements Ltd", "2026-03-14", "5000", "bitcoin", "", ""],
-    ));
+    ), IMPORT_CONTEXT);
     expect(plan.rows[0]?.errors.length).toBeGreaterThan(0);
   });
 
@@ -219,7 +228,7 @@ describe("⭐ receipts — the form's schema, applied in two steps", () => {
     const plan = planImportRecords(receipts, receiptFile(
       ["Acme Cements Ltd", "2026-03-14", "5000", "neft", "UTR9931", ""],
       ["ACME   cements ltd", "2026-03-14", "5000", "neft", "UTR9931", ""],
-    ));
+    ), IMPORT_CONTEXT);
     expect(plan.rows[0]?.errors).toEqual([]);
     expect(plan.rows[1]?.errors.length).toBeGreaterThan(0);
   });
@@ -238,8 +247,8 @@ describe("🔴 safe to run twice — as far as a suite without Postgres can prov
       ["Acme Cements Ltd", "2026-03-14", "5000", "neft", "UTR9931", ""],
       ["Beta Traders", "2026-03-15", "2500.75", "cash", "", ""],
     );
-    const first = planImportRecords(receipts, rows).rows.map((r) => r.naturalKey);
-    const second = planImportRecords(receipts, rows).rows.map((r) => r.naturalKey);
+    const first = planImportRecords(receipts, rows, IMPORT_CONTEXT).rows.map((r) => r.naturalKey);
+    const second = planImportRecords(receipts, rows, IMPORT_CONTEXT).rows.map((r) => r.naturalKey);
     expect(second).toEqual(first);
     expect(first.every((k) => k !== null)).toBe(true);
   });
@@ -247,10 +256,10 @@ describe("🔴 safe to run twice — as far as a suite without Postgres can prov
   it("a differently-spelled customer name lands on the same key", () => {
     const a = planImportRecords(receipts, receiptFile(
       ["Acme Cements Ltd", "2026-03-14", "5000", "neft", "utr9931", ""],
-    )).rows[0]?.naturalKey?.value;
+    ), IMPORT_CONTEXT).rows[0]?.naturalKey?.value;
     const b = planImportRecords(receipts, receiptFile(
       ["  ACME   Cements   Ltd ", "2026-03-14", "5000", "neft", "UTR9931", ""],
-    )).rows[0]?.naturalKey?.value;
+    ), IMPORT_CONTEXT).rows[0]?.naturalKey?.value;
     expect(a).toBe(b);
   });
 

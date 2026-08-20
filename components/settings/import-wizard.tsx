@@ -2,58 +2,61 @@
 
 /**
  * Ordence — The Import Wizard
- * Version: v1.57.0-alpha (Batch 57)
+ * Version: v1.89.0-alpha · Wave 2A
  *
  * ══════════════════════════════════════════════════════════════════════
- * FOUR STEPS, AND THE ORDER OF STEPS 2 AND 3 IS THE SAFETY PROPERTY
+ * FOUR STEPS, AND THE ORDER OF STEPS 3 AND 4 IS THE SAFETY PROPERTY
  * ══════════════════════════════════════════════════════════════════════
- *   1. What are you importing?          (and take the blank template)
- *   2. The file.
+ *   1. What are you importing?          (and where it sits in the order)
+ *   2. The file, and what your columns mean.
  *   3. 🔴 What happens to records that already exist? — BEFORE the run.
  *   4. Dry run, then commit.
  *
- * ⚠️ STEP 3 COMES BEFORE THE DRY RUN AND HAS NO PRESELECTED ANSWER
- *    (constraint 3).
- *
+ * ⚠️ STEP 3 COMES BEFORE THE DRY RUN AND HAS NO PRESELECTED ANSWER.
  * The natural place to ask is after the preview, when the wizard can say
  * "we found 340 matches — update them?". It is also the place where the
- * answer stops being a decision. By then the customer has chosen a file,
- * waited for an upload, read a report and is committed to finishing;
- * "yes" is the path to being done, and "yes" here means overwriting 340
- * records they may not have looked at. Asked first, with the file still
- * in front of them and nothing invested, it is a real choice about their
- * own data.
- *
- * ⚠️ AND NOTHING IS PRE-TICKED. A default is the mechanism by which a
- * decision stops being made — the server schema has no default either, so
- * this is enforced rather than merely encouraged.
+ * answer stops being a decision: by then the customer has chosen a file,
+ * waited for an upload, read a report and is committed to finishing.
+ * "Yes" is the path to being done, and "yes" here means overwriting 340
+ * records they may not have looked at.
  *
  * ⚠️ THE COMMIT BUTTON DOES NOT EXIST UNTIL A PREVIEW HAS RUN. Not
- * disabled — absent. A disabled control invites the question "how do I
- * enable this", and the answer we want the customer to reach is "look at
- * the dry run first", which is the same answer whether or not they were
- * going to.
+ * disabled — absent. A disabled control invites "how do I enable this",
+ * and the answer we want is "look at the dry run first".
  *
  * ══════════════════════════════════════════════════════════════════════
- * ⭐⭐⭐ WAVE 6 — THE SAME FOUR STEPS, FOR A MIGRATION
+ * ⭐⭐⭐ WAVE 2A — WHAT CHANGED, AND WHY EACH OF IT IS A DEFECT REPAIRED
  * ══════════════════════════════════════════════════════════════════════
- * Three things changed and the shape did not:
+ * ① 🔴 EIGHTEEN ENTITIES, NOT TWO. This screen offered `IMPORT_ENTITIES`
+ *    — companies and GST parties — while `ALL_IMPORT_ENTITIES` has held
+ *    eighteen since Phase 9. Sixteen entities were built, contracted,
+ *    given writers, proven against a real PostgreSQL, and reachable by
+ *    nobody. The picker is now the load-order screen itself, so choosing
+ *    what to import and knowing when to import it are one act.
  *
- * ① ANY FILE, NOT A CSV. `lib/import/sources/` reads Excel, JSON and
- *    Tally XML IN THE BROWSER — every reader in it is pure — into
- *    exactly the record stream `parseCsv` produces. The format is
- *    detected from the BYTES, never the file name, because a file name
- *    is a claim by whoever renamed it.
+ * ② 🔴 THE FILE IS FINGERPRINTED. `beginImportRun` has REQUIRED a
+ *    `sha256:` fingerprint over the bytes since Phase 2 and this wizard
+ *    never sent one, so every migration failed at the first call. See
+ *    `components/import/fingerprint.ts` for what the fingerprint is over
+ *    and why that matters.
  *
- * ② THE COLUMNS ARE PROPOSED, WITH A REASON AND A CONFIDENCE. A file of
- *    `F1 F2 F3` used to be unimportable; `lib/import/shapes.ts` matches
- *    on what the values ARE. Every proposal says why, because a mapping
- *    somebody clicked past is not a mapping somebody decided.
+ * ③ ⭐ `resumed` AND `note` ARE RENDERED. "Starting" and "picking up
+ *    where the last attempt stopped" are different sentences, and a
+ *    customer shown the first when the second is true will wonder why the
+ *    progress bar begins at 60%.
  *
- * ③ 🔴 MORE THAN `MAX_IMPORT_ROWS` NO LONGER MEANS "SPLIT YOUR FILE".
- *    The browser sends it in chunks under one run, and the run refuses
- *    to report itself as finished until every row is accounted for. The
- *    file never leaves the customer's machine.
+ * ④ ⚠️ THE DUPLICATE STEP READS THE ENTITY. It used to carry
+ *    `entityKey === "companies" ? "…domain…" : "…GSTIN…"` — the exact
+ *    ternary `ImportEntityDefinition.duplicateRule` was added to delete —
+ *    so every entity after the second was described to the customer as a
+ *    GST party. It now reads `duplicateRule`, `duplicateModes` and
+ *    `contract.duplicateDecision`, so an entity that cannot be overwritten
+ *    does not offer overwriting.
+ *
+ * ⑤ ⭐ THE TALLY VIEW PICKER. `TALLY_VIEW_LABELS` is documented "one line
+ *    each, for a picker" and there has been no picker since v1.74.0-alpha;
+ *    Phase 9 added three more views to the same silence. Five views, one
+ *    file, and only the first was reachable.
  */
 
 import { useMemo, useState, useTransition } from "react";
@@ -62,12 +65,20 @@ import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { ImportReportPanel } from "@/components/settings/import-report-panel";
+import { LoadOrder } from "@/components/import/load-order";
+import { MappingReview } from "@/components/import/mapping-review";
 import {
-  IMPORT_ENTITIES,
+  fingerprintBytes,
+  FingerprintUnavailableError,
+} from "@/components/import/fingerprint";
+import { formatCount } from "@/components/import/figures";
+import {
+  ALL_IMPORT_ENTITIES,
   MAX_IMPORT_ROWS,
   buildTemplateCsv,
+  isImportEntityKey,
+  type AnyImportEntityKey,
   type DuplicateMode,
-  type ImportEntityKey,
   type ImportReport,
 } from "@/lib/import";
 import type { ActionResult } from "@/lib/validators/crm";
@@ -88,7 +99,11 @@ import {
   readSource,
   SourceReadError,
   SOURCE_FORMAT_LABELS,
+  TALLY_VIEWS,
+  TALLY_VIEW_LABELS,
+  isTallyView,
   type ImportSourceFormat,
+  type TallyView,
 } from "@/lib/import/sources";
 
 /**
@@ -108,6 +123,11 @@ type Action = (input: {
   duplicateMode: DuplicateMode;
 }) => Promise<ActionResult<ImportReport>>;
 
+/**
+ * 🔴 `sourceFingerprint` IS NOT OPTIONAL HERE EITHER. Typing it optional
+ * to "keep the change small" is how a required server input goes unsent
+ * for two waves — which is exactly what happened.
+ */
 type BeginRun = (input: {
   entity: string;
   sourceFormat: ImportSourceFormat;
@@ -115,7 +135,13 @@ type BeginRun = (input: {
   sourceSheet?: string;
   duplicateMode: DuplicateMode;
   expectedRows: number;
-}) => Promise<ActionResult<{ runId: string; chunkSize: number }>>;
+  sourceFingerprint: string;
+}) => Promise<ActionResult<{
+  runId: string;
+  chunkSize: number;
+  resumed: boolean;
+  note: string | null;
+}>>;
 
 type EndRun = (input: {
   runId: string;
@@ -152,14 +178,17 @@ type Decide = (input: {
  * none that describe what happens to the customer's data. The sentence
  * under each option is what the person is actually choosing between, and
  * `update` says the destructive part out loud — including that a name
- * match is not proof of identity, which is the specific way this can go
- * wrong for a company or an unregistered party.
+ * match is not proof of identity.
+ *
+ * ⚠️ THERE IS NO `recommended` FLAG IN THIS TABLE ANY MORE. Which mode is
+ * recommended is a property of the ENTITY — `contract.duplicateDecision`
+ * — and a flag here would be a second answer that disagrees with the
+ * contract for sixteen of the eighteen entities.
  */
 const DUPLICATE_OPTIONS: Array<{
   value: DuplicateMode;
   title: string;
   detail: string;
-  recommended?: boolean;
 }> = [
   {
     value: "skip",
@@ -168,7 +197,6 @@ const DUPLICATE_OPTIONS: Array<{
       "The row is counted as skipped and nothing about the record you already " +
       "have changes. Safe to run twice — it is what makes re-uploading a whole " +
       "file after fixing a few rows harmless.",
-    recommended: true,
   },
   {
     value: "update",
@@ -190,6 +218,8 @@ const DUPLICATE_OPTIONS: Array<{
   },
 ];
 
+const ALL_DUPLICATE_MODES: readonly DuplicateMode[] = ["skip", "update", "fail"];
+
 export function ImportWizard({
   preview,
   commit,
@@ -205,7 +235,7 @@ export function ImportWizard({
   propose: Propose;
   decide: Decide;
 }) {
-  const [entityKey, setEntityKey] = useState<ImportEntityKey>("companies");
+  const [entityKey, setEntityKey] = useState<AnyImportEntityKey>("companies");
   const [csvText, setCsvText] = useState("");
   const [fileName, setFileName] = useState<string | null>(null);
   const [duplicateMode, setDuplicateMode] = useState<DuplicateMode | null>(null);
@@ -213,15 +243,18 @@ export function ImportWizard({
   const [error, setError] = useState<string | null>(null);
   const [pending, start] = useTransition();
 
-  /* ── WAVE 6 ─────────────────────────────────────────────────────── */
   const [records, setRecords] = useState<CsvRecord[] | null>(null);
   const [sourceFormat, setSourceFormat] = useState<ImportSourceFormat | null>(null);
   const [sourceNotes, setSourceNotes] = useState<readonly string[]>([]);
   const [sheetNames, setSheetNames] = useState<readonly string[]>([]);
   const [selectedSheet, setSelectedSheet] = useState<string | null>(null);
-  /** ⚠️ Kept so changing the sheet re-reads without asking for the file again. */
+  /** ⭐ WAVE 2A. Which Tally view the XML was read as. Five exist. */
+  const [tallyView, setTallyView] = useState<TallyView>("ledger-masters");
+  /** ⚠️ Kept so changing the sheet or the view re-reads without asking for the file again. */
   const [fileBytes, setFileBytes] = useState<Uint8Array | null>(null);
   const [progress, setProgress] = useState<string | null>(null);
+  /** ⭐ WAVE 2A. What `beginImportRun` said when it started or resumed. */
+  const [runNote, setRunNote] = useState<string | null>(null);
   const [proposal, setProposal] = useState<MappingProposal | null>(null);
   const [autoCommit, setAutoCommit] = useState<{ allowed: boolean; reason: string } | null>(null);
   const [aiRefusal, setAiRefusal] = useState<string | null>(null);
@@ -230,7 +263,7 @@ export function ImportWizard({
   const [overrides, setOverrides] = useState<Record<string, string>>({});
   const [mappingSettled, setMappingSettled] = useState(false);
 
-  const entity = IMPORT_ENTITIES[entityKey];
+  const entity = ALL_IMPORT_ENTITIES[entityKey];
 
   /*
    * ⭐ THE TEMPLATE IS BUILT IN THE BROWSER FROM THE SAME COLUMN LIST THE
@@ -238,16 +271,24 @@ export function ImportWizard({
    * server round trip — a checked-in template is a copy of the column
    * list that goes stale the first time a column is added, and a stale
    * template is worse than none because the customer trusts it.
-   *
-   * This is only possible because `lib/import/` is pure: it imports no
-   * database and no `node:` module, so it can be in a client bundle.
    */
   const template = useMemo(() => buildTemplateCsv(entity.columns), [entity]);
+
+  /**
+   * ⚠️ THE MODES ON OFFER ARE THE ENTITY'S, AND THE SERVER AGREES.
+   * `server/actions/import.ts` refuses a mode outside `duplicateModes`;
+   * offering one here would be a control whose only outcome is an error
+   * message — an opening journal entry cannot be overwritten, because
+   * `journal_entries` is append-only by design.
+   */
+  const offeredModes = entity.duplicateModes ?? ALL_DUPLICATE_MODES;
+  const recommended = entity.contract.duplicateDecision.recommended;
 
   function reset() {
     setReport(null);
     setError(null);
     setProgress(null);
+    setRunNote(null);
   }
 
   /** ⚠️ Clears the FILE as well. Used when the source itself changes. */
@@ -271,15 +312,20 @@ export function ImportWizard({
   }
 
   /**
-   * ⭐⭐⭐ ASK WHAT THE COLUMNS MEAN.
-   *
-   * ⚠️ HEADERS AND A SAMPLE OF VALUES, AND THE VALUES DO NOT GO ANYWHERE
-   * EXCEPT OUR OWN SERVER. `lib/import/shapes.ts` reads them there to
-   * decide what each column IS; `server/import/ai-mapper.ts` sends only
-   * headings and statistical descriptions onward when the model is used,
-   * and refuses to send the call at all if a value ever reaches the
-   * prompt.
+   * ⚠️ CHANGING THE ENTITY CLEARS THE MAPPING AND THE REPORT, NOT THE
+   * FILE. A person who picked the wrong record type for the right file
+   * should not have to choose the file again — but a proposal made
+   * against the old entity's columns, and a dry run of it, are answers to
+   * a question that is no longer being asked.
    */
+  function chooseEntity(key: string) {
+    if (!isImportEntityKey(key)) return;
+    setEntityKey(key);
+    setDuplicateMode(null);
+    reset();
+    resetMapping();
+  }
+
   function askForMapping(withAi: boolean) {
     if (!records || records.length < 2) return;
     const headers = records[0]!;
@@ -310,17 +356,14 @@ export function ImportWizard({
    * 🔴 THIS IS NOT A SHORTCUT — IT IS WHY THE CORRECTION STICKS.
    * `planImportRecords` decides what each column is by matching the
    * header row against the entity's canonical headers. A mapping held
-   * beside the records, as a separate structure, would have to be threaded
-   * through the planner, the preview, the commit and the failed-rows CSV,
-   * and any one of those forgetting it is a silent mis-import.
+   * beside the records would have to be threaded through the planner, the
+   * preview, the commit and the failed-rows CSV, and any one of those
+   * forgetting it is a silent mis-import.
    *
-   * Rewriting the header row means the planner matches EXACTLY, by the
-   * same code path an already-correct file takes. There is no second
-   * mapping mechanism to keep in step.
-   *
-   * ⚠️ A COLUMN NOBODY MAPPED KEEPS ITS ORIGINAL HEADING rather than being
-   * blanked, so it still appears in the report as an unrecognised column —
-   * which is how the customer finds out something was left behind.
+   * ⚠️ AND IT DOES NOT CHANGE THE FILE'S FINGERPRINT, WHICH IS CORRECT.
+   * The fingerprint is over the bytes the customer uploaded. Correcting a
+   * mapping and pressing import again is the SAME upload and must resume
+   * the same run, not start a rival one.
    */
   function applyMapping(outcome: "confirmed" | "corrected") {
     if (!records || !proposal) return;
@@ -359,41 +402,43 @@ export function ImportWizard({
    * ⭐⭐⭐ READ ANY FILE, IN THE BROWSER.
    *
    * ⚠️ `arrayBuffer()` AND NOT `text()`. A spreadsheet is a zip; decoding
-   * it as UTF-8 first destroys it. The bytes are also what
-   * `detectFormat` needs — the format comes from the BYTES, never from
-   * the file name, because a `.csv` that is really an `.xlsx` and an
-   * `.xlsx` that is really an old `.xls` are both routine.
-   *
-   * ⚠️ THE BOM IS LEFT ALONE. `lib/import/csv.ts` strips it, in one
-   * place, so no reader of a CSV in this codebase has to remember.
+   * it as UTF-8 first destroys it. The bytes are also what `detectFormat`
+   * needs — the format comes from the BYTES, never from the file name —
+   * and they are what the fingerprint is taken over.
    */
   async function readFile(file: File) {
     resetSource();
     setFileName(file.name);
     const bytes = new Uint8Array(await file.arrayBuffer());
     setFileBytes(bytes);
-    parseBytes(bytes, file.name, null);
+    parseBytes(bytes, file.name, null, "ledger-masters");
   }
 
-  function parseBytes(bytes: Uint8Array, name: string, sheet: string | null) {
+  function parseBytes(
+    bytes: Uint8Array,
+    name: string,
+    sheet: string | null,
+    view: TallyView,
+  ) {
     try {
       const table = readSource(bytes, {
         fileName: name,
         ...(sheet ? { sheet } : {}),
         /**
-         * ⚠️ NO `inflateRaw` PASSED, AND A SPREADSHEET STILL OPENS.
-         * `lib/import/sources/unzip.ts` falls back to
-         * `lib/import/sources/inflate.ts` — two hundred lines of RFC 1951,
-         * pure and synchronous — precisely so this runs in a browser,
-         * where `node:zlib` does not exist and `DecompressionStream` is
-         * asynchronous.
+         * ⭐ WAVE 2A — WHICH TALLY VIEW. `readTally` defaults to
+         * `ledger-masters`, so a customer whose file is a day book of
+         * vouchers saw a list of ledgers and no way to ask for anything
+         * else. The default is unchanged; it is now a default rather than
+         * the only reachable answer.
          */
+        tallyView: view,
       });
       setRecords([...table.records]);
       setSourceFormat(table.format);
       setSourceNotes(table.notes);
       setSheetNames(table.sheetNames ?? []);
       setSelectedSheet(table.selectedSheet ?? null);
+      setTallyView(view);
       /** ⚠️ Text and records are mutually exclusive. See the Action type. */
       setCsvText("");
       setError(null);
@@ -419,8 +464,12 @@ export function ImportWizard({
   const dataRowCount = records ? Math.max(0, records.length - 1) : null;
   /** ⭐ More than one part means a migration rather than an upload. */
   const needsChunking = dataRowCount !== null && dataRowCount > MAX_IMPORT_ROWS;
+  const sampleRows = useMemo(
+    () => (records ? records.slice(1, EVIDENCE_SAMPLE_ROWS + 1).map((r) => r.cells) : []),
+    [records],
+  );
 
-  function run(action: Action, mode: "preview" | "commit") {
+  function run(action: Action, _mode: "preview" | "commit") {
     if (!duplicateMode) {
       setError("Choose what should happen to records that already exist.");
       return;
@@ -428,11 +477,10 @@ export function ImportWizard({
     setError(null);
     start(async () => {
       /**
-       * ⚠️ THE DRY RUN ONLY EVER LOOKS AT THE FIRST PART. Planning
-       * forty-thousand rows in one request is the thing chunking exists
-       * to avoid, and a preview that times out is a preview nobody runs.
-       * The sentence under the button says so — a preview silently
-       * covering a fraction of the file would be worse than no preview.
+       * ⚠️ THE DRY RUN ONLY EVER LOOKS AT THE FIRST PART. Planning forty
+       * thousand rows in one request is the thing chunking exists to
+       * avoid, and a preview that times out is a preview nobody runs. The
+       * sentence under the button says so.
        */
       const first =
         records && needsChunking ? [records[0]!, ...records.slice(1, MAX_IMPORT_ROWS + 1)] : null;
@@ -458,22 +506,44 @@ export function ImportWizard({
    * ⭐⭐⭐ THE MIGRATION. One run, many chunks, and a finish that refuses
    * to call itself complete when rows are missing.
    *
-   * 🔴 IT STOPS AT THE FIRST FAILED CHUNK RATHER THAN CARRYING ON. A loop
+   * 🔴 IT STOPS AT THE FIRST FAILED CHUNK rather than carrying on. A loop
    * that swallowed a failure and continued would produce a run that ended
-   * "successfully" with a hole in the middle, and the hole would be
-   * invisible until somebody counted. Stopping leaves the run marked
-   * incomplete with the number of missing rows in the message, and
-   * re-uploading the same file is safe — every entity matches on a
-   * natural key, so the rows already here are recognised rather than
-   * duplicated.
+   * "successfully" with a hole in the middle, invisible until somebody
+   * counted.
    */
   function runMigration() {
     if (!duplicateMode || !records || !sourceFormat) return;
+    /**
+     * 🔴 NO BYTES, NO RUN — AND IT IS A REFUSAL WITH A SENTENCE, NOT A
+     * SILENT RETURN. The only way to reach this with records and no bytes
+     * is a future edit that lets pasted text be migrated, and the failure
+     * it would otherwise produce is `beginImportRun` rejecting a
+     * fingerprint that is `undefined`.
+     */
+    if (!fileBytes) {
+      setError(
+        "A migration this size is tracked against the file it came from, so it has to be " +
+          "uploaded as a file rather than pasted in.",
+      );
+      return;
+    }
     const header = records[0]!;
     const dataRows = records.slice(1);
     setError(null);
 
     start(async () => {
+      let sourceFingerprint: string;
+      try {
+        sourceFingerprint = await fingerprintBytes(fileBytes);
+      } catch (err) {
+        setError(
+          err instanceof FingerprintUnavailableError
+            ? err.message
+            : "This file could not be fingerprinted, so nothing was started.",
+        );
+        return;
+      }
+
       const begun = await beginRun({
         entity: entityKey,
         sourceFormat,
@@ -481,11 +551,25 @@ export function ImportWizard({
         ...(selectedSheet ? { sourceSheet: selectedSheet } : {}),
         duplicateMode,
         expectedRows: dataRows.length,
+        sourceFingerprint,
       });
       if (!begun.ok) {
         setError(begun.error);
         return;
       }
+
+      /**
+       * ⭐ "STARTING" AND "PICKING UP WHERE THE LAST ATTEMPT STOPPED" ARE
+       * DIFFERENT SENTENCES. `beginImportRun` distinguishes them and the
+       * distinction used to die in this function.
+       */
+      setRunNote(
+        begun.data.note ??
+          (begun.data.resumed
+            ? "Picking up where the last attempt stopped. The rows already here will be " +
+              "recognised rather than duplicated."
+            : "Starting a new migration for this file."),
+      );
 
       const { runId, chunkSize } = begun.data;
       const chunkCount = Math.ceil(dataRows.length / chunkSize);
@@ -494,10 +578,9 @@ export function ImportWizard({
 
       for (let index = 0; index < chunkCount; index += 1) {
         setProgress(
-          `Part ${index + 1} of ${chunkCount} — ${Math.min(
-            (index + 1) * chunkSize,
-            dataRows.length,
-          ).toLocaleString("en-IN")} of ${dataRows.length.toLocaleString("en-IN")} rows`,
+          `Part ${formatCount(index + 1)} of ${formatCount(chunkCount)} — ${formatCount(
+            Math.min((index + 1) * chunkSize, dataRows.length),
+          )} of ${formatCount(dataRows.length)} rows`,
         );
 
         const slice = dataRows.slice(index * chunkSize, (index + 1) * chunkSize);
@@ -518,22 +601,33 @@ export function ImportWizard({
         lastReport = result.data;
       }
 
-      const ended = await endRun({ runId, ...(stopped ? { abandoned: false } : {}) });
+      /**
+       * ⚠️ NO `abandoned` FLAG FROM HERE, AND THE OLD ONE WAS DEAD CODE.
+       * This call used to read `...(stopped ? { abandoned: false } : {})`
+       * — which passes `false` on one branch and omits it on the other,
+       * where it defaults to `false`. Two spellings of the same value, so
+       * `abandoned: true` had no caller anywhere in the product and the
+       * `abandoned` run status was unreachable.
+       *
+       * 🔴 AND SETTING IT HERE WOULD BE WRONG, not merely useless. A
+       * chunk that failed is a FAILURE; "abandoned" means the person
+       * walked away, which this code path cannot observe because it is
+       * still running. Claiming it would relabel every broken migration
+       * as somebody's change of mind. See `PATCH-REQUEST-WAVE-2A.md` §3.
+       */
+      const ended = await endRun({ runId });
       setProgress(null);
       if (lastReport) setReport(lastReport);
 
       if (stopped) {
-        setError(
-          `${stopped}${ended.ok ? ` ${ended.data.message}` : ""}`,
-        );
+        setError(`${stopped}${ended.ok ? ` ${ended.data.message}` : ""}`);
         return;
       }
       if (ended.ok) {
         /**
          * ⚠️ THE FINISHING SENTENCE IS SHOWN AS AN ERROR WHEN ROWS ARE
-         * MISSING. Not as a neutral note: "your migration is missing
-         * 1,600 rows" is not information, it is a problem, and a customer
-         * who reads it as a status line will not act on it.
+         * MISSING. "Your migration is missing 1,600 rows" is not
+         * information, it is a problem.
          */
         if (ended.data.status === "completed") setProgress(ended.data.message);
         else setError(ended.data.message);
@@ -551,40 +645,15 @@ export function ImportWizard({
       {/* ── STEP 1 ────────────────────────────────────────────────── */}
       <section className="space-y-3">
         <h2 className="text-sm font-semibold">1. What are you importing?</h2>
-        <div className="grid gap-3 sm:grid-cols-2">
-          {(Object.keys(IMPORT_ENTITIES) as ImportEntityKey[]).map((key) => {
-            const def = IMPORT_ENTITIES[key];
-            const active = key === entityKey;
-            return (
-              <label
-                key={key}
-                className={`cursor-pointer rounded-lg border p-4 ${
-                  active ? "border-primary bg-primary/5" : "border-border bg-card"
-                }`}
-              >
-                <span className="flex items-start gap-2">
-                  <input
-                    type="radio"
-                    name="entity"
-                    value={key}
-                    checked={active}
-                    className="mt-1"
-                    onChange={() => {
-                      setEntityKey(key);
-                      reset();
-                    }}
-                  />
-                  <span>
-                    <span className="block text-sm font-medium">{def.label}</span>
-                    <span className="mt-0.5 block text-xs text-muted-foreground">
-                      {def.description}
-                    </span>
-                  </span>
-                </span>
-              </label>
-            );
-          })}
-        </div>
+
+        {/*
+          ⭐⭐⭐ THE PICKER IS THE ORDER. Choosing what to import and
+          knowing when it can be imported are the same question, and a
+          flat list of eighteen radio buttons answers only the first —
+          which is how a customer loads their invoices on Monday morning
+          and gets nine hundred unresolved-customer errors.
+        */}
+        <LoadOrder selected={entityKey} onChoose={chooseEntity} />
 
         <div className="rounded-lg border bg-card">
           <div className="flex items-center justify-between gap-3 border-b p-3">
@@ -632,16 +701,12 @@ export function ImportWizard({
               ))}
             </tbody>
           </table>
-          {/*
-            Spelling is not the constraint, and saying so prevents a
-            support conversation. `Company Name`, `company_name` and
-            `COMPANY NAME` all match.
-          */}
           <p className="border-t p-3 text-xs text-muted-foreground">
             Capitals, spaces and underscores in your headings do not matter — and
             common alternatives are recognised. Columns this does not recognise are
-            ignored and listed in the report rather than causing a failure. Up to{" "}
-            {MAX_IMPORT_ROWS} rows per file.
+            ignored and listed in the report rather than causing a failure. Files
+            larger than {formatCount(MAX_IMPORT_ROWS)} rows are imported in parts
+            under one migration.
           </p>
         </div>
       </section>
@@ -658,11 +723,9 @@ export function ImportWizard({
             type="file"
             /*
               ⚠️ THE `accept` LIST IS A HINT TO THE FILE PICKER AND NOTHING
-              MORE. The format is decided from the BYTES — see
-              `detectFormat` — because a `.csv` that is really an `.xlsx`,
-              and an `.xlsx` that is really an old `.xls`, are both
-              routine and both produce a bewildering report when the name
-              is trusted.
+              MORE. The format is decided from the BYTES — a `.csv` that is
+              really an `.xlsx` is routine, and produces a bewildering
+              report when the name is trusted.
             */
             accept=".csv,.txt,.xlsx,.json,.jsonl,.ndjson,.xml,text/csv,application/json"
             className="mt-2 block w-full text-sm file:mr-3 file:rounded-md file:border file:border-input file:bg-background file:px-3 file:py-1.5 file:text-sm"
@@ -675,7 +738,7 @@ export function ImportWizard({
             <p className="mt-2 text-xs text-muted-foreground">
               Loaded {fileName} as {SOURCE_FORMAT_LABELS[sourceFormat]}
               {dataRowCount !== null
-                ? ` — ${dataRowCount.toLocaleString("en-IN")} row${dataRowCount === 1 ? "" : "s"}`
+                ? ` — ${formatCount(dataRowCount)} row${dataRowCount === 1 ? "" : "s"}`
                 : ""}
               .
             </p>
@@ -702,12 +765,56 @@ export function ImportWizard({
                 onChange={(e) => {
                   if (!fileBytes || !fileName) return;
                   reset();
-                  parseBytes(fileBytes, fileName, e.target.value);
+                  resetMapping();
+                  parseBytes(fileBytes, fileName, e.target.value, tallyView);
                 }}
               >
                 {sheetNames.map((name) => (
                   <option key={name} value={name}>
                     {name}
+                  </option>
+                ))}
+              </select>
+            </div>
+          ) : null}
+
+          {/*
+            ⭐⭐ WAVE 2A — THE TALLY VIEW PICKER.
+
+            🔴 ONE FILE, FIVE ANSWERS, AND ONLY ONE OF THEM WAS REACHABLE.
+            A Tally export is not a table; it is an envelope out of which
+            `readTally` can build five different tables — the ledgers, the
+            vouchers, the voucher-type census, the cost-centre allocations
+            and the bill references. `TALLY_VIEW_LABELS` has said "one line
+            each, for a picker" since v1.74.0-alpha, and there was no
+            picker, so a customer whose file was a day book saw a list of
+            ledgers and no way to ask for anything else.
+
+            ⚠️ IT RE-READS THE SAME BYTES. Changing the view is not a new
+            file and must not be treated as one — the fingerprint, and
+            therefore the run, is unchanged.
+          */}
+          {sourceFormat === "tally-xml" ? (
+            <div className="mt-3">
+              <Label htmlFor="import-tally-view" className="text-sm">
+                What should Ordence read out of this Tally file?
+              </Label>
+              <select
+                id="import-tally-view"
+                className="mt-2 h-9 w-full rounded-md border border-input bg-background px-3 text-sm"
+                value={tallyView}
+                onChange={(e) => {
+                  if (!fileBytes || !fileName) return;
+                  const next = e.target.value;
+                  if (!isTallyView(next)) return;
+                  reset();
+                  resetMapping();
+                  parseBytes(fileBytes, fileName, selectedSheet, next);
+                }}
+              >
+                {TALLY_VIEWS.map((view) => (
+                  <option key={view} value={view}>
+                    {TALLY_VIEW_LABELS[view]}
                   </option>
                 ))}
               </select>
@@ -760,24 +867,11 @@ export function ImportWizard({
               }}
             />
           </div>
-          {/*
-            ⚠️ EXPORTING AS CSV IS THE STEP CUSTOMERS GET WRONG, and the
-            failure is silent: an .xlsx renamed to .csv parses as binary
-            noise and produces a bewildering report.
-          */}
-          {/*
-            ⚠️ THIS PARAGRAPH USED TO TELL PEOPLE TO SAVE AS CSV, and that
-            advice was the cause of the failure it warned about: an .xlsx
-            renamed rather than re-saved. Since wave 6 the spreadsheet is
-            read directly, which also keeps the cell TYPES — so an invoice
-            number of `0012345` survives, where the same file saved as CSV
-            would have lost the leading zeroes before it ever reached us.
-          */}
           <p className="mt-2 text-xs text-muted-foreground">
-            Excel workbooks (.xlsx), CSV, JSON and a Tally day-book export are all
-            read directly — you do not need to convert anything first. An Excel file
-            is better than a CSV of the same data: it keeps invoice numbers, GSTINs
-            and dates as what they are, where a CSV turns them into whatever the
+            Excel workbooks (.xlsx), CSV, JSON and a Tally export are all read
+            directly — you do not need to convert anything first. An Excel file is
+            better than a CSV of the same data: it keeps invoice numbers, GSTINs and
+            dates as what they are, where a CSV turns them into whatever the
             spreadsheet decided.
           </p>
         </div>
@@ -786,19 +880,13 @@ export function ImportWizard({
       {/* ── STEP 2b — WHAT DO YOUR COLUMNS MEAN? ──────────────────── */}
       {records && records.length > 1 ? (
         <section className="space-y-3">
-          <h2 className="text-sm font-semibold">
-            2b. What do your columns mean?
-          </h2>
+          <h2 className="text-sm font-semibold">2b. What do your columns mean?</h2>
           <p className="text-sm text-muted-foreground">
-            {/*
-              ⭐ THE SENTENCE THAT MAKES THIS STEP WORTH HAVING. A file
-              whose headings are `F1 F2 F3` used to be unimportable; the
-              columns are now matched on what their VALUES are as well as
-              on what they are called.
-            */}
             Ordence matches your columns on their headings and on what the values in
             them actually look like — so a column of GSTINs is recognised whatever it
-            is called. Check what it decided before you import; every match says why.
+            is called, and a column CALLED GSTIN that holds something else says so.
+            Three of your own values are shown under each column: that is the check,
+            and it takes a second.
           </p>
 
           {!proposal ? (
@@ -840,75 +928,15 @@ export function ImportWizard({
 
           {proposal ? (
             <div className="space-y-3">
-              <div className="overflow-x-auto rounded-lg border bg-card">
-                <table className="w-full text-sm">
-                  <thead>
-                    <tr className="border-b text-left text-xs uppercase tracking-wide text-muted-foreground">
-                      <th scope="col" className="p-3 font-medium">Ordence field</th>
-                      <th scope="col" className="p-3 font-medium">Your column</th>
-                      <th scope="col" className="p-3 font-medium">Why</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {proposal.columns.map((column) => {
-                      const chosen = overrides[column.field] ?? column.sourceHeader ?? "";
-                      return (
-                        <tr key={column.field} className="border-b align-top last:border-0">
-                          <td className="p-3">
-                            <span className="font-medium">{column.header}</span>
-                            {column.required ? (
-                              <span className="ml-2 text-xs text-muted-foreground">required</span>
-                            ) : null}
-                          </td>
-                          <td className="p-3">
-                            <select
-                              aria-label={`Which of your columns is ${column.header}`}
-                              className="h-9 w-full min-w-40 rounded-md border border-input bg-background px-2 text-sm"
-                              value={chosen}
-                              onChange={(e) => {
-                                setOverrides((current) => ({
-                                  ...current,
-                                  [column.field]: e.target.value,
-                                }));
-                                setMappingSettled(false);
-                              }}
-                            >
-                              <option value="">— not in my file —</option>
-                              {proposal.sourceHeaders.map((header) => (
-                                <option key={header} value={header}>
-                                  {header}
-                                </option>
-                              ))}
-                            </select>
-                          </td>
-                          <td className="p-3 text-xs text-muted-foreground">
-                            {/*
-                              ⚠️ THE REASON, NOT A PERCENTAGE ON ITS OWN.
-                              "72%" is not something a person can check.
-                              "matched on its contents — 92% of its values
-                              look like a GSTIN" is.
-                            */}
-                            {column.why}
-                            {column.conflict ? (
-                              <span className="mt-1 block text-amber-700">{column.conflict}</span>
-                            ) : null}
-                          </td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
-              </div>
-
-              {proposal.cautions.map((caution) => (
-                <p
-                  key={caution}
-                  className="flex gap-2 rounded-md border border-amber-500/40 bg-amber-500/5 p-2.5 text-xs"
-                >
-                  <TriangleAlert className="mt-px h-3.5 w-3.5 shrink-0 text-amber-600" aria-hidden="true" />
-                  <span>{caution}</span>
-                </p>
-              ))}
+              <MappingReview
+                proposal={proposal}
+                sampleRows={sampleRows}
+                overrides={overrides}
+                onOverride={(field, sourceHeader) => {
+                  setOverrides((current) => ({ ...current, [field]: sourceHeader }));
+                  setMappingSettled(false);
+                }}
+              />
 
               {/*
                 ⚠️ WHY THIS FILE WILL NOT GO THROUGH ON ITS OWN, SAID EVEN
@@ -949,55 +977,82 @@ export function ImportWizard({
         <h2 className="text-sm font-semibold">
           3. What if a {entity.noun.one} is already here?
         </h2>
+        {/*
+          🔴 THE MATCHING RULE, IN THE CUSTOMER'S WORDS, FROM THE ENTITY.
+          "We match on a natural key" means nothing to anybody; "we match
+          on the GSTIN, and on the name where there is no GSTIN" is a rule
+          they can check against their own file before they run it.
+
+          ⚠️ AND IT IS READ FROM `entity.duplicateRule` RATHER THAN CHOSEN
+          BY A TERNARY ON THE ENTITY KEY. The ternary that used to be here
+          is named in `lib/import/types.ts` as the reason that member
+          exists: with eighteen entities it described sixteen of them as a
+          GST party, at the moment the customer decides what happens to
+          their data.
+        */}
+        {entity.duplicateRule ? (
+          <p className="text-sm text-muted-foreground">{entity.duplicateRule}</p>
+        ) : null}
         <p className="text-sm text-muted-foreground">
-          {/*
-            🔴 THE NATURAL KEY, NAMED, IN THE CUSTOMER'S WORDS. "We match
-            on a natural key" means nothing to anybody; "we match on the
-            GSTIN, and on the name where there is no GSTIN" is a rule they
-            can check against their own file before they run it.
-          */}
-          {entityKey === "companies"
-            ? "Two rows are the same company when they have the same domain — or, where there is no domain, the same name."
-            : "Two rows are the same party when they have the same GSTIN and are both customers or both vendors — or, where there is no GSTIN, the same legal name."}{" "}
-          This is checked against what is already in your workspace and against the
-          rest of this file, so running the same file twice will not double your data.
+          Matches are checked against what is already in your workspace and against
+          the rest of this file, so running the same file twice will not double your
+          data.
         </p>
         <div className="space-y-2">
-          {DUPLICATE_OPTIONS.map((option) => (
-            <label
-              key={option.value}
-              className={`flex cursor-pointer gap-3 rounded-lg border p-3 ${
-                duplicateMode === option.value
-                  ? "border-primary bg-primary/5"
-                  : "border-border bg-card"
-              }`}
-            >
-              <input
-                type="radio"
-                name="duplicateMode"
-                value={option.value}
-                className="mt-1"
-                checked={duplicateMode === option.value}
-                onChange={() => {
-                  setDuplicateMode(option.value);
-                  reset();
-                }}
-              />
-              <span>
-                <span className="block text-sm font-medium">
-                  {option.title}
-                  {option.recommended ? (
-                    <span className="ml-2 text-xs font-normal text-muted-foreground">
-                      recommended
+          {DUPLICATE_OPTIONS.filter((option) => offeredModes.includes(option.value)).map(
+            (option) => (
+              <label
+                key={option.value}
+                className={`flex cursor-pointer gap-3 rounded-lg border p-3 ${
+                  duplicateMode === option.value
+                    ? "border-primary bg-primary/5"
+                    : "border-border bg-card"
+                }`}
+              >
+                {/*
+                  ⚠️ NOTHING IS PRE-TICKED. A default is the mechanism by
+                  which a decision stops being made — and the server schema
+                  has no default either, so this is enforced rather than
+                  merely encouraged. "Recommended" is a label, not a
+                  selection.
+                */}
+                <input
+                  type="radio"
+                  name="duplicateMode"
+                  value={option.value}
+                  className="mt-1"
+                  checked={duplicateMode === option.value}
+                  onChange={() => {
+                    setDuplicateMode(option.value);
+                    reset();
+                  }}
+                />
+                <span>
+                  <span className="block text-sm font-medium">
+                    {option.title}
+                    {option.value === recommended ? (
+                      <span className="ml-2 text-xs font-normal text-muted-foreground">
+                        recommended
+                      </span>
+                    ) : null}
+                  </span>
+                  <span className="mt-0.5 block text-xs text-muted-foreground">
+                    {option.detail}
+                  </span>
+                  {/*
+                    ⭐ WHY IT IS THE RECOMMENDATION, FROM THE CONTRACT.
+                    A recommendation with no reason is a recommendation
+                    nobody can overrule with confidence.
+                  */}
+                  {option.value === recommended ? (
+                    <span className="mt-1 block text-xs text-muted-foreground">
+                      {entity.contract.duplicateDecision.because}
                     </span>
                   ) : null}
                 </span>
-                <span className="mt-0.5 block text-xs text-muted-foreground">
-                  {option.detail}
-                </span>
-              </span>
-            </label>
-          ))}
+              </label>
+            ),
+          )}
         </div>
       </section>
 
@@ -1019,61 +1074,60 @@ export function ImportWizard({
             ⚠️ ABSENT UNTIL A CLEAN PREVIEW EXISTS, not disabled — and it
             disappears again the moment the file, the entity or the
             duplicate choice changes (every one of those calls `reset()`).
-            A commit button that survived a change to the file would
-            import something other than what was previewed, which is
-            constraint 1 defeated by the user interface rather than by the
-            server.
           */}
           {previewedCleanly && !needsChunking ? (
-            <Button
-              type="button"
-              disabled={pending}
-              onClick={() => run(commit, "commit")}
-            >
+            <Button type="button" disabled={pending} onClick={() => run(commit, "commit")}>
               <Upload className="mr-1.5 h-4 w-4" aria-hidden="true" />
               {pending
                 ? "Importing…"
-                : `Import ${(report?.counts.create ?? 0) + (report?.counts.update ?? 0)} row${
-                    (report?.counts.create ?? 0) + (report?.counts.update ?? 0) === 1
-                      ? ""
-                      : "s"
+                : `Import ${formatCount(
+                    (report?.counts.create ?? 0) + (report?.counts.update ?? 0),
+                  )} row${
+                    (report?.counts.create ?? 0) + (report?.counts.update ?? 0) === 1 ? "" : "s"
                   }`}
             </Button>
           ) : null}
 
-          {/*
-            ⭐⭐⭐ THE MIGRATION BUTTON. Same rule as the ordinary commit —
-            absent until a clean dry run exists, not disabled.
-          */}
           {previewedCleanly && needsChunking && dataRowCount !== null ? (
             <Button type="button" disabled={pending} onClick={runMigration}>
               <Upload className="mr-1.5 h-4 w-4" aria-hidden="true" />
-              {pending
-                ? "Migrating…"
-                : `Import all ${dataRowCount.toLocaleString("en-IN")} rows`}
+              {pending ? "Migrating…" : `Import all ${formatCount(dataRowCount)} rows`}
             </Button>
           ) : null}
         </div>
 
         {/*
           🔴 WHAT THE DRY RUN COVERED, WHEN THE FILE IS BIGGER THAN ONE
-          PART. A preview that silently examined the first thousand rows
-          of forty thousand and said nothing would be worse than no
-          preview — the customer would read its numbers as the whole file.
+          PART. A preview that silently examined the first thousand rows of
+          forty thousand and said nothing would be worse than no preview.
         */}
         {needsChunking && dataRowCount !== null ? (
           <p className="flex gap-2 rounded-md border border-border bg-muted/40 p-3 text-xs text-muted-foreground">
             <TriangleAlert className="mt-px h-4 w-4 shrink-0" aria-hidden="true" />
             <span>
-              This file has {dataRowCount.toLocaleString("en-IN")} rows, so it is imported
-              in {Math.ceil(dataRowCount / MAX_IMPORT_ROWS)} parts of up to{" "}
-              {MAX_IMPORT_ROWS.toLocaleString("en-IN")}. The dry run above covered the{" "}
+              This file has {formatCount(dataRowCount)} rows, so it is imported in{" "}
+              {formatCount(Math.ceil(dataRowCount / MAX_IMPORT_ROWS))} parts of up to{" "}
+              {formatCount(MAX_IMPORT_ROWS)}. The dry run above covered the{" "}
               <strong>first part only</strong> — it is a check on your columns and your
               file&apos;s shape, not a count of the whole thing. Ordence keeps track of
               the parts, and will tell you plainly if any of them did not arrive. If the
-              connection drops you can upload the same file again: rows already here are
-              recognised rather than duplicated.
+              connection drops you can upload the same file again: it is recognised as
+              the same file and picks up where it stopped.
             </span>
+          </p>
+        ) : null}
+
+        {/*
+          ⭐ WHETHER THIS IS A NEW MIGRATION OR THE SAME ONE CONTINUING.
+          Shown above the progress line, because it is the sentence that
+          explains a progress bar that starts at 60%.
+        */}
+        {runNote ? (
+          <p
+            aria-live="polite"
+            className="rounded-md border border-border bg-muted/40 p-3 text-sm"
+          >
+            {runNote}
           </p>
         ) : null}
 
@@ -1085,10 +1139,6 @@ export function ImportWizard({
 
         {/*
           🔴 WHAT THE DRY RUN CANNOT PROMISE, SAID PLAINLY.
-          The preview runs exactly the same checks the import does — that
-          is the design, and it is why the numbers can be trusted. Two
-          things are still genuinely unknowable, and claiming otherwise is
-          how a dry run stops being believed the first time it is wrong.
         */}
         {previewedCleanly ? (
           <p className="text-xs text-muted-foreground">

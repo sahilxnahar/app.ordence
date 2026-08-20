@@ -135,7 +135,69 @@ export function coerceInteger(
  * before the first caller, is the cheapest moment this decision is ever
  * available.
  */
-export function coerceMoneyMinor(raw: string, exponent = 2): CoercionResult {
+/**
+ * ⭐ WAVE 2C — THE MESSAGE STOPPED LYING.
+ *
+ * 🔴 IT USED TO SAY, FOR EVERY CURRENCY IN THE WORLD: *"Write it as
+ * rupees with up to 2 decimal places."* Shown to a Kuwaiti workspace
+ * about a perfectly good `1.234`, that sentence does active harm — the
+ * customer believes it, deletes the third digit, and turns 1.234 dinars
+ * into 1.230. The importer would then accept it silently, so the damage
+ * is a wrong number in a ledger rather than a failed import.
+ *
+ * ⚠️ THE EXAMPLE IS GENERATED FROM THE EXPONENT rather than hardcoded,
+ * because "for example 1250.50" is itself unwritable in JPY.
+ */
+export function describeAmountRefusal(
+  value: string,
+  exponent: number,
+  code?: string,
+): string {
+  const named = code ? `a valid amount in ${code}` : "an amount";
+  const example =
+    exponent === 0 ? "1250" : `1250.${"5".padEnd(exponent, "0")}`;
+  const places =
+    exponent === 0
+      ? `${code ?? "This currency"} has no decimal places — write whole units, for example ${example}`
+      : `Write it with up to ${exponent} decimal place${exponent === 1 ? "" : "s"}, for example ${example}`;
+  return `"${value}" is not ${named}. ${places} — no symbol needed.`;
+}
+
+/**
+ * ⭐⭐⭐ WAVE 2C — THE EXPONENT IS REQUIRED, AND THE DEFAULT IS GONE.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 THE DEFECT THIS PARAMETER'S DEFAULT CAUSED
+ * ══════════════════════════════════════════════════════════════════════
+ * The signature was `(raw: string, exponent = 2)`. `lib/import/plan.ts`
+ * line 94 read `coerceMoneyMinor(raw)`, and so EVERY money column in the
+ * product was coerced at two decimal places:
+ *
+ *     "1.234" -> refused: "is not an amount ... up to 2 decimal places"
+ *     "1234"  -> 123400
+ *
+ * `1.234` in KWD is 1,234 fils and is an ordinary amount. `1234` in JPY
+ * is ¥1,234 and became ¥123,400. The FUNCTION was right the whole time
+ * and the CALLER never passed anything.
+ *
+ * ⚠️ SO THE DEFAULT IS REMOVED RATHER THAN THE CALLER MERELY FIXED. A
+ * default of 2 is not a convenience, it is a wrong answer available for
+ * free: the next caller written under time pressure omits the argument
+ * and reintroduces this exact bug with no diagnostic anywhere. Required,
+ * so the omission is a compile error — which is the standard the writer
+ * registry (a destination with no writer is a compile error) already
+ * sets in this framework.
+ *
+ * ⚠️ `code` IS FOR THE MESSAGE AND NOTHING ELSE. The arithmetic is
+ * driven by `exponent` alone, so this function stays free of the
+ * currency table and can be called with a bare exponent by
+ * `coerceQuantityThousandths`, which is not money at all.
+ */
+export function coerceMoneyMinor(
+  raw: string,
+  exponent: number,
+  code?: string,
+): CoercionResult {
   const value = blankIsNull(raw);
   if (value === null) return NOTHING;
 
@@ -151,9 +213,7 @@ export function coerceMoneyMinor(raw: string, exponent = 2): CoercionResult {
   if (!pattern.test(cleaned)) {
     return {
       ok: false,
-      message:
-        `"${value}" is not an amount. Write it as rupees with up to ` +
-        `${exponent} decimal places, for example 1250.50 — no symbol needed.`,
+      message: describeAmountRefusal(value, exponent, code),
     };
   }
 

@@ -48,6 +48,15 @@ import { IMPORT_WRITERS } from "@/server/import/writers/registry";
 import type { TenantContext } from "@/server/tenant-context";
 import { asSuperuser } from "../setup";
 
+/**
+ * ⭐ WAVE 2C. The planner takes the workspace's currency as data — see
+ * `ImportContext`. These files are all about entities whose amounts are
+ * in rupees, so every call passes the same one; the exponent behaviour
+ * itself is proven in `tests/ui/import-money-exponent.test.ts`.
+ */
+const IMPORT_CONTEXT = { workspaceCurrency: "INR" } as const;
+
+
 const RUN = randomUUID().slice(0, 8);
 
 type Fixtures = { tenant: string; user: string; acme: string };
@@ -135,7 +144,7 @@ async function runOnce(
   const entity = ALL_IMPORT_ENTITIES[entityKey];
   const writer = IMPORT_WRITERS[entity.table];
 
-  const plan = planImport(entity, csv);
+  const plan = planImport(entity, csv, IMPORT_CONTEXT);
   const dispositions = new Map<number, Disposition>();
   const errors = new Map<number, string[]>();
 

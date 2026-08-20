@@ -58,11 +58,32 @@ import {
 } from "./values";
 import type {
   ImportColumn,
+  ImportContext,
   ImportEntityDefinition,
   ImportPlan,
   ImportRowError,
   ImportRowPlan,
 } from "./types";
+/*
+ * ⚠️ RULE 4 IS NOT BROKEN BY THIS IMPORT, AND THE DISTINCTION IS THE
+ * WHOLE DESIGN. `lib/fx/currency.ts` is a pure module — no `server-only`,
+ * no database, no clock, its own header says so — holding the published
+ * ISO-4217 exponent table. It is the same table `currency_units` is
+ * seeded from, and `server/fx/rate-service.ts#verifyCurrencyUnits()`
+ * compares the two so they cannot drift in silence.
+ *
+ * 🔴 THE ALTERNATIVE — passing an exponent map in through `ImportContext`
+ * "so the pure layer takes it as data" — makes a THIRD copy of that
+ * fact with no checker over it, and the copy would be assembled by
+ * whichever caller happened to be writing. What genuinely is not
+ * knowable here is the WORKSPACE'S currency, which is a row in
+ * `tenants`, and that does arrive as data. See `ImportContext`.
+ */
+import {
+  isKnownCurrency,
+  minorUnitExponent,
+  normaliseCurrencyCode,
+} from "@/lib/fx/currency";
 
 /**
  * ⚠️ CAPPED, AND THE CAP IS A PRODUCT DECISION RATHER THAN A LIMITATION.
@@ -86,12 +107,24 @@ export const MAX_IMPORT_ROWS = 1000;
  */
 export const MAX_IMPORT_BYTES = 4 * 1024 * 1024;
 
-function coerceCell(raw: string, column: ImportColumn): CoercionResult {
+/**
+ * ⭐⭐⭐ WAVE 2C. `money` NOW CARRIES THE ROW'S CURRENCY WITH IT.
+ *
+ * The exponent and the code both come from `resolveRowCurrency` below,
+ * once per row, and are handed down rather than looked up here — a money
+ * column cannot be coerced without knowing which currency the row is in,
+ * and this function has no row.
+ */
+function coerceCell(
+  raw: string,
+  column: ImportColumn,
+  currency: RowCurrency,
+): CoercionResult {
   switch (column.kind) {
     case "integer":
       return coerceInteger(raw, column.bounds);
     case "money":
-      return coerceMoneyMinor(raw);
+      return coerceMoneyMinor(raw, currency.exponent, currency.code);
     /*
      * ⭐ BATCH 58. Integer thousandths, through the same BigInt string
      * parse the money coercion uses — `0.1 + 0.2 !== 0.3`, and a stock
@@ -109,6 +142,119 @@ function coerceCell(raw: string, column: ImportColumn): CoercionResult {
     default:
       return coerceText(raw, column.maxLength);
   }
+}
+
+/* ------------------------------------------------------------------ */
+/* ⭐⭐⭐ WAVE 2C — THE ROW'S CURRENCY, AND THEREFORE ITS EXPONENT       */
+/* ------------------------------------------------------------------ */
+
+type RowCurrency = { readonly code: string; readonly exponent: number };
+
+/**
+ * The refusal an entity gets when its `money` contract does not describe
+ * its own columns. Written as a `fatal` because it is not a property of
+ * the customer's file — no row they could edit would fix it — and
+ * continuing would coerce real amounts at an exponent nobody chose.
+ *
+ * ⚠️ THIS IS THE RUNTIME HALF OF A RULE THAT IS ALSO A CI GATE.
+ * `checkImportContract()` (gate 29) is asked to reject the same shape
+ * across the whole allowlist, so it never reaches a customer; this check
+ * is what makes the rule true for an entity the allowlist has not seen —
+ * a test fixture, or an entity added between gate runs. Both exist
+ * because `{ source: "none" }` is the one variant that could otherwise be
+ * used as a way of not deciding.
+ */
+function describeMoneyContractBreach(entity: ImportEntityDefinition): string {
+  const money = entity.columns.filter((c) => c.kind === "money").map((c) => c.header);
+  return (
+    `The "${entity.key}" importer declares no currency for its amounts ` +
+    `(money: { source: "none" }) but has ${money.length} money column` +
+    `${money.length === 1 ? "" : "s"}: ${money.join(", ")}. ` +
+    `Nothing has been read. An amount cannot be converted to minor units ` +
+    `without knowing how many decimal places its currency has — two is ` +
+    `wrong by a factor of ten for the Gulf dinars and a hundred for the yen.`
+  );
+}
+
+/**
+ * ⚠️ RESOLVED FROM THE RAW CELL, BEFORE ANY COLUMN IS COERCED, and that
+ * ordering is not cosmetic. The currency column is an ordinary `text` or
+ * `enum` column and the mapper may place it AFTER the money columns in
+ * `assignments`; resolving it inside the same loop would coerce the
+ * amounts of a row whose currency had not been read yet.
+ *
+ * Returns either the row's currency or the row error that replaces it.
+ * A row whose currency is unreadable produces ONE error naming the
+ * currency cell, not one error per amount — the customer has one thing
+ * to fix.
+ */
+function resolveRowCurrency(
+  entity: ImportEntityDefinition,
+  context: ImportContext,
+  cellFor: (field: string) => string | null,
+): { ok: true; currency: RowCurrency } | { ok: false; error: ImportRowError } {
+  const workspace = () => {
+    /*
+     * ⚠️ AN UNKNOWN WORKSPACE CURRENCY IS A REFUSAL, NOT A FALLBACK.
+     * `functionalCurrencyFromSettings` already refuses an unrecognised
+     * code before it gets here, so this branch means the caller built
+     * the context by hand. Guessing INR at this point would be the
+     * silent-default defect one layer further down.
+     */
+    if (!isKnownCurrency(context.workspaceCurrency)) {
+      return {
+        ok: false as const,
+        error: {
+          column: null,
+          message:
+            `This workspace's currency is set to "${context.workspaceCurrency}", which is ` +
+            `not a currency this system knows, so no amount in this file can be read. ` +
+            `Set the workspace currency in Settings and run the import again.`,
+        },
+      };
+    }
+    const code = normaliseCurrencyCode(context.workspaceCurrency);
+    return { ok: true as const, currency: { code, exponent: minorUnitExponent(code) } };
+  };
+
+  const money = entity.money;
+
+  if (money.source === "none" || money.source === "workspace") return workspace();
+
+  const raw = cellFor(money.field);
+  const trimmed = (raw ?? "").trim();
+
+  if (trimmed === "") {
+    if (money.whenBlank === "workspace") return workspace();
+    const column = entity.columns.find((c) => c.field === money.field);
+    return {
+      ok: false,
+      error: {
+        column: column?.header ?? money.field,
+        message:
+          `This row has no currency. Every amount on it is meaningless until the ` +
+          `currency is known — 1.234 is a real amount in Kuwaiti dinars and a ` +
+          `malformed one in rupees. Fill in the currency column with a three-letter ` +
+          `code such as INR, USD or KWD.`,
+      },
+    };
+  }
+
+  const code = normaliseCurrencyCode(trimmed);
+  if (!isKnownCurrency(code)) {
+    const column = entity.columns.find((c) => c.field === money.field);
+    return {
+      ok: false,
+      error: {
+        column: column?.header ?? money.field,
+        message:
+          `"${trimmed}" is not a currency this system knows, so the amounts on this ` +
+          `row cannot be read. Use the three-letter ISO code — INR, USD, AED, KWD.`,
+      },
+    };
+  }
+
+  return { ok: true, currency: { code, exponent: minorUnitExponent(code) } };
 }
 
 function fatalPlan(entityKey: string, fatal: string): ImportPlan {
@@ -132,6 +278,7 @@ function fatalPlan(entityKey: string, fatal: string): ImportPlan {
 export function planImport(
   entity: ImportEntityDefinition,
   csvText: string,
+  context: ImportContext,
 ): ImportPlan {
   if (csvText.length > MAX_IMPORT_BYTES) {
     return fatalPlan(
@@ -145,7 +292,7 @@ export function planImport(
   const parsed = parseCsv(csvText);
   if (!parsed.ok) return fatalPlan(entity.key, parsed.error);
 
-  return planImportRecords(entity, parsed.records);
+  return planImportRecords(entity, parsed.records, context);
 }
 
 /**
@@ -175,7 +322,18 @@ export function planImport(
 export function planImportRecords(
   entity: ImportEntityDefinition,
   records: readonly CsvRecord[],
+  context: ImportContext,
 ): ImportPlan {
+  /*
+   * ⭐⭐ WAVE 2C. BEFORE THE HEADER IS EVEN READ. An entity whose money
+   * contract contradicts its own columns is refused outright rather than
+   * coercing amounts at a guessed exponent. See
+   * `describeMoneyContractBreach`.
+   */
+  if (entity.money.source === "none" && entity.columns.some((c) => c.kind === "money")) {
+    return fatalPlan(entity.key, describeMoneyContractBreach(entity));
+  }
+
   const [header, ...dataRecords] = records;
   if (!header) return fatalPlan(entity.key, "That file has no rows in it.");
 
@@ -246,6 +404,25 @@ export function planImportRecords(
       continue;
     }
 
+    /*
+     * ⭐⭐ WAVE 2C. ONE RESOLUTION PER ROW, ABOVE THE COLUMN LOOP — see
+     * `resolveRowCurrency` for why it cannot happen inside it.
+     */
+    const currency = resolveRowCurrency(entity, context, (field) => {
+      const assignment = mapping.assignments.find((a) => a.field === field);
+      if (!assignment || assignment.index < 0) return null;
+      return unguardFormulaPrefix(aligned.cells[assignment.index] ?? "");
+    });
+
+    if (!currency.ok) {
+      rows.push({
+        recordNumber: record.recordNumber,
+        cells: aligned.cells,
+        errors: [currency.error],
+      });
+      continue;
+    }
+
     const values: Record<string, string | number | boolean | null> = {};
     for (const assignment of mapping.assignments) {
       const column = entity.columns.find((c) => c.field === assignment.field);
@@ -259,7 +436,7 @@ export function planImportRecords(
       // Undoes the formula guard our own failed-rows CSV applies, so the
       // fix-and-re-upload loop is lossless. See `unguardFormulaPrefix`.
       const raw = unguardFormulaPrefix(aligned.cells[assignment.index] ?? "");
-      const coerced = coerceCell(raw, column);
+      const coerced = coerceCell(raw, column, currency.currency);
       if (!coerced.ok) {
         errors.push({ column: column.header, message: coerced.message });
         continue;

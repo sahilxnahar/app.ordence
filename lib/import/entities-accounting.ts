@@ -104,6 +104,8 @@ function text(value: unknown, fallback: string): string {
  */
 const chartOfAccountsEntity: ContractedImportEntity = {
   key: "chart-of-accounts",
+  /** ⭐ WAVE 2C. No money column on this entity. */
+  money: { source: "none" },
   label: "Chart of accounts",
   noun: { one: "account", many: "accounts" },
   description:
@@ -505,6 +507,8 @@ const chartOfAccountsEntity: ContractedImportEntity = {
  */
 const costCentresEntity: ContractedImportEntity = {
   key: "cost-centres",
+  /** ⭐ WAVE 2C. No money column on this entity. */
+  money: { source: "none" },
   label: "Cost centres",
   noun: { one: "cost centre", many: "cost centres" },
   description:
@@ -707,6 +711,8 @@ const costCentresEntity: ContractedImportEntity = {
  */
 const taxCodesEntity: ContractedImportEntity = {
   key: "tax-codes",
+  /** ⭐ WAVE 2C. No money column on this entity. */
+  money: { source: "none" },
   label: "Tax codes (HSN and SAC)",
   noun: { one: "tax code", many: "tax codes" },
   description:

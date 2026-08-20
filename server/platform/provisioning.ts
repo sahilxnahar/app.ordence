@@ -45,6 +45,10 @@ import { sql } from "drizzle-orm";
 import { withPlatformScope } from "@/db";
 import { requireCapability, recordPlatformAudit } from "./guard";
 import { claimSlug } from "./claim-slug";
+import {
+  createOrgForProvisionedTenant,
+  resolveOwnerUserId,
+} from "@/server/platform/adopt-clerk-org";
 import type { PlatformResult } from "@/lib/platform/schemas";
 import { checkSlugShape, foldSlug, rejection, type SlugRejection } from "@/lib/slug";
 import { operatorSlugSchema } from "@/lib/slug-schema";
@@ -693,11 +697,69 @@ export async function provisionTenant(
      * half-happened must be visible, or it becomes an orphan nobody knows
      * to finish.
      */
-    const pending: string[] = [
-      `Create the Clerk organisation and invite ${data.ownerEmail} as owner, then replace ` +
-        `the placeholder clerk_org_id "pending:${data.slug}".`,
-      `Send the welcome message to ${data.ownerEmail}.`,
-    ];
+    /*
+     * ══════════════════════════════════════════════════════════════════
+     * ⭐⭐⭐ WAVE 1 , THE CLERK ORGANISATION IS CREATED HERE, NOT DESCRIBED
+     * ══════════════════════════════════════════════════════════════════
+     * 🔴 THIS USED TO BE A SENTENCE IN `pending`:
+     *
+     *      "Create the Clerk organisation and invite {email} as owner,
+     *       then replace the placeholder clerk_org_id."
+     *
+     * ⚠️ NOTHING IN CODE DID IT, AND DOING IT BY HAND MADE THINGS WORSE
+     *    RATHER THAN FINISHING THE JOB. The operator creates the
+     *    organisation in Clerk's dashboard; `organization.created` fires;
+     *    `organizationUpsert()` looks the workspace up by
+     *    `clerk_org_id = org.id`, finds NOTHING because the row still says
+     *    `pending:<slug>`, and provisions a SECOND workspace , on a
+     *    fallback hostname, because the good one is held by the first.
+     *
+     *    One unreachable workspace on the right address, one real
+     *    workspace on an address nobody chose. Verified: nothing anywhere
+     *    read the `pending:` marker.
+     *
+     * ⭐ `server/actions/claim.ts` has created organisations this way for
+     *    self-serve signup since v1.7x. This makes the console the SAME
+     *    shape rather than a second one.
+     *
+     * ⚠️ AND IT RUNS AFTER THE TRANSACTION COMMITS, WHICH IS NOT A
+     *    COMPROMISE , it is forced. Clerk is an HTTP call and Postgres
+     *    cannot roll it back. The slug claim must stay atomic (that is the
+     *    whole argument of `claim-slug.ts`), so the window between the two
+     *    is real. What changed is that the window is now RECOVERABLE:
+     *    every failure below leaves the workspace intact on its hostname
+     *    and lands it in `listPendingProvisions()`.
+     */
+    const pending: string[] = [];
+
+    const ownerUserId = await resolveOwnerUserId(data.ownerEmail);
+
+    if (!ownerUserId) {
+      /*
+       * ⚠️ NOT AN ERROR, AND THE WORKSPACE IS NOT ROLLED BACK. It exists,
+       * holds its hostname and has its chart of accounts. What it lacks is
+       * an owner, because Clerk cannot create an organisation without an
+       * existing user and inventing one would mean making an Ordence
+       * employee the owner of a customer's books.
+       */
+      pending.push(
+        `${data.ownerEmail} has no Ordence account yet, so the Clerk organisation could not ` +
+          `be created with them as owner. Invite them to sign up, then finish this workspace ` +
+          `from the pending list. The workspace exists and holds "${data.slug}".`,
+      );
+    } else {
+      const adopted = await createOrgForProvisionedTenant({
+        tenantId,
+        slug: data.slug,
+        name: data.name,
+        ownerUserId,
+      });
+      if (!adopted.ok) {
+        pending.push(adopted.reason);
+      }
+    }
+
+    pending.push(`Send the welcome message to ${data.ownerEmail}.`);
     if (data.customDomain) {
       pending.push(
         `Custom domain ${data.customDomain} is recorded but unverified — hand the customer the two DNS records.`,

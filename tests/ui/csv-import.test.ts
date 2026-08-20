@@ -37,6 +37,15 @@ import { planImport, MAX_IMPORT_ROWS } from "@/lib/import/plan";
 import { buildFailedRowsCsv, buildReport, buildTemplateCsv } from "@/lib/import/report";
 import { IMPORT_ENTITIES, isImportEntityKey } from "@/lib/import/entities";
 
+/**
+ * ⭐ WAVE 2C. The planner takes the workspace's currency as data — see
+ * `ImportContext`. These files are all about entities whose amounts are
+ * in rupees, so every call passes the same one; the exponent behaviour
+ * itself is proven in `tests/ui/import-money-exponent.test.ts`.
+ */
+const IMPORT_CONTEXT = { workspaceCurrency: "INR" } as const;
+
+
 const ROOT = join(__dirname, "..", "..");
 const read = (p: string) => readFileSync(join(ROOT, p), "utf8");
 
@@ -126,7 +135,7 @@ describe("the CSV parser", () => {
     const withBom = "﻿Name,City\nAcme,Pune";
     expect(cells(withBom)[0]).toEqual(["Name", "City"]);
     // And the whole way through: the header maps, so the row validates.
-    const plan = planImport(IMPORT_ENTITIES.companies, "﻿Name\nAcme Traders");
+    const plan = planImport(IMPORT_ENTITIES.companies, "﻿Name\nAcme Traders", IMPORT_CONTEXT);
     expect(plan.fatal).toBeNull();
     expect(plan.rows[0]?.errors).toEqual([]);
   });
@@ -305,7 +314,7 @@ describe("header mapping", () => {
   it("refuses the whole file when a required column is absent", () => {
     const plan = planImport(
       IMPORT_ENTITIES.companies,
-      "Nickname,Town\nAcme,Pune\nBeta,Delhi",
+      "Nickname,Town\nAcme,Pune\nBeta,Delhi", IMPORT_CONTEXT,
     );
     expect(plan.fatal).not.toBeNull();
     expect(plan.rows).toHaveLength(0);
@@ -323,7 +332,7 @@ describe("header mapping", () => {
   it("reports columns nothing claimed rather than silently dropping them", () => {
     const plan = planImport(
       IMPORT_ENTITIES.companies,
-      "Name,Favourite colour\nAcme,blue",
+      "Name,Favourite colour\nAcme,blue", IMPORT_CONTEXT,
     );
     expect(plan.fatal).toBeNull();
     expect(plan.unrecognisedHeaders).toEqual(["Favourite colour"]);
@@ -333,7 +342,7 @@ describe("header mapping", () => {
   it("treats the error column of a re-uploaded failed-rows file as ignorable", () => {
     const plan = planImport(
       IMPORT_ENTITIES.companies,
-      "Name,What was wrong with this row\nAcme,Name: required",
+      "Name,What was wrong with this row\nAcme,Name: required", IMPORT_CONTEXT,
     );
     expect(plan.fatal).toBeNull();
     expect(plan.rows[0]?.errors).toEqual([]);
@@ -353,34 +362,34 @@ describe("money", () => {
    */
   it("the float version would have been wrong", () => {
     expect(Math.round(Number("1.005") * 100)).toBe(100);
-    expect(coerceMoneyMinor("1.005")).toEqual({ ok: false, message: expect.any(String) });
+    expect(coerceMoneyMinor("1.005", 2)).toEqual({ ok: false, message: expect.any(String) });
     // Two decimal places is the limit; 1.01 is unambiguous and exact.
-    expect(coerceMoneyMinor("1.01")).toEqual({ ok: true, value: "101" });
+    expect(coerceMoneyMinor("1.01", 2)).toEqual({ ok: true, value: "101" });
   });
 
   it("parses the string rather than multiplying a float", () => {
-    expect(coerceMoneyMinor("1250.50")).toEqual({ ok: true, value: "125050" });
-    expect(coerceMoneyMinor("0.01")).toEqual({ ok: true, value: "1" });
-    expect(coerceMoneyMinor("12345")).toEqual({ ok: true, value: "1234500" });
-    expect(coerceMoneyMinor("1.1")).toEqual({ ok: true, value: "110" });
-    expect(coerceMoneyMinor("-99.99")).toEqual({ ok: true, value: "-9999" });
+    expect(coerceMoneyMinor("1250.50", 2)).toEqual({ ok: true, value: "125050" });
+    expect(coerceMoneyMinor("0.01", 2)).toEqual({ ok: true, value: "1" });
+    expect(coerceMoneyMinor("12345", 2)).toEqual({ ok: true, value: "1234500" });
+    expect(coerceMoneyMinor("1.1", 2)).toEqual({ ok: true, value: "110" });
+    expect(coerceMoneyMinor("-99.99", 2)).toEqual({ ok: true, value: "-9999" });
   });
 
   /** Large enough that `Number` would already have lost digits. */
   it("survives an amount beyond the safe-integer range", () => {
-    expect(coerceMoneyMinor("999999999999.99")).toEqual({
+    expect(coerceMoneyMinor("999999999999.99", 2)).toEqual({
       ok: true,
       value: "99999999999999",
     });
   });
 
   it("accepts what a spreadsheet actually writes", () => {
-    expect(coerceMoneyMinor("1,250.50")).toEqual({ ok: true, value: "125050" });
-    expect(coerceMoneyMinor("₹1,250.50")).toEqual({ ok: true, value: "125050" });
+    expect(coerceMoneyMinor("1,250.50", 2)).toEqual({ ok: true, value: "125050" });
+    expect(coerceMoneyMinor("₹1,250.50", 2)).toEqual({ ok: true, value: "125050" });
   });
 
   it("returns a string, because a bigint cannot cross to the browser", () => {
-    const result = coerceMoneyMinor("10.00");
+    const result = coerceMoneyMinor("10.00", 2);
     expect(result.ok).toBe(true);
     if (!result.ok) return;
     expect(typeof result.value).toBe("string");
@@ -398,8 +407,8 @@ describe("money", () => {
   });
 
   it("blank is nothing supplied, not zero", () => {
-    expect(coerceMoneyMinor("")).toEqual({ ok: true, value: null });
-    expect(coerceMoneyMinor("   ")).toEqual({ ok: true, value: null });
+    expect(coerceMoneyMinor("", 2)).toEqual({ ok: true, value: null });
+    expect(coerceMoneyMinor("   ", 2)).toEqual({ ok: true, value: null });
   });
 });
 
@@ -481,7 +490,7 @@ describe("the dry run is the real run", () => {
      */
     const modeReads = code.match(/mode === "commit"/g) ?? [];
     expect(modeReads).toHaveLength(3);
-    const plannerAt = code.indexOf("planImportRecords(entity, params.records)");
+    const plannerAt = code.indexOf("planImportRecords(entity, params.records, planContext)");
     for (const index of [...code.matchAll(/mode === "commit"/g)].map((m) => m.index ?? 0)) {
       expect(index).toBeGreaterThan(plannerAt);
     }
@@ -494,7 +503,7 @@ describe("the dry run is the real run", () => {
    */
   it("the planner has no mode, depth or skip argument", () => {
     const code = codeOnly(PLAN);
-    expect(code).toContain("export function planImport(\n  entity: ImportEntityDefinition,\n  csvText: string,\n): ImportPlan");
+    expect(code).toContain("export function planImport(\n  entity: ImportEntityDefinition,\n  csvText: string,\n  context: ImportContext,\n): ImportPlan");
     expect(code).not.toMatch(/skipValidation|quick|shallow|dryRun\b/i);
   });
 
@@ -528,7 +537,7 @@ describe("the dry run is the real run", () => {
       [
         "Customer or vendor,Legal name,GSTIN,Registration type,Effective from",
         "customer,Acme Traders,,regular,2026-04-01",
-      ].join("\n"),
+      ].join("\n"), IMPORT_CONTEXT,
     );
     expect(plan.fatal).toBeNull();
     expect(plan.rows[0]?.errors.length).toBeGreaterThan(0);
@@ -542,7 +551,7 @@ describe("the dry run is the real run", () => {
       [
         "Customer or vendor,Legal name,GSTIN,Registration type,Effective from,City,PIN code",
         "Customer,Acme Traders,27AAPFU0939F1ZV,Regular,2026-04-01,Pune,411001",
-      ].join("\n"),
+      ].join("\n"), IMPORT_CONTEXT,
     );
     expect(plan.rows[0]?.errors).toEqual([]);
     const payload = plan.rows[0]?.payload as Record<string, unknown>;
@@ -563,7 +572,7 @@ describe("the dry run is the real run", () => {
       [
         "Customer or vendor,Legal name,GSTIN,Registration type,Effective from",
         "customer,Acme Traders,27AAPFU0939F1ZV,regular,2026-04-01",
-      ].join("\n"),
+      ].join("\n"), IMPORT_CONTEXT,
     );
     const payload = plan.rows[0]?.payload as Record<string, unknown>;
     // Absent, not `{}` — and `{}` is what an over-eager `buildPayload`
@@ -587,7 +596,7 @@ describe("partial success", () => {
   ].join("\n");
 
   it("good rows survive alongside bad ones", () => {
-    const plan = planImport(IMPORT_ENTITIES.companies, MIXED);
+    const plan = planImport(IMPORT_ENTITIES.companies, MIXED, IMPORT_CONTEXT);
     expect(plan.fatal).toBeNull();
     expect(plan.rows).toHaveLength(4);
     expect(plan.rows.filter((r) => r.errors.length === 0)).toHaveLength(2);
@@ -601,7 +610,7 @@ describe("partial success", () => {
    * which 100 are not.
    */
   it("hands the failed rows back as a CSV with their original columns", () => {
-    const plan = planImport(IMPORT_ENTITIES.companies, MIXED);
+    const plan = planImport(IMPORT_ENTITIES.companies, MIXED, IMPORT_CONTEXT);
     const report = buildReport(IMPORT_ENTITIES.companies, plan, {
       mode: "preview",
       duplicateMode: "skip",
@@ -650,7 +659,7 @@ describe("partial success", () => {
    * not, the loop the whole constraint exists for does not close.
    */
   it("the failed-rows file can be fixed and imported again", () => {
-    const plan = planImport(IMPORT_ENTITIES.companies, MIXED);
+    const plan = planImport(IMPORT_ENTITIES.companies, MIXED, IMPORT_CONTEXT);
     const report = buildReport(IMPORT_ENTITIES.companies, plan, {
       mode: "preview",
       duplicateMode: "skip",
@@ -664,7 +673,7 @@ describe("partial success", () => {
     const fixed = (report.failedRowsCsv ?? "")
       .replace("\r\n,nameless.example", "\r\nNameless Ltd,nameless.example")
       .replace("not-a-number", "9");
-    const second = planImport(IMPORT_ENTITIES.companies, fixed);
+    const second = planImport(IMPORT_ENTITIES.companies, fixed, IMPORT_CONTEXT);
     expect(second.fatal).toBeNull();
     expect(second.rows.filter((r) => r.errors.length > 0)).toHaveLength(0);
   });
@@ -677,7 +686,7 @@ describe("partial success", () => {
     const rows = ["Name"];
     for (let i = 0; i < 60; i += 1) rows.push(`Company ${i}`);
     for (let i = 0; i < 30; i += 1) rows.push(`"${"x".repeat(300)}"`);
-    const plan = planImport(IMPORT_ENTITIES.companies, rows.join("\n"));
+    const plan = planImport(IMPORT_ENTITIES.companies, rows.join("\n"), IMPORT_CONTEXT);
     const report = buildReport(IMPORT_ENTITIES.companies, plan, {
       mode: "commit",
       duplicateMode: "skip",
@@ -783,7 +792,7 @@ describe("re-running an import", () => {
   it("refuses the second of two rows for the same record, naming the first", () => {
     const plan = planImport(
       IMPORT_ENTITIES.companies,
-      ["Name,Domain", "Acme Traders,acme.example", "Acme Trading,acme.example"].join("\n"),
+      ["Name,Domain", "Acme Traders,acme.example", "Acme Trading,acme.example"].join("\n"), IMPORT_CONTEXT,
     );
     expect(plan.rows[0]?.errors).toEqual([]);
     expect(plan.rows[1]?.errors).toHaveLength(1);
@@ -954,7 +963,7 @@ describe("the framework", () => {
   it("refuses a file beyond the row cap instead of importing part of it", () => {
     const rows = ["Name"];
     for (let i = 0; i <= MAX_IMPORT_ROWS; i += 1) rows.push(`Company ${i}`);
-    const plan = planImport(IMPORT_ENTITIES.companies, rows.join("\n"));
+    const plan = planImport(IMPORT_ENTITIES.companies, rows.join("\n"), IMPORT_CONTEXT);
     expect(plan.fatal).toContain(String(MAX_IMPORT_ROWS));
     expect(plan.rows).toHaveLength(0);
   });
