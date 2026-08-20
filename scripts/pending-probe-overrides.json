@@ -1,0 +1,149 @@
+{
+  "_comment": "Probes that cannot be derived mechanically. `object` probes are generated from the migration text; these are not, and each says why in `looked_for`. Keep this file when regenerating. Data probes are guarded with to_regclass: on a database that never ran the migration, the table is absent and an unguarded probe aborts the entire checker. 0126's probe deliberately reads a row written AFTER the statement the broken version aborted on. The original probe read a function created BEFORE it, so a file that stopped half way reported PRESENT. That is the exact lie this file exists to stop.",
+  "probes": {
+    "0047": {
+      "file": "0047_grant_missing_views.sql",
+      "looked_for": "grant: SELECT on v_boq_billing_position to ordence_app",
+      "how": "privilege",
+      "expr": "EXISTS (SELECT 1 FROM information_schema.role_table_grants WHERE table_schema='public' AND table_name='v_boq_billing_position' AND grantee='ordence_app' AND privilege_type='SELECT')"
+    },
+    "0079": {
+      "file": "0079_rls_opt_in_and_telemetry.sql",
+      "looked_for": "security_events policy carries app_platform_scope in USING",
+      "how": "content",
+      "expr": "EXISTS (SELECT 1 FROM pg_policies WHERE schemaname='public' AND tablename='security_events' AND policyname='security_events_tenant_isolation' AND qual LIKE '%app_platform_scope%')"
+    },
+    "0086": {
+      "file": "0086_policy_platform_platform_tables.sql",
+      "looked_for": "tenant_health_events policy restored to the house form",
+      "how": "content",
+      "expr": "EXISTS (SELECT 1 FROM pg_policies WHERE schemaname='public' AND policyname='tenant_health_events_platform_only' AND qual LIKE '%IS NULL) OR app_platform_scope%')"
+    },
+    "0087": {
+      "file": "0087_hardening_narrow_grants.sql",
+      "looked_for": "NOT PROBEABLE , run VERIFY-0087-neon-safe.sql",
+      "how": "manual",
+      "expr": "NULL::boolean"
+    },
+    "0090": {
+      "file": "0090_period_close_message_normalization.sql",
+      "looked_for": "function enforce_period_close() contains \"FROM public.transactions\"",
+      "how": "content",
+      "expr": "EXISTS (SELECT 1 FROM pg_proc WHERE proname='enforce_period_close' AND position('FROM public.transactions' in prosrc) > 0)"
+    },
+    "0093": {
+      "file": "0093_user_notification_preferences.sql",
+      "looked_for": "users.preferences , ALSO created by drizzle-kit push, so cannot be distinguished",
+      "how": "indistinguishable",
+      "expr": "NULL::boolean"
+    },
+    "0095": {
+      "file": "0095_employee_tax_regime_elections.sql",
+      "looked_for": "employees.tax_regime_elections , ALSO created by drizzle-kit push",
+      "how": "indistinguishable",
+      "expr": "NULL::boolean"
+    },
+    "0099": {
+      "file": "0099_stock_movement_valuation.sql",
+      "looked_for": "function ordence_validate_stock_movement() contains \"SELECT id, name, uom, tenant_id INTO ite\"",
+      "how": "content",
+      "expr": "EXISTS (SELECT 1 FROM pg_proc WHERE proname='ordence_validate_stock_movement' AND position('SELECT id, name, uom, tenant_id INTO item' in prosrc) > 0)"
+    },
+    "0104": {
+      "file": "0104_analytics_views_carry_currency.sql",
+      "looked_for": "view v_ledger_daily carries a currency column",
+      "how": "content",
+      "expr": "EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='v_ledger_daily' AND column_name='currency')"
+    },
+    "0121": {
+      "file": "0121_revoke_prune_from_app_role.sql",
+      "looked_for": "ordence_app has NO EXECUTE on prune_security_events",
+      "how": "privilege",
+      "expr": "CASE WHEN NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='ordence_app') THEN NULL WHEN NOT EXISTS (SELECT 1 FROM pg_proc WHERE proname='prune_security_events') THEN FALSE ELSE NOT EXISTS (SELECT 1 FROM pg_proc p, aclexplode(p.proacl) a JOIN pg_roles r ON r.oid=a.grantee WHERE p.proname='prune_security_events' AND r.rolname='ordence_app' AND a.privilege_type='EXECUTE') END"
+    },
+    "0123": {
+      "file": "0123_dunning_chronology_uses_raised_at.sql",
+      "looked_for": "function dunning_ladder_has_no_gaps() contains \"v_last_effective timestamptz;\"",
+      "how": "content",
+      "expr": "EXISTS (SELECT 1 FROM pg_proc WHERE proname='dunning_ladder_has_no_gaps' AND position('v_last_effective timestamptz;' in prosrc) > 0)"
+    },
+    "0124": {
+      "file": "0124_restore_stock_movement_checks.sql",
+      "looked_for": "stock validator has BOTH the tenant match and the reversal check",
+      "how": "content",
+      "expr": "EXISTS (SELECT 1 FROM pg_proc WHERE proname='ordence_validate_stock_movement' AND position('reverses_movement_id' in prosrc) > 0 AND position('tenant_id = NEW.tenant_id' in prosrc) > 0)"
+    },
+    "0127": {
+      "file": "0127_dunning_log_delivery_writeback.sql",
+      "looked_for": "column UPDATE on credit_dunning_log.delivery to ordence_app",
+      "how": "privilege",
+      "expr": "EXISTS (SELECT 1 FROM information_schema.column_privileges WHERE table_schema='public' AND table_name='credit_dunning_log' AND column_name='delivery' AND grantee='ordence_app' AND privilege_type='UPDATE')"
+    },
+    "0092": {
+      "file": "0092_reserve_clerk_hosts.sql",
+      "looked_for": "reserved_slugs row added_by=migration:0092",
+      "how": "data",
+      "expr": "(to_regclass('public.reserved_slugs') IS NOT NULL AND EXISTS (SELECT 1 FROM public.reserved_slugs WHERE added_by='migration:0092'))"
+    },
+    "0103": {
+      "file": "0103_reserve_resend_hosts.sql",
+      "looked_for": "reserved_slugs row added_by=migration:0103",
+      "how": "data",
+      "expr": "(to_regclass('public.reserved_slugs') IS NOT NULL AND EXISTS (SELECT 1 FROM public.reserved_slugs WHERE added_by='migration:0103'))"
+    },
+    "0109": {
+      "file": "0109_payroll_entitlement_grandfather.sql",
+      "looked_for": "CONDITIONAL , only writes a row for basic-tier tenants already using payroll",
+      "how": "conditional",
+      "expr": "NULL::boolean"
+    },
+    "0008": {
+      "file": "0008_phase10_analytics.sql",
+      "looked_for": "view v_asset_portfolio (v_asset_portfolio is re-created by a later file, so no artefact is unique to 0008)",
+      "how": "object",
+      "expr": "to_regclass('public.v_asset_portfolio') IS NOT NULL"
+    },
+    "0141": {
+      "file": "0141_retention_with_teeth.sql",
+      "looked_for": "prune_security_events takes older_than_days and dry_run (0141 rewrote the signature)",
+      "how": "content",
+      "expr": "EXISTS (SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='public' AND p.proname='prune_security_events' AND pg_get_function_identity_arguments(p.oid) LIKE '%boolean%')"
+    },
+    "0142": {
+      "file": "0142_capture_schema_contract.sql",
+      "looked_for": "a row in schema_contract_snapshots (0142 only CALLS capture_schema_contract, so the row is the artefact) , reported in the data section because naming a table makes the probe fail at PARSE time on a database that lacks it, which would take sections 1 and 2 down with it.",
+      "how": "data",
+      "expr": "(to_regclass('public.schema_contract_snapshots') IS NOT NULL AND EXISTS (SELECT 1 FROM public.schema_contract_snapshots))"
+    },
+    "0156": {
+      "file": "0156_perf_drop_duplicate_indexes.sql",
+      "looked_for": "NOT PROBEABLE , it only DROPS indexes. Absence cannot be told apart from never having existed.",
+      "how": "manual",
+      "expr": "NULL::boolean"
+    },
+    "0157": {
+      "file": "0157_perf_drop_redundant_tenant_indexes.sql",
+      "looked_for": "NOT PROBEABLE , same reason as 0156: a dropped index leaves nothing to find.",
+      "how": "manual",
+      "expr": "NULL::boolean"
+    },
+    "0167": {
+      "file": "0167_impersonation_guard_exemption_record.sql",
+      "looked_for": "change_log carries Track D's exemption verdict as a table comment , data section: obj_description() names a table and therefore resolves at parse time.",
+      "how": "data",
+      "expr": "(to_regclass('public.change_log') IS NOT NULL AND coalesce(obj_description('public.change_log'::regclass,'pg_class'),'') LIKE '%needs_action%')"
+    },
+    "0126": {
+      "file": "0126_updated_at_coverage.sql",
+      "looked_for": "the exclusion registry has been POPULATED, which only happens after the block that the original 0126 aborted on , reported in the data section because naming a table makes the probe fail at PARSE time on a database that lacks it, which would take sections 1 and 2 down with it.",
+      "how": "data",
+      "expr": "(to_regclass('public.updated_at_exclusions') IS NOT NULL AND EXISTS (SELECT 1 FROM public.updated_at_exclusions))"
+    },
+    "0168": {
+      "file": "0168_audit_stream_comment_correction.sql",
+      "looked_for": "the COMMENT on view security_event_stream no longer says platform-scope raises are unrecorded , 0168 only rewrites a comment, so the comment text IS the artefact",
+      "how": "content",
+      "expr": "(EXISTS (SELECT 1 FROM pg_views WHERE schemaname='public' AND viewname='security_event_stream') AND coalesce(obj_description((SELECT c.oid FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relname='security_event_stream'),'pg_class'),'') NOT LIKE '%not recorded anywhere%')"
+    }
+  }
+}

@@ -139,6 +139,320 @@ export type DuplicateMode =
   | "fail";
 
 /* ------------------------------------------------------------------ */
+/* ⭐⭐ TRACK M1 — THE MIGRATION CONTRACT                                */
+/* ------------------------------------------------------------------ */
+
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * WHY THIS SECTION EXISTS AT ALL
+ * ══════════════════════════════════════════════════════════════════════
+ * Everything above this line describes ONE FILE being loaded into ONE
+ * table. That was the right unit for Batch 57 and it is the wrong unit
+ * for a migration, which is twenty files loaded in an order, by somebody
+ * who has never used this product, out of a system we have never seen,
+ * on a day when their old software is being switched off.
+ *
+ * Four things a migration needs that a single upload does not:
+ *
+ *   ORDER        Customers before their invoices. Nothing above states
+ *                this, so a client who uploads in the wrong order gets
+ *                foreign-key misses that read to them as data errors in
+ *                a file that is in fact perfect.
+ *
+ *   REVERSAL     A migration is an experiment. The first attempt is
+ *                usually wrong and the customer usually wants it gone.
+ *                Track M2 builds the ledger that undoes a run; this is
+ *                the part each entity must contribute to it, declared at
+ *                DEFINITION time because at undo time the entity that
+ *                wrote the row may no longer be the one being asked.
+ *
+ *   PROVENANCE   "Which file, which line, which run put this row here."
+ *                Migration support is mostly answering that question,
+ *                and today nothing in the product can. Verified:
+ *                `grep -rn "importRunId\|import_run_id" db/schema/`
+ *                returns nothing at all.
+ *
+ *   REQUIREDNESS `ImportColumn.required` already means "the FILE must
+ *                have this column" and says so at length. It does not
+ *                mean "the ROW is meaningless without a value", which is
+ *                a different question with a different answer: a contact
+ *                with no email is fine, an invoice with no customer is
+ *                not. The Zod schema settles per-field validity; what it
+ *                cannot express is which absences make the row not a
+ *                thing.
+ *
+ * ⚠️ EVERY MEMBER ADDED BY THIS SECTION IS REQUIRED, AND THAT IS THE
+ *    POINT. This codebase's characteristic defect — found more than
+ *    thirty times — is built and unreachable, declared and unenforced,
+ *    or verified by a floor. An optional `reversal?:` would be that
+ *    defect in its purest form: the six tracks writing entities behind
+ *    this one would each omit it, the undo would silently do nothing for
+ *    the entities that skipped it, and the run report would still say
+ *    "reversed". Required, checked by `checkImportContract()`, and that
+ *    checker is CI gate 29.
+ */
+
+/* ---------------- ORDER ---------------- */
+
+/**
+ * What must already be in the workspace before rows of this entity can
+ * be written.
+ *
+ * ⚠️ THIS IS NOT `lookups`, AND CONFUSING THE TWO IS THE EASY MISTAKE.
+ * `lookups` is a per-ROW question — "this row names account 4000, find
+ * it" — resolved against whatever is in the database at the time. This
+ * is a per-ENTITY statement about the SHAPE of a migration: contacts
+ * name companies, so companies are loaded first. A row can have no
+ * lookups and the entity still depend on another (an entity whose
+ * dependency shows up only in an optional column), and an entity can
+ * have lookups into something it does not depend on (a currency table
+ * that ships with the product and is never imported).
+ *
+ * ⚠️ DEPENDENCIES ARE ON ENTITY KEYS, NOT TABLES. Two entities can write
+ * the same table — an opening trial balance and a general journal import
+ * both write `transactions` — and they do not have the same
+ * predecessors.
+ *
+ * 🔴 THE ARRAY IS `readonly string[]` AND NOT `AnyImportEntityKey[]` ON
+ *    PURPOSE, AND IT IS NOT LAZINESS. `types.ts` cannot import
+ *    `entities.ts`: `entities.ts` imports this file, and the cycle would
+ *    be a real one at module-evaluation time, not merely a type-level
+ *    one. So the key is a string here and `checkImportContract()`
+ *    verifies every string names a real entity. A dangling dependency is
+ *    a refusal at CI, not a type error — which is strictly weaker, and
+ *    saying so is better than pretending otherwise.
+ */
+export type ImportDependency = {
+  /** The entity key that must be loaded first. */
+  entity: string;
+  /**
+   * Whether the migration can proceed without it.
+   *
+   * `hard`  — rows will fail without it. Contacts without companies get
+   *           an unresolved lookup on every row that names one.
+   * `soft`  — rows will succeed but will be less complete. Loading them
+   *           out of order costs the customer a re-run, not their data.
+   *
+   * ⚠️ THE DISTINCTION EARNS ITS KEEP IN THE PLANNER, NOT HERE. A
+   * migration that refuses to start until every soft dependency is
+   * satisfied is a migration nobody can start, because most customers do
+   * not have all twenty files on day one.
+   */
+  strength: "hard" | "soft";
+  /**
+   * Why, in the customer's words, for the screen that shows the order.
+   * "Contacts are linked to companies by name, so companies go first."
+   */
+  because: string;
+};
+
+/* ---------------- REVERSAL ---------------- */
+
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 HOW A ROW THIS ENTITY WROTE IS UNDONE
+ * ══════════════════════════════════════════════════════════════════════
+ * ⚠️ "DELETE THE ROWS THIS RUN CREATED" IS THE ANSWER FOR SOME ENTITIES
+ *    AND A DATA-DESTROYING BUG FOR OTHERS, AND THE DIFFERENCE IS NOT
+ *    VISIBLE FROM THE WRITE SITE.
+ *
+ * Three cases, and they behave differently enough that one generic undo
+ * cannot serve all three:
+ *
+ * ① The row did not exist before the run. Deleting it restores the
+ *    prior state exactly. This is `delete`.
+ *
+ * ② The row existed and the run OVERWROTE it (`duplicateMode: "update"`).
+ *    Deleting it destroys a record the customer had before the migration
+ *    and did not ask to lose. Undo means putting the old values back,
+ *    which means the old values were captured at write time — because
+ *    they are gone by undo time. This is `restore-prior`, and the
+ *    capture is not optional: an entity that permits `update` and
+ *    declares `delete` is declaring that its undo deletes customer data.
+ *    `checkImportContract()` refuses that combination by name.
+ *
+ * ③ The row is in an append-only ledger. It cannot be deleted or
+ *    rewritten; `journal_entries` says so in a comment where `updatedAt`
+ *    and `deletedAt` would have been. Undo is a REVERSING entry, which
+ *    is an accounting act with its own audit trail and its own date.
+ *    This is `reverse-entry`.
+ *
+ * ⚠️ AND ONE HONEST FOURTH. Some effects genuinely cannot be undone: an
+ *    email that went out, a file pushed to a customer's portal. An
+ *    entity whose write has such an effect declares `irreversible` and
+ *    says what escapes, and the planner shows that sentence to the
+ *    customer BEFORE the run rather than after. A migration tool that
+ *    cannot be honest about this is one that says "reverted" while the
+ *    customer's suppliers have already had the email.
+ */
+export type ImportReversalKind =
+  | "delete"
+  | "restore-prior"
+  | "reverse-entry"
+  | "irreversible";
+
+export type ImportReversalPolicy = {
+  kind: ImportReversalKind;
+  /**
+   * Fields whose PRIOR values must be captured before an `update`
+   * overwrites them, so `restore-prior` has something to restore.
+   *
+   * 🔴 REQUIRED AND NON-EMPTY WHEN `kind` IS `restore-prior`. Checked.
+   * An empty list here is the same failure as a missing one: an undo
+   * that runs, reports success, and restores nothing — verified by a
+   * floor, which is the shape this project keeps finding.
+   *
+   * ⚠️ NAMING `"*"` MEANS THE WHOLE ROW, and it is the right answer for
+   * most entities. Listing individual fields is for the case where the
+   * row carries something the import did not write and must not restore.
+   */
+  capturePriorFields?: readonly string[];
+  /**
+   * What escapes an undo, in one sentence, for the screen shown before
+   * the run. `null` when nothing does.
+   *
+   * ⚠️ `null` IS A CLAIM, NOT A DEFAULT. It says the author looked. It
+   * is a separate member from `kind` because `kind: "delete"` and "but a
+   * webhook fired" are both true at once.
+   */
+  escapes: string | null;
+  /** Why this kind and not another. One or two sentences. */
+  because: string;
+};
+
+/* ---------------- PROVENANCE ---------------- */
+
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * ⭐ WHICH FILE, WHICH LINE, WHICH RUN
+ * ══════════════════════════════════════════════════════════════════════
+ * The obvious implementation adds `import_run_id` and `import_row_no`
+ * columns to every destination table. It is obvious and it is wrong
+ * here, for a measured reason: there are 313 tables, the migration
+ * tracks will target something like thirty of them, and each column pair
+ * is a migration, an index, a schema change on a live table, and a
+ * `NOT NULL`-less column that every non-import write leaves empty. The
+ * signal-to-cost ratio is bad and it gets worse with every entity.
+ *
+ * ⭐ SO PROVENANCE IS A SIDECAR: one table, `import_row_provenance`,
+ * holding (run, entity, row number, target table, target id). It is
+ * written by the same transaction as the row it describes — see SQL
+ * 0196 — so a row and its provenance cannot disagree.
+ *
+ * ⚠️ AND THE SIDECAR IS WHAT MAKES REVERSAL POSSIBLE AT ALL. `delete`
+ * needs to know which ids this run created. Without provenance the only
+ * available answer is "rows created between these two timestamps", which
+ * catches every row the customer's staff typed in by hand during the
+ * migration window. That is not a hypothetical: a migration takes hours
+ * and the office does not stop.
+ *
+ * The entity's job here is small and it is not automatable: name the
+ * destination table for a written row, and name the id. Both are needed
+ * because an entity can write more than one table per row.
+ */
+export type ImportProvenancePolicy = {
+  /**
+   * Every table this entity may write a row into, as the string
+   * discriminants used by `import_row_provenance.target_table`.
+   *
+   * 🔴 IT MUST INCLUDE `table`. Checked. An entity whose provenance
+   * omits its own destination is an entity whose rows are unattributable
+   * and therefore unreversible, while the contract looks complete.
+   */
+  /**
+   * ⚠️ THE UNION INCLUDES `PendingImportTableKey` SO THAT A WORKED
+   * EXAMPLE CAN DECLARE ITS PROVENANCE HONESTLY BEFORE THE WRITE PATH
+   * SUPPORTS IT. That widening cannot make an entity reachable — reach
+   * is decided by membership in `ALL_IMPORT_ENTITIES`, whose element
+   * type pins `table` to `ImportTableKey`.
+   */
+  targets: readonly (ImportTableKey | PendingImportTableKey)[];
+  /**
+   * ⚠️ WHETHER ONE INPUT ROW PRODUCES ONE OUTPUT ROW.
+   *
+   * `one-to-one` for a company. `many` for an invoice with lines, and
+   * `whole-file` for an opening trial balance, which is one document
+   * assembled from every row in the file.
+   *
+   * This is not decoration: it decides whether a provenance miss is a
+   * bug. A `one-to-one` entity that wrote 900 rows and recorded 880
+   * provenance rows has lost 20; a `whole-file` entity that wrote 1 row
+   * for 40 input lines is correct. Track M8's reconciliation reads this.
+   */
+  cardinality: "one-to-one" | "many" | "whole-file";
+};
+
+/* ---------------- REQUIREDNESS ---------------- */
+
+/**
+ * ⚠️ SEPARATE FROM `ImportColumn.required` AND FROM THE ZOD SCHEMA, AND
+ *    NOT A THIRD COPY OF EITHER.
+ *
+ *   `ImportColumn.required`  the FILE must have this HEADER.
+ *   the Zod schema           this VALUE, if present, must be valid, and
+ *                            may itself refuse a blank.
+ *   this                     without this value the ROW IS NOT A THING.
+ *
+ * The third is not derivable from the second. `createContactSchema`
+ * makes `companyId` optional and is right to: a contact with no company
+ * is a real contact. `sales_invoices` would make a customer optional in
+ * exactly the same shape — `.optional().nullable()` — because the form
+ * fills it from context, and an invoice with no customer is not an
+ * invoice.
+ *
+ * ⭐ WHAT IT IS FOR: the planner reports a row missing a structural
+ * field as `error` with a sentence naming what is missing, BEFORE the
+ * write, in the dry run, where the customer can still fix the file. The
+ * alternative is a foreign-key violation at 3am on cutover night.
+ *
+ * ⚠️ AN EMPTY ARRAY IS A VALID AND COMMON ANSWER. It is required rather
+ * than optional so that "nothing is structurally required here" is a
+ * decision somebody made, not a member somebody forgot.
+ */
+export type ImportRequiredness = {
+  /** Payload field names, post-Zod. Absent or null means the row fails. */
+  structural: readonly string[];
+  /** What the failed-rows CSV says. Keyed by field name. */
+  messages: Readonly<Record<string, string>>;
+};
+
+/* ---------------- THE DUPLICATE DECISION ---------------- */
+
+/**
+ * `duplicateModes` above says which modes are OFFERED. This says which
+ * one is RECOMMENDED and why.
+ *
+ * ⚠️ THE REASON IS THE REQUIRED PART. A default with no reason is a
+ * default nobody can overrule with confidence, and the customer choosing
+ * between "skip" and "update" for the first time is choosing about their
+ * own live data with no information. `because` is shown next to the
+ * radio button.
+ */
+export type ImportDuplicateDecision = {
+  recommended: DuplicateMode;
+  because: string;
+};
+
+/**
+ * Everything Track M1 adds, gathered so it can be attached to an entity
+ * defined in a file this track does not own.
+ *
+ * ⚠️ THIS IS NOT A SECOND REGISTRY AND MUST NOT BECOME ONE. It is never
+ * consulted on the write path; `ALL_IMPORT_ENTITIES` remains the single
+ * allowlist and `isImportEntityKey` remains membership in it. What this
+ * type permits is DECORATING an entity that lives elsewhere, which is
+ * how the four opening-balance entities get a contract without this
+ * track editing a file it does not own.
+ */
+export type ImportContract = {
+  dependsOn: readonly ImportDependency[];
+  reversal: ImportReversalPolicy;
+  provenance: ImportProvenancePolicy;
+  requiredness: ImportRequiredness;
+  duplicateDecision: ImportDuplicateDecision;
+};
+
+/* ------------------------------------------------------------------ */
 /* ENTITY DEFINITION                                                   */
 /* ------------------------------------------------------------------ */
 
@@ -391,6 +705,82 @@ export type ImportEntityDefinition = {
    * moment they choose what happens to it.
    */
   duplicateRule?: string;
+};
+
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 AN ENTITY THAT HAS BEEN THROUGH THE CONTRACT
+ * ══════════════════════════════════════════════════════════════════════
+ * ⚠️ WHY A SECOND TYPE RATHER THAN A REQUIRED MEMBER ON THE FIRST.
+ *
+ * The first attempt at this made `contract` a required member of
+ * `ImportEntityDefinition`. It was rejected for a reason worth writing
+ * down, because the next author will try it again:
+ *
+ * Entity definitions live in more than one file, and Track M1 does not
+ * own all of them. A required member would have made every file that
+ * declares an entity fail to compile until its owner edited it — which
+ * blocks six tracks for the sake of a mechanical addition, and which
+ * pushes toward the one outcome that must not happen: somebody making it
+ * `contract?:` to unblock themselves. An optional reversal policy is an
+ * undo that silently does nothing for the entities that omitted it,
+ * while the run report says "reversed".
+ *
+ * ⭐ SO THE REQUIREMENT SITS WHERE THE PRODUCT ALREADY PUTS ITS ONE
+ * GUARD: at `ALL_IMPORT_ENTITIES`, the single allowlist on the write
+ * path. An entity is reachable only by being in that map, that map is
+ * typed `Record<string, ContractedImportEntity>`, and so an entity is
+ * reachable only if it has a contract. The check is in exactly one
+ * place, it is the same place `isImportEntityKey` guards, and it cannot
+ * be softened without softening the allowlist itself.
+ *
+ * ⚠️ AND IT IS NOT MERELY A TYPE. `checkImportContract()` reads the same
+ * map at CI gate 29 and refuses contracts that are present but
+ * meaningless — a `restore-prior` that captures nothing, a provenance
+ * that omits its own table. Types insist the object exists; the gate
+ * insists it means something.
+ */
+export type ContractedImportEntity = ImportEntityDefinition & {
+  contract: ImportContract;
+};
+
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 A DESTINATION THE WRITE PATH CANNOT REACH YET
+ * ══════════════════════════════════════════════════════════════════════
+ * ⚠️ THIS TYPE EXISTS BECAUSE OF A GUARD THAT FIRED, AND THE STORY IS
+ *    WORTH THE TWENTY LINES.
+ *
+ * Track M1's second worked example is a `contacts` entity. Adding
+ * `"contacts"` to `ImportTableKey` broke the build in exactly one place:
+ * `REVALIDATE_AFTER` in `server/actions/import.ts`, a `Record` keyed on
+ * this union whose own comment says it is a `Record` rather than a
+ * ternary so that "TypeScript refuses to compile when a destination is
+ * added without one". It did.
+ *
+ * ⭐ THAT REFUSAL WAS CORRECT AND IT SHOULD NOT BE PAPERED OVER. The
+ * write path has no `contacts` branch. `writeRow` and
+ * `findExistingByNaturalKey` dispatch on `entity.table` with `if`
+ * chains, so an unhandled destination does not fail to compile — it
+ * falls through. Registering the entity anyway would have produced the
+ * exact defect this codebase has been found to have thirty times over: a
+ * thing that is built, offered in a picker, and unreachable.
+ *
+ * ⚠️ SO THE WORKED EXAMPLE IS NOT IN `ALL_IMPORT_ENTITIES`. It is fully
+ * typed, fully contracted, and exercised by the contract tests — it
+ * proves the contract can express a dependent entity — and it is
+ * deliberately not reachable from the server, because the three changes
+ * that would make it reachable are in a file this track does not own and
+ * are written out in `PATCH-REQUEST-M1.md`.
+ *
+ * 🔴 THIS TYPE IS A DEBT MARKER, NOT AN EXTENSION POINT. Every member of
+ *    it is an entity that cannot be imported. Adding to it is a way of
+ *    saying "not yet"; the goal is for it to be empty.
+ */
+export type PendingImportTableKey = "contacts";
+
+export type PendingImportEntity = Omit<ContractedImportEntity, "table"> & {
+  table: PendingImportTableKey;
 };
 
 /* ------------------------------------------------------------------ */

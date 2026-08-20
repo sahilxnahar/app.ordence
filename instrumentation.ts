@@ -118,6 +118,28 @@ export async function register() {
      */
     const { installSecurityAlerting } = await import("@/server/security/alerting");
     installSecurityAlerting();
+
+    /**
+     * ══════════════════════════════════════════════════════════════════
+     * ⭐⭐⭐ WAVE 14 — AND THE THIRD ONE, WHICH IS THE PROCESS ITSELF
+     * ══════════════════════════════════════════════════════════════════
+     * `installObservability()` attaches `uncaughtExceptionMonitor` and
+     * `unhandledRejection` listeners and writes one boot line.
+     *
+     * ⚠️ IT IS `uncaughtExceptionMonitor` AND NOT `uncaughtException`,
+     * and the difference is that the second one would SUPPRESS Node's
+     * default crash and leave this process serving traffic from a state
+     * nobody has reasoned about. `server/observability/runtime.ts`
+     * argues it at length; it is repeated here because this is the line
+     * somebody would "tidy up".
+     *
+     * ⚠️ IT OPENS NO DATABASE CONNECTION. `register()` runs before the
+     * first request; a database call here turns a Neon cold start into a
+     * failed deploy, with an error naming the observability layer rather
+     * than the database.
+     */
+    const { installObservability } = await import("@/server/observability/runtime");
+    installObservability();
   }
 
   if (!SENTRY_ENABLED) return;
@@ -199,6 +221,65 @@ export function onRequestError(
     console.error(
       `[ordence:error] cause: ${cause?.name ?? typeof err.cause}: ${cause?.message ?? String(err.cause)}`,
     );
+  }
+
+  /**
+   * ══════════════════════════════════════════════════════════════════════
+   * ⭐⭐⭐ WAVE 14 — AND THEN TO `captureError()`, WHICH HAD NO CALLERS
+   * ══════════════════════════════════════════════════════════════════════
+   * `lib/telemetry/report.ts` has existed since v0.12.0-alpha. It has a
+   * scrubber with a positive allow-list, a fingerprint scheme for
+   * grouping, a no-throw contract argued over forty lines, a table with
+   * five CHECK constraints and an RLS policy, and — verified by grep
+   * across the whole tree at v1.81.0-alpha — NOT ONE CALLER. Every
+   * server-side exception in this product's history reached `console.error`
+   * and Sentry, and `error_events` has only ever held rows posted by
+   * browsers to `/api/telemetry`.
+   *
+   * 🔴 SO THE ONE TABLE BUILT TO ANSWER "IS THIS TENANT BROKEN OR IS THE
+   * PRODUCT BROKEN" HAS NEVER SEEN A SERVER ERROR. That is why this line
+   * is here and why it is here rather than anywhere else: `onRequestError`
+   * is the only place Next.js hands over the real error object before it
+   * becomes a digest, and it is called for every uncaught server error in
+   * the application.
+   *
+   * ⚠️ `captureErrorSync`, NOT `await captureError`. This function is
+   * declared `void` and is called by Next.js on the error path; awaiting
+   * is not available and floating the promise without a `.catch()` is a
+   * process crash since Node 15. `captureErrorSync` exists for exactly
+   * this call shape and attaches the catch itself.
+   *
+   * ⚠️ THE TENANT IS NULL, AND THAT IS NOT AN OVERSIGHT. `onRequestError`
+   * receives no session and cannot read headers — `headers()` is not
+   * available outside a request scope here. So these rows land as
+   * null-tenant rows: still grouped, still fingerprinted, still
+   * searchable by route, but NOT attributable to a workspace. Attribution
+   * needs one line inside `requireTenantContext()`; it is in
+   * PATCH-REQUEST-B.md and it is the single highest-value line in that
+   * document.
+   */
+  try {
+    void import("@/lib/telemetry/report")
+      .then(({ captureErrorSync }) => {
+        captureErrorSync({
+          error,
+          severity: "error",
+          source: "server",
+          route: context?.routePath ?? request?.path ?? null,
+          tenantId: null,
+          userId: null,
+          metadata: {
+            component: "next",
+            boundary: context?.routeType ?? "unknown",
+            ...(err?.digest ? { digest: err.digest } : {}),
+          },
+        });
+      })
+      .catch(() => {
+        /* Telemetry being unavailable must never mask the original error. */
+      });
+  } catch {
+    /* Same, for a synchronous failure of the import itself. */
   }
 
   /**

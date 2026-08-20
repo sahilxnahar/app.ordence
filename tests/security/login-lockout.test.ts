@@ -174,11 +174,19 @@ describe("login lockouts — counter and lockout planting", () => {
 
   it("isLocked reads the window and reports an expired lockout as not-locked", async () => {
     const email = uniqueEmail();
+    /*
+     * ⚠️ `degraded: false` IS NEW IN WAVE 15 AND IS NOT COSMETIC. Before it,
+     * "this identifier is clean" and "the lockout store could not be read"
+     * were the same object, so a total failure of the evidence table was
+     * invisible to every possible caller. Asserting it here pins that the
+     * ordinary answer is a READING and not a guess.
+     */
     expect(await isLocked(email)).toEqual({
       locked: false,
       lockedUntil: null,
       failedAttempts: 0,
       expired: false,
+      degraded: false,
     });
 
     for (let i = 0; i < LOCKOUT_THRESHOLD; i++) {

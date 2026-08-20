@@ -1,6 +1,6 @@
 {
   "name": "ordence",
-  "version": "1.81.0-alpha",
+  "version": "1.84.0-alpha",
   "private": true,
   "scripts": {
     "gen:cron-runbook": "node scripts/generate-cron-runbook.mjs",
@@ -17,7 +17,7 @@
     "check:migrations": "node scripts/check-migrations.mjs",
     "check:rls": "node scripts/check-rls-coverage.mjs",
     "db:status": "node scripts/neon-status.mjs",
-    "release": "bash scripts/make-release.sh",
+    "release": "node scripts/release.mjs",
     "db:generate": "node scripts/drizzle-kit.mjs generate",
     "db:migrate": "node scripts/drizzle-kit.mjs migrate",
     "db:push": "node -e \"if(process.env.NODE_ENV==='production'){console.error('\\n\u26d4 drizzle-kit push is FORBIDDEN in this project: it drops RLS policies on 300+ tables. Use the numbered SQL-FILES/ instead.\\n');process.exit(1)}\" && node scripts/drizzle-kit.mjs push && echo '\\n\u26a0\ufe0f  drizzle-kit push DROPS RLS POLICIES. Now run SQL-FILES/ALL-IN-ONE-SETUP.sql, then: npm run db:verify\\n'",
@@ -68,7 +68,20 @@
     "migrate:status": "node scripts/migrate.mjs --status",
     "migrate:dry": "node scripts/migrate.mjs --dry-run",
     "test:bootstrap": "node scripts/bootstrap-test-db.mjs",
-    "check:unresolved-imports": "node scripts/check-unresolved-imports.mjs"
+    "check:unresolved-imports": "node scripts/check-unresolved-imports.mjs",
+    "check:track-ownership": "node scripts/check-track-ownership.mjs --tree",
+    "pending:generate": "node scripts/generate-pending-checker.mjs --write",
+    "pending:report": "node scripts/generate-pending-checker.mjs --report",
+    "rehearse": "node scripts/rehearse-delivery.mjs",
+    "check:fail-open": "node scripts/check-fail-open.mjs",
+    "check:import-contract": "node scripts/check-import-contract.mjs",
+    "report:allinone": "node scripts/report-allinone-dependency.mjs",
+    "assemble": "node scripts/assemble-wave.mjs",
+    "verify:report": "node scripts/verify-report.mjs",
+    "patch:collect": "node scripts/collect-patch-requests.mjs",
+    "env:drift": "node scripts/report-env-drift.mjs",
+    "drill:rebuild": "node scripts/drill-rebuild.mjs",
+    "measure:query": "node scripts/measure-query.mjs"
   },
   "dependencies": {
     "@clerk/nextjs": "^6.39.6",

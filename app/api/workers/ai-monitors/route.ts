@@ -123,7 +123,7 @@ export async function POST(req: NextRequest) {
      * they were last session. Unscoped is not a wider view; it is no view.
      */
     const activeTenants = await withPlatformScope(
-      `Scheduled sweep: list the workspaces to enqueue work for`,
+      `Scheduled sweep: list the workspaces to run every AI monitor for. The set of workspaces IS the input to this pass, so there is no one tenant whose scope could contain it`,
       (tx) =>
         tx
         .select({ id: tenants.id, slug: tenants.slug })

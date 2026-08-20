@@ -32,8 +32,42 @@
  * It does NOT require a database.
  */
 
-import { readdirSync, existsSync } from "node:fs";
+import { readdirSync, existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+
+/**
+ * ⭐ WAVE 14: SEVEN TRACKS NUMBER IN PARALLEL, SO GAPS ARE NORMAL AGAIN.
+ *
+ * Until now "a new file is exactly max+1" was right, because one person
+ * wrote migrations one at a time. From wave 14 the number space is
+ * carved into reserved blocks, one per track, in `track-ownership.json`.
+ * Track A holds 0129 to 0132 and may ship two files; track C starts at
+ * 0136 regardless. A gap inside or between reserved blocks is therefore
+ * the design, not a defect.
+ *
+ * ⚠️ IT IS STILL NOT A FREE PASS. A gap is tolerated only where a block
+ * reserves the number AND no file uses it. A number in nobody's block
+ * still fails, duplicates still fail, and reusing a retired number still
+ * fails. `check:track-ownership --tree` polices the other direction.
+ *
+ * When the waves are done, delete this and the sequence tightens back up.
+ */
+function reservedNumbers() {
+  const reserved = new Map();
+  try {
+    const map = JSON.parse(readFileSync(join(import.meta.dirname, "track-ownership.json"), "utf8"));
+    for (const [letter, t] of Object.entries(map.tracks)) {
+      if (!t.sql) continue;
+      for (let n = t.sql[0]; n <= t.sql[1]; n++) {
+        reserved.set(n, `reserved for track ${letter} (${t.name}) during waves 14 to 16`);
+      }
+    }
+  } catch {
+    /* No map means no parallel waves. The strict rule applies unchanged. */
+  }
+  return reserved;
+}
+const RESERVED = reservedNumbers();
 
 const DIR = "SQL-FILES";
 let failures = 0;
@@ -155,7 +189,7 @@ const numbers = [...seen.keys()].sort((a, b) => a - b);
 const max = numbers[numbers.length - 1];
 
 for (let n = 1; n <= max; n++) {
-  if (seen.has(n) || KNOWN_GAPS.has(n)) continue;
+  if (seen.has(n) || KNOWN_GAPS.has(n) || RESERVED.has(n)) continue;
   fail(
     `Missing migration ${String(n).padStart(4, "0")} — the sequence jumps over it. ` +
       `A new file must be exactly max+1 (currently ${String(max + 1).padStart(4, "0")}). ` +
@@ -187,6 +221,13 @@ if (failures > 0) {
 }
 
 const gapNote = KNOWN_GAPS.size ? ` (${KNOWN_GAPS.size} documented historical gaps)` : "";
+if (RESERVED.size > 0) {
+  const unused = [...RESERVED.keys()].filter((n) => !seen.has(n));
+  console.log(
+    `  ${RESERVED.size} numbers reserved for parallel tracks, ${unused.length} still unused. ` +
+      `A gap inside a reserved block is expected until every track has delivered.`,
+  );
+}
 console.log(
   `✅ Migrations contiguous — ${numbered.length} files, 0001…${String(max).padStart(4, "0")}${gapNote}. ` +
     `Next number: ${String(max + 1).padStart(4, "0")}.`,

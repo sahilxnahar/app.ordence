@@ -125,15 +125,71 @@ BEGIN
     RETURN;
   END IF;
 
+  -- ══════════════════════════════════════════════════════════════════════
+  -- 🔴 REPAIRED IN WAVE 15 (Track C). THIS BLOCK HAD NEVER EXECUTED, ANYWHERE.
+  -- ══════════════════════════════════════════════════════════════════════
+  -- It read:
+  --
+  --     FROM information_schema.columns c
+  --     JOIN information_schema.tables  t ON …
+  --    WHERE c.table_schema = 'public'
+  --      AND NOT has_any_column_privilege('ordence_app',
+  --                                       quote_ident(c.table_name), 'UPDATE')
+  --
+  -- and it failed, every time, with
+  --
+  --     ERROR:  relation "collations" does not exist
+  --     CONTEXT: PL/pgSQL function inline_code_block line 13 at FOR over SELECT
+  --
+  -- ⚠️ THE CAUSE IS THE ARGUMENT TYPE, NOT THE QUERY SHAPE.
+  -- `has_any_column_privilege(name, TEXT, text)` takes a table NAME, which
+  -- PostgreSQL resolves through `search_path` at evaluation time. The planner
+  -- is free to push that filter down below the join — and it does: `EXPLAIN`
+  -- shows it as a `Filter:` on the `Seq Scan on pg_class`, i.e. applied to
+  -- EVERY relation in EVERY schema before `nspname = 'public'` is ever
+  -- considered. `information_schema.collations` is one of those relations;
+  -- there is no `public.collations`; the function raises 42P01 and the whole
+  -- block dies.
+  --
+  -- 🔴 CONSEQUENCES, ALL OF WHICH WERE LIVE UNTIL WAVE 15:
+  --   · `updated_at_exclusions` was EMPTY on every database. The list this
+  --     file exists to declare had zero rows in it.
+  --   · Section 2 therefore treated append-only tables as sweepable and
+  --     attached `set_updated_at` to `plans`, on which the application role
+  --     holds no UPDATE — a BEFORE UPDATE trigger that can never fire, which
+  --     is precisely what the header says must not happen.
+  --   · Section 3 still printed `0126 PASS`, because with an empty exclusion
+  --     list nothing can be "uncovered". The file's own verification could
+  --     not see that half the file had not run.
+  --   · `psql -v ON_ERROR_STOP=1 -f 0126_…sql` exits **3**. That is the exact
+  --     invocation in `.github/workflows/security-ci.yml`'s "Apply the
+  --     numbered SQL files, in order" step, so the security-tests job has
+  --     been unable to go green since this file landed.
+  --
+  -- ⚠️ THIS FILE IS EDITED IN PLACE RATHER THAN SUPERSEDED BY A LATER
+  -- MIGRATION, AND THAT IS DELIBERATE. CI reapplies every numbered file from
+  -- scratch, in order, with ON_ERROR_STOP=1 — so a forward-only repair in a
+  -- later file never runs: the pipeline stops HERE, at 0126, before reaching
+  -- it. A defect that aborts the sequence has to be fixed in the file that
+  -- aborts it. The state repair for databases where the broken version
+  -- already ran is separate, and lives in
+  -- `0138_updated_at_consolidation.sql`.
+  --
+  -- ⭐ THE FIX: pass the OID. `has_any_column_privilege(name, OID, text)`
+  -- needs no name resolution, so a relation in another schema is simply a
+  -- relation this predicate answers `false` about instead of an error. The
+  -- query is rewritten onto `pg_class`/`pg_attribute` for the same reason —
+  -- `information_schema` hands out names, and names are the bug.
   FOR r IN
-    SELECT c.table_name AS tbl
-      FROM information_schema.columns c
-      JOIN information_schema.tables t
-        ON t.table_schema = c.table_schema AND t.table_name = c.table_name
-     WHERE c.table_schema = 'public'
-       AND c.column_name  = 'updated_at'
-       AND t.table_type   = 'BASE TABLE'
-       AND NOT has_any_column_privilege('ordence_app', quote_ident(c.table_name), 'UPDATE')
+    SELECT c.relname::text AS tbl
+      FROM pg_class c
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE n.nspname = 'public'
+       AND c.relkind = 'r'
+       AND EXISTS (SELECT 1 FROM pg_attribute a
+                    WHERE a.attrelid = c.oid AND a.attname = 'updated_at'
+                      AND a.attnum > 0 AND NOT a.attisdropped)
+       AND NOT has_any_column_privilege('ordence_app', c.oid, 'UPDATE')
   LOOP
     INSERT INTO public.updated_at_exclusions (table_name, reason, declared_in)
     VALUES (

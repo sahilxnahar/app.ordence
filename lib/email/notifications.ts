@@ -1,83 +1,49 @@
 /**
- * Ordence — Email Notification Helper
- * Version: v0.83.0-alpha
- *
- * Sends email notifications via Resend when configured.
- * Falls back silently when RESEND_API_KEY is not set — the in-app
- * notification is still created, just not emailed.
+ * Ordence — Notification email RENDERING
+ * Version: v1.82.0-alpha
  *
  * ⚠️ NEVER INCLUDES SENSITIVE DATA. Email bodies contain only the
  * notification title, body, and a link to the app. No financial figures,
  * no personal data, no vault contents.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 THIS FILE NO LONGER SENDS ANYTHING, AND THAT IS THE CHANGE
+ * ══════════════════════════════════════════════════════════════════════
+ * It used to export a second `sendEmail`. In its first form that function
+ * called `resend.emails.send(...)` and returned `true` with the result
+ * discarded — the Resend SDK does NOT throw when the provider rejects a
+ * message, it returns `{ data, error }` — so it reported a suppressed
+ * address, an unverified domain, a rate limit and a malformed payload
+ * alike as success. Three separate files named it, by path, as the thing
+ * not to do. v1.79 made it a thin adapter over `lib/email/resend.ts`,
+ * which was the right repair for the caller it had.
+ *
+ * ⭐ v1.82 REMOVED THE CALLER INSTEAD. `server/notifications/create.ts`
+ * now writes `email_outbox` rows inside its own transaction and lets the
+ * dispatcher deliver them, so this module's `sendEmail` had no call sites
+ * left anywhere in the repository.
+ *
+ * 🔴 IT IS DELETED RATHER THAN LEFT EXPORTED, and that is deliberate. An
+ * exported sender with no callers is the codebase's own recurring defect
+ * — built and unreachable — and worse than inert: it is the obvious thing
+ * for the next person to reach for, and reaching for it puts a message
+ * past the suppression list, the attempt ceiling and the delivery record
+ * all at once. There is now exactly ONE way for this product to send an
+ * email: `sendEmail` in `lib/email/resend.ts`, called by the dispatcher in
+ * `server/email/outbox.ts`.
+ *
+ * ⚠️ THE REGRESSION TEST THAT PINNED THE OLD SHAPE STILL EXISTS and now
+ * fails: `tests/ui/wave13-tooling.test.ts` asserts this file contains
+ * `await import("./resend")`. That file belongs to another stream.
+ * `PATCH-REQUEST-G.md` carries the replacement assertion, which is
+ * stronger than the one it retires: no module outside
+ * `server/email/outbox.ts` may call the dispatcher at all.
+ *
+ * What remains here is rendering, which has no I/O and no opinion about
+ * delivery.
  */
 
 import "server-only";
-
-type EmailPayload = {
-  to: string;
-  subject: string;
-  html: string;
-  text: string;
-};
-
-/**
- * Send a notification email.
- *
- * ══════════════════════════════════════════════════════════════════════
- * 🔴 THIS USED TO BE A SECOND, BROKEN COPY OF THE DISPATCHER
- * ══════════════════════════════════════════════════════════════════════
- * It called `resend.emails.send(...)` and then `return true`, with the
- * result discarded. The Resend SDK does NOT throw when the provider
- * rejects a message — it returns `{ data, error }`. So this function
- * returned `true` for a suppressed address, an unverified domain, a rate
- * limit, and a malformed payload alike. Every notification email that
- * never arrived was reported as sent.
- *
- * ⚠️ AND IT WAS A KNOWN DEFECT. Three separate files name this exact
- * function, by path, as the thing not to do:
- *
- *   server/email/outbox.ts      "which is how the codebase already ended
- *   server/receivables/dunning.ts   up with a `sendEmail` in
- *                               lib/email/notifications.ts that ignores
- *                               every safeguard in the real one"
- *   lib/email/outbox.ts         "🔴 SUCCESS WITHOUT A PROVIDER ID IS NOT
- *                               SUCCESS"
- *
- * It was documented as wrong and left wired to a live caller.
- *
- * ⭐ SO IT IS NOW A THIN ADAPTER over `lib/email/resend.ts`, which checks
- * `error`, refuses success without a provider message id, classifies rate
- * limits, validates and de-duplicates recipients, and logs with context.
- * One dispatcher, one set of safeguards.
- *
- * The boolean return is kept because that is the contract this module's
- * callers were written against; the difference is that it is now the
- * truth.
- */
-export async function sendEmail(payload: EmailPayload): Promise<boolean> {
-  const { sendEmail: dispatch } = await import("./resend");
-
-  const result = await dispatch({
-    to: payload.to,
-    subject: payload.subject,
-    html: payload.html,
-    text: payload.text,
-    logContext: { channel: "notification" },
-  });
-
-  if (!result.ok) {
-    // ⚠️ Named, not swallowed. `resend.ts` already logged the provider's
-    // own words; this line says which subsystem lost the message, because
-    // "[email] provider error" alone does not tell an operator whether a
-    // notification, an invoice or a dunning notice went missing.
-    console.error(
-      `[email:notification] not delivered (${result.reason}): ${result.message}`,
-    );
-    return false;
-  }
-
-  return true;
-}
 
 /**
  * Build an HTML email body for a notification.

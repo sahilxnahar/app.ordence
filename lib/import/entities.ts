@@ -41,13 +41,14 @@
 import { COMPANY_SIZES, createCompanySchema } from "@/lib/validators/crm";
 import { upsertPartySchema } from "@/lib/validators/gst";
 import { OPENING_IMPORT_ENTITIES } from "./opening-entities";
-import type { ImportEntityDefinition } from "./types";
+import { OPENING_CONTRACTS } from "./contract/opening-policies";
+import type { ContractedImportEntity } from "./types";
 
 /* ------------------------------------------------------------------ */
 /* COMPANIES                                                           */
 /* ------------------------------------------------------------------ */
 
-const companiesEntity: ImportEntityDefinition = {
+const companiesEntity: ContractedImportEntity = {
   key: "companies",
   label: "Companies",
   noun: { one: "company", many: "companies" },
@@ -241,6 +242,80 @@ const companiesEntity: ImportEntityDefinition = {
   },
 
   rowLabel: (parsed) => (typeof parsed.name === "string" ? parsed.name : "(no name)"),
+
+  /* ---------------------------------------------------------------- */
+  /* ⭐⭐ TRACK M1 — THE CONTRACT. WORKED EXAMPLE 1 OF 2.                */
+  /* ---------------------------------------------------------------- */
+
+  /**
+   * ⚠️ READ THIS ONE FIRST IF YOU ARE ADDING AN ENTITY.
+   *
+   * `companies` was chosen as the first worked example because it is the
+   * boring case, and the boring case is where the contract has to be
+   * legible. Everything below is a decision with a reason attached, and
+   * the reasons are the part that took the time.
+   */
+  contract: {
+    /**
+     * ⚠️ NOTHING, AND IT IS THE REASON COMPANIES ARE WAVE ZERO.
+     *
+     * A company row is self-contained: every value it needs is in the
+     * row. That is unusual and it is why this is the file a customer is
+     * asked for first.
+     */
+    dependsOn: [],
+
+    /**
+     * 🔴 `restore-prior`, NOT `delete`, AND THE DIFFERENCE IS THE WHOLE
+     *    REASON THIS MEMBER EXISTS.
+     *
+     * `companies` offers `update`, and customers use it — the second
+     * upload of a customer list is usually a refresh, not a first load.
+     * In `update` mode this entity OVERWRITES a record that existed
+     * before the migration, carrying notes, deals and history the import
+     * knows nothing about. An undo that deleted it would destroy data
+     * that was never part of the run, in the name of undoing the run.
+     *
+     * ⚠️ AND `restore-prior` IS NOT FREE. The prior values must be
+     * captured at write time, because by undo time they are gone. That
+     * capture is Track M2's ledger; this declaration is what tells M2 to
+     * take it. `checkImportContract()` refuses `restore-prior` with an
+     * empty capture list, because an undo that runs and restores nothing
+     * is worse than one that refuses.
+     */
+    reversal: {
+      kind: "restore-prior",
+      /**
+       * ⚠️ `"*"` — THE WHOLE ROW, AND THAT IS THE RIGHT ANSWER HERE
+       * RATHER THAN A LAZY ONE. An import in `update` mode writes every
+       * mapped column, and which columns are mapped depends on the
+       * customer's file, so the set of fields at risk is not knowable
+       * when this definition is written. Naming individual fields would
+       * be naming the ones today's template happens to carry.
+       */
+      capturePriorFields: ["*"],
+      escapes: null,
+      because:
+        "This entity offers `update`, so a run can overwrite records that pre-date the migration. Deleting those on undo would destroy customer data the run never created. The prior values are captured at write time because they do not survive to undo time.",
+    },
+
+    provenance: { targets: ["companies"], cardinality: "one-to-one" },
+
+    /**
+     * ⚠️ EMPTY, AND CHECKED RATHER THAN ASSUMED. `createCompanySchema`
+     * already refuses a blank name, which is the only field without
+     * which a company is not a company. Restating it here would be a
+     * second copy of a rule that would disagree with the first the day
+     * the schema moved.
+     */
+    requiredness: { structural: [], messages: {} },
+
+    duplicateDecision: {
+      recommended: "skip",
+      because:
+        "Most second uploads are the whole file again after fixing a few rows, and `skip` makes that safe. `update` turns the import into a mass edit of records you already have — pick it only when the file is deliberately a refresh, and note that it needs a separate permission.",
+    },
+  },
 };
 
 /* ------------------------------------------------------------------ */
@@ -274,7 +349,7 @@ const companiesEntity: ImportEntityDefinition = {
  * row number and no explanation — which is precisely the "one of four
  * write paths" problem `server/actions/gst.ts` warns about at the top.
  */
-const gstPartiesEntity: ImportEntityDefinition = {
+const gstPartiesEntity: ContractedImportEntity = {
   key: "gst-parties",
   label: "GST parties",
   noun: { one: "party", many: "parties" },
@@ -538,7 +613,41 @@ const gstPartiesEntity: ImportEntityDefinition = {
 
   rowLabel: (parsed) =>
     typeof parsed.legalName === "string" ? parsed.legalName : "(no name)",
+
+  /**
+   * ⭐⭐ TRACK M1 — THE CONTRACT.
+   *
+   * ⚠️ NOTE HOW LITTLE OF THIS RESEMBLES `companies`, WHICH IS THE POINT
+   * OF HAVING WRITTEN BOTH.
+   */
+  contract: {
+    dependsOn: [],
+    /**
+     * 🔴 `restore-prior` FOR THE SAME REASON AS `companies` — this entity
+     * offers `update` — but with a materially sharper consequence. A GST
+     * party carries the registration a customer's invoices are raised
+     * against. Overwriting one and then deleting it on undo would leave
+     * invoices pointing at a party that no longer exists, in a system of
+     * record an assessing officer may later read.
+     */
+    reversal: {
+      kind: "restore-prior",
+      capturePriorFields: ["*"],
+      escapes:
+        "A party overwritten in `update` mode may already have been quoted on invoices raised between the import and the undo. Restoring the party's prior values does not restate those invoices, which captured their GST details at issue and are deliberately immutable.",
+      because:
+        "`update` is offered, so a run can rewrite a registration that pre-dates the migration. The escape above is real and is shown before the run rather than discovered after it.",
+    },
+    provenance: { targets: ["gst_parties"], cardinality: "one-to-one" },
+    requiredness: { structural: [], messages: {} },
+    duplicateDecision: {
+      recommended: "skip",
+      because:
+        "The natural key for an UNREGISTERED party is only its name and type, which is a weak match — two different one-off vendors with the same name look like one party. `skip` makes that weakness harmless; `update` would let the weak match overwrite the wrong record.",
+    },
+  },
 };
+
 
 /* ------------------------------------------------------------------ */
 /* THE REGISTRY                                                        */
@@ -547,7 +656,7 @@ const gstPartiesEntity: ImportEntityDefinition = {
 export const IMPORT_ENTITIES = {
   companies: companiesEntity,
   "gst-parties": gstPartiesEntity,
-} as const satisfies Record<string, ImportEntityDefinition>;
+} as const satisfies Record<string, ContractedImportEntity>;
 
 export type ImportEntityKey = keyof typeof IMPORT_ENTITIES;
 
@@ -569,10 +678,49 @@ export const IMPORT_ENTITY_KEYS = Object.keys(IMPORT_ENTITIES) as ImportEntityKe
  * `ALL_IMPORT_ENTITIES` and through `isImportEntityKey`, which is
  * membership in it — never a dynamic lookup on a caller's string.
  */
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * ⭐⭐ TRACK M1 — THE ALLOWLIST IS ALSO WHERE THE CONTRACT IS REQUIRED
+ * ══════════════════════════════════════════════════════════════════════
+ * ⚠️ THE TYPE CHANGED FROM `ImportEntityDefinition` TO
+ *    `ContractedImportEntity`, AND THAT ONE-WORD CHANGE IS THE
+ *    ENFORCEMENT.
+ *
+ * An entity is reachable from the server only by being in this map —
+ * that is what the note above says and it is why `isImportEntityKey` is
+ * membership in it rather than a dynamic lookup. Requiring the contract
+ * HERE therefore means: an entity without a contract is an entity the
+ * write path cannot reach. Not a lint. Not a convention. The same guard
+ * that already stops a crafted entity string from reaching `users`.
+ *
+ * ⚠️ WHY THE OPENING ENTITIES ARE DECORATED RATHER THAN EDITED.
+ * `opening-entities.ts` belongs to another track. Their four contracts
+ * are declared in `contract/opening-policies.ts`, which this track owns,
+ * and merged here. That file argues the case at length and asks to be
+ * deleted once the owning track folds the objects into its own
+ * definitions.
+ *
+ * 🔴 THIS MERGE CANNOT MAKE AN ENTITY REACHABLE. It only adds a member
+ *    to an entity already present in `OPENING_IMPORT_ENTITIES`. A key
+ *    that appears in `OPENING_CONTRACTS` and nowhere else contributes
+ *    nothing at all — and `checkImportContract()` at CI gate 29 refuses
+ *    that state rather than letting it sit, because a contract written
+ *    for an entity that does not exist is a contract somebody believes
+ *    is in force.
+ */
+const openingWithContracts = Object.fromEntries(
+  Object.entries(OPENING_IMPORT_ENTITIES).map(([key, definition]) => [
+    key,
+    { ...definition, contract: OPENING_CONTRACTS[key as keyof typeof OPENING_CONTRACTS] },
+  ]),
+) as {
+  [K in keyof typeof OPENING_IMPORT_ENTITIES]: ContractedImportEntity;
+};
+
 export const ALL_IMPORT_ENTITIES = {
   ...IMPORT_ENTITIES,
-  ...OPENING_IMPORT_ENTITIES,
-} as const satisfies Record<string, ImportEntityDefinition>;
+  ...openingWithContracts,
+} as const satisfies Record<string, ContractedImportEntity>;
 
 export type AnyImportEntityKey = keyof typeof ALL_IMPORT_ENTITIES;
 

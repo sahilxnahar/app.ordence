@@ -140,6 +140,55 @@ export const SECURITY_EVENT_TYPES = [
 
   /* --- Anomaly detector output ------------------------------------- */
   "anomaly.detected",
+
+  /* --- Track D, wave 15: A CONTROL THAT COULD NOT DECIDE ------------ *
+   *
+   * ══════════════════════════════════════════════════════════════════
+   * ⚠️ THESE FOUR EXIST BECAUSE "IT FAILED" AND "IT WAS FINE" LOOKED
+   * IDENTICAL FROM OUTSIDE.
+   * ══════════════════════════════════════════════════════════════════
+   * Every other member of this enum records something that HAPPENED. These
+   * record something that DID NOT: a gate that could not reach the fact it
+   * needed, a piece of evidence that did not persist, a queue entry that was
+   * dropped. Before wave 15 each of the four printed to stderr at best, and
+   * a control whose only failure symptom is a line in a log drain nobody
+   * greps is a control that reports success while doing nothing.
+   *
+   * They are `warning` and `critical`, never `info` — the whole point is
+   * that somebody has to look. `security.evidence_write_failed` is critical
+   * because it is the one that eats the others: if IT fails, the failure of
+   * whatever it was reporting is now invisible too.
+   */
+
+  /**
+   * The billing access gate could not resolve a workspace's standing and
+   * refused writes rather than granting them. One row per occurrence, never
+   * coalesced — the count IS the blast radius of the outage.
+   */
+  "billing.standing_unresolved",
+
+  /**
+   * `withPlatformScope()` was entered: somebody read across tenant
+   * boundaries. The justification travels on `reason`. This is the row a
+   * customer's "who at Ordence looked at my data, and why?" is answered
+   * from, so it is written on EVERY raise, including the routine ones.
+   */
+  "platform.scope_raised",
+
+  /**
+   * A piece of security evidence could not be written — a lockout counter,
+   * a denial, an event. Critical: the gap it describes is a gap in the
+   * record everything else in this file relies on.
+   */
+  "security.evidence_write_failed",
+
+  /**
+   * An automation event was not queued, so every workflow watching that
+   * record did not fire for it. The business record itself survived (that
+   * trade is deliberate — see `server/automation/emit.ts`); what is lost is
+   * the automation, silently, unless this row exists.
+   */
+  "automation.event_dropped",
 ] as const;
 
 export type SecurityEventType = (typeof SECURITY_EVENT_TYPES)[number];
@@ -222,6 +271,20 @@ export const DEFAULT_SEVERITY: Record<SecurityEventType, SecuritySeverity> = {
   "tenant.cross_access_attempt": "critical",
 
   "anomaly.detected": "warning",
+
+  // Track D, wave 15. See the enum above for why each sits where it does.
+  //
+  // ⚠️ `billing.standing_unresolved` is a WARNING and not a notice. It means
+  // paying customers are being refused writes right now; the previous
+  // behaviour of this path was to grant everybody unlimited access silently,
+  // and a "notice" would be the same silence with extra steps.
+  "billing.standing_unresolved": "warning",
+  // Raising platform scope is ordinary, frequent and expected — the row is
+  // the evidence, not the alarm. An UNJUSTIFIED raise escalates at the call
+  // site (`lib/security/platform-scope.ts`) rather than by living here.
+  "platform.scope_raised": "info",
+  "security.evidence_write_failed": "critical",
+  "automation.event_dropped": "warning",
 };
 
 /**
@@ -393,6 +456,10 @@ export const SECURITY_EVENT_LABELS: Record<SecurityEventType, string> = {
   "authz.denial_spike": "Spike in permission denials",
   "tenant.cross_access_attempt": "Cross-tenant access attempt",
   "anomaly.detected": "Anomaly detected",
+  "billing.standing_unresolved": "Billing standing could not be resolved — writes refused",
+  "platform.scope_raised": "Cross-tenant platform scope raised",
+  "security.evidence_write_failed": "Security evidence could not be written",
+  "automation.event_dropped": "Automation event dropped",
 };
 
 export function describeSecurityEvent(type: SecurityEventType): string {

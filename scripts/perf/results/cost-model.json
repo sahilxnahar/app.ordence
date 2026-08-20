@@ -1,0 +1,95 @@
+{
+  "rates": {
+    "cuHourUsd": 0.16,
+    "gbMonthUsd": 0.35
+  },
+  "activity": {
+    "basic": {
+      "label": "starter",
+      "users": 5,
+      "listViews": 6000,
+      "invoices": 35,
+      "postings": 45
+    },
+    "advanced": {
+      "label": "growth",
+      "users": 20,
+      "listViews": 26000,
+      "invoices": 140,
+      "postings": 180
+    },
+    "enterprise": {
+      "label": "enterprise",
+      "users": 200,
+      "listViews": 260000,
+      "invoices": 1400,
+      "postings": 1800
+    }
+  },
+  "measured": {
+    "readMs": 2.476,
+    "invoiceWriteUs": 128.6,
+    "legWriteUs": 394,
+    "legWriteBareUs": 34.4
+  },
+  "bytesPerRow": {
+    "sales_invoice_lines": 325.3285925925926,
+    "contacts": 584.3626666666667,
+    "audit_logs": 375.46666666666664,
+    "journal_entries": 360.53902222222223,
+    "transactions": 304.19626666666665,
+    "sales_invoices": 600.5191111111111,
+    "change_log": 375.63733333333334,
+    "companies": 400.4977777777778
+  },
+  "rows": [
+    {
+      "tier": "basic",
+      "label": "starter",
+      "users": 5,
+      "readMs": 29712,
+      "writeMs": 88.924,
+      "totalMs": 29800.924,
+      "totalSeconds": 29.800924,
+      "cuHours": 0.008278034444444445,
+      "computeUsd": 0.0013244855111111111,
+      "storageGb": 0.006533559163411458,
+      "storageUsd": 0.00228674570719401,
+      "totalUsd": 0.0036112312183051213,
+      "perUserUsd": 0.0007222462436610243,
+      "sampleSlug": "starter-05"
+    },
+    {
+      "tier": "advanced",
+      "label": "growth",
+      "users": 20,
+      "readMs": 128752,
+      "writeMs": 355.696,
+      "totalMs": 129107.696,
+      "totalSeconds": 129.107696,
+      "cuHours": 0.035863248888888886,
+      "computeUsd": 0.005738119822222222,
+      "storageGb": 0.026134236653645834,
+      "storageUsd": 0.00914698282877604,
+      "totalUsd": 0.014885102650998263,
+      "perUserUsd": 0.0007442551325499132,
+      "sampleSlug": "growth-01"
+    },
+    {
+      "tier": "enterprise",
+      "label": "enterprise",
+      "users": 200,
+      "readMs": 1287520,
+      "writeMs": 3556.96,
+      "totalMs": 1291076.96,
+      "totalSeconds": 1291.0769599999999,
+      "cuHours": 0.3586324888888889,
+      "computeUsd": 0.05738119822222222,
+      "storageGb": 0.2613423665364583,
+      "storageUsd": 0.0914698282877604,
+      "totalUsd": 0.1488510265099826,
+      "perUserUsd": 0.0007442551325499131,
+      "sampleSlug": "enterprise-01"
+    }
+  ]
+}

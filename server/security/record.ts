@@ -333,10 +333,72 @@ export async function recordSecurityEvent(
       occurrenceCount = decision.occurrenceCount;
     }
 
+    /*
+     * ══════════════════════════════════════════════════════════════════
+     * 🔴 A TENANT-ATTRIBUTED EVENT CANNOT BE WRITTEN BY THE UNSCOPED
+     *    CLIENT, AND SEVEN CALL SITES HAD NEVER WRITTEN A ROW.
+     * ══════════════════════════════════════════════════════════════════
+     * `security_events`' WITH CHECK compares `tenant_id` against
+     * `app_current_tenant_id()`, which is NULL outside a transaction. So
+     * clause 1 is NULL, clause 2 fails on `tenant_id IS NULL`, clause 3 is
+     * false, and the INSERT is REFUSED. `relforcerowsecurity` is true, so
+     * production's table-owning role is not exempt either.
+     *
+     * Measured in wave 15 across every environment: upload rejections,
+     * rate-limit breaches, search abuse, impersonation close, session
+     * anomalies, every anomaly finding carrying a tenant , and
+     * `tenant.cross_access_attempt`, one of two `critical` types, whose
+     * own comment calls it a page-someone event. None of them could fire.
+     *
+     * ⚠️ THE FALLBACK IS NOT DEFENSIVE PADDING. If the scoped write fails
+     * , tenant deleted, id malformed, database unreachable , the event
+     * must still land with `tenant_id NULL` and the id preserved in
+     * `detail`, because a security event lost is worse than a security
+     * event filed in the wrong drawer. `lib/security/evidence.ts` uses
+     * the same ordering.
+     */
+    const row = buildSecurityEventRow(input, facts, occurrenceCount);
+
+    if (input.tenantId) {
+      try {
+        const { withTenant } = await import("@/db");
+        await withTenant(input.tenantId, (tx) =>
+          tx.insert(securityEvents).values(row),
+        );
+        return true;
+      } catch (scopedErr) {
+        /*
+         * FAIL OPEN, and named as such so the gate can see the decision.
+         * The scoped write failed , tenant deleted, id malformed, database
+         * unreachable. Returning `false` here would be honest about this
+         * write and would LOSE the event, and a security event lost is
+         * worse than a security event filed in the wrong drawer. So it is
+         * demoted to platform scope, the tenant id is preserved in
+         * `detail` where it remains queryable, and the demotion is logged
+         * loudly. `true` means "the evidence exists", not "it is perfect".
+         */
+        const { db } = await import("@/db");
+        await db.insert(securityEvents).values({
+          ...row,
+          tenantId: null,
+          detail: {
+            ...(row.detail && typeof row.detail === "object" ? row.detail : {}),
+            tenant_id_unwritable: input.tenantId,
+            tenant_scope_error:
+              scopedErr instanceof Error ? scopedErr.message : String(scopedErr),
+          },
+        });
+        console.error("[SECURITY EVENT DEMOTED TO PLATFORM SCOPE]", {
+          type: input.type,
+          tenantId: input.tenantId,
+          error: scopedErr instanceof Error ? scopedErr.message : String(scopedErr),
+        });
+        return true;
+      }
+    }
+
     const { db } = await import("@/db");
-    await db.insert(securityEvents).values(
-      buildSecurityEventRow(input, facts, occurrenceCount),
-    );
+    await db.insert(securityEvents).values(row);
 
     return true;
   } catch (err) {

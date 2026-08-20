@@ -251,6 +251,19 @@ NEXT_PUBLIC_ORDENCE_TRIAL_NOTICE_DAYS=
 NEXT_PUBLIC_ORDENCE_TRIAL_GRACE_DAYS=
 NEXT_PUBLIC_ORDENCE_DUNNING_GRACE_DAYS=
 
+# ---- SCHEDULER -----------------------------------
+# The cron entrypoint. Absent values fall back, so a scheduler with none of these still runs.
+SCHEDULER_APP_URL=
+MAINTENANCE_DATABASE_URL=
+
+# ---- ALERTING ------------------------------------
+# Where security and SLO alerts are posted. Absent means alerts degrade to logs. The URL is a credential.
+DISCORD_ALERT_WEBHOOK_URL=
+
+# ---- E-INVOICING ---------------------------------
+# Whether invoices are registered with the IRP. Absent or false means the payload is built and never sent.
+ORDENCE_EINVOICE_IRP_ENABLED=
+
 # ---- LEGACY --------------------------------------
 # Kept for rollback safety; no live code path.
 #

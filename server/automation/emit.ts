@@ -41,6 +41,7 @@ import "server-only";
 
 import { sql } from "drizzle-orm";
 import { automationEvents } from "@/db/schema/patterns";
+import { recordSecurityEvidence } from "@/lib/security/evidence";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type Tx = any;
@@ -152,6 +153,43 @@ export async function emitAutomationEvent(args: EmitArgs): Promise<void> {
  * 🔴 IT DOES NOT SWALLOW SILENTLY. The reason comes back so the caller
  * can put it in the audit row, because a queue that quietly drops events
  * is worse than one that has none: people build on it.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴🔴 WAVE 15 CORRECTION: THE SENTENCE ABOVE WAS TRUE AND USELESS.
+ * ══════════════════════════════════════════════════════════════════════
+ * Track D's brief says this function "discards its failure reasons". It
+ * does not — it returns `{ emitted, reason }` and has since v1.19.0. The
+ * brief is wrong about the function and right about the outcome, because
+ * of what happens one line up the stack.
+ *
+ * Measured, not assumed. Every call site in the repository at 1.81.0:
+ *
+ *     server/actions/purchase-orders.ts:185   const emitted = await tryEmit…   ← used
+ *     server/actions/purchase-orders.ts:245   await tryEmit…                   ← discarded
+ *     server/actions/purchase-orders.ts:519   await tryEmit…                   ← discarded
+ *     server/actions/purchase-orders.ts:699   await tryEmit…                   ← discarded
+ *
+ * Three of four throw the reason away, and TypeScript cannot object: an
+ * ignored return value is legal, so "returns the reason" is a guarantee
+ * the type system does not enforce and nobody re-checked. The whole
+ * automation queue could be refusing every write — wrong grant, storm
+ * brake stuck, `purge_after` constraint — and three of the four business
+ * flows that feed it would report complete success.
+ *
+ * ⭐ SO THE EVIDENCE IS WRITTEN HERE, BY THE FUNCTION THAT KNOWS, RATHER
+ * THAN BEING OFFERED TO A CALLER THAT MAY NOT LOOK. A discarding caller
+ * now still leaves an `automation.event_dropped` row behind it. The
+ * return value stays, because a caller that DOES look should still be
+ * able to put the reason in its audit entry.
+ *
+ * ⚠️ THE EVIDENCE WRITE IS DELIBERATELY *OUTSIDE* THE CALLER'S
+ * TRANSACTION. `recordSecurityEvidence` uses the standalone recorder,
+ * which opens its own connection. Writing it on `args.tx` would put the
+ * row inside the transaction that is about to roll back in the one case
+ * where the caller decides the failure is fatal — so the record of the
+ * drop would vanish along with the thing that dropped. It would also land
+ * inside a transaction whose statement just errored, which in PostgreSQL
+ * is a transaction that refuses every subsequent statement.
  */
 export async function tryEmitAutomationEvent(
   args: EmitArgs,
@@ -176,12 +214,42 @@ export async function tryEmitAutomationEvent(
     } catch {
       // Nothing further to do; the caller's own error handling takes over.
     }
-    return {
-      emitted: false,
-      reason:
-        e instanceof Error
-          ? e.message.slice(0, 300)
-          : "The automation event could not be recorded.",
-    };
+    const reason =
+      e instanceof Error
+        ? e.message.slice(0, 300)
+        : "The automation event could not be recorded.";
+
+    /*
+     * ⭐ AWAITED. A floating promise here would be killed with the
+     * serverless instance the moment the action returns, which produces the
+     * empty table this whole change exists to prevent. The cost is one
+     * insert on a path that has already failed.
+     *
+     * ⚠️ AND IT IS ITSELF WRAPPED, because `recordSecurityEvidence` is a
+     * database write and this catch block exists precisely because the
+     * database just refused something. A throw here would convert a
+     * best-effort queue insert into a failed invoice — the exact trade this
+     * function was written to prevent.
+     */
+    try {
+      await recordSecurityEvidence({
+        type: "automation.event_dropped",
+        severity: "warning",
+        source: "server/automation/emit#tryEmitAutomationEvent",
+        tenantId: args.tenantId,
+        subjectType: args.recordType,
+        subjectId: args.recordId,
+        reason: `Automation event not queued: ${reason}`,
+        detail: {
+          trigger: args.trigger,
+          record_type: args.recordType,
+          changed_fields: args.changedFields ? [...args.changedFields] : null,
+        },
+      });
+    } catch {
+      // Nothing further is available. The caller still receives `reason`.
+    }
+
+    return { emitted: false, reason };
   }
 }

@@ -239,7 +239,46 @@ BEGIN
 
     GRANT EXECUTE ON FUNCTION app_current_tenant_id()          TO PUBLIC;
     GRANT EXECUTE ON FUNCTION app_current_impersonation_id()   TO PUBLIC;
-    GRANT EXECUTE ON FUNCTION app_is_platform_scope()          TO PUBLIC;
+    -- ══════════════════════════════════════════════════════════════
+    -- ⚠️ GUARDED IN WAVE 15 (Track C). THIS LINE STOPPED THE WHOLE
+    --    NUMBERED SEQUENCE ON ANY DATABASE NOT BUILT FROM
+    --    ALL-IN-ONE-SETUP.sql.
+    -- ══════════════════════════════════════════════════════════════
+    -- `app_is_platform_scope()` is a DEPRECATED ALIAS of
+    -- `app_platform_scope()` on the line below, and it is defined ONLY in
+    -- `ALL-IN-ONE-SETUP.sql` — in no numbered file. On a database built
+    -- from `SQL-FILES/[0-9][0-9][0-9][0-9]_*.sql` alone this GRANT raises
+    --
+    --     ERROR:  function app_is_platform_scope() does not exist
+    --
+    -- which, under the `ON_ERROR_STOP=1` that CI and every operator use,
+    -- aborts 0087 and every file after it. Measured: a migrations-only
+    -- build stops here, at file 87 of 129.
+    --
+    -- ⭐ 0136 now creates the alias, so a full rebuild has it — but 0136
+    -- runs FORTY-NINE FILES AFTER THIS ONE, and a migration cannot depend
+    -- on a later migration. The guard is what makes the sequence
+    -- replayable in the only order it is ever applied in.
+    --
+    -- ⚠️ IT IS A GUARD, NOT A REMOVAL. Where the function exists — which
+    -- is production, CI, and every database anyone has looked at — the
+    -- grant still happens, identically. Removing the line instead would
+    -- silently change the privilege surface of a database that has been
+    -- live for months.
+    DO $guard$
+    BEGIN
+      IF EXISTS (SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+                  WHERE n.nspname = 'public' AND p.proname = 'app_is_platform_scope') THEN
+        EXECUTE 'GRANT EXECUTE ON FUNCTION app_is_platform_scope() TO PUBLIC';
+      ELSE
+        RAISE NOTICE
+          '0087: app_is_platform_scope() does not exist here, so its grant is '
+          'skipped. It is a deprecated alias of app_platform_scope() and is '
+          'defined only in ALL-IN-ONE-SETUP.sql; 0136 creates it for '
+          'migrations-only builds.';
+      END IF;
+    END
+    $guard$;
     GRANT EXECUTE ON FUNCTION app_platform_scope()             TO PUBLIC;
     GRANT EXECUTE ON FUNCTION app_origin_id()                  TO PUBLIC;
 

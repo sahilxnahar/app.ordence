@@ -95,6 +95,24 @@ describe("⭐ every declared event type is emitted by something", () => {
     "app/portal/[token]/page.tsx",
     "app/portal/[token]/documents/[documentId]/route.ts",
     "lib/security/lockout.ts",
+    /**
+     * ⭐ ADDED AT INTEGRATION, WAVE 15. Track D added four event types and
+     * four emitters; this hand-maintained list did not know about them, so
+     * four assertions went red on correct code.
+     *
+     * ⚠️ THE HAND-MAINTAINED LIST IS THE DEFECT, NOT THE ADDITION. The CI
+     * gate doing the same job over the whole tree
+     * (`scripts/check-security-events.mjs`) passed throughout, because it
+     * discovers emitters rather than being told about them. This list
+     * should be replaced by that discovery; until it is, it will go red
+     * once per wave, on correct work, and teach people to edit tests to
+     * make builds green , which is the habit that ends with a test suite
+     * nobody believes.
+     */
+    "lib/security/evidence.ts",
+    "lib/security/platform-scope.ts",
+    "server/billing/access.ts",
+    "server/automation/emit.ts",
   ];
 
   const bodies = FILES.map((f) => codeOnly(read(f)));

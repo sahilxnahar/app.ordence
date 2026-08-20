@@ -1,0 +1,280 @@
+{
+  "_comment": "Waves 14-16 parallel track ownership. See ORDENCE-WAVE-PLAN-DELEGATION.md. A path belongs to exactly one track. `shared` is owned by integration only. `excludes` wins over `paths`: a broad glob minus the files lent to another track. SQL-FILES is owned by NUMBER BLOCK, not by directory: any track may add SQL-FILES/NNNN_*.sql when NNNN is inside its own block. Unnumbered files in SQL-FILES are ordinary owned paths: VERIFY and DRILL belong to C, the read-only checkers to H. `anyTrack` paths may be delivered by any track: drills are inert by name and belong with the work that needs them. `repairsInPlace` is an explicit, argued exception: an already-applied migration may be edited only when it aborts the sequence, so no later file can fix it. Wave 18 adds tracks I (Schema) and N (Core). H keeps 0166-0168, which it has already used for three tracks' unnumbered files, and holds 0181-0195 for later. I and N took 0169-0180. Wave 19 adds the migration tracks M1-M8. M2 owns server/import/**, which includes M7's dryrun.ts by glob, so M7's file is listed explicitly and M2 excludes it. Track I lends db/schema/import-runs.ts to M2, because the run ledger and its Drizzle definition are one decision and splitting them across two chats guarantees they disagree.",
+  "legacyMaxSql": 128,
+  "shared": [
+    "package.json",
+    "CHANGELOG.md",
+    "scripts/run-gates.mjs"
+  ],
+  "tracks": {
+    "A": {
+      "name": "Scheduler",
+      "sql": [
+        129,
+        132
+      ],
+      "paths": [
+        "app/api/workers/**",
+        "server/scheduler/**",
+        "railway.json",
+        "railway.toml",
+        "docs/SCHEDULER.md",
+        "railway.cron.json",
+        "app/(platform)/jobs/**"
+      ]
+    },
+    "B": {
+      "name": "Observability",
+      "sql": [
+        133,
+        135
+      ],
+      "paths": [
+        "lib/telemetry/**",
+        "server/observability/**",
+        "server/security/siem.ts",
+        "instrumentation.ts",
+        "instrumentation-client.ts",
+        "app/(platform)/admin/health/**",
+        "docs/SLOS.md"
+      ]
+    },
+    "C": {
+      "name": "Database integrity",
+      "sql": [
+        136,
+        145
+      ],
+      "paths": [
+        "scripts/check-rls-coverage.mjs",
+        "scripts/check-sealed-grants.mjs",
+        "docs/DATA-MODEL.md",
+        "SQL-FILES/VERIFY-*.sql",
+        "SQL-FILES/DRILL-DO-NOT-RUN-IN-NEON-*.sql"
+      ],
+      "repairsInPlace": [
+        "SQL-FILES/0087_hardening_narrow_grants.sql",
+        "SQL-FILES/0126_updated_at_coverage.sql"
+      ]
+    },
+    "D": {
+      "name": "Fail closed",
+      "sql": null,
+      "paths": [
+        "lib/security/**",
+        "lib/rbac/**",
+        "server/billing/**",
+        "server/automation/**",
+        "app/(platform)/admin/access/**",
+        "tests/security/**"
+      ],
+      "excludes": [
+        "tests/security/gst-*.test.ts",
+        "tests/security/tax-*.test.ts"
+      ]
+    },
+    "E": {
+      "name": "GST and tax",
+      "sql": [
+        146,
+        150
+      ],
+      "paths": [
+        "server/gst/**",
+        "server/tax/**",
+        "app/(finance)/**",
+        "lib/money/**",
+        "docs/TAX.md",
+        "tests/security/gst-*.test.ts",
+        "tests/security/tax-*.test.ts"
+      ]
+    },
+    "F": {
+      "name": "Performance",
+      "sql": [
+        151,
+        158
+      ],
+      "paths": [
+        "scripts/perf/**",
+        "db/indexes/**",
+        "lib/cache/**",
+        "docs/PERFORMANCE.md"
+      ]
+    },
+    "G": {
+      "name": "Durable jobs",
+      "sql": [
+        159,
+        165
+      ],
+      "paths": [
+        "server/jobs/**",
+        "lib/outbox/**",
+        "lib/email/**",
+        "server/notifications/**",
+        "server/webhooks/**",
+        "docs/JOBS.md"
+      ]
+    },
+    "H": {
+      "name": "Integration",
+      "sql": [
+        166,
+        168
+      ],
+      "paths": [
+        "scripts/**",
+        ".github/workflows/**",
+        "tests/setup.ts",
+        "tests/helpers/**",
+        "vitest.config.ts",
+        "docs/RUNBOOK.md",
+        "DEPLOY.md",
+        "README.md",
+        "tests/ui/**",
+        "SQL-FILES/WHATS-PENDING-neon-safe.sql",
+        "SQL-FILES/WHICH-MIGRATIONS-ARE-APPLIED-neon-safe.sql",
+        "SQL-FILES/WHO-DOES-THE-APP-CONNECT-AS-neon-safe.sql",
+        "SQL-FILES/IS-TENANT-ISOLATION-ACTUALLY-ON-neon-safe.sql",
+        "docs/INTEGRATION-PREMORTEM.md",
+        "docs/ENVIRONMENT.md",
+        "docs/RESTORE.md"
+      ],
+      "excludes": [
+        "scripts/check-rls-coverage.mjs",
+        "scripts/check-sealed-grants.mjs",
+        "scripts/perf/**"
+      ],
+      "ownsShared": true,
+      "sqlAlso": [
+        181,
+        195
+      ]
+    },
+    "I": {
+      "name": "Schema",
+      "sql": [
+        169,
+        174
+      ],
+      "paths": [
+        "db/schema/**"
+      ],
+      "excludes": [
+        "db/schema/import-runs.ts"
+      ]
+    },
+    "N": {
+      "name": "Core",
+      "sql": [
+        175,
+        180
+      ],
+      "paths": [
+        "db/index.ts",
+        "server/security/record.ts",
+        "server/email/outbox.ts",
+        "server/actions/accounting.ts",
+        "server/actions/client-account.ts",
+        "server/actions/sales-bookings.ts",
+        "server/receivables/receipts.ts"
+      ]
+    },
+    "M1": {
+      "name": "Import contract",
+      "sql": [
+        196,
+        199
+      ],
+      "paths": [
+        "lib/import/entities.ts",
+        "lib/import/plan.ts",
+        "lib/import/types.ts",
+        "lib/import/shapes.ts",
+        "lib/import/mapping.ts",
+        "lib/import/values.ts",
+        "lib/import/contract/**"
+      ]
+    },
+    "M2": {
+      "name": "Import ledger",
+      "sql": [
+        200,
+        206
+      ],
+      "paths": [
+        "server/import/**",
+        "db/schema/import-runs.ts"
+      ],
+      "excludes": [
+        "server/import/dryrun.ts"
+      ]
+    },
+    "M3": {
+      "name": "Sales entities",
+      "sql": [
+        207,
+        210
+      ],
+      "paths": [
+        "lib/import/entities/sales/**"
+      ]
+    },
+    "M4": {
+      "name": "Supply entities",
+      "sql": [
+        211,
+        214
+      ],
+      "paths": [
+        "lib/import/entities/supply/**"
+      ]
+    },
+    "M5": {
+      "name": "People entities",
+      "sql": [
+        215,
+        218
+      ],
+      "paths": [
+        "lib/import/entities/people/**"
+      ]
+    },
+    "M6": {
+      "name": "Source adapters",
+      "sql": null,
+      "paths": [
+        "lib/import/sources/**",
+        "lib/import/dictionaries/**"
+      ]
+    },
+    "M7": {
+      "name": "Discovery and dry run",
+      "sql": [
+        219,
+        222
+      ],
+      "paths": [
+        "lib/import/discover/**",
+        "server/import/dryrun.ts"
+      ]
+    },
+    "M8": {
+      "name": "Reconcile and cutover",
+      "sql": [
+        223,
+        226
+      ],
+      "paths": [
+        "lib/import/reconcile/**",
+        "docs/CUTOVER.md"
+      ]
+    }
+  },
+  "anyTrack": [
+    "SQL-FILES/DRILL-DO-NOT-RUN-IN-NEON-*.sql",
+    "docs/CALL-SITES-*.md",
+    "TRACK-REPORT*.md"
+  ]
+}

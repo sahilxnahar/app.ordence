@@ -322,6 +322,71 @@ export const ENV_CATEGORIES: EnvCategory[] = [
     ],
   },
   {
+    /**
+     * ⭐ ADDED AT INTEGRATION, WAVE 14. Track A introduced these five names
+     * and could not catalogue them: `lib/platform/env-catalog.ts` is not in
+     * its ownership block, and its patch request did not ask for the entry.
+     * `check:env-catalogue` refused the delivery, which is the gate doing
+     * exactly its job , a setting the code reads and the catalogue omits is
+     * invisible to `/api/diag`, the one endpoint built to explain a missing
+     * setting.
+     *
+     * ⚠️ ALL FIVE ARE OPTIONAL BY DESIGN. The entrypoint falls back for each,
+     * so a scheduler with none of them set still runs. That is deliberate:
+     * a cron service that refuses to start because a timeout was not tuned
+     * is a cron service that does not run.
+     */
+    name: "Scheduler",
+    description:
+      "The cron entrypoint. Absent values fall back, so a scheduler with none of these still runs.",
+    required: [],
+    /**
+     * ⭐ NARROWED AT INTEGRATION, WAVE 17. The first delivery read five names;
+     * Track A's wave-17 deleted three of them , `APP_URL` in favour of the
+     * existing `NEXT_PUBLIC_APP_URL`, and `SCHEDULER_SOURCE` and
+     * `SCHEDULER_TIMEOUT_MS` as knobs nobody would ever turn. `check:env-catalogue`
+     * caught the leftovers immediately, in the opposite direction from last
+     * time: catalogued and read by nothing rather than read and uncatalogued.
+     * Deleting a setting is rarer and better than adding one.
+     */
+    optional: ["SCHEDULER_APP_URL", "MAINTENANCE_DATABASE_URL"],
+  },
+  {
+    /**
+     * ⭐ ADDED AT INTEGRATION, WAVE 14, for the same reason as "Scheduler"
+     * above: Track B introduced this name and cannot edit this file.
+     *
+     * 🔴 THE WEBHOOK URL IS A CREDENTIAL. Anyone holding it can post into
+     * the alert channel as Ordence. It is optional because alerting must
+     * degrade to logs rather than refuse to start, and it must never
+     * appear in a log line, an error message or a report.
+     */
+    name: "Alerting",
+    description:
+      "Where security and SLO alerts are posted. Absent means alerts degrade to logs. The URL is a credential.",
+    required: [],
+    optional: ["DISCORD_ALERT_WEBHOOK_URL"],
+  },
+  {
+    /**
+     * ⭐ ADDED AT INTEGRATION, WAVE 15. Third time this wave: a track
+     * introduced a setting and cannot edit this file. Tracks A, B and E
+     * each hit it, none of the three asked for the entry in its patch
+     * request, and the gate caught all three. That is the gate working and
+     * a brief that needs one more line.
+     *
+     * ⚠️ OFF IS THE SAFE VALUE AND THE DEFAULT. Turning it on makes Ordence
+     * call the government IRP for an invoice reference number. Absent
+     * means the e-invoice payload is built and validated and nothing
+     * leaves the building.
+     */
+    name: "E-invoicing",
+    description:
+      "Whether invoices are registered with the IRP. Absent or false means the payload is built and never sent.",
+    required: [],
+    optional: ["ORDENCE_EINVOICE_IRP_ENABLED"],
+  },
+  {
     name: "Legacy",
     description: "Kept for rollback safety; no live code path.",
     required: [],

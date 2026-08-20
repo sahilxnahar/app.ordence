@@ -163,10 +163,25 @@ describe("the gate itself still exports what its callers import", () => {
     expect(body).toMatch(/withTenant\(/);
   });
 
-  it("⚠️ still fails OPEN — asserted so nobody 'hardens' it into an outage", () => {
-    // Every other gate in this system fails closed. This one must not: the
-    // cost of wrongly denying is that every paying customer loses their
-    // workspace because one query timed out.
-    expect(access).toMatch(/failing OPEN/i);
+  it("🔴 fails CLOSED to restricted, and says so , reversed in wave 15", () => {
+    /**
+     * ⚠️ THIS ASSERTION USED TO BE ITS OWN OPPOSITE. It read
+     * `expect(access).toMatch(/failing OPEN/i)` and its comment said it was
+     * pinned "so nobody hardens it into an outage". The argument was not
+     * stupid, it was incomplete: the old catch called `evaluateAccess()`
+     * with the tenant row's stale `plan_tier`, so a database blip promoted
+     * every workspace to whatever its stalest column said, with no
+     * subscription checked at all. That is not "keep the lights on", it is
+     * "everyone is unlimited during an outage, silently".
+     *
+     * Track D replaced it with `restricted`: reads, exports, payments and
+     * statutory filing still work, writes do not. A materially smaller
+     * outage than the one the old comment compared itself against.
+     *
+     * ⚠️ A test that pins a behaviour is only as good as the argument in
+     * its comment. This one outlived its argument by two waves.
+     */
+    expect(access).toMatch(/restricted/i);
+    expect(access).not.toMatch(/failing OPEN/i);
   });
 });

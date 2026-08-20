@@ -56,7 +56,13 @@ const results = [];
 
 for (const gate of selected) {
   process.stdout.write(`\n──── check:${gate.id} ────\n`);
-  const r = spawnSync("node", [gate.script], {
+  /**
+   * A gate may declare `args`. `check:track-ownership` needs `--tree`,
+   * because without it the script validates only the map and would pass
+   * while the tree it is meant to police went unread , a gate that runs
+   * and checks nothing, which is the failure this manifest exists for.
+   */
+  const r = spawnSync("node", [gate.script, ...(gate.args ?? [])], {
     stdio: "inherit",
     shell: process.platform === "win32",
   });

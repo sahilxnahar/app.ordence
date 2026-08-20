@@ -1,0 +1,53 @@
+{
+  "_comment": "Fail-open and deliberately-swallowed catch blocks reviewed at wave 14. Each was read and judged correct as written. This file is a BASELINE, and baselines rot: it exists so the gate can refuse NEW ones today rather than waiting for these to be re-annotated by tracks that own the files. When a track edits one of these files, it should move the reason into a FAIL OPEN comment in the code and delete the entry here.",
+  "declared": [
+    {
+      "file": "lib/security/lockout.ts",
+      "line": 193,
+      "reason": "Evidence write for a webhook. A 5xx here would make Svix retry the whole webhook; the retry carries the failure again and the counter catches up.",
+      "reviewed": "wave 14"
+    },
+    {
+      "file": "lib/security/rate-limit.ts",
+      "line": 726,
+      "reason": "A broken degradation listener must not break the request it is reporting on. This function exists to report a problem and may not create one.",
+      "reviewed": "wave 14"
+    },
+    {
+      "file": "lib/security/rate-limit.ts",
+      "line": 879,
+      "reason": "The limiter itself is broken, which is a bug in this file rather than a Redis outage. Allowing is the lesser harm: refusing means every guarded route returns 429 until someone deploys. It logs loudly.",
+      "reviewed": "wave 14"
+    },
+    {
+      "file": "server/automation/drain.ts",
+      "line": 189,
+      "reason": "Deliberately not counted as an event failure. The agent's own run row already carries the error; the event itself was dispatched correctly.",
+      "reviewed": "wave 14"
+    },
+    {
+      "file": "middleware.ts",
+      "line": 317,
+      "reason": "Diagnostics must never be the reason a request fails.",
+      "reviewed": "wave 14"
+    },
+    {
+      "file": "server/automation/emit.ts",
+      "line": 214,
+      "reason": "Savepoint rollback during error handling. Throwing here would leave the caller unable to commit the invoice, which is the outcome this function exists to prevent. Re-registered at integration: Track D's edit moved it from line 176.",
+      "reviewed": "wave 15 integration"
+    },
+    {
+      "file": "server/automation/emit.ts",
+      "line": 249,
+      "reason": "The evidence write for a dropped automation event has itself failed. Nothing further is available and the caller still receives `reason`. Added by Track D; a second failure on top of the one being recorded must not become the thing that throws.",
+      "reviewed": "wave 15 integration"
+    },
+    {
+      "file": "server/security/record.ts",
+      "line": 422,
+      "reason": "A broken alert path must not become a second failure on top of the one being alerted about. Re-registered at integration: applying Track D's patch to the same function moved it from line 360.",
+      "reviewed": "wave 17 integration"
+    }
+  ]
+}

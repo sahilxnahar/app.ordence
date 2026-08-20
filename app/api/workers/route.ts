@@ -69,7 +69,7 @@
 import { NextResponse } from "next/server";
 import { headers } from "next/headers";
 import { timingSafeEqual } from "node:crypto";
-import { eq, and, isNull } from "drizzle-orm";
+import { eq, and, isNull, sql } from "drizzle-orm";
 import { Receiver } from "@upstash/qstash";
 import { db, withPlatformScope } from "@/db";
 /**
@@ -111,6 +111,26 @@ import {
   findScheduledJob,
   runScheduledJob,
 } from "@/server/scheduling/registry";
+/**
+ * ⭐⭐⭐ WAVE 14, TRACK A — THE SCHEDULER AND THE JOB CONTROL PLANE.
+ *
+ * Everything above this import was already correct and had one thing
+ * missing: a clock. `{"mode":"scheduled","jobId":…}` runs a job when
+ * somebody calls it, and nothing has ever called it.
+ *
+ * ⚠️ THE NEW MODES LIVE ON THIS PATH RATHER THAN ON `/api/scheduler`, AND
+ * THAT IS FORCED, not preferred. `middleware.ts` matches public paths
+ * EXACTLY, not by prefix — `/api/workers` and `/api/workers/ai-monitors`
+ * are two separate entries in that list. A new path would need a new line
+ * in `middleware.ts`, which belongs to another stream this wave, and a
+ * scheduled route that is not in the public list is refused by Clerk on
+ * every single run: present, correct, never executed. The comment above
+ * `runRegisteredJob` already recorded this reasoning for the `scheduled`
+ * mode; it applies unchanged to `tick`.
+ */
+import { runTick } from "@/server/scheduler/tick";
+import { SCHEDULER_CATALOG, DORMANT_NOT_SCHEDULED } from "@/server/scheduler/catalog";
+import { watchdogReport } from "@/server/scheduler/watchdog";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -246,6 +266,10 @@ export async function POST(req: Request) {
     jobId?: unknown;
     tenantId?: unknown;
     limit?: unknown;
+    /** Free text naming the caller of a tick, e.g. "railway-cron". */
+    source?: unknown;
+    /** True when the caller can execute SQL as `ordence_maintenance`. */
+    maintenance?: unknown;
   };
   try {
     parsed = rawBody ? (JSON.parse(rawBody) as typeof parsed) : {};
@@ -256,6 +280,31 @@ export async function POST(req: Request) {
   /* ---- CRON SWEEP -------------------------------------------------- */
   if (parsed.mode === "cron") {
     return runCronSweep({ authMethod: auth.method, cron: parsed.cron, startedAt });
+  }
+
+  /* ---- THE CLOCK --------------------------------------------------- */
+  //
+  // ⭐ ONE TICK, EVERY FIVE MINUTES, FROM THE RAILWAY CRON SERVICE. It
+  // carries no job id: the tick asks the catalog what is due. That is what
+  // keeps every cadence in `server/scheduling/registry.ts` and
+  // `server/scheduler/policy.ts` rather than in a web console, and it is
+  // why adding a ninth job schedules it by the commit that adds it.
+  if (parsed.mode === "tick") {
+    return runSchedulerTick({
+      authMethod: auth.method,
+      source: typeof parsed.source === "string" ? parsed.source : "railway-cron",
+      /**
+       * ⚠️ THE CALLER ASSERTS THIS, THE APPLICATION DOES NOT ASSUME IT.
+       * Maintenance slots are claimed here and executed by whoever sent
+       * the tick, over a database connection this process does not have.
+       * A tick from a caller with no such connection must not claim them:
+       * the row would sit unowned until the watchdog reclaimed it half an
+       * hour later, and the `skip` overrun policy would suppress the next
+       * slot in the meantime.
+       */
+      claimMaintenance: parsed.maintenance === true,
+      startedAt,
+    });
   }
 
   /* ---- ONE REGISTERED SCHEDULED JOB -------------------------------- */
@@ -277,7 +326,11 @@ export async function POST(req: Request) {
   return NextResponse.json(
     {
       error:
-        'Nothing to do. Send {"job": {...}} to process a job, or {"mode":"cron"} to run the sweep.',
+        'Nothing to do. Send {"mode":"tick"} to run the scheduler (this is what the Railway ' +
+        'cron service sends), {"mode":"scheduled","jobId":"<id>"} to run one job by hand, ' +
+        '{"job": {...}} to process a queue job, or {"mode":"cron"} to run the legacy sweep.',
+      validModes: ["tick", "scheduled", "cron", "job"],
+      validJobIds: SCHEDULED_JOB_IDS,
     },
     { status: 400 },
   );
@@ -429,6 +482,119 @@ async function runRegisteredJob(args: {
 }
 
 /* ------------------------------------------------------------------ */
+/* THE SCHEDULER TICK                                                  */
+/* ------------------------------------------------------------------ */
+
+/**
+ * One turn of the clock.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 THE STATUS CODE IS THE ALERT, AND A TICK THAT RAN OUT OF TIME IS RED
+ * ══════════════════════════════════════════════════════════════════════
+ * No scheduler reads JSON. Railway, a cron dashboard and a `curl -f` in a
+ * runbook agree on exactly one thing: 2xx is green. `runTick` returns
+ * `ok: false` when a unit failed, when a workspace was not reached, when
+ * a cron string would not parse, or when the tick hit its own wall-clock
+ * budget — and every one of those becomes a 500 here.
+ *
+ * ⚠️ THE BUDGET CASE IS THE ONE WORTH ARGUING FOR. A tick that quietly
+ * ran out of time every night, reporting green, is how the last thirty
+ * workspaces in the list end up never being swept — which is this
+ * codebase's characteristic defect, delivered by the file written to
+ * remove it.
+ */
+async function runSchedulerTick(args: {
+  authMethod: string;
+  source: string;
+  claimMaintenance: boolean;
+  startedAt: number;
+}): Promise<NextResponse> {
+  let report;
+  try {
+    report = await runTick({ source: args.source, claimMaintenance: args.claimMaintenance });
+  } catch (err) {
+    /**
+     * 🔴 A THROW HERE IS ALMOST CERTAINLY THE CATALOG REFUSING TO LOAD.
+     * `server/scheduler/catalog.ts` asserts on import that every
+     * registered job has a policy and that both upstream registries are
+     * either scheduled or explicitly declined; a violation throws, and
+     * that is deliberate — see its header. Surface the message rather
+     * than a bare 500, because the message names the fault.
+     */
+    const message = err instanceof Error ? err.message : String(err);
+    console.error("[workers] scheduler tick failed to start:", message);
+    return NextResponse.json(
+      {
+        ok: false,
+        mode: "tick",
+        error: message,
+        hint:
+          "If this names the scheduler catalog, a job was added to a registry without a " +
+          "policy in server/scheduler/policy.ts, or removed while a policy still names it.",
+        tookMs: Date.now() - args.startedAt,
+      },
+      { status: 500 },
+    );
+  }
+
+  if (!report.ok) {
+    console.error(
+      `[workers] tick: ${report.unitsFailed} failed, ${report.tenantsNotReached} not reached, ` +
+        `budgetExhausted=${report.budgetExhausted}`,
+      report.errors.slice(0, 10),
+    );
+  }
+
+  return NextResponse.json(
+    {
+      ok: report.ok,
+      authMethod: args.authMethod,
+      mode: "tick",
+      source: args.source,
+      startedAt: report.startedAt,
+      budgetExhausted: report.budgetExhausted,
+      expectationsDeclared: report.expectationsDeclared,
+      expectationsRetired: report.expectationsRetired,
+      staleReclaimed: report.staleReclaimed,
+      resumedQueued: report.resumedQueued,
+      unitsConsidered: report.unitsConsidered,
+      unitsRun: report.unitsRun,
+      unitsSkipped: report.unitsSkipped,
+      unitsFailed: report.unitsFailed,
+      /**
+       * ⚠️ REPORTED AS A NUMBER, AND IT MAKES THE RUN RED. "A silent cap
+       * is a lie" — the same property `notReached` already has on the
+       * registry path, for the same reason.
+       */
+      tenantsNotReached: report.tenantsNotReached,
+      errors: report.errors,
+      /**
+       * ⭐ SLOTS THIS PROCESS CLAIMED AND CANNOT RUN. The caller executes
+       * them as `ordence_maintenance` and writes the outcome back onto the
+       * same ledger row. Empty unless the caller asked for them.
+       *
+       * ⚠️ THE CALLER MUST NOT TREAT AN UNEXECUTED HANDOFF AS HARMLESS: the
+       * slot is already claimed, so abandoning it means that job does not
+       * run this cycle. `server/scheduler/cron-entrypoint.mjs` marks any
+       * handoff it fails to execute as `failed` with the reason, rather
+       * than leaving it to be reclaimed silently thirty minutes later.
+       */
+      maintenance: report.maintenance,
+      outcomes: report.outcomes.map((o) => ({
+        jobId: o.jobId,
+        tenantId: o.subjectTenantId,
+        slotAt: o.slotAt ? o.slotAt.toISOString() : null,
+        state: o.state,
+        tookMs: o.tookMs,
+        error: o.error,
+      })),
+      tookMs: Date.now() - args.startedAt,
+    },
+    { status: report.ok ? 200 : 500 },
+  );
+}
+
+/* ------------------------------------------------------------------ */
 /* CRON SWEEP                                                          */
 /* ------------------------------------------------------------------ */
 
@@ -472,7 +638,7 @@ async function runCronSweep(args: {
    * they were last session. Unscoped is not a wider view; it is no view.
    */
   const activeTenants = await withPlatformScope(
-    `Scheduled sweep: list the workspaces to enqueue work for`,
+    `Scheduled sweep: list the workspaces to enqueue contract-expiry work for. The set of workspaces IS the input to this pass, so there is no one tenant whose scope could contain it`,
     (tx) =>
       tx
       .select({ id: tenants.id, slug: tenants.slug })
@@ -534,6 +700,51 @@ async function runCronSweep(args: {
 
   const failed = results.filter((r) => !r.queued);
 
+  /* ══════════════════════════════════════════════════════════════════
+   * ⭐⭐ WAVE 17 — THIS SWEEP IS NOW VISIBLE IN THE RUN LEDGER
+   * ══════════════════════════════════════════════════════════════════
+   * 🔴 THE PROBLEM IT SOLVES IS TWO CLOCKS, NOT TWO EXECUTIONS.
+   *
+   * `{"mode":"cron"}` and `{"mode":"tick"}` overlap on real work:
+   * this sweep enqueues `contract_expiry_scan` for every workspace and
+   * drains the mail outbox, and the tick has a `contract_expiry_scan`
+   * job and a `mail_drain` job that do the same two things. Both paths
+   * are documented — `docs/current/CRON-RUNBOOK.md` tells operators
+   * "Keep it if you are already running it" — so a deployment may well
+   * be running both.
+   *
+   * ⚠️ RUNNING BOTH IS SAFE AND WAS ALREADY SAFE. Each job argues its own
+   * idempotency: the outbox claim is `FOR UPDATE SKIP LOCKED` with a
+   * fixed key per row, and the expiry scan raises notifications that
+   * coalesce on their own key. Nothing is sent twice.
+   *
+   * 🔴 WHAT WAS NOT SAFE IS THAT THIS PATH LEFT NO TRACE. A deployment
+   * driving only `{"mode":"cron"}` would do the work every night and
+   * `scheduler_overdue()` would report `mail_drain` and
+   * `contract_expiry_scan` as never having run — a red watchdog on a
+   * healthy system, which is the fastest way to get a watchdog ignored.
+   * So the sweep now writes a ledger row.
+   *
+   * ⚠️ `run_kind = 'manual'` AND `slot_at = NULL`, DELIBERATELY. This
+   * sweep has no declared cadence — whoever calls it decides — so it has
+   * no slot to claim, and claiming one would let a legacy caller consume
+   * the slot the tick was going to use and silently cancel it. A manual
+   * row is never blocked and never blocks, which is exactly right for a
+   * trigger nobody owns.
+   */
+  try {
+    await recordLegacyCronSweep({
+      tenantsSwept: results.length,
+      failed: failed.length,
+      mailSent,
+      mailUndelivered: mailFailed,
+      cron: args.cron ?? null,
+    });
+  } catch (err) {
+    // Visibility is not worth failing the sweep for.
+    console.warn("[workers] could not record the legacy cron sweep in the ledger:", err);
+  }
+
   if (failed.length > 0) {
     console.error(
       `[workers] cron sweep: ${failed.length}/${results.length} tenants failed`,
@@ -558,9 +769,52 @@ async function runCronSweep(args: {
       mailSent,
       mailUndelivered: mailFailed,
       truncated: results.length >= MAX_TENANTS_PER_SWEEP,
+      /**
+       * ⚠️ SAID IN THE RESPONSE, NOT ONLY IN A DOCUMENT. An operator who
+       * set this up two years ago reads the JSON, not docs/SCHEDULER.md.
+       */
+      deprecated: true,
+      replacedBy: 'POST /api/workers {"mode":"tick"}',
+      deprecationNote:
+        "This sweep overlaps the scheduler's contract_expiry_scan and mail_drain jobs. " +
+        "Running both is safe — each job is idempotent by construction — but only the tick " +
+        "records a claimed slot, so the jobs calendar and the watchdog see the tick and not " +
+        "this. Move the schedule to {\"mode\":\"tick\"} and this endpoint can stop being " +
+        "called. See docs/SCHEDULER.md.",
       tookMs: Date.now() - args.startedAt,
     },
     { status: failed.length === 0 ? 200 : 500 },
+  );
+}
+
+/**
+ * Write one ledger row so the legacy sweep shows on the jobs calendar.
+ *
+ * ⚠️ IT DOES NOT CLAIM A SLOT — see the block in `runCronSweep` above for
+ * why a trigger with no declared cadence must not.
+ */
+async function recordLegacyCronSweep(detail: {
+  tenantsSwept: number;
+  failed: number;
+  mailSent: number;
+  mailUndelivered: number;
+  cron: string | null;
+}): Promise<void> {
+  await withPlatformScope(
+    "Scheduled sweep: recording that the legacy cron path ran, so the jobs calendar does not report its work as never having happened",
+    (tx) =>
+      tx.execute(sql`
+        INSERT INTO scheduler_runs (
+          job_id, lane, subject_tenant_id, slot_at, run_kind, state,
+          triggered_by, justification, finished_at, started_at, outcome
+        )
+        VALUES (
+          'legacy_cron_sweep', 'app', NULL, NULL, 'manual', ${detail.failed === 0 ? "succeeded" : "failed"},
+          'legacy-cron', 
+          'Legacy {"mode":"cron"} sweep, retained for compatibility with an existing external schedule. Use {"mode":"tick"} instead; see docs/SCHEDULER.md.',
+          now(), now(), ${JSON.stringify(detail)}::jsonb
+        )
+      `),
   );
 }
 
@@ -576,10 +830,102 @@ async function runCronSweep(args: {
  * it happens inside the user's request. Reporting `true` here is how an
  * operator ends up believing they have a queue they do not have.
  */
-export async function GET() {
+export async function GET(req: Request) {
   const auth = await authenticate("");
   if (!auth.ok) {
     return NextResponse.json({ error: auth.reason }, { status: auth.status });
+  }
+
+  /* ---- THE DEAD MAN SWITCH ------------------------------------------
+   *
+   * ══════════════════════════════════════════════════════════════════
+   * 🔴 THIS IS THE ONE ALARM THAT DOES NOT DEPEND ON OUR SCHEDULER
+   * ══════════════════════════════════════════════════════════════════
+   * Every other signal in this system is downstream of a run: a failed
+   * workspace is counted, a tick returns 500, a red tick appears. All of
+   * them require the scheduler to be alive. The failure that has actually
+   * been happening in this product for years is the scheduler not
+   * existing, and no run-driven signal can see it.
+   *
+   * So: an external uptime monitor — cron-job.org, UptimeRobot, a Railway
+   * healthcheck on another service, anything that polls a URL — points at
+   *
+   *     GET /api/workers?watchdog=1
+   *
+   * 200 means every declared job has completed inside its declared
+   * window and the clock is beating. 503 means it has not. Nothing about
+   * that answer is computed by the thing being watched: the windows live
+   * in `scheduler_job_expectations`, the evaluation is
+   * `scheduler_overdue()` in SQL, and both keep working when the tick
+   * stops. That is the whole point.
+   *
+   * ⚠️ THE QUERY PARAMETER IS WHY THIS DOES NOT BREAK ANYTHING. A bare
+   * GET /api/workers answers exactly what it always did, with the same
+   * keys and the same 200. `docs/current/CRON-RUNBOOK.md` documents that
+   * call and `npx vitest run --project=ui` compares that document against
+   * the generator; changing the bare GET's status code would have made an
+   * operator's `curl -fsS` start failing on a healthy deployment, which
+   * is how a check gets removed from a runbook.
+   */
+  if (new URL(req.url).searchParams.get("watchdog") !== null) {
+    let report;
+    try {
+      report = await watchdogReport();
+    } catch (err) {
+      /**
+       * 🔴 A THROW IS RED, NEVER GREEN. The likeliest cause is that
+       * SQL-FILES/0129–0131 have not been applied, so the functions this
+       * calls do not exist — which means there is no watchdog at all,
+       * which is the worst state and must not answer 200.
+       */
+      const message = err instanceof Error ? err.message : String(err);
+      return NextResponse.json(
+        {
+          ok: false,
+          headline:
+            "The watchdog could not evaluate. This is NOT a pass. Most likely " +
+            "SQL-FILES/0129 to 0132 have not been applied to this database, so there is " +
+            "no run ledger and no expectations table to check against.",
+          error: message,
+        },
+        { status: 503 },
+      );
+    }
+
+    return NextResponse.json(
+      {
+        ok: report.ok,
+        headline: report.headline,
+        heartbeatAt: report.heartbeatAt?.toISOString() ?? null,
+        heartbeatAgeSeconds: report.heartbeatAgeSeconds,
+        heartbeatStale: report.heartbeatStale,
+        neverRanCount: report.neverRanCount,
+        overdue: report.overdue.map((j) => ({
+          jobId: j.jobId,
+          label: j.label,
+          lane: j.lane,
+          everRan: j.everRan,
+          lastSuccessAt: j.lastSuccessAt?.toISOString() ?? null,
+          silentSeconds: j.silentSeconds,
+          maxSilenceSeconds: j.maxSilenceSeconds,
+          consequence: j.consequence,
+        })),
+        /**
+         * ⚠️ REPORTED AND NOT COUNTED. A job an operator disabled with a
+         * written reason is silent on purpose and does not make this red
+         * — until the pause is a month old, at which point
+         * `watchdogReport` moves it into `overdue`, because a pause
+         * nobody has revisited in a month is not a decision any more.
+         */
+        pausedSilent: report.pausedSilent.map((j) => ({
+          jobId: j.jobId,
+          pausedReason: j.pausedReason,
+          pausedBy: j.pausedBy,
+          pausedForDays: j.pausedForDays,
+        })),
+      },
+      { status: report.ok ? 200 : 503 },
+    );
   }
 
   return NextResponse.json({
@@ -602,6 +948,46 @@ export async function GET() {
       cadenceInIst: j.cadenceInIst,
       consequenceWhenStopped: j.consequenceWhenStopped,
       idempotency: j.idempotency,
+    })),
+    /**
+     * ⭐ THE FULL CATALOG, WHICH IS A SUPERSET OF `scheduledJobs` ABOVE.
+     *
+     * `scheduledJobs` is left exactly as it was because
+     * `docs/current/CRON-RUNBOOK.md` is generated from the same registry
+     * and a UI test compares the two; narrowing or renaming it would make
+     * an operator's `curl` disagree with their runbook.
+     *
+     * This key adds the jobs Wave 14 scheduled that were in no registry —
+     * the contract expiry scan, the automation event purge, the two
+     * platform sweeps that only ran when somebody opened a screen — and
+     * the maintenance lane, which the application cannot run at all.
+     */
+    catalog: SCHEDULER_CATALOG.map((e) => ({
+      id: e.id,
+      label: e.label,
+      lane: e.lane,
+      scope: e.scope,
+      feature: e.feature,
+      cronUtc: e.cronUtc,
+      cadenceInIst: e.cadenceInIst,
+      overrun: e.policy.overrun,
+      maxMs: e.policy.maxMs,
+      backfillable: e.policy.backfillable,
+      maxSilenceSeconds: e.maxSilenceSeconds,
+      consequenceWhenStopped: e.consequenceWhenStopped,
+    })),
+    /**
+     * 🔴 AND WHAT IS DORMANT AND DELIBERATELY NOT SCHEDULED, WITH THE
+     * REASON. A control plane that lists only what it runs implies that
+     * what it runs is everything. The six AI background workers at
+     * /api/workers/ai-monitors are the case in point: they exist, they
+     * are in no document, and they are ungated.
+     */
+    notScheduled: DORMANT_NOT_SCHEDULED.map((d) => ({
+      id: d.id,
+      where: d.where,
+      reason: d.reason,
+      owner: d.owner,
     })),
   });
 }

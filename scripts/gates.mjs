@@ -60,6 +60,7 @@
  * @typedef {Object} Gate
  * @property {string} id          the npm script name, without `check:`
  * @property {string} script      the file it runs
+ * @property {string[]} [args]    extra argv, when the script has modes
  * @property {"static"|"database"|"slow"} tier
  * @property {string} why         what it catches, in one sentence
  * @property {number} [wave]      the wave that introduced it
@@ -80,6 +81,28 @@ export const GATES = Object.freeze([
     script: "scripts/check-action-guards.mjs",
     tier: "static",
     why: "a server action that does not ask who is calling it, or a write behind an identity check only",
+  },
+  {
+    id: "track-ownership",
+    script: "scripts/check-track-ownership.mjs",
+    args: ["--tree"],
+    tier: "static",
+    wave: 14,
+    why: "two parallel tracks claiming one path, or a migration landing in another track's number block",
+  },
+  {
+    id: "fail-open",
+    script: "scripts/check-fail-open.mjs",
+    tier: "static",
+    wave: 14,
+    why: "a catch block that records a failure as a success, undeclared",
+  },
+  {
+    id: "import-contract",
+    script: "scripts/check-import-contract.mjs",
+    tier: "static",
+    wave: 15,
+    why: "an entity whose undo would delete records that pre-date the migration, or a load order with no solution",
   },
   {
     id: "migrations",

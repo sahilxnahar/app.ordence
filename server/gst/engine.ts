@@ -28,7 +28,7 @@ import { resolveRateOn, describeMissingRate, type DatedRate } from "@/lib/gst/ra
 import { computeInvoiceTax, type TaxComputation, type TaxLineInput } from "@/lib/gst/tax";
 import { parseMoney } from "@/lib/billing/money";
 import type { ComputeTaxInput } from "@/lib/validators/gst";
-import type { GstRegistration } from "@/db/schema/gst";
+import type { GstRegistration, HsnSacCode } from "@/db/schema/gst";
 
 export type QuotedTax = {
   registration: GstRegistration;
@@ -36,6 +36,21 @@ export type QuotedTax = {
   computation: TaxComputation;
   /** The `hsn_sac_rates` row each line was priced from, keyed by line key. */
   rateByLine: Record<string, DatedRate>;
+  /**
+   * ⭐ ADDED IN WAVE 15 (Track E). The `hsn_sac_codes` row each line's
+   * classification RESOLVED TO, keyed by line key.
+   *
+   * ⚠️ IT WAS ALREADY BEING LOADED AND THEN THROWN AWAY. `quoteTax` has
+   * always called `findHsnSacByCode` — that is how it refuses a line whose
+   * code is not in the master — and it kept only the rate history that
+   * hung off it. So `sales_invoice_lines.hsn_sac_code_id` had no
+   * engine-resolved value to be written from, and every caller wrote the
+   * one the CLIENT posted, exactly as `server/actions/orders.ts:174` still
+   * does for the rate pin.
+   *
+   * Additive: nothing that destructures `QuotedTax` today is affected.
+   */
+  codeByLine: Record<string, HsnSacCode>;
   taxPointDate: string;
 };
 
@@ -91,6 +106,7 @@ export async function quoteTax(
   }
 
   const rateByLine: Record<string, DatedRate> = {};
+  const codeByLine: Record<string, HsnSacCode> = {};
   const lines: TaxLineInput[] = [];
 
   for (const line of input.lines) {
@@ -123,6 +139,7 @@ export async function quoteTax(
     }
 
     rateByLine[line.key] = rate;
+    codeByLine[line.key] = code;
     lines.push({
       key: line.key,
       description: line.description,
@@ -157,6 +174,7 @@ export async function quoteTax(
       placeOfSupply: pos.supply,
       computation,
       rateByLine,
+      codeByLine,
       taxPointDate: input.taxPointDate,
     },
   };

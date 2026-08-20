@@ -40,8 +40,11 @@
  *   3. Billing and export stay reachable       — the remedy must never be
  *      behind the restriction.
  *   4. The MCP surface obeys the same rule     — the hole S1 closed.
- *   5. It fails OPEN on its own errors         — a billing-table outage
- *      must not become an outage in a customer's business.
+ *   5. 🔴 It fails **CLOSED** on its own errors — REVERSED in wave 15.
+ *      A billing-table outage now makes a workspace READ-ONLY rather than
+ *      unlimited. Reads, export, payment and statutory filing all survive;
+ *      ordinary writes do not. The induced-failure proof, with positive
+ *      controls, is in `tests/security/fail-closed-billing.test.ts`.
  *
  * Runs in the `security` project: real PostgreSQL, `.env.test` guard,
  * sequential. See `vitest.config.ts`.
@@ -201,15 +204,44 @@ describe("getAccessDecisionForTenant — resolved from the database", () => {
     expect(decision.level).not.toBe("restricted");
   });
 
-  it("⚠️ FAILS OPEN on a malformed tenant id rather than locking the workspace", async () => {
-    // `withTenant()` throws on a non-UUID. The catch must grant, not deny:
-    // a billing-lookup fault must never become a customer outage. This is
-    // the one place in the codebase where failing open is correct, and it
-    // is asserted so nobody "hardens" it later.
+  it("🔴 FAILS **CLOSED** on a malformed tenant id — REVERSED in wave 15", async () => {
+    /*
+     * ══════════════════════════════════════════════════════════════════
+     * ⚠️ THIS ASSERTION USED TO READ `toBe(true)` AND SAID SO IN WORDS:
+     * ══════════════════════════════════════════════════════════════════
+     *     "⚠️ FAILS OPEN on a malformed tenant id rather than locking the
+     *      workspace. `withTenant()` throws on a non-UUID. The catch must
+     *      grant, not deny: a billing-lookup fault must never become a
+     *      customer outage. This is the one place in the codebase where
+     *      failing open is correct, and it is asserted so nobody
+     *      'hardens' it later."
+     *
+     * It was hardened later, deliberately, by Track D in wave 15. The old
+     * comment's argument compared "grant everything" against "refuse
+     * everything" and those were never the only two options:
+     *
+     *   • The refusal is `restricted`, NOT `locked`. Reads still work,
+     *     export still works, paying us still works, and payroll/GST/TDS
+     *     filing still work. Nobody loses their workspace.
+     *   • And the input here is a caller that could not name a valid
+     *     tenant at all. There is no workspace to protect from an outage;
+     *     answering "full access" to a malformed id was never defensible.
+     *   • Under the old behaviour the SAME catch also handled a real query
+     *     failure, and there it promoted every tenant in the system to
+     *     whatever their stalest `plan_tier` column said.
+     *
+     * The full proof — with the database genuinely made unreadable, and a
+     * positive control on every assertion — is in
+     * `tests/security/fail-closed-billing.test.ts`.
+     */
     const { getAccessDecisionForTenant } = await import("@/server/billing/access");
     const decision = await getAccessDecisionForTenant("not-a-uuid");
 
-    expect(decision.canWrite).toBe(true);
+    expect(decision.canWrite).toBe(false);
+    expect(decision.standing).toBe("unresolved");
+    // ⭐ And still readable and exportable — the half that makes it survivable.
+    expect(decision.canRead).toBe(true);
+    expect(decision.canExport).toBe(true);
   });
 });
 

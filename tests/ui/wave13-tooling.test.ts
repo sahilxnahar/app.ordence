@@ -223,21 +223,38 @@ describe("the fail-open paths that reported success", () => {
     }
   });
 
-  it("🔴 the notification mailer checks the provider result", () => {
-    const mailer = read("lib/email/notifications.ts");
-    // The Resend SDK returns { data, error } and does not throw on a
-    // provider rejection, so `await send(); return true;` reported every
-    // failure as a success.
-    expect(mailer).toContain('await import("./resend")');
-    expect(mailer).toContain("if (!result.ok)");
-    expect(mailer).not.toMatch(/await resend\.emails\.send\(/);
-  });
-
-  it("🔴 and its caller no longer tests a state that cannot occur", () => {
+  it("🔴 nothing sends notification mail outside the outbox , superseded in wave 16", () => {
+    /**
+     * ⚠️ THIS REPLACES TWO ASSERTIONS THAT NO LONGER HAVE A SUBJECT.
+     *
+     * They pinned `lib/email/notifications.ts`'s `sendEmail`: that it read
+     * the Resend result rather than returning `true` blindly, and that its
+     * caller stopped filtering on a rejection that could not happen. Both
+     * were real repairs and both are now moot, because Track G DELETED
+     * that sender. Its one caller now writes outbox rows inside the
+     * transaction instead of calling the provider after commit.
+     *
+     * ⭐ THE REPLACEMENT IS STRICTLY STRONGER. Checking a provider result
+     * correctly is worth less than not talking to the provider at all from
+     * this path: the outbox carries the suppression list, the attempt
+     * ceiling, the delivery record and the idempotency key, and a direct
+     * send bypasses all four at once. So rather than assert how a deleted
+     * function behaved, assert the property that made deleting it right.
+     */
     const create = read("server/notifications/create.ts");
-    // `sendEmail` can never REJECT, so filtering on `status === "rejected"`
-    // alone was provably always zero and the console.error was unreachable.
-    expect(create).toContain("r.value === false");
+    expect(create).not.toMatch(/sendEmail\(/);
+    expect(create).toMatch(/outbox/i);
+
+    /** And the sender really is gone, not merely unused. */
+    let mailerStillHasSender = false;
+    try {
+      mailerStillHasSender = /export\s+(async\s+)?function\s+sendEmail/.test(
+        read("lib/email/notifications.ts"),
+      );
+    } catch {
+      /* FAIL OPEN: the whole module may have gone, which is also fine. */
+    }
+    expect(mailerStillHasSender).toBe(false);
   });
 
   it("🔴 the security alerting install has a failure path", () => {

@@ -1,0 +1,51 @@
+{
+  "rows": 2000,
+  "indexes": 1417,
+  "triggers": 992,
+  "redundantBareTenantIndexes": 0,
+  "redundantByTable": {},
+  "scenarios": [
+    {
+      "table": "sales_invoices",
+      "label": "A · production shape",
+      "totalMs": 257.25,
+      "perRowUs": 128.6,
+      "changeLogRowsWritten": 2000
+    },
+    {
+      "table": "sales_invoices",
+      "label": "B · change-log trigger off",
+      "totalMs": 69.27,
+      "perRowUs": 34.6,
+      "changeLogRowsWritten": 0
+    },
+    {
+      "table": "sales_invoices",
+      "label": "D · all user triggers off",
+      "totalMs": 61.6,
+      "perRowUs": 30.8,
+      "changeLogRowsWritten": 0
+    },
+    {
+      "table": "journal_entries",
+      "label": "A · production shape",
+      "totalMs": 787.99,
+      "perRowUs": 394,
+      "changeLogRowsWritten": 4000
+    },
+    {
+      "table": "journal_entries",
+      "label": "B · change-log trigger off",
+      "totalMs": 690.74,
+      "perRowUs": 345.4,
+      "changeLogRowsWritten": 2000
+    },
+    {
+      "table": "journal_entries",
+      "label": "D · all user triggers off",
+      "totalMs": 68.83,
+      "perRowUs": 34.4,
+      "changeLogRowsWritten": 0
+    }
+  ]
+}

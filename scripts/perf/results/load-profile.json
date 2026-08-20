@@ -1,0 +1,145 @@
+{
+  "generatedBy": "scripts/perf/seed-load.mjs",
+  "scale": 1,
+  "tenants": [
+    {
+      "slug": "starter-01",
+      "tier": "basic",
+      "points": 1
+    },
+    {
+      "slug": "starter-02",
+      "tier": "basic",
+      "points": 1
+    },
+    {
+      "slug": "starter-03",
+      "tier": "basic",
+      "points": 1
+    },
+    {
+      "slug": "starter-04",
+      "tier": "basic",
+      "points": 1
+    },
+    {
+      "slug": "starter-05",
+      "tier": "basic",
+      "points": 1
+    },
+    {
+      "slug": "starter-06",
+      "tier": "basic",
+      "points": 1
+    },
+    {
+      "slug": "starter-07",
+      "tier": "basic",
+      "points": 1
+    },
+    {
+      "slug": "starter-08",
+      "tier": "basic",
+      "points": 1
+    },
+    {
+      "slug": "growth-01",
+      "tier": "advanced",
+      "points": 4
+    },
+    {
+      "slug": "growth-02",
+      "tier": "advanced",
+      "points": 4
+    },
+    {
+      "slug": "growth-03",
+      "tier": "advanced",
+      "points": 4
+    },
+    {
+      "slug": "enterprise-01",
+      "tier": "enterprise",
+      "points": 40
+    }
+  ],
+  "rows": {
+    "change_log": 480000,
+    "journal_entries": 360000,
+    "sales_invoice_lines": 216000,
+    "audit_logs": 180000,
+    "campaign_recipients": 150000,
+    "stock_movements": 120000,
+    "transactions": 90000,
+    "sales_invoices": 72000,
+    "contacts": 12000,
+    "stock_items": 6000,
+    "companies": 3600,
+    "ledgers": 480,
+    "users": 240,
+    "warehouses": 120,
+    "tenants": 12
+  },
+  "perTenant": [
+    {
+      "slug": "enterprise-01",
+      "invoices": 48000,
+      "journalEntries": 240000
+    },
+    {
+      "slug": "growth-01",
+      "invoices": 4800,
+      "journalEntries": 24000
+    },
+    {
+      "slug": "growth-02",
+      "invoices": 4800,
+      "journalEntries": 24000
+    },
+    {
+      "slug": "growth-03",
+      "invoices": 4800,
+      "journalEntries": 24000
+    },
+    {
+      "slug": "starter-05",
+      "invoices": 1200,
+      "journalEntries": 6000
+    },
+    {
+      "slug": "starter-06",
+      "invoices": 1200,
+      "journalEntries": 6000
+    },
+    {
+      "slug": "starter-01",
+      "invoices": 1200,
+      "journalEntries": 6000
+    },
+    {
+      "slug": "starter-08",
+      "invoices": 1200,
+      "journalEntries": 6000
+    },
+    {
+      "slug": "starter-07",
+      "invoices": 1200,
+      "journalEntries": 6000
+    },
+    {
+      "slug": "starter-02",
+      "invoices": 1200,
+      "journalEntries": 6000
+    },
+    {
+      "slug": "starter-03",
+      "invoices": 1200,
+      "journalEntries": 6000
+    },
+    {
+      "slug": "starter-04",
+      "invoices": 1200,
+      "journalEntries": 6000
+    }
+  ]
+}

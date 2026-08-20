@@ -1,0 +1,189 @@
+[
+  {
+    "id": "sales_invoices_tenant_due_idx",
+    "table": "sales_invoices",
+    "ddl": "CREATE INDEX IF NOT EXISTS sales_invoices_tenant_due_idx ON sales_invoices (tenant_id, due_date)",
+    "why": "enum_eq is not leakproof, so `status` cannot become an index condition under RLS; `due_date` can",
+    "claims": [
+      "invoices.overdue"
+    ],
+    "verdict": "accepted",
+    "reason": "used by the planner and removed 96% of median time",
+    "plannerUsedIt": true,
+    "measurements": [
+      {
+        "query": "invoices.overdue",
+        "beforeMs": 32.252,
+        "afterMs": 1.23,
+        "beforeBuffers": 5628,
+        "afterBuffers": 1236,
+        "afterPlanTop": "Limit",
+        "forcedMs": null,
+        "forcedBuffers": null,
+        "forcedUsedIt": null
+      }
+    ]
+  },
+  {
+    "id": "audit_logs_tenant_keyset_idx",
+    "table": "audit_logs",
+    "ddl": "CREATE INDEX IF NOT EXISTS audit_logs_tenant_keyset_idx ON audit_logs (tenant_id, created_at DESC, id DESC)",
+    "why": "the keyset cursor orders by (created_at DESC, id DESC) and no index carries the tiebreak",
+    "claims": [
+      "audit.page"
+    ],
+    "verdict": "accepted",
+    "reason": "used by the planner and removed 33% of median time",
+    "plannerUsedIt": true,
+    "measurements": [
+      {
+        "query": "audit.page",
+        "beforeMs": 0.602,
+        "afterMs": 0.402,
+        "beforeBuffers": 452,
+        "afterBuffers": 162,
+        "afterPlanTop": "Limit",
+        "forcedMs": null,
+        "forcedBuffers": null,
+        "forcedUsedIt": null
+      }
+    ]
+  },
+  {
+    "id": "journal_entries_trial_balance_cover",
+    "table": "journal_entries",
+    "ddl": "CREATE INDEX IF NOT EXISTS journal_entries_trial_balance_cover ON journal_entries (tenant_id, ledger_id, entry_type) INCLUDE (amount_minor)",
+    "why": "an index-only scan would avoid the 6,800-page heap scan the trial balance does today",
+    "claims": [
+      "journal.trialBalance"
+    ],
+    "verdict": "rejected",
+    "reason": "the planner did not choose it — an index that never appears in a plan is write cost only",
+    "plannerUsedIt": false,
+    "measurements": [
+      {
+        "query": "journal.trialBalance",
+        "beforeMs": 57.834,
+        "afterMs": 56.763,
+        "beforeBuffers": 27948,
+        "afterBuffers": 27948,
+        "afterPlanTop": "Sort",
+        "forcedMs": 27.893,
+        "forcedBuffers": 5916,
+        "forcedUsedIt": true
+      }
+    ]
+  },
+  {
+    "id": "stock_movements_balance_cover",
+    "table": "stock_movements",
+    "ddl": "CREATE INDEX IF NOT EXISTS stock_movements_balance_cover ON stock_movements (tenant_id, stock_item_id, warehouse_id) INCLUDE (quantity)",
+    "why": "on-hand balance reads only three key columns plus quantity; the heap visit is pure waste",
+    "claims": [
+      "stock.balance"
+    ],
+    "verdict": "rejected",
+    "reason": "the planner did not choose it — an index that never appears in a plan is write cost only",
+    "plannerUsedIt": false,
+    "measurements": [
+      {
+        "query": "stock.balance",
+        "beforeMs": 23.665,
+        "afterMs": 24.543,
+        "beforeBuffers": 6546,
+        "afterBuffers": 6546,
+        "afterPlanTop": "Aggregate",
+        "forcedMs": 22.103,
+        "forcedBuffers": 4625,
+        "forcedUsedIt": false
+      }
+    ]
+  },
+  {
+    "id": "change_log_tenant_changed_at_idx",
+    "table": "change_log",
+    "ddl": "CREATE INDEX IF NOT EXISTS change_log_tenant_changed_at_idx ON change_log (tenant_id, changed_at)",
+    "why": "prune_change_log() scans the whole table once per tenant and no index leads with tenant_id",
+    "claims": [
+      "changeLog.retentionSweep"
+    ],
+    "verdict": "accepted",
+    "reason": "used by the planner and removed 84% of median time",
+    "plannerUsedIt": true,
+    "measurements": [
+      {
+        "query": "changeLog.retentionSweep",
+        "beforeMs": 95.305,
+        "afterMs": 14.92,
+        "beforeBuffers": 43752,
+        "afterBuffers": 702,
+        "afterPlanTop": "Aggregate",
+        "forcedMs": null,
+        "forcedBuffers": null,
+        "forcedUsedIt": null
+      }
+    ]
+  },
+  {
+    "id": "campaign_recipients_tenant_idx",
+    "table": "campaign_recipients",
+    "ddl": "CREATE INDEX IF NOT EXISTS campaign_recipients_tenant_idx ON campaign_recipients (tenant_id, campaign_id)",
+    "why": "all three existing indexes lead with campaign_id; the RLS predicate is on tenant_id",
+    "claims": [
+      "campaign.recipientBoard"
+    ],
+    "verdict": "rejected",
+    "reason": "used, but removed only -5% of median time and 28% of buffers",
+    "plannerUsedIt": true,
+    "measurements": [
+      {
+        "query": "campaign.recipientBoard",
+        "beforeMs": 27.315,
+        "afterMs": 28.578,
+        "beforeBuffers": 3252,
+        "afterBuffers": 2344,
+        "afterPlanTop": "Aggregate",
+        "forcedMs": null,
+        "forcedBuffers": null,
+        "forcedUsedIt": null
+      }
+    ]
+  },
+  {
+    "id": "contacts_tenant_live_idx",
+    "table": "contacts",
+    "ddl": "CREATE INDEX IF NOT EXISTS contacts_tenant_live_idx ON contacts (tenant_id, created_at) WHERE deleted_at IS NULL",
+    "why": "every contact list and every export filters `deleted_at IS NULL` and no index carries it",
+    "claims": [
+      "contacts.count",
+      "export.contacts"
+    ],
+    "verdict": "accepted",
+    "reason": "used by the planner and removed 52% of median time",
+    "plannerUsedIt": true,
+    "measurements": [
+      {
+        "query": "contacts.count",
+        "beforeMs": 1.459,
+        "afterMs": 0.703,
+        "beforeBuffers": 678,
+        "afterBuffers": 48,
+        "afterPlanTop": "Aggregate",
+        "forcedMs": null,
+        "forcedBuffers": null,
+        "forcedUsedIt": null
+      },
+      {
+        "query": "export.contacts",
+        "beforeMs": 13.149,
+        "afterMs": 14.201,
+        "beforeBuffers": 1216,
+        "afterBuffers": 1216,
+        "afterPlanTop": "Sort",
+        "forcedMs": null,
+        "forcedBuffers": null,
+        "forcedUsedIt": null
+      }
+    ]
+  }
+]

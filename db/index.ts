@@ -387,6 +387,33 @@ export async function withPlatformScope<T>(
     console.warn(`[PLATFORM SCOPE] Reading across tenants: ${reason}`);
   }
 
+  /*
+   * ══════════════════════════════════════════════════════════════════════
+   * ⭐ THE JUSTIFICATION IS RECORDED, NOT DISCARDED.
+   * ══════════════════════════════════════════════════════════════════════
+   * Until wave 15 the reason was validated on the line above and then
+   * thrown away, and the `console.warn` runs only OUTSIDE production ,
+   * that is, in every environment except the one where "who read my
+   * customer's data, and why?" is ever actually asked. 94 files call this.
+   *
+   * ⚠️ THE TEN-CHARACTER FLOOR ABOVE IS THE `count(*) >= 10` GATE IN
+   * MINIATURE. `"debugging1"` passes it. So does `"aaaaaaaaaa"`. The
+   * recorder applies a real validator and records an invalid
+   * justification AS invalid rather than refusing, which is why adding
+   * this line cannot break any of the 94 existing call sites.
+   *
+   * ⚠️ NOT AWAITED, DELIBERATELY. The recorder opens its own connection;
+   * awaiting it would put an INSERT in front of every platform read. It is
+   * explicitly `void`-ed and `.catch`-ed so that the floating promise is a
+   * decision somebody made rather than an oversight somebody missed, and
+   * so a failure to record can never fail the read it was recording.
+   */
+  void import("@/lib/security/platform-scope")
+    .then(({ recordPlatformScopeRaise }) =>
+      recordPlatformScopeRaise({ justification: reason, source: "db/withPlatformScope" }),
+    )
+    .catch(() => undefined);
+
   const database = drizzleServerless(getPool(), { schema });
 
   return database.transaction(async (tx) => {

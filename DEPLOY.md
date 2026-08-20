@@ -1,4 +1,33 @@
-# Ordence — Deploy Guide
+# Ordence , Deploy Guide
+
+> ## Is this the file you want?
+>
+> **This document is for standing Ordence up from nothing:** a fresh
+> clone, a new Railway project, a new Neon database, DNS. It was written
+> at v0.83.0-alpha and it still describes that job correctly.
+>
+> **Ordence is already live.** If you are shipping a change to the
+> running system, this is the wrong file and following it will have you
+> re-provisioning infrastructure that exists. Use instead:
+>
+> | You want to | Use |
+> |---|---|
+> | Ship a build | `node scripts/release.mjs --version x.y.z-alpha` |
+> | Know what SQL to run | `SQL-FILES/WHATS-PENDING-neon-safe.sql`, pasted into Neon. It is read only. |
+> | Something is broken | `docs/RUNBOOK.md` |
+> | Accept work from a parallel track | `npm run assemble -- --order … --dir …` |
+>
+> ⚠️ Two things in this guide are now dangerous if applied to production:
+> any step involving `drizzle-kit push`, which drops row level security
+> policies on 300+ tables and exits 0, and any instruction to apply SQL
+> as a batch. Both are correct for a brand new database and wrong for a
+> live one.
+>
+> ⚠️ When rebuilding from nothing, the order is `drizzle-kit push`, then
+> `ALL-IN-ONE-SETUP.sql`, then the numbered files. Skipping the middle
+> step costs 26 objects, 23 of them protections, on the accounting core.
+> `npm run report:allinone` lists them by name.
+
 
 **Version:** v0.83.0-alpha · Railway · GitHub · Cloudflare DNS
 
