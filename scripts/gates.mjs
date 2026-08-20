@@ -105,6 +105,13 @@ export const GATES = Object.freeze([
     why: "an entity whose undo would delete records that pre-date the migration, or a load order with no solution",
   },
   {
+    id: "writer-registry",
+    script: "scripts/check-writer-registry.mjs",
+    tier: "static",
+    wave: 15,
+    why: "an entity registered with no writer, reaching the customer's picker and writing nothing",
+  },
+  {
     id: "migrations",
     script: "scripts/check-migrations.mjs",
     tier: "static",

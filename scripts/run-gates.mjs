@@ -51,6 +51,35 @@ if (!tier || !["static", "database", "all"].includes(tier)) {
   process.exit(2);
 }
 
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * ⭐⭐ A FOURTH STATE: PENDING , AN ACCEPTANCE CRITERION NOT YET OWED
+ * ══════════════════════════════════════════════════════════════════════
+ * `check:writer-registry` was written by integration BEFORE Phase 1
+ * delivered, so that the track could build to its acceptance criterion
+ * instead of discovering it in review. Until Phase 1 lands, the tree
+ * genuinely does not satisfy it.
+ *
+ * Three ways to handle that, and two of them are wrong:
+ *
+ *   ① Leave it out of the manifest. Refused , by `check:gate-coverage`,
+ *      correctly: "a gate that is not in the manifest is a gate that runs
+ *      only when somebody remembers, which is the state fourteen of them
+ *      were in."
+ *   ② Run it and let the suite go red. Honest, and it makes `gates:static`
+ *      red for every other track too. A suite that is always red is a
+ *      suite people stop reading, which removes the signal for the case
+ *      it exists for , the same argument the watchdog makes about alarms
+ *      that fire on healthy systems.
+ *   ③ Run it, report PENDING, and name who owes it. Chosen.
+ *
+ * ⚠️ PENDING IS NOT SKIPPED AND IT IS NOT PASSED. It is printed on every
+ * run with the owner attached, it is counted separately in the summary,
+ * and the day `pendingOn` is removed from the manifest it becomes an
+ * ordinary gate that can fail. What it must never become is a quiet
+ * green: a gate whose failure is expected is still a gate whose failure
+ * has to be visible.
+ */
 const selected = GATES.filter((g) => TIERS.includes(g.tier));
 const results = [];
 
@@ -66,6 +95,15 @@ for (const gate of selected) {
     stdio: "inherit",
     shell: process.platform === "win32",
   });
+
+  if (gate.pendingOn && r.status !== 0) {
+    process.stdout.write(
+      `\n⏳ PENDING , this acceptance criterion is owed by ${gate.pendingOn}.\n` +
+        `   It is expected to be red until then. It is NOT a pass.\n`,
+    );
+    results.push({ gate, ok: false, skipped: false, pending: gate.pendingOn, code: r.status });
+    continue;
+  }
 
   /**
    * ⚠️ THREE STATES, NOT TWO.
@@ -84,7 +122,7 @@ for (const gate of selected) {
   results.push({ gate, ok: r.status === 0, skipped, code: r.status });
 }
 
-const failed = results.filter((r) => !r.ok && !r.skipped);
+const failed = results.filter((r) => !r.ok && !r.skipped && !r.pending);
 const skips = results.filter((r) => r.skipped);
 const pad = (s, n) => String(s).padEnd(n);
 
@@ -98,12 +136,30 @@ for (const r of results) {
 }
 console.log("═".repeat(72));
 
+const pendings = results.filter((r) => r.pending);
 const passed = results.filter((r) => r.ok).length;
 console.log(
-  `  ${passed}/${results.length} passed` +
+  `  ${passed}/${results.length - pendings.length} passed` +
     (failed.length > 0 ? `  ·  ${failed.length} FAILED` : "") +
-    (skips.length > 0 ? `  ·  ${skips.length} SKIPPED` : ""),
+    (skips.length > 0 ? `  ·  ${skips.length} SKIPPED` : "") +
+    (pendings.length > 0 ? `  ·  ${pendings.length} PENDING` : ""),
 );
+
+/**
+ * ⚠️ NAMED, EVERY RUN, WITH THE OWNER. A pending gate that scrolls past
+ * in silence is a pending gate nobody chases, and the whole point of
+ * writing the acceptance criterion early is that somebody is building to
+ * it right now.
+ */
+if (pendings.length > 0) {
+  console.log("");
+  console.log(`  ⏳  ${pendings.length} acceptance criterion/criteria not yet met, by design:`);
+  for (const p of pendings) {
+    console.log(`       check:${p.gate.id}  ,  owed by ${p.pending}`);
+  }
+  console.log("     These are NOT passes. When the owing track lands, remove");
+  console.log("     `pendingOn` from scripts/gates.mjs and the gate must go green.");
+}
 
 if (skips.length > 0) {
   console.log("");

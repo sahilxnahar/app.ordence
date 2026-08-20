@@ -1,6 +1,6 @@
 {
   "name": "ordence",
-  "version": "1.84.1-alpha",
+  "version": "1.85.0-alpha",
   "private": true,
   "scripts": {
     "gen:cron-runbook": "node scripts/generate-cron-runbook.mjs",
@@ -81,7 +81,9 @@
     "patch:collect": "node scripts/collect-patch-requests.mjs",
     "env:drift": "node scripts/report-env-drift.mjs",
     "drill:rebuild": "node scripts/drill-rebuild.mjs",
-    "measure:query": "node scripts/measure-query.mjs"
+    "measure:query": "node scripts/measure-query.mjs",
+    "check:writer-registry": "node scripts/check-writer-registry.mjs",
+    "typecheck:tests": "tsc --noEmit -p tsconfig.tests.json"
   },
   "dependencies": {
     "@clerk/nextjs": "^6.39.6",

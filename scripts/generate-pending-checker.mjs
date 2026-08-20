@@ -123,7 +123,9 @@ const PATTERNS = [
 
 const files = fs.readdirSync(DIR).filter((f) => /^\d{4}_.+\.sql$/.test(f)).sort();
 const byArtefact = new Map();   // "kind:name" -> Set(number)
-const perFile = new Map();      // number -> [{kind,name,table,rank}]
+const perFile = new Map();      // number -> [{kind,name,table,rank,at}]
+const fileText = new Map();     // number -> the de-noised SQL, for the completeness heuristic
+const blindTail = [];           // files no probe can prove complete
 
 for (const f of files) {
   const num = f.slice(0, 4);
@@ -141,10 +143,11 @@ for (const f of files) {
       const key = p.kind + ":" + name + (table ? ":" + table : "");
       if (!byArtefact.has(key)) byArtefact.set(key, new Set());
       byArtefact.get(key).add(num);
-      found.push({ kind: p.kind, name, table, rank: p.rank, key });
+      found.push({ kind: p.kind, name, table, rank: p.rank, key, at: m.index });
     }
   }
   perFile.set(num, found);
+  fileText.set(num, sql);
 }
 
 /**
@@ -217,13 +220,80 @@ for (const f of files) {
     rows.push({ num, file: o.file, desc: o.looked_for, how: o.how, expr: o.expr });
     continue;
   }
-  /** Unique to this file, best rank first. Shared artefacts are useless: two files, one answer. */
+  /** Unique to this file. Shared artefacts are useless: two files, one answer. */
   const unique = perFile.get(num)
     .filter((a) => byArtefact.get(a.key).size === 1)
     .filter((a) => !droppedLater.has(
       a.kind + ":" + (a.kind === "policy" ? `${a.table}.${a.name}` : a.name),
     ))
     .sort((a, b) => a.rank - b.rank);
+
+  /**
+   * ══════════════════════════════════════════════════════════════════
+   * 🔴 AMONG STRONG ARTEFACTS, THE LAST ONE IN THE FILE WINS , AND THIS
+   *    IS A CORRECTION PAID FOR ON A REAL DATABASE.
+   * ══════════════════════════════════════════════════════════════════
+   * The original rule was "best KIND first" and nothing else. It picked,
+   * for `0134_audit_event_stream.sql`, the policy on `siem_export_cursors`
+   * at character offset ~line 148, because a policy outranks a view.
+   *
+   * ⚠️ THE VIEW `security_event_stream` IS AT LINE 221, AND ON PRODUCTION
+   *    IT DID NOT EXIST. The file had half-applied. The checker reported
+   *    `0134` as PRESENT, the operator moved on, and the failure surfaced
+   *    two steps later as `relation "public.security_event_stream" does
+   *    not exist` while running `0168` , a file that was not at fault.
+   *
+   *    The same thing happened to `0138_updated_at_consolidation.sql`,
+   *    whose probe is a function created early and whose repair section
+   *    never ran. Two files, one blind spot.
+   *
+   * ⭐ A PROBE ANSWERS "DID THIS FILE FINISH", NOT "DID THIS FILE START".
+   * So among artefacts strong enough to be worth probing, take the one
+   * that appears LATEST in the file. It is the closest thing to a
+   * finished-line marker that a catalogue read can offer.
+   *
+   * ⚠️ IT IS STILL NOT A PROOF OF COMPLETION, and the header still says
+   * so. A file whose last CREATE is followed by forty lines of DML or by
+   * a verification block that RAISEs can still read PRESENT while having
+   * failed at the end. This narrows the window; it does not close it.
+   * The VERIFY-00NN files close it, and nothing else does.
+   *
+   * ⚠️ ONLY RANKS 1 TO 4 (policy, trigger, function, view). Below that
+   * the artefact kinds are weak for reasons the ranking already explains
+   * , a constraint or a table can be created by `drizzle-kit push`, and
+   * an index can be dropped dynamically by 0157 where no static scan can
+   * see it. Preferring a late weak artefact over an early strong one
+   * would trade a known blind spot for a worse one.
+   */
+  const strongLatest = unique
+    .filter((a) => a.rank <= 4)
+    .sort((a, b) => b.at - a.at)[0];
+  if (strongLatest) unique.unshift(strongLatest);
+
+  /**
+   * ⚠️ AND WHERE EVEN THE LAST ARTEFACT IS NOT ENOUGH, SAY SO OUT LOUD.
+   *
+   * `0138_updated_at_consolidation.sql` has exactly ONE strong artefact,
+   * `updated_at_census()`, at line 120 of 435. Everything that file
+   * actually DOES , dropping wrongly-attached triggers, re-attaching the
+   * right ones, verifying coverage , happens inside DO blocks that create
+   * nothing a catalogue read can find. On production it half-applied and
+   * every probe that exists still said PRESENT.
+   *
+   * 🔴 A CHECKER THAT CANNOT ANSWER A QUESTION MUST SAY WHICH QUESTION,
+   *    NOT ROUND UP TO GREEN. So a file whose last strong artefact sits
+   *    in its first half AND which raises after that point is listed by
+   *    name in the header, with the instruction to run its VERIFY block.
+   *    This is the same discipline the reconciliation rule uses: a
+   *    difference of zero is not the same as a check that did not run.
+   */
+  const text = fileText.get(num) ?? "";
+  if (strongLatest && text.length > 0) {
+    const tail = text.slice(strongLatest.at);
+    const earlyArtefact = strongLatest.at < text.length / 2;
+    const raisesLater = /RAISE\s+EXCEPTION/i.test(tail);
+    if (earlyArtefact && raisesLater) blindTail.push(num);
+  }
 
   if (unique.length === 0) {
     unprobeable.push(num);
@@ -308,6 +378,12 @@ const sql = `-- ================================================================
 --    PRESENT      the artefact exists. In practice the file ran.
 --    MISSING      the file did not run, or ran and failed early.
 --    UNPROBEABLE  no probe can answer it. See the notes beside each.
+--
+--  ⚠️ THESE FILES CANNOT BE PROVEN COMPLETE BY ANY PROBE:
+--    ${blindTail.length ? blindTail.join(", ") : "(none)"}
+--    Their last catalogue artefact sits early and they RAISE after it, so
+--    a PRESENT here means "it started". Run the VERIFY-00NN file beside
+--    each before believing it. This list is computed, not maintained.
 --
 --  It cannot prove a migration ran COMPLETELY. A file that created its
 --  first object then failed on statement forty reads PRESENT. Run the

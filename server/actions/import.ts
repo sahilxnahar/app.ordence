@@ -94,6 +94,8 @@ import {
 import type { TenantContext } from "@/server/tenant-context";
 import type { ActionResult } from "@/lib/validators/crm";
 import { IMPORT_SOURCE_FORMATS } from "@/lib/import/sources";
+import { IMPORT_WRITERS } from "@/server/import/writers/registry";
+import type { PlannedWrite } from "@/server/import/writers/types";
 /**
  * ⭐⭐⭐ WAVE 6 — THE MIGRATION ENGINE'S OWN PIECES.
  *
@@ -293,344 +295,31 @@ async function guardImport(
 /* ------------------------------------------------------------------ */
 
 /**
- * Which of these natural keys already exist in the workspace.
+ * Find rows already in the workspace matching these natural keys.
  *
- * ⚠️ ONE QUERY FOR THE WHOLE FILE, NOT ONE PER ROW. A thousand rows would
- * otherwise be a thousand round trips before a single byte was written,
- * and the preview would be slower than the commit.
+ * ⚠️ THE FIVE `if (entity.table === ...)` BRANCHES THAT USED TO BE HERE
+ * ARE GONE, AND SO IS THE SIXTH THING THAT WAS NOT AN `if`.
  *
- * ⚠️ AND IT IS CALLED BY BOTH RUNS FROM THE SAME LINE. The dedupe
- * decision is as much a part of "what will happen" as validation is; a
- * preview that guessed at it — or skipped it "because it needs the
- * database" — would report creations that turn into updates. That is the
- * exact drift constraint 1 forbids.
+ * `gst_parties` was the UNGUARDED CODE AFTER THE LAST BRANCH. A
+ * destination nobody had written a branch for did not fall through to
+ * nothing , it matched existing GST parties by natural key, and then
+ * `writeRow` inserted into `gst_parties`. A stock-item import missing its
+ * branch would have put the customer's stock list in their tax master and
+ * reported success.
  *
- * The returned map is keyed `"kind:value"`, matching the composite the
- * pure layer builds for in-file duplicate detection, so the two notions
- * of "the same record" cannot diverge.
+ * ⭐ Dispatch is now `IMPORT_WRITERS[entity.table]`, a `Record` over the
+ * destination union, so a destination with no writer is a compile error
+ * at the registry rather than a silent write to whichever branch happened
+ * to be last.
  */
 async function findExistingByNaturalKey(
   ctx: TenantContext,
   entity: ImportEntityDefinition,
   keys: readonly ImportNaturalKey[],
 ): Promise<Map<string, string>> {
-  const found = new Map<string, string>();
-  if (keys.length === 0) return found;
-
-  const valuesOf = (kind: string) =>
-    Array.from(new Set(keys.filter((k) => k.kind === kind).map((k) => k.value)));
-
-  if (entity.table === "companies") {
-    const domains = valuesOf("domain");
-    const names = valuesOf("name");
-    if (domains.length === 0 && names.length === 0) return found;
-
-    const rows = await withTenant(ctx.tenant.id, (tx) =>
-      tx
-        .select({
-          id: companies.id,
-          domain: companies.domain,
-          name: companies.name,
-        })
-        .from(companies)
-        .where(
-          and(
-            // The tenant predicate is written even though RLS enforces it
-            // independently. Relying on a single layer is how single
-            // layers become the only layer.
-            eq(companies.tenantId, ctx.tenant.id),
-            // ⚠️ SOFT-DELETED ROWS ARE NOT MATCHES. The partial unique
-            // index excludes them too, so treating one as an existing
-            // record would mean `skip` silently discarded a row the
-            // database would have happily accepted — and the customer's
-            // deleted company would stay deleted with no new one created.
-            isNull(companies.deletedAt),
-            matchAny([
-              /*
-               * ⚠️ `lower(...)` ON BOTH SIDES. The pure layer lower-cases
-               * the key it built from the file; comparing that against a
-               * mixed-case column would find nothing, and "finds nothing"
-               * here does not fail loudly — it reports every row as a
-               * creation and then duplicates the workspace.
-               */
-              domains.length > 0
-                ? inArray(sql`lower(${companies.domain})`, domains)
-                : null,
-              names.length > 0
-                ? inArray(
-                    // ⚠️ `\\s` NOT `\s`. This is a template literal, where
-                    // `\s` is a NonEscapeCharacter and collapses to a bare
-                    // `s` — so the pattern would become `'s+'` and the
-                    // query would strip the letter s out of every company
-                    // name before comparing. It matches nothing, silently,
-                    // and "matches nothing" here reports every row as new
-                    // and duplicates the workspace.
-                    sql`lower(regexp_replace(${companies.name}, '\\s+', ' ', 'g'))`,
-                    names,
-                  )
-                : null,
-            ]),
-          ),
-        )
-        .limit(5000),
-    );
-
-    for (const row of rows) {
-      if (row.domain) {
-        const key = `domain:${row.domain.toLowerCase()}`;
-        if (!found.has(key)) found.set(key, row.id);
-      }
-      const nameKey = `name:${row.name.toLowerCase().replace(/\s+/g, " ")}`;
-      if (!found.has(nameKey)) found.set(nameKey, row.id);
-    }
-    return found;
-  }
-
-  /* ================================================================ */
-  /* ⭐⭐ BATCH 58 — THE OPENING-BALANCE DESTINATIONS                   */
-  /* ================================================================ */
-
-  /**
-   * ══════════════════════════════════════════════════════════════════
-   * 🔴 THE OPENING TRIAL BALANCE IS KEYED ON THE WHOLE ENTRY, NOT THE
-   *    ROW
-   * ══════════════════════════════════════════════════════════════════
-   * `entity.batchKey` produces ONE key for the whole file —
-   * `OPENING:TB:<as-at date>` — and it is looked for in
-   * `transactions.transaction_number`, which carries a UNIQUE INDEX per
-   * tenant. That index, not this query, is what makes two people
-   * pressing the button at the same moment safe; this is what turns the
-   * collision into a sentence instead of a `23505`.
-   *
-   * ⚠️ A REVERSED OR VOIDED ENTRY IS STILL A COLLISION, deliberately.
-   * The transaction number stays on a reversed transaction, so posting
-   * the same opening key again would hit the index and fail with a
-   * database error rather than our message. Reversing an opening entry
-   * and wanting a different one is a real need, and the answer is a
-   * different as-at date — which is a different opening position and
-   * should say so.
-   */
-  if (entity.table === "transactions") {
-    const keyValues = valuesOf("openingEntry");
-    if (keyValues.length === 0) return found;
-
-    const rows = await withTenant(ctx.tenant.id, (tx) =>
-      tx
-        .select({ id: transactions.id, number: transactions.transactionNumber })
-        .from(transactions)
-        .where(
-          and(
-            eq(transactions.tenantId, ctx.tenant.id),
-            inArray(transactions.transactionNumber, keyValues),
-          ),
-        )
-        .limit(10),
-    );
-
-    for (const row of rows) {
-      if (row.number) found.set(`openingEntry:${row.number}`, row.id);
-    }
-    return found;
-  }
-
-  /**
-   * ⚠️ THE INVOICE NUMBER, COMPARED EXACTLY. `sales_invoices_number_
-   * tenant_key` is `UNIQUE (tenant_id, invoice_number)` with no
-   * case folding, so lower-casing here would report `AH/2026/0041` and
-   * `ah/2026/0041` as the same invoice and then watch Postgres accept
-   * both.
-   */
-  if (entity.table === "sales_invoices") {
-    const numbers = valuesOf("invoiceNumber");
-    if (numbers.length === 0) return found;
-
-    const rows = await withTenant(ctx.tenant.id, (tx) =>
-      tx
-        .select({ id: salesInvoices.id, number: salesInvoices.invoiceNumber })
-        .from(salesInvoices)
-        .where(
-          and(
-            eq(salesInvoices.tenantId, ctx.tenant.id),
-            inArray(salesInvoices.invoiceNumber, numbers),
-          ),
-        )
-        .limit(5000),
-    );
-
-    for (const row of rows) found.set(`invoiceNumber:${row.number}`, row.id);
-    return found;
-  }
-
-  /**
-   * ⚠️ A JOIN, BECAUSE THE KEY SPANS TWO TABLES.
-   * `vendor_ledger_entries` has no unique index on the reference number
-   * — two suppliers both numbering a bill `001` is completely ordinary
-   * — so the key is `(vendor code, bill number)` and the vendor's code
-   * lives on `vendors`. Keying on the number alone would silently skip
-   * the second supplier's bill as a duplicate of the first, and the
-   * money would simply never be recorded as owed.
-   */
-  if (entity.table === "vendor_ledger_entries") {
-    const composites = valuesOf("vendorBill");
-    if (composites.length === 0) return found;
-
-    const rows = await withTenant(ctx.tenant.id, (tx) =>
-      tx
-        .select({
-          id: vendorLedgerEntries.id,
-          code: vendors.code,
-          reference: vendorLedgerEntries.referenceNumber,
-        })
-        .from(vendorLedgerEntries)
-        .innerJoin(
-          vendors,
-          and(
-            eq(vendors.id, vendorLedgerEntries.vendorId),
-            eq(vendors.tenantId, vendorLedgerEntries.tenantId),
-          ),
-        )
-        .where(
-          and(
-            eq(vendorLedgerEntries.tenantId, ctx.tenant.id),
-            inArray(
-              sql`(lower(${vendors.code}) || '|' || coalesce(${vendorLedgerEntries.referenceNumber}, ''))`,
-              composites,
-            ),
-          ),
-        )
-        .limit(5000),
-    );
-
-    for (const row of rows) {
-      found.set(`vendorBill:${row.code.toLowerCase()}|${row.reference ?? ""}`, row.id);
-    }
-    return found;
-  }
-
-  /**
-   * ⚠️ ONLY MOVEMENTS WHOSE REASON IS `opening_balance` COUNT AS A
-   * MATCH. An item that has been received and sold twenty times since
-   * go-live has twenty movements against the same slot, and treating any
-   * of those as "the opening balance is already in" would make the
-   * opening import silently do nothing on a workspace that had traded
-   * for a week. The question is not "has this item ever moved" but "has
-   * its opening position already been posted".
-   */
-  if (entity.table === "stock_movements") {
-    const slots = valuesOf("stockSlot");
-    if (slots.length === 0) return found;
-
-    const rows = await withTenant(ctx.tenant.id, (tx) =>
-      tx
-        .select({
-          id: stockMovements.id,
-          sku: stockItems.sku,
-          code: warehouses.code,
-          batchNo: stockMovements.batchNo,
-        })
-        .from(stockMovements)
-        .innerJoin(
-          stockItems,
-          and(
-            eq(stockItems.id, stockMovements.stockItemId),
-            eq(stockItems.tenantId, stockMovements.tenantId),
-          ),
-        )
-        .innerJoin(
-          warehouses,
-          and(
-            eq(warehouses.id, stockMovements.warehouseId),
-            eq(warehouses.tenantId, stockMovements.tenantId),
-          ),
-        )
-        .where(
-          and(
-            eq(stockMovements.tenantId, ctx.tenant.id),
-            eq(stockMovements.reason, "opening_balance"),
-            inArray(
-              sql`(lower(${stockItems.sku}) || '|' || lower(${warehouses.code}) || '|' || lower(coalesce(${stockMovements.batchNo}, '')))`,
-              slots,
-            ),
-          ),
-        )
-        .limit(5000),
-    );
-
-    for (const row of rows) {
-      const key = `stockSlot:${row.sku.toLowerCase()}|${row.code.toLowerCase()}|${(row.batchNo ?? "").toLowerCase()}`;
-      if (!found.has(key)) found.set(key, row.id);
-    }
-    return found;
-  }
-
-  // gst_parties. The key is composite — `partyType|gstin` — because the
-  // database's own unique index is `(tenant_id, party_type, gstin)`.
-  const gstinValues = valuesOf("gstin");
-  const nameValues = valuesOf("legalName");
-  if (gstinValues.length === 0 && nameValues.length === 0) return found;
-
-  const rows = await withTenant(ctx.tenant.id, (tx) =>
-    tx
-      .select({
-        id: gstParties.id,
-        partyType: gstParties.partyType,
-        gstin: gstParties.gstin,
-        legalName: gstParties.legalName,
-      })
-      .from(gstParties)
-      .where(
-        and(
-          eq(gstParties.tenantId, ctx.tenant.id),
-          // ⚠️ THE INDEX IS `WHERE ... AND is_active`, so a retired row is
-          // not a collision. Matching one would mean a party whose
-          // registration lapsed could never be re-added.
-          eq(gstParties.isActive, true),
-          matchAny([
-            gstinValues.length > 0
-              ? inArray(
-                  sql`(${gstParties.partyType}::text || '|' || ${gstParties.gstin})`,
-                  gstinValues,
-                )
-              : null,
-            nameValues.length > 0
-              ? inArray(
-                  // `\\s`, for the reason spelled out on the companies branch.
-                  sql`(${gstParties.partyType}::text || '|' || lower(regexp_replace(${gstParties.legalName}, '\\s+', ' ', 'g')))`,
-                  nameValues,
-                )
-              : null,
-          ]),
-        ),
-      )
-      .limit(5000),
-  );
-
-  for (const row of rows) {
-    if (row.gstin) {
-      const key = `gstin:${row.partyType}|${row.gstin}`;
-      if (!found.has(key)) found.set(key, row.id);
-    }
-    const nameKey = `legalName:${row.partyType}|${row.legalName.toLowerCase().replace(/\s+/g, " ")}`;
-    if (!found.has(nameKey)) found.set(nameKey, row.id);
-  }
-  return found;
+  return IMPORT_WRITERS[entity.table].findExisting(ctx, keys);
 }
 
-/**
- * OR together the predicates that are actually present.
- *
- * ⚠️ AN EMPTY LIST MUST BECOME `false`, NEVER `true`. Drizzle's `or()`
- * with nothing in it returns `undefined`, which `and()` then drops — and
- * a dropped predicate here would turn "find the rows matching these
- * keys" into "find every row in the table". The caller returns early when
- * both lists are empty, and this is the second layer that makes the
- * mistake impossible rather than merely unlikely.
- */
-function matchAny(parts: Array<SQL | undefined | null>): SQL {
-  const present = parts.filter((p): p is SQL => p !== null && p !== undefined);
-  if (present.length === 0) return sql`false`;
-  return or(...present) ?? sql`false`;
-}
 
 /* ------------------------------------------------------------------ */
 /* ⭐⭐ BATCH 58 — RESOLVING WHAT A ROW REFERS TO                       */
@@ -806,12 +495,6 @@ async function resolveLookups(
 const ALL_DUPLICATE_MODES = ["skip", "update", "fail"] as const;
 
 /** A row that has passed everything and is waiting for the write. */
-type PlannedWrite = {
-  row: ImportRowPlan;
-  /** The payload with every resolved lookup id merged in. */
-  payload: Record<string, unknown>;
-  existingId: string | null;
-};
 
 async function runImport(
   input: unknown,
@@ -1041,7 +724,7 @@ async function runImport(
         },
       });
 
-      revalidatePath(REVALIDATE_AFTER[entity.table]);
+      revalidatePath(IMPORT_WRITERS[entity.table].revalidatePath);
     }
 
     /*
@@ -1095,24 +778,6 @@ async function runImport(
   }
 }
 
-/**
- * Where a successful import invalidates a cached page.
- *
- * ⚠️ A MAP RATHER THAN A TERNARY. The ternary this replaced read
- * `entity.table === "companies" ? "/companies" : "/settings/gst"`, which
- * meant every entity added after the second one revalidated the GST
- * settings page — a wrong page refreshed and the right one left stale, in
- * silence. A `Record` keyed on the union makes TypeScript refuse to
- * compile when a destination is added without one.
- */
-const REVALIDATE_AFTER: Record<ImportEntityDefinition["table"], string> = {
-  companies: "/companies",
-  gst_parties: "/settings/gst",
-  transactions: "/accounting",
-  sales_invoices: "/invoices",
-  vendor_ledger_entries: "/purchases",
-  stock_movements: "/inventory",
-};
 
 /**
  * ⭐⭐ BATCH 58 — WRITE WHAT WAS PLANNED.
@@ -1139,8 +804,20 @@ async function performWrites(
 ): Promise<void> {
   if (planned.length === 0) return;
 
-  if (entity.table === "transactions") {
-    const written = await writeOpeningTrialBalance(ctx, planned);
+  /**
+   * ⭐ THE ATOMIC PATH IS CHOSEN BY THE WRITER'S SHAPE, NOT BY NAMING A
+   * DESTINATION.
+   *
+   * This used to read `if (entity.table === "transactions")`, which meant
+   * a second destination written as one document , a general journal
+   * import, say , would silently take the per-row path and write a
+   * fraction of a journal entry. Now a writer that declares `writeFile`
+   * IS the whole-file case, and the registry refuses a writer declaring
+   * both `writeFile` and `writeRow`.
+   */
+  const writer = IMPORT_WRITERS[entity.table];
+  if (writer.writeFile) {
+    const written = await writer.writeFile(ctx, planned);
     if (written.ok) return;
     for (const item of planned) {
       outcomes.set(item.row.recordNumber, {
@@ -1185,189 +862,20 @@ async function performWrites(
   }
 }
 
-/** Minor units held as a digit string, as the coercion layer produces them. */
-function minorOf(value: unknown): bigint {
-  if (typeof value === "bigint") return value;
-  if (typeof value !== "string" || value.trim() === "") return 0n;
-  /*
-   * 🔴 NEVER `Number(value)`. These are paise and routinely run past
-   * 2^53 — a crore of rupees is 10^9 paise and a balance-sheet total is
-   * a hundred times that. `BigInt` of a digit string cannot lose a digit
-   * it never converted.
-   */
-  return BigInt(value);
-}
+
+
 
 /**
- * Integer thousandths to the `numeric(18,3)` literal Postgres wants.
+ * Write one planned row.
  *
- * ⚠️ ASSEMBLED FROM THE QUOTIENT AND THE REMAINDER, never
- * `Number(n) / 1000`. That division is exact for small numbers and
- * silently lossy for large ones, and the symptom is a stock ledger that
- * is a fraction out on the movements nobody looks at.
- */
-function thousandthsToDecimal(value: bigint): string {
-  const negative = value < 0n;
-  const magnitude = negative ? -value : value;
-  const whole = magnitude / 1000n;
-  const fraction = magnitude % 1000n;
-  return `${negative ? "-" : ""}${whole.toString()}.${fraction.toString().padStart(3, "0")}`;
-}
-
-/**
- * ══════════════════════════════════════════════════════════════════════
- * 🔴🔴 THE OPENING POSITION POSTS AS A REAL JOURNAL ENTRY
- * ══════════════════════════════════════════════════════════════════════
- * Not an `opening_balance` column beside the ledger, not a number the
- * balance sheet adds on afterwards. One row in `transactions` and one
- * `journal_entries` leg per account, which means the opening position is
- * in the trial balance, the P&L, the balance sheet, the statement of
- * every account it touches and the Tally export — all of which read the
- * ledger and only the ledger — without any of them being taught about
- * it. A figure the ledger cannot explain is a figure that will disagree
- * with every report, and disagree quietly.
+ * ⚠️ SEE `findExistingByNaturalKey` ABOVE for why the branches are gone
+ * and what the unguarded final one used to do.
  *
- * ⭐ `reference_type` IS `opening_balance`, WHICH ALREADY EXISTED IN THE
- * ENUM AND HAD NEVER BEEN USED. Somebody anticipated this. It means the
- * entry is classifiable — a reader, a report or the Tally exporter can
- * tell a migration artefact from a trade — and `classifyVoucherType`
- * maps it to a plain journal voucher, which is what it is.
- *
- * ⚠️ THE WHOLE ENTRY IS ONE DATABASE TRANSACTION. The deferred constraint
- * trigger from Phase 4 checks that debits equal credits PER TRANSACTION
- * at commit, so a half-written opening entry cannot survive. That is the
- * third of three gates: the pure layer refuses an unbalanced file, the
- * schema refuses an unbalanced payload, and the database refuses an
- * unbalanced commit. All three would have to be removed to corrupt the
- * ledger.
- */
-async function writeOpeningTrialBalance(
-  ctx: TenantContext,
-  planned: readonly PlannedWrite[],
-): Promise<{ ok: true } | { ok: false; error: string }> {
-  const first = planned[0];
-  if (!first) return { ok: true };
-
-  const asAt = String(first.payload.asAt ?? "");
-  const key = openingBatchKey("trial_balance", asAt);
-
-  let debitTotal = 0n;
-  for (const item of planned) debitTotal += minorOf(item.payload.debitMinor);
-
-  try {
-    const refusal = await withTenant(ctx.tenant.id, async (tx) => {
-      /*
-       * 🔴🔴 THE PERIOD LOCK. `server/accounting/post-sales.ts` makes the
-       * same check and says why: closing a period is a statement made to
-       * an auditor that the numbers are final, and an import that keeps
-       * landing entries inside a closed month is worse than having no
-       * period close at all.
-       *
-       * ⚠️ AND AN OPENING BALANCE IS THE MOST LIKELY THING TO HIT IT,
-       * because it is dated in the PAST by definition — usually the last
-       * day of a financial year, which is exactly the period somebody
-       * closes first.
-       */
-      const [locked] = await tx
-        .select({ name: financialPeriods.name })
-        .from(financialPeriods)
-        .where(
-          and(
-            eq(financialPeriods.tenantId, ctx.tenant.id),
-            lte(financialPeriods.startDate, asAt),
-            gte(financialPeriods.endDate, asAt),
-            inArray(financialPeriods.status, ["closed", "locked"]),
-          ),
-        )
-        .limit(1);
-
-      if (locked) {
-        return (
-          `${asAt} falls inside "${locked.name}", which is closed. Nothing has been ` +
-          `posted. Reopen that period deliberately, or date the opening position ` +
-          `to a day that is still open — closing a period is a statement that its ` +
-          `numbers are final, so this refuses rather than quietly making it untrue.`
-        );
-      }
-
-      const [txn] = await tx
-        .insert(transactions)
-        .values({
-          tenantId: ctx.tenant.id,
-          /*
-           * 🔴 THE IDEMPOTENCY KEY, AND THE DATABASE HOLDS IT UNIQUE PER
-           * TENANT. Our own check ran in `findExistingByNaturalKey`
-           * above and produced a readable outcome; this index is what
-           * makes two people pressing the button at the same moment
-           * safe, and it cannot be forgotten by a future caller.
-           */
-          transactionNumber: key,
-          description: `Opening balances as at ${asAt}`,
-          transactionDate: asAt,
-          status: "posted",
-          referenceType: "opening_balance",
-          currency: "INR",
-          /*
-           * ⚠️ THE DEBIT SIDE, NOT THE SUM OF EVERY LEG. Adding both
-           * sides reports an opening position of ₹20,00,000 as
-           * ₹40,00,000 — exactly twice the truth, and entirely plausible
-           * on a list of transactions.
-           */
-          totalAmount: formatMoneyPlain(debitTotal, "INR"),
-          createdBy: ctx.user.id,
-          postedAt: new Date(),
-          metadata: { source: "import", asAt, lines: planned.length },
-        })
-        .returning({ id: transactions.id });
-
-      if (!txn) throw new Error("The opening journal entry could not be created.");
-
-      await tx.insert(journalEntries).values(
-        planned.map((item) => {
-          const debit = minorOf(item.payload.debitMinor);
-          const credit = minorOf(item.payload.creditMinor);
-          const isDebit = debit > 0n;
-          return {
-            tenantId: ctx.tenant.id,
-            transactionId: txn.id,
-            ledgerId: String(item.payload.ledgerId),
-            entryType: isDebit ? ("debit" as const) : ("credit" as const),
-            /*
-             * ⭐ THE INTEGER, WRITTEN AS AN INTEGER. Batch 0108.
-             *
-             * ⚠️ THIS WAS `formatMoneyPlain(x, "INR")` — a bigint turned
-             * into a two-decimal string on the way into a numeric(18,2),
-             * with the currency hardcoded. The import already counts in
-             * minor units (`debitMinor` / `creditMinor` above); the round
-             * trip through a decimal string existed only because the
-             * column could not hold what the importer already had.
-             */
-            amountMinor: isDebit ? debit : credit,
-            description: `Opening balance as at ${asAt}`,
-            referenceType: "opening_balance" as const,
-          };
-        }),
-      );
-
-      return null;
-    });
-
-    if (refusal) return { ok: false, error: refusal };
-    return { ok: true };
-  } catch (err) {
-    return { ok: false, error: describeWriteFailure(err) };
-  }
-}
-
-/**
- * Insert or update one row.
- *
- * ⚠️ IT RETURNS A RESULT INSTEAD OF THROWING, because a database refusal
- * of ONE row must not end the run — that is constraint 2 again, at the
- * lowest level. The message is passed through where Postgres wrote one
- * for a human (the CHECK constraints on `gst_parties` do), because
- * replacing "the registration type and the GSTIN disagree" with
- * "something went wrong" throws away the whole explanation.
+ * 🔴 A DESTINATION WITHOUT `writeRow` IS AN ATOMIC ONE, and reaching here
+ *    with it means the caller took the per-row path for a file that is a
+ *    single document. That is a programming error rather than a customer
+ *    error, so it says so instead of writing a fraction of a journal
+ *    entry.
  */
 async function writeRow(
   ctx: TenantContext,
@@ -1375,287 +883,18 @@ async function writeRow(
   payload: Record<string, unknown>,
   existingId: string | null,
 ): Promise<{ ok: true } | { ok: false; error: string }> {
-  try {
-    if (entity.table === "companies") {
-      const values = {
-        name: String(payload.name ?? ""),
-        domain: (payload.domain as string | null) ?? null,
-        industry: (payload.industry as string | null) ?? null,
-        employeeCount: (payload.employeeCount as number | null) ?? null,
-        companySize: (payload.companySize as (typeof companies.$inferInsert)["companySize"]) ?? null,
-        website: (payload.website as string | null) ?? null,
-        phone: (payload.phone as string | null) ?? null,
-        addressLine1: (payload.addressLine1 as string | null) ?? null,
-        addressLine2: (payload.addressLine2 as string | null) ?? null,
-        city: (payload.city as string | null) ?? null,
-        state: (payload.state as string | null) ?? null,
-        postalCode: (payload.postalCode as string | null) ?? null,
-        country: (payload.country as string | null) ?? null,
-        notes: (payload.notes as string | null) ?? null,
-      };
-
-      await withTenant(ctx.tenant.id, async (tx) => {
-        if (existingId) {
-          await tx
-            .update(companies)
-            .set({ ...values, updatedAt: new Date() })
-            .where(
-              and(
-                eq(companies.id, existingId),
-                eq(companies.tenantId, ctx.tenant.id),
-                isNull(companies.deletedAt),
-              ),
-            );
-          return;
-        }
-        await tx.insert(companies).values({
-          ...values,
-          tenantId: ctx.tenant.id,
-          customFields: {},
-          ownerId: ctx.user.id,
-          createdBy: ctx.user.id,
-        });
-      });
-      return { ok: true };
-    }
-
-    /* ============================================================== */
-    /* ⭐⭐ BATCH 58 — THE OPENING SUB-LEDGERS                          */
-    /* ============================================================== */
-
-    /**
-     * ══════════════════════════════════════════════════════════════
-     * 🔴🔴 AN OPENING INVOICE IS A BALANCE BROUGHT FORWARD, NOT A TAX
-     *      INVOICE, AND THE DIFFERENCE IS A RETURN FILED TWICE
-     * ══════════════════════════════════════════════════════════════
-     * The customer's unpaid invoices were raised in the system they are
-     * leaving. Their supply was reported in that system's GSTR-1 and the
-     * tax on it has been paid. Re-creating them here as full tax
-     * invoices — with a taxable value and a tax split — would put the
-     * same supplies into an Ordence return, and the Government would be
-     * told about them twice.
-     *
-     * ⭐ SO `taxable_value_minor` AND EVERY TAX COLUMN ARE ZERO. What is
-     * carried is `total_minor`, which is what the customer owes, and
-     * that is what a statement of account, an ageing report and a
-     * reminder letter need. There are no invoice LINES either: this
-     * document has no HSN summary to contribute, because the supply it
-     * records was not made in Ordence.
-     *
-     * 🔴 AND `issued_at` IS THE INVOICE'S OWN DATE, NOT `now()`.
-     * `loadGstr1Documents` filters on `issued_at` — its own comment says
-     * "THE FILTER IS ON `issued_at`, NOT ON `invoice_date`, AND THE
-     * DIFFERENCE IS A LATE FILING". Stamping today's date would sweep
-     * every historical invoice into THIS month's return, which is the
-     * single most expensive mistake available in this file. Dated at the
-     * invoice's own day it lands in a period that closed before the
-     * workspace existed and that nobody will ever file from here.
-     *
-     * ⚠️ THE ROW IS `issued` AND NOT `draft`, DELIBERATELY. A draft is
-     * excluded from the customer ledger and from ageing, which would
-     * make the whole import invisible — the one thing it exists to
-     * prevent.
-     */
-    if (entity.table === "sales_invoices") {
-      const invoiceDate = String(payload.invoiceDate ?? "");
-      const outstanding = minorOf(payload.outstandingMinor);
-      const invoiceNumber = String(payload.invoiceNumber ?? "");
-
-      await withTenant(ctx.tenant.id, async (tx) => {
-        await tx.insert(salesInvoices).values({
-          tenantId: ctx.tenant.id,
-          invoiceNumber,
-          /*
-           * ⚠️ THE FINANCIAL YEAR OF THE INVOICE'S OWN DATE. Rule 46(b)
-           * makes a serial unique for a financial year, and the Indian
-           * one runs 1 April to 31 March — `financialYearOf` is the
-           * single place that decides where the boundary is, so this
-           * cannot drift from the numbering the rest of the product does.
-           */
-          financialYear: financialYearOf(invoiceDate),
-          status: "issued",
-          companyId: String(payload.companyId),
-          invoiceDate,
-          dueDate: (payload.dueDate as string | null) ?? null,
-          currency: "INR",
-          subtotalMinor: outstanding,
-          taxableValueMinor: 0n,
-          totalMinor: outstanding,
-          issuedAt: new Date(`${invoiceDate}T00:00:00+05:30`),
-          issuedBy: ctx.user.id,
-          notes:
-            (payload.notes as string | null) ??
-            "Opening balance brought forward from the previous system.",
-          createdBy: ctx.user.id,
-        });
-      });
-      return { ok: true };
-    }
-
-    /**
-     * ⚠️ A CREDIT, BECAUSE A VENDOR ACCOUNT IS A PAYABLE.
-     * `lib/purchases/vendor-ledger.ts` states the convention and warns
-     * that copying the customer side's by analogy produces a report on
-     * which every counterparty is in credit — "which looks like a data
-     * problem and gets debugged in the wrong place for a day". A bill
-     * INCREASES what we owe, so it is a credit.
-     *
-     * ⭐ `entry_type` IS `purchase_invoice` EVEN THOUGH THERE IS NO
-     * `purchase_invoices` ROW BEHIND IT. That is what this is — a bill —
-     * and `purchase_invoice_id` is nullable precisely so a ledger entry
-     * can exist without the document. Calling it an `adjustment` would
-     * be filing a genuine liability under "miscellaneous", where the
-     * MSME ageing report is entitled to ignore it.
-     */
-    if (entity.table === "vendor_ledger_entries") {
-      await withTenant(ctx.tenant.id, async (tx) => {
-        await tx.insert(vendorLedgerEntries).values({
-          tenantId: ctx.tenant.id,
-          vendorId: String(payload.vendorId),
-          entryDate: String(payload.billDate ?? ""),
-          entryType: "purchase_invoice",
-          referenceNumber: String(payload.billNumber ?? ""),
-          description:
-            (payload.notes as string | null) ??
-            "Opening balance brought forward from the previous system.",
-          debitMinor: 0n,
-          creditMinor: minorOf(payload.outstandingMinor),
-          dueDate: (payload.dueDate as string | null) ?? null,
-          createdBy: ctx.user.id,
-        });
-      });
-      return { ok: true };
-    }
-
-    /**
-     * ⚠️ THE BALANCE IS NOT WRITTEN — THE MOVEMENT IS.
-     * `stock_balances` is maintained by a trigger from `stock_movements`,
-     * and `stock_movements.quantity` is `SUM`med to get it. Writing a
-     * balance directly would be a second writer of a column that has one,
-     * and the two would disagree the first time anything else moved.
-     *
-     * ⭐ `reason` IS `opening_balance`, WHICH THE ENUM ALREADY HAD. It is
-     * also what makes the re-run check above answerable: the question is
-     * not "has this item ever moved" but "has its opening position
-     * already been posted", and only a reason can tell those apart.
-     */
-    if (entity.table === "stock_movements") {
-      const asAt = String(payload.asAt ?? "");
-      const quantityThousandths = minorOf(payload.quantityThousandths);
-      const unitCostMinor = minorOf(payload.unitCostMinor);
-
-      await withTenant(ctx.tenant.id, async (tx) => {
-        await tx.insert(stockMovements).values({
-          tenantId: ctx.tenant.id,
-          stockItemId: String(payload.stockItemId),
-          warehouseId: String(payload.warehouseId),
-          /*
-           * ⚠️ `numeric(18,3)` FROM INTEGER THOUSANDTHS BY STRING, never
-           * by dividing. `Number(n) / 1000` is where `0.1 + 0.2 !== 0.3`
-           * gets into a stock ledger, and a ledger that is out by a
-           * millionth on every movement stops reconciling after a few
-           * thousand of them.
-           */
-          quantity: thousandthsToDecimal(quantityThousandths),
-          reason: "opening_balance",
-          /*
-           * ⚠️ THE DAY IT WAS COUNTED, NOT THE DAY IT WAS UPLOADED. A
-           * count done on the 31st and imported on the 4th is a count as
-           * at the 31st, and every valuation report that reads
-           * `moved_at` would otherwise put four days of trading on the
-           * wrong side of it.
-           */
-          movedAt: new Date(`${asAt}T00:00:00+05:30`),
-          unitCostMinor,
-          /*
-           * ⚠️ VALUE IS COMPUTED IN `BigInt` FROM THE THOUSANDTHS AND
-           * THE PAISE, then divided by 1000 — integer arithmetic
-           * throughout. The rounding is toward zero, which is worth at
-           * most a paisa on a line, and it is the same direction every
-           * time rather than whichever way a float happened to land.
-           */
-          valueMinor: (quantityThousandths * unitCostMinor) / 1000n,
-          batchNo: (payload.batchNo as string | null) ?? null,
-          referenceType: "opening_balance",
-          documentNo: openingBatchKey("stock", asAt),
-          createdBy: ctx.user.id,
-        });
-      });
-      return { ok: true };
-    }
-
-    const gstin = (payload.gstin as string | null) ?? null;
-    const values = {
-      partyType: payload.partyType as (typeof gstParties.$inferInsert)["partyType"],
-      legalName: String(payload.legalName ?? ""),
-      tradeName: (payload.tradeName as string | null) ?? null,
-      gstin,
-      panNumber: (payload.panNumber as string | null) ?? null,
-      registrationType: payload.registrationType as (typeof gstParties.$inferInsert)["registrationType"],
-      /*
-       * ⚠️ DERIVED FROM THE GSTIN WHERE THERE IS ONE, exactly as
-       * `saveParty` does. A GSTIN's first two digits ARE its state and
-       * the CHECK constraint holds them equal; taking the CSV's value in
-       * preference would let a mistyped state column flip an invoice
-       * between IGST and CGST+SGST.
-       */
-      stateCode: gstin ? gstin.slice(0, 2) : ((payload.stateCode as string | null) ?? null),
-      address:
-        (payload.address as (typeof gstParties.$inferInsert)["address"]) ?? {},
-      effectiveFrom: String(payload.effectiveFrom ?? ""),
-      effectiveTo: (payload.effectiveTo as string | null) ?? null,
-      notes: (payload.notes as string | null) ?? null,
+  const writer = IMPORT_WRITERS[entity.table];
+  if (!writer.writeRow) {
+    return {
+      ok: false,
+      error:
+        `"${entity.table}" is written as one document for the whole file, ` +
+        `so it cannot be written a row at a time.`,
     };
-
-    await withTenant(ctx.tenant.id, async (tx) => {
-      if (existingId) {
-        await tx
-          .update(gstParties)
-          .set(values)
-          .where(and(eq(gstParties.id, existingId), eq(gstParties.tenantId, ctx.tenant.id)));
-        return;
-      }
-      await tx.insert(gstParties).values({ ...values, tenantId: ctx.tenant.id });
-    });
-    return { ok: true };
-  } catch (err) {
-    return { ok: false, error: describeWriteFailure(err) };
   }
+  return writer.writeRow(ctx, payload, existingId);
 }
 
-/**
- * ⚠️ THE DATABASE'S OWN SENTENCE, WHERE IT WROTE ONE FOR A PERSON.
- *
- * `server/gst/guards.ts` makes the same argument: the CHECK constraints
- * and triggers in this product raise messages written to be read, and
- * replacing them with a generic string discards the only explanation of
- * a rule nobody understands on first encounter. What is NOT passed
- * through is anything without a recognised SQLSTATE — an unexpected error
- * could carry internals, and a row-level message ends up in a CSV the
- * customer may forward.
- */
-function describeWriteFailure(err: unknown): string {
-  const candidate = err as { code?: unknown; constraint?: unknown; message?: unknown };
-  const code = typeof candidate?.code === "string" ? candidate.code : null;
-  const constraint =
-    typeof candidate?.constraint === "string" ? candidate.constraint : "";
-
-  if (code === "23505") {
-    return (
-      `The database already has a record this would collide with (${constraint || "unique constraint"}). ` +
-      `Another user may have created it since the preview ran.`
-    );
-  }
-  if (code === "23514" && typeof candidate.message === "string") {
-    return candidate.message.replace(/^error:\s*/i, "").split("\nCONTEXT:")[0] ?? "Refused.";
-  }
-  if (code === "23503") {
-    return "Something this row refers to no longer exists.";
-  }
-
-  console.error("[import:writeRow]", err);
-  return "This row was refused by the database and has not been imported.";
-}
 
 /* ------------------------------------------------------------------ */
 /* THE TWO EXPORTS                                                     */
