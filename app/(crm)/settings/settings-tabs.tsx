@@ -37,6 +37,14 @@ const TABS = [
    * next to a setting that changes what every customer sees.
    */
   { href: "/settings/branding", label: "Branding" },
+  /*
+   * ⭐ WAVE 3B. Next to Branding because they answer the same question ,
+   * what this workspace looks like to the outside , and because the
+   * enforcement that refuses an unverified hostname landed in the same
+   * commit as this tab. A refusal with no screen to clear it is a
+   * lockout.
+   */
+  { href: "/settings/domain", label: "Custom domain" },
   // ⚠️ THE DEFINITIONS, NOT THE RECORDS. `/objects` is where the records
   // live and is reached from the main navigation; this tab is where the
   // shapes are inspected. Two routes, two questions.

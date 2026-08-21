@@ -23,8 +23,83 @@ export const TENANT_HEADERS = {
   tenantRole: "x-tenant-role",
   clerkOrgId: "x-tenant-org-id",
   userId: "x-tenant-user-id",
+  /**
+   * ⭐ WAVE 3B — THE HOSTNAME THE REQUEST ARRIVED ON, CLASSIFIED.
+   *
+   * ══════════════════════════════════════════════════════════════════
+   * 🔴 WHY A SEPARATE HEADER AND NOT `tenantSlug`
+   * ══════════════════════════════════════════════════════════════════
+   * Middleware used to record a custom domain by writing
+   * `domain:<host>` into `tenantSlug` , and then, seventy lines later,
+   * overwrote it with the Clerk organisation slug. The value never
+   * survived to any reader, and no reader existed either. That is this
+   * codebase's characteristic defect twice over in one field.
+   *
+   * ⚠️ IT IS IN `TENANT_HEADERS`, SO IT IS IN `SPOOFABLE_HEADERS`, so
+   * middleware strips any client-supplied copy before setting its own.
+   * That is the whole reason the value below can be trusted by
+   * `requireTenantContext` to refuse a request.
+   */
+  tenantHost: "x-tenant-host",
   requestId: "x-request-id",
 } as const;
+
+/**
+ * The classified hostname, as carried between middleware and the server.
+ *
+ * Encoded as a string because headers are strings; the two functions
+ * below are the only place that shape is written or read, so the
+ * producer and the consumer cannot drift.
+ */
+export type TenantHostClaim =
+  | { kind: "root" }
+  | { kind: "platform" }
+  | { kind: "subdomain"; slug: string }
+  | { kind: "custom-domain"; domain: string };
+
+export function encodeTenantHostClaim(claim: TenantHostClaim): string {
+  switch (claim.kind) {
+    case "subdomain":
+      return `subdomain:${claim.slug}`;
+    case "custom-domain":
+      return `domain:${claim.domain}`;
+    case "platform":
+      return "platform";
+    default:
+      return "root";
+  }
+}
+
+/**
+ * ⚠️ RETURNS NULL FOR ANYTHING IT DOES NOT RECOGNISE, and the caller
+ * treats null as "not a custom domain" rather than as "trusted". An
+ * unparseable value can only come from our own middleware, because the
+ * client's copy is deleted before this is set.
+ */
+export function parseTenantHostClaim(value: string | null | undefined): TenantHostClaim | null {
+  if (!value) return null;
+  if (value === "root") return { kind: "root" };
+  if (value === "platform") return { kind: "platform" };
+  if (value.startsWith("subdomain:")) {
+    const slug = value.slice("subdomain:".length);
+    return slug ? { kind: "subdomain", slug } : null;
+  }
+  if (value.startsWith("domain:")) {
+    const domain = value.slice("domain:".length);
+    return domain ? { kind: "custom-domain", domain } : null;
+  }
+  return null;
+}
+
+/**
+ * Compare two hostnames the way DNS does: case-insensitively, and
+ * ignoring a single trailing dot. `ACME.com.` and `acme.com` are the
+ * same name, and a comparison that says otherwise locks a customer out
+ * of the domain they verified.
+ */
+export function normaliseHostname(host: string): string {
+  return host.trim().toLowerCase().replace(/\.$/, "");
+}
 
 /**
  * Every header the client is FORBIDDEN from supplying.
@@ -229,6 +304,26 @@ export function resolveTenantFromHost(
    */
   if (host.endsWith(".workers.dev")) return { kind: "root" };
   if (host.endsWith(".vercel.app")) return { kind: "root" };
+  /**
+   * 🔴 THE PLATFORM'S OWN HOSTNAME , AND ITS ABSENCE HERE WAS A LIVE
+   *    REGRESSION WAITING FOR WAVE 3B.
+   *
+   * Ordence is deployed on Railway, which always issues
+   * `<service>.up.railway.app` alongside the custom hosts. Two lines
+   * above, the same courtesy is extended to Cloudflare and Vercel; the
+   * host we ACTUALLY RUN ON was the one missing.
+   *
+   * ⚠️ IT DID NOT MATTER UNTIL NOW, AND THAT IS THE POINT. Before this
+   * wave a `custom-domain` verdict changed nothing downstream, so the
+   * Railway hostname resolved as a "custom domain" harmlessly. Wave 3B
+   * makes an unverified custom domain refuse every signed-in request ,
+   * so without this line, the first deploy would have locked everybody
+   * out of the generated hostname, including whoever went there to find
+   * out why.
+   */
+  if (host.endsWith(".up.railway.app") || host.endsWith(".railway.app")) {
+    return { kind: "root" };
+  }
 
   // Bare root, or www.
   if (host === root || host === `www.${root}`) return { kind: "root" };

@@ -198,6 +198,7 @@ ORDENCE_INLINE_JOBS=true
 # first, or the report-only phase collects nothing and can never end.
 CSP_ENFORCE=false
 CSP_REPORT_URI=
+CUSTOM_DOMAIN_VERIFICATION_SECRET=
 #
 # NEVER set this to true.
 SEED_ALLOW_PROD=false

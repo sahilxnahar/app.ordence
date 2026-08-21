@@ -75,6 +75,49 @@ import type { ContractedImportEntity, ImportReport, RowDisposition } from "@/lib
 export const PROVENANCE_TABLE = "import_row_provenance";
 
 /**
+ * 🔴 TABLES THAT MOVE BECAUSE A DESTINATION MOVED, AND ARE NOT
+ *    THEMSELVES DESTINATIONS — Wave 4 integration.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * WHY THIS LIST HAD TO EXIST BEFORE THE PACK WAS APPLIED
+ * ══════════════════════════════════════════════════════════════════════
+ * `everyTenantScopedDestination()` asks the catalogue for every table
+ * with a `tenant_id`, which is the right question and sweeps up the
+ * recorders too. `change_log` gains a row for every recorded write, so
+ * the first time this measurement ran against a database with the import
+ * pack applied, EVERY entity reported `change_log` as an undeclared
+ * destination — a finding that is always true, tells nobody anything, and
+ * would have buried the real ones.
+ *
+ * ⚠️ THEY ARE STILL COUNTED. This list only governs what is REPORTED as
+ * an undeclared destination. Drift in these tables is still measured, so
+ * a preview that wrote an audit row is still caught being a preview that
+ * wrote.
+ *
+ * ⚠️ THE LIST IS NOT INVENTED HERE. It mirrors `v_denied` in SQL 0205's
+ * `import_row_provenance_same_transaction` trigger, which refuses
+ * provenance naming any of them: the database and the measurement agree
+ * on what is not an import destination, and they agree by construction
+ * rather than by two people remembering.
+ */
+export const NEVER_A_DESTINATION: readonly string[] = [
+  "tenants",
+  "users",
+  "audit_logs",
+  "change_log",
+  "security_events",
+  "permission_denials",
+  "error_events",
+  "vault_items",
+  "vault_secrets",
+  "import_runs",
+  "import_run_chunks",
+  "import_row_prior_values",
+  "import_reversals",
+  "import_reversal_failures",
+];
+
+/**
  * Every table this entity's contract says it may write, plus the sidecar.
  *
  * ⚠️ READ FROM THE CONTRACT, NEVER FROM A LIST HERE. A second list of
@@ -535,9 +578,18 @@ export async function verifyDryRun(args: {
   const comparison = compareRuns(preview, commit);
 
   const declared = new Set(declaredDestinations(entity));
+  const notADestination = new Set(NEVER_A_DESTINATION);
+  /*
+   * ⚠️ FILTERED FOR THE REPORT, NOT FOR THE MEASUREMENT. `commitMoved`
+   * still carries the recorders, so a preview that wrote an audit row is
+   * still a preview that wrote and `problems` still says so. What is
+   * removed here is the claim that `change_log` is a destination the
+   * entity forgot to declare — which is true of every entity, always, and
+   * would bury the findings this field exists to surface.
+   */
   const undeclaredDestinations = commitMoved
     .map((delta) => delta.destination)
-    .filter((destination) => !declared.has(destination))
+    .filter((destination) => !declared.has(destination) && !notADestination.has(destination))
     .sort();
 
   const problems: string[] = [];

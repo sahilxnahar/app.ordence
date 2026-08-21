@@ -19,7 +19,7 @@ import { eq, and, isNull } from "drizzle-orm";
 import { db, withPlatformScope, withTenant } from "@/db";
 import { SENTRY_ENABLED } from "@/lib/observability/sentry-options";
 import { tenants, users } from "@/db/schema";
-import { TENANT_HEADERS } from "@/lib/tenant";
+import { TENANT_HEADERS, parseTenantHostClaim, normaliseHostname } from "@/lib/tenant";
 import { getImpersonatedTenantContext } from "@/server/platform/impersonation-context";
 import type { SystemRole, Tenant, User } from "@/db/schema";
 import type { ImpersonationScope } from "@/db/schema/platform";
@@ -64,7 +64,11 @@ export class TenantAccessError extends Error {
       | "tenant_inactive"
       | "user_not_provisioned"
       | "user_suspended"
-      | "tenant_mismatch",
+      | "tenant_mismatch"
+      /* ⭐ Wave 3B. The request arrived on a hostname this workspace has
+         not verified. Distinct from `tenant_mismatch`, which is about
+         WHOSE session it is; this one is about WHOSE NAME is on the door. */
+      | "custom_domain_unverified",
   ) {
     super(message);
     this.name = "TenantAccessError";
@@ -169,6 +173,48 @@ export async function requireTenantContext(): Promise<TenantContext> {
       "Tenant header does not match session organization.",
       "tenant_mismatch",
     );
+  }
+
+  /**
+   * ══════════════════════════════════════════════════════════════════
+   * 🔴 WAVE 3B — THE HOSTNAME MUST BELONG TO THIS WORKSPACE
+   * ══════════════════════════════════════════════════════════════════
+   * `resolveTenantFromHost` classifies ANY hostname it does not
+   * recognise as `{ kind: "custom-domain" }`, and the deployment answers
+   * on it. Until this block, nothing checked that the name had anything
+   * to do with the workspace being served: point DNS at Ordence, sign
+   * in, and the product renders YOUR OWN workspace under SOMEONE ELSE'S
+   * name with a valid certificate. Not a data leak , RLS never widened ,
+   * but a phishing page hosted on request, and the column that was meant
+   * to prevent it (`custom_domain_verified_at`) was written by nothing.
+   *
+   * ⚠️ IT IS ENFORCED HERE AND NOT IN MIDDLEWARE, and that is the whole
+   * design. Middleware may not open a database connection , its own
+   * header says why: "a slow query takes every tenant hostname offline".
+   * By this line the tenant row is ALREADY LOADED for a different
+   * reason, so the check costs zero extra queries.
+   *
+   * ⚠️ BOTH HALVES ARE REQUIRED. The domain must match, AND the
+   * timestamp must be present. A row whose `custom_domain` was set but
+   * never verified is exactly the state an attacker who can create a
+   * workspace can reach on their own.
+   *
+   * ⚠️ THE HEADER IS TRUSTED BECAUSE MIDDLEWARE DELETED THE CLIENT'S
+   * COPY FIRST. `TENANT_HEADERS.tenantHost` is in `SPOOFABLE_HEADERS` by
+   * construction (`Object.values(TENANT_HEADERS)`), and middleware sets
+   * it unconditionally at step 2b, before every exit that forwards.
+   */
+  const hostClaim = parseTenantHostClaim(headerList.get(TENANT_HEADERS.tenantHost));
+  if (hostClaim?.kind === "custom-domain") {
+    const claimed = normaliseHostname(hostClaim.domain);
+    const owned = tenantRow.customDomain ? normaliseHostname(tenantRow.customDomain) : null;
+
+    if (!owned || owned !== claimed || !tenantRow.customDomainVerifiedAt) {
+      throw new TenantAccessError(
+        "This address is not verified for your workspace.",
+        "custom_domain_unverified",
+      );
+    }
   }
 
   /**

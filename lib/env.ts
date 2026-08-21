@@ -169,6 +169,24 @@ const serverSchema = z.object({
   WORKER_API_SECRET: z.string().optional(),
 
   /**
+   * ⭐ WAVE 3B. HMAC key for the `_ordence-challenge` TXT record a
+   * customer publishes to prove they own a custom domain.
+   *
+   * ⚠️ OPTIONAL HERE, REFUSED AT USE. Absent, `deriveDomainChallenge`
+   * throws and the verify action reports that the deployment is not
+   * configured. It must never mean "no token expected", because a
+   * verification that expects nothing succeeds against a domain that
+   * carries nothing, and the whole point of this wave is that an
+   * unverified hostname does not serve a workspace.
+   *
+   * ⚠️ CHANGING IT INVALIDATES EVERY PUBLISHED RECORD, so a rotation
+   * makes every customer re-verify. Already-verified domains keep
+   * working , `custom_domain_verified_at` is the stored fact and this
+   * secret only proves it in the first place.
+   */
+  CUSTOM_DOMAIN_VERIFICATION_SECRET: z.string().optional(),
+
+  /**
    * 🔴🔴 THE KEY THE VAULT HAS BEEN WAITING FOR SINCE 0037.
    *
    * `vault_secrets` holds ciphertext and the NAME of a key. This is the

@@ -344,23 +344,23 @@ describe("⚠️ the two indexes SQL 0230 creates, read back from the catalogue"
 });
 
 /* ================================================================== */
-describe("🔴 undo — what is available today, and what is not", () => {
+describe("⭐ undo — what was missing when this file was written, and is not now", () => {
   /**
-   * ⚠️ THIS IS NOT AN UNDO TEST. It cannot be one.
+   * ⚠️ WHEN THIS FILE WAS WRITTEN THIS COULD NOT BE AN UNDO TEST.
    *
    * `reversal: { kind: "delete" }` means "delete the rows THIS RUN
    * created", and the only source of truth for which those are is
-   * `import_row_provenance` — which does not exist in this tree. The
-   * available alternative, "everything created between two timestamps",
-   * would sweep up every receipt the customer's staff keyed in by hand
-   * during the migration window, and a migration takes hours while the
-   * office does not stop.
+   * `import_row_provenance` — which did not exist in the tree Phase 5 was
+   * given. The available alternative, "everything created between two
+   * timestamps", would sweep up every receipt the customer's staff keyed
+   * in by hand during the migration window, and a migration takes hours
+   * while the office does not stop.
    *
-   * What this proves is the narrower claim the entity actually makes: a
-   * row this entity wrote can be deleted, and deleting it leaves nothing
-   * behind — no ledger entry, no allocation, nothing referencing it. That
-   * is what makes `delete` the honest KIND once Phase 2 can identify the
-   * rows.
+   * ⭐ BOTH HALVES LANDED AFTERWARDS. Phase 2 wrote
+   * `server/import/reversal.ts`, and SQL 0205 creates the sidecar. The
+   * second test below used to assert their ABSENCE; it now asserts their
+   * presence, so the narrow claim in the first test is joined to the
+   * mechanism that makes `delete` an honest reversal kind.
    */
   it("a row this entity wrote deletes cleanly, leaving nothing that referenced it", async () => {
     const before = await countReceipts();
@@ -382,14 +382,38 @@ describe("🔴 undo — what is available today, and what is not", () => {
     expect(leftovers.legs).toBe(0);
   });
 
-  it("and the tree still has nothing that could have identified those rows", async () => {
+  /**
+   * ⚠️ INVERTED AT WAVE 4 INTEGRATION, NOT DELETED. This test recorded a
+   * gap; the gap was closed, so it now records the closure. Deleting it
+   * would have left nothing asserting that the mechanism the entity's
+   * `delete` kind depends on is actually there.
+   */
+  it("and the tree now HAS what identifies those rows — both halves", async () => {
     const { existsSync } = await import("node:fs");
-    expect(existsSync("server/import/reversal.ts")).toBe(false);
-    const missing = await asSuperuser(async (c) => {
+    expect(existsSync("server/import/reversal.ts")).toBe(true);
+
+    const present = await asSuperuser(async (c) => {
       const r = await c.query(`SELECT to_regclass('public.import_row_provenance') AS t`);
       return r.rows[0].t;
     });
-    /* 🔴 The table the whole reversal design rests on is not in the database. */
-    expect(missing).toBeNull();
+    /* ⭐ The table the whole reversal design rests on, created by SQL 0205. */
+    expect(present).not.toBeNull();
+
+    /*
+     * 🔴 AND IT IS THE SHAPE A REVERSAL CAN USE. A sidecar with no
+     * `reversal_id` records what happened and cannot record that it was
+     * undone, which is the half of the design that identifies the rows.
+     */
+    const columns = await asSuperuser(async (c) => {
+      const r = await c.query(
+        `SELECT column_name FROM information_schema.columns
+          WHERE table_schema = 'public' AND table_name = 'import_row_provenance'`,
+      );
+      return r.rows.map((row: { column_name: string }) => row.column_name);
+    });
+    expect(columns).toContain("run_id");
+    expect(columns).toContain("target_id");
+    expect(columns).toContain("reversed_at");
+    expect(columns).toContain("reversal_id");
   });
 });

@@ -581,6 +581,31 @@ BEGIN
       v_policies;
   END IF;
 
+  /*
+   * ══════════════════════════════════════════════════════════════════════
+   * ⭐ AMENDED AT INTEGRATION — THE CHANGE-LOG TRIGGER IS CONDITIONAL
+   * ══════════════════════════════════════════════════════════════════════
+   * This block originally demanded FOUR triggers, one of them
+   * `import_row_provenance_change_log`. 0215 then declares this table in
+   * `change_log_exclusions` and detaches that recorder, for reasons stated
+   * in its header: one change_log row per imported row, each carrying two
+   * JSONB copies of a row that can never differ, written into the
+   * fastest-growing table in the product during a bulk import.
+   *
+   * So the two files asserted opposite things about the same trigger. A
+   * first forward run happened to pass, because 0205 runs first and the
+   * recorder was still attached when it looked. RE-RUNNING 0205 AFTER 0215
+   * FAILED — and these files are written idempotent precisely so they can
+   * be re-run.
+   *
+   * ⚠️ THE FIX IS NOT TO DROP THE ASSERTION. It now asks the same question
+   * `attach_change_log_triggers()` asks: the recorder must be attached
+   * UNLESS the table is declared excluded. Present-and-excluded is refused
+   * too, because that is the contradictory state 0215 §3 exists to clear.
+   *
+   * The other three are unconditional and unchanged. Without
+   * `same_transaction` the whole guarantee of this file is a comment.
+   */
   SELECT count(*)::int INTO v_triggers
     FROM pg_trigger tg
    WHERE tg.tgrelid = 'public.import_row_provenance'::regclass
@@ -588,16 +613,52 @@ BEGIN
      AND tg.tgname IN (
        'import_row_provenance_same_transaction',
        'import_row_provenance_immutable',
-       'import_row_provenance_change_log',
        'no_delete_under_impersonation'
      );
-  IF v_triggers <> 4 THEN
+  IF v_triggers <> 3 THEN
     RAISE EXCEPTION
-      'import_row_provenance carries % of the 4 required triggers '
-      '(same_transaction, immutable, change_log, no_delete_under_impersonation). '
+      'import_row_provenance carries % of the 3 unconditional triggers '
+      '(same_transaction, immutable, no_delete_under_impersonation). '
       'Without same_transaction the whole guarantee of this file is a comment.',
       v_triggers;
   END IF;
+
+  DECLARE
+    v_logged   boolean;
+    v_excluded boolean;
+  BEGIN
+    SELECT EXISTS (
+      SELECT 1 FROM pg_trigger tg
+       WHERE tg.tgrelid = 'public.import_row_provenance'::regclass
+         AND NOT tg.tgisinternal
+         AND tg.tgname = 'import_row_provenance_change_log'
+    ) INTO v_logged;
+
+    SELECT EXISTS (
+      SELECT 1 FROM public.change_log_exclusions
+       WHERE table_name = 'import_row_provenance'
+    ) INTO v_excluded;
+
+    IF NOT v_logged AND NOT v_excluded THEN
+      RAISE EXCEPTION
+        'import_row_provenance has no change_log recorder and is not in '
+        'change_log_exclusions. That is the silent gap 0122 exists to close: '
+        'a tenant table nothing records and nothing declares exempt.';
+    END IF;
+
+    IF v_logged AND v_excluded THEN
+      RAISE EXCEPTION
+        'import_row_provenance is BOTH recorded and declared exempt. 0122''s '
+        'coverage check passes on either, so nothing else would ever report '
+        'this. Re-run 0215, whose section 3 detaches the recorder.';
+    END IF;
+
+    IF v_excluded THEN
+      RAISE NOTICE
+        '0205: change_log recorder correctly absent — the table is declared '
+        'in change_log_exclusions (see 0215 section 3).';
+    END IF;
+  END;
 
   IF NOT EXISTS (
     SELECT 1 FROM pg_constraint
@@ -611,6 +672,7 @@ BEGIN
 
   RAISE NOTICE
     '0205: import_row_provenance verified — % columns, RLS enabled and forced, '
-    '1 policy, 4 triggers, composite key on import_runs.',
+    '1 policy, 3 unconditional triggers, change-log posture consistent, '
+    'composite key on import_runs.',
     array_length(v_required, 1);
 END $$;

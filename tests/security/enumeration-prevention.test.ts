@@ -57,6 +57,42 @@ function runtimeFiles(): string[] {
   return out;
 }
 
+/**
+ * ⭐ DECLARED EXEMPTIONS — one entry, added at Wave 4 integration.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 WHY AN EXEMPTION AND NOT A LOOSER PATTERN
+ * ══════════════════════════════════════════════════════════════════════
+ * This test's own comment says what the two acceptable fixes are:
+ * *"Remove the call, or gate it behind an internal-admin surface with its
+ * own authorization."* It had no way to express the second, so a file
+ * that took it looked identical to a leak. Widening the regex would have
+ * hidden the next real one; deleting the assertion would have hidden all
+ * of them.
+ *
+ * ⚠️ AN ENTRY HERE IS A DECISION, SO `reason` IS REQUIRED AND THE PATH IS
+ * EXACT. No globs: `server/platform/**` would exempt forty files on the
+ * strength of one review.
+ *
+ * ⚠️ AND THE EXEMPTION IS ITSELF VERIFIED. The test below refuses an entry
+ * whose file no longer exists, or that no longer matches any forbidden
+ * pattern — otherwise a stale exemption quietly widens over time, which
+ * is how the fail-open registry rotted before it was pinned.
+ */
+const DECLARED_EXEMPTIONS: ReadonlyArray<{ file: string; reason: string }> = [
+  {
+    file: "server/platform/adopt-clerk-org.ts",
+    reason:
+      "resolveOwnerUserId() calls users.getUserList to find the Clerk account " +
+      "that will own a workspace being provisioned. It is reached only from " +
+      "the platform console behind requirePlatformAdmin(), it never answers " +
+      "an anonymous caller, and it takes the address from the provisioning " +
+      "record rather than from a request body. It also refuses on " +
+      "totalCount !== 1 rather than picking one, so it cannot be used to " +
+      "probe: two accounts for one address is an error, not an answer.",
+  },
+];
+
 const CLERK_ADMIN_PATTERNS = [
   /clerkClient\.users\./,
   /\baut\(\)\.users\./,
@@ -72,8 +108,10 @@ describe("user enumeration — no server-side existence surface", () => {
     // the CALL ITSELF is the leak, because its response distinguishes
     // existing accounts from invented ones. Remove the call, or gate it
     // behind an internal-admin surface with its own authorization.
+    const exempt = new Set(DECLARED_EXEMPTIONS.map((e) => join(ROOT, e.file)));
     const offenders: string[] = [];
     for (const file of runtimeFiles()) {
+      if (exempt.has(file)) continue;
       const src = readFileSync(file, "utf8");
       for (const pattern of CLERK_ADMIN_PATTERNS) {
         if (pattern.test(src)) {
@@ -83,6 +121,35 @@ describe("user enumeration — no server-side existence surface", () => {
       }
     }
     expect(offenders, offenders.join("\n")).toHaveLength(0);
+  });
+
+  /**
+   * 🔴 THE EXEMPTIONS ARE CHECKED TOO, AND THIS IS THE HALF THAT ROTS.
+   * A declared exemption whose file was deleted or whose call was removed
+   * is a hole standing open for whatever is written there next.
+   */
+  it("every declared exemption still names a real file that still needs it", () => {
+    const stale: string[] = [];
+    for (const entry of DECLARED_EXEMPTIONS) {
+      const full = join(ROOT, entry.file);
+      let src: string;
+      try {
+        src = readFileSync(full, "utf8");
+      } catch {
+        stale.push(`${entry.file} — declared exempt but the file does not exist`);
+        continue;
+      }
+      if (!CLERK_ADMIN_PATTERNS.some((p) => p.test(src))) {
+        stale.push(
+          `${entry.file} — no longer calls a Clerk admin user API, so the ` +
+            `exemption is dead and must be deleted`,
+        );
+      }
+      if (entry.reason.trim().length < 40) {
+        stale.push(`${entry.file} — reason is too short to be a decision`);
+      }
+    }
+    expect(stale, stale.join("\n")).toHaveLength(0);
   });
 
   it("no route or action answers an existence question about an email", () => {

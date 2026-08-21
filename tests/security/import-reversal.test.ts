@@ -429,14 +429,22 @@ describe("kind: restore-prior", () => {
     });
 
     /**
-     * 🔴 AND THE ONE THING THAT DOES NOT COME BACK, MEASURED RATHER THAN
-     * ASSUMED. `companies` declares `escapes: null` — a claim that nothing
-     * survives an undo — and carries `companies_set_updated_at`, whose
-     * whole body is `NEW.updated_at = now()`. The declaration is wrong, and
-     * `import_restore_prior_values()` is what says so, per row, by
-     * re-reading what it wrote.
+     * ⭐ AND THE ONE THING THAT DOES NOT COME BACK, MEASURED RATHER THAN
+     * ASSUMED — AND NOW DECLARED.
+     *
+     * `companies` used to declare `escapes: null`, a claim that nothing
+     * survives an undo, while carrying `companies_set_updated_at`, whose
+     * whole body is `NEW.updated_at = now()`. The declaration was wrong and
+     * `import_restore_prior_values()` is what said so, per row, by
+     * re-reading what it wrote:  rows_affected 1 | unrestored {updated_at}.
+     *
+     * ⚠️ THE ASSERTION IS NOW THAT THE TWO AGREE. The measurement is the
+     * authority and the declaration is what the customer is shown, so the
+     * test that matters is that the sentence names the column the database
+     * actually failed to restore — not merely that some sentence exists.
      */
-    expect(entity.contract.reversal.escapes).toBeNull();
+    expect(entity.contract.reversal.escapes).not.toBeNull();
+    expect(entity.contract.reversal.escapes).toContain("last updated");
     expect(undo.measuredEscapes).toEqual(["companies.updated_at"]);
 
     const after = await snapshotWorkspace(t);
@@ -964,25 +972,41 @@ describe("provenance", () => {
 
 describe("opening-stock", () => {
   /**
-   * 🔴 THE FINDING. `opening-stock` declares `reversal: { kind: "delete" }`.
+   * ⭐ THE FINDING, AND THE FIX IT PRODUCED.
+   *
+   * `opening-stock` used to declare `reversal: { kind: "delete" }`.
    * `stock_movements` carries `trg_stock_ledger_append_only`, whose first
    * statement is `IF TG_OP = 'DELETE' THEN RAISE EXCEPTION 'Stock movements
-   * cannot be deleted…'` — for every role, owner or not.
+   * cannot be deleted…'` — for every role, owner or not. The declared undo
+   * would have been refused on the first row of every undo.
    *
-   * CI gate 29 passes and always will: `checkImportContract()` is pure and
-   * cannot ask `pg_trigger` anything. This test is the half of the contract
-   * only a database can check.
+   * The contract now declares `reverse-entry`, which is what the ledger's
+   * own error message tells you to do: post a reversing movement carrying
+   * `reverses_movement_id`.
+   *
+   * ⚠️ CI GATE 29 PASSED THROUGHOUT AND ALWAYS WOULD HAVE.
+   * `checkImportContract()` is pure and cannot ask `pg_trigger` anything.
+   * This test is the half of the contract only a database can check, which
+   * is exactly why it is kept after the fix rather than deleted with it.
    */
-  it("declares an undo the stock ledger refuses, and the refusal comes before anything is touched", async () => {
+  it("declares the undo the stock ledger will actually accept", async () => {
     const entity = ALL_IMPORT_ENTITIES["opening-stock"];
-    expect(entity.contract.reversal.kind).toBe("delete");
+    expect(entity.contract.reversal.kind).toBe("reverse-entry");
 
+    /* 🔴 And the reason it cannot be `delete`, still true, still measured. */
     await asSuperuser(async (c) => {
       const { rows } = await c.query(
         `SELECT delete_blocked_by FROM import_destination_reversibility('stock_movements')`,
       );
       expect(rows[0].delete_blocked_by).toBe("ordence_stock_ledger_append_only");
     });
+
+    /*
+     * ⚠️ AND THE ESCAPE IS DECLARED, because a reverse-entry undo is not a
+     * silent one: the customer is left with two movements, not none, and
+     * the contract has to say so before they press the button.
+     */
+    expect(entity.contract.reversal.escapes).toContain("stays in the stock ledger");
   });
 });
 

@@ -266,10 +266,57 @@ beforeAll(async () => {
   });
 });
 
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 TEARDOWN CANNOT SIMPLY DELETE THE TENANT, AND THE REASON IS A REAL
+ *    OPEN QUESTION ABOUT THE PRODUCT — Wave 4 integration
+ * ══════════════════════════════════════════════════════════════════════
+ * `DELETE FROM tenants` cascades into `lead_activities`, which is
+ * append-only: `lead_activities_append_only` refuses every DELETE for
+ * every role including the owner. So the cascade fails and the whole
+ * teardown throws — which is what this file did the first time it ran
+ * against a database with the import pack applied and Phase 4's writer
+ * actually creating activity rows.
+ *
+ * ⚠️ THIS IS THE SECOND INSTANCE OF A FAMILY TRACK D ALREADY DOCUMENTED.
+ * `SQL-FILES/DRILL-DO-NOT-RUN-IN-NEON-TRACK-D-tenant-delete-blocked.sql`
+ * records the first: `security_events` is `ON DELETE SET NULL`, SET NULL
+ * is implemented as an UPDATE, and the append-only trigger refuses the
+ * UPDATE. Same collision, different mechanism — there a refused UPDATE,
+ * here a refused DELETE.
+ *
+ * ⚠️ THE PRODUCT IS NOT CHANGED HERE, AND THAT IS DELIBERATE. Whether a
+ * workspace can ever be hard-deleted, and what happens to its evidence
+ * when it is, is Track D's decision and not a thing to settle inside a
+ * test teardown. The product soft-deletes (`deleted_at`) everywhere that
+ * matters. This teardown uses the pattern already established in
+ * `import-undo-action.test.ts`: disable the append-only triggers for the
+ * duration of the delete, and put them back in a `finally`.
+ */
+const APPEND_ONLY_FOR_TEARDOWN: readonly [string, string][] = [
+  ["lead_activities", "lead_activities_append_only"],
+  ["journal_entries", "journal_entries_no_delete"],
+  ["audit_logs", "audit_logs_no_delete"],
+  ["permission_denials", "permission_denials_no_delete"],
+];
+
 afterAll(async () => {
-  await asSuperuser(async (c) => {
-    if (F.tenant) await c.query(`DELETE FROM tenants WHERE id = $1`, [F.tenant]);
-  });
+  if (!F.tenant) return;
+  for (const [table, trigger] of APPEND_ONLY_FOR_TEARDOWN) {
+    await asSuperuser((c) => c.query(`ALTER TABLE ${table} DISABLE TRIGGER ${trigger}`));
+  }
+  try {
+    await asSuperuser(async (c) => {
+      await c.query(`DELETE FROM change_log WHERE tenant_id = $1`, [F.tenant]);
+      await c.query(`DELETE FROM audit_logs WHERE tenant_id = $1`, [F.tenant]);
+      await c.query(`DELETE FROM permission_denials WHERE tenant_id = $1`, [F.tenant]);
+      await c.query(`DELETE FROM tenants WHERE id = $1`, [F.tenant]);
+    });
+  } finally {
+    for (const [table, trigger] of APPEND_ONLY_FOR_TEARDOWN) {
+      await asSuperuser((c) => c.query(`ALTER TABLE ${table} ENABLE TRIGGER ${trigger}`));
+    }
+  }
 });
 
 /* ================================================================== */

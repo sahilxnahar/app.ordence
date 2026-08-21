@@ -954,8 +954,20 @@ export const TAX_CALL_SITES: readonly CallSite[] = [
     id: "opening-balance-import",
     table: "sales_invoices",
     drizzleSymbol: "salesInvoices",
-    file: "server/actions/import.ts",
-    fn: "writeRow (entity sales_invoices)",
+    /*
+     * ⚠️ THE CODE MOVED AND THIS ENTRY DID NOT — corrected at Wave 4
+     * integration. Phase 1 lifted every destination write out of
+     * `server/actions/import.ts` into `server/import/writers/**`, and the
+     * register kept pointing at the old file. Both halves of this test
+     * caught it: §2 reported the new writer as an undeclared writer of a
+     * tax-bearing table, and §3 reported this entry's anchor as missing.
+     *
+     * 🔴 THAT PAIR IS THE WHOLE VALUE OF THE REGISTER. A single check
+     * would have gone quiet — an entry pointing at a file where nothing
+     * happens any more reads exactly like a call site that was removed.
+     */
+    file: "server/import/writers/sales-invoices.ts",
+    fn: "salesInvoicesWriter.writeRow",
     anchor: "insert(salesInvoices)",
     status: "non-tax-write",
     taxSource:

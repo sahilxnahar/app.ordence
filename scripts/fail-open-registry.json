@@ -27,9 +27,9 @@
     },
     {
       "file": "middleware.ts",
-      "line": 329,
+      "line": 330,
       "reason": "Diagnostics must never be the reason a request fails.",
-      "reviewed": "wave 14; line moved at wave 21 integration (Wave 2E added a public route above it)"
+      "reviewed": "wave 14; line moved at wave 21 integration (Wave 2E added a public route above it), and again at Wave 3B (one import line)"
     },
     {
       "file": "server/automation/emit.ts",

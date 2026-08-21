@@ -252,6 +252,38 @@ async function makeRun(): Promise<string> {
   return result.rows[0].id as string;
 }
 
+/**
+ * ⚠️ ONE TRANSACTION, AND THAT IS THE POINT. 0205's `same_transaction`
+ * trigger reads the destination row's `xmin` and refuses provenance for a
+ * row this transaction did not write — so a helper that inserted the
+ * company first and the provenance afterwards would be refused, correctly.
+ */
+async function writeCompanyWithProvenance(
+  runId: string | null,
+  over: { cardinality?: string; inputRowNumber?: number | null } = {},
+): Promise<string> {
+  const { withTenant } = await import("@/db");
+  const { sql } = await import("drizzle-orm");
+  return withTenant(tenantId, async (tx) => {
+    const company = await tx.execute(sql`
+      INSERT INTO companies (tenant_id, name)
+      VALUES (${tenantId}, ${"Provenance Fixture " + randomUUID().slice(0, 8)})
+      RETURNING id
+    `);
+    const companyId = (company.rows[0] as { id: string }).id;
+    await tx.execute(sql`
+      INSERT INTO import_row_provenance
+        (tenant_id, run_id, entity_key, input_row_number, cardinality,
+         target_table, target_id, operation, reversal_kind, written_xid)
+      VALUES (${tenantId}, ${runId}, 'companies',
+              ${over.inputRowNumber === undefined ? 1 : over.inputRowNumber},
+              ${over.cardinality ?? "one-to-one"},
+              'companies', ${companyId}, 'insert', 'delete', 0)
+    `);
+    return companyId;
+  });
+}
+
 function camelise(row: Record<string, unknown>): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(row)) {
@@ -471,81 +503,150 @@ describe("§0b `a dry run touches nothing` is also enforced by the database", ()
    * preview does not write. These prove it COULD not, which is a different
    * and stronger claim: they survive a refactor of `server/actions/import.ts`
    * that this suite would otherwise have to be re-run to catch.
+   *
+   * ══════════════════════════════════════════════════════════════════════
+   * ⭐ REWRITTEN AT WAVE 4 INTEGRATION — SAME RULES, THE TABLE THAT SHIPPED
+   * ══════════════════════════════════════════════════════════════════════
+   * Phase 2 and Phase 3 each wrote `import_row_provenance` without seeing
+   * the other. These tests were written against Phase 3's version, with
+   * `record_number`, `source_name` and no reversal columns. The version
+   * that ships is Phase 2's (0205) — because that is the shape
+   * `db/schema/import-runs.ts` declares and `server/import/reversal.ts`
+   * writes, and nothing in TypeScript ever read the other one.
+   *
+   * ⚠️ EVERY RULE THESE TESTS ASSERTED STILL HOLDS. Only the column names
+   * and the enforcing object changed:
+   *   · run_id NOT NULL              → still a NOT NULL column
+   *   · destination must exist       → 0205's `same_transaction` trigger,
+   *                                     which also refuses a denied table,
+   *                                     a table with no tenant_id, and a
+   *                                     target row this transaction did
+   *                                     not write
+   *   · whole-file ⇒ no row number   → CHECK
+   *                                     `import_row_provenance_row_number_present`
+   *                                     on `input_row_number`
+   *   · evidence cannot be rewritten → 0205's `immutable` trigger
+   *
+   * ⚠️ AND ONE TEST IS ADDED, NOT TRANSLATED. Phase 3's file refused EVERY
+   * update. `server/import/reversal.ts:444` records a reversal by updating
+   * this row, so that rule would have broken every undo in the product.
+   * The last test below pins the distinction: evidence is frozen, the
+   * reversal fields are not.
    */
-  it("REFUSES provenance with no run — and a preview has no run", async () => {
+
+  /** 0205's shape. `written_xid` is NOT NULL and the trigger overwrites it. */
+  const insertProvenance = async (over: {
+    runId: string | null;
+    targetTable: string;
+    targetId: string;
+    cardinality?: string;
+    inputRowNumber?: number | null;
+  }) => {
     const { withTenant } = await import("@/db");
     const { sql } = await import("drizzle-orm");
+    return withTenant(tenantId, (tx) =>
+      tx.execute(sql`
+        INSERT INTO import_row_provenance
+          (tenant_id, run_id, entity_key, input_row_number, cardinality,
+           target_table, target_id, operation, reversal_kind, written_xid)
+        VALUES (${tenantId}, ${over.runId}, 'companies',
+                ${over.inputRowNumber === undefined ? 1 : over.inputRowNumber},
+                ${over.cardinality ?? "one-to-one"},
+                ${over.targetTable}, ${over.targetId}, 'insert', 'delete', 0)
+      `),
+    );
+  };
+
+  /**
+   * ⚠️ THE TARGET ROW IS WRITTEN FOR REAL, IN THE SAME TRANSACTION, AND
+   * THAT IS NOT FIXTURE FUSS. A BEFORE INSERT trigger runs before NOT NULL
+   * and CHECK are evaluated, so `same_transaction` refuses an invented
+   * target id first and the constraint under test never gets a turn. An
+   * earlier version of this test passed a `gen_random_uuid()` and asserted
+   * on the wrong refusal.
+   */
+  it("REFUSES provenance with no run — and a preview has no run", async () => {
     await expectRefusal(
-      withTenant(tenantId, (tx) =>
-        tx.execute(sql`
-          INSERT INTO import_row_provenance
-            (tenant_id, run_id, entity_key, record_number, target_table, target_id, cardinality)
-          VALUES (${tenantId}, NULL, 'companies', 2, 'companies', gen_random_uuid(), 'one-to-one')
-        `),
-      ),
+      writeCompanyWithProvenance(null),
       /null value in column "run_id"/,
     );
   });
 
   it("REFUSES a destination table that does not exist", async () => {
-    const { withTenant } = await import("@/db");
-    const { sql } = await import("drizzle-orm");
     const runId = await makeRun();
     await expectRefusal(
-      withTenant(tenantId, (tx) =>
-        tx.execute(sql`
-          INSERT INTO import_row_provenance
-            (tenant_id, run_id, entity_key, record_number, target_table, target_id, cardinality)
-          VALUES (${tenantId}, ${runId}, 'companies', 2, 'not_a_table', gen_random_uuid(), 'one-to-one')
-        `),
-      ),
-      /cannot be reversed and cannot be reconciled/,
+      insertProvenance({
+        runId,
+        targetTable: "not_a_table",
+        targetId: randomUUID(),
+      }),
+      /can never be reversed and never be reconciled/,
+    );
+  });
+
+  it("REFUSES a destination that is not an import destination at all", async () => {
+    const runId = await makeRun();
+    await expectRefusal(
+      insertProvenance({ runId, targetTable: "users", targetId: randomUUID() }),
+      /not an import destination/,
     );
   });
 
   it("REFUSES a whole-file row that names a record number, and one that omits it when it should not", async () => {
-    const { withTenant } = await import("@/db");
-    const { sql } = await import("drizzle-orm");
     const runId = await makeRun();
-
-    const insert = (cardinality: string, record: number | null) =>
-      withTenant(tenantId, (tx) =>
-        tx.execute(sql`
-          INSERT INTO import_row_provenance
-            (tenant_id, run_id, entity_key, record_number, target_table, target_id, cardinality)
-          VALUES (${tenantId}, ${runId}, 'opening-trial-balance', ${record},
-                  'transactions', gen_random_uuid(), ${cardinality})
-        `),
-      );
-
-    await expectRefusal(insert("whole-file", 2), /record_number_matches_cardinality/);
-    await expectRefusal(insert("one-to-one", null), /record_number_matches_cardinality/);
+    await expectRefusal(
+      writeCompanyWithProvenance(runId, { cardinality: "whole-file", inputRowNumber: 2 }),
+      /import_row_provenance_row_number_present/,
+    );
+    await expectRefusal(
+      writeCompanyWithProvenance(runId, { cardinality: "one-to-one", inputRowNumber: null }),
+      /import_row_provenance_row_number_present/,
+    );
     /* ⭐ AND THE POSITIVE CASE, so this is a rule and not a locked door. */
-    await expect(insert("whole-file", null)).resolves.toBeDefined();
+    await expect(
+      writeCompanyWithProvenance(runId, { cardinality: "whole-file", inputRowNumber: null }),
+    ).resolves.toBeDefined();
   });
 
-  it("REFUSES an UPDATE — provenance is what a reversal reads to decide what to delete", async () => {
+  it("REFUSES an UPDATE to the evidence — provenance is what a reversal reads to decide what to delete", async () => {
     const { withTenant } = await import("@/db");
     const { sql } = await import("drizzle-orm");
     const runId = await makeRun();
-
-    await withTenant(tenantId, (tx) =>
-      tx.execute(sql`
-        INSERT INTO import_row_provenance
-          (tenant_id, run_id, entity_key, record_number, target_table, target_id, cardinality)
-        VALUES (${tenantId}, ${runId}, 'companies', 2, 'companies', gen_random_uuid(), 'one-to-one')
-      `),
-    );
+    const companyId = await writeCompanyWithProvenance(runId);
 
     await expectRefusal(
       withTenant(tenantId, (tx) =>
         tx.execute(sql`
-          UPDATE import_row_provenance SET run_id = ${runId}
-           WHERE tenant_id = ${tenantId} AND run_id = ${runId}
+          UPDATE import_row_provenance
+             SET target_table = 'leads'
+           WHERE tenant_id = ${tenantId} AND target_id = ${companyId}
         `),
       ),
-      /import_row_provenance is append-only/,
+      /cannot be rewritten/,
     );
+  });
+
+  /**
+   * ⭐ THE OTHER HALF OF THE SAME RULE, AND THE TEST THAT WOULD HAVE CAUGHT
+   * THE SUPERSEDED FILE. Phase 3's blanket trigger refused this write, so
+   * the first customer to undo an import would have been told the table is
+   * append-only and their rows would have stayed imported.
+   */
+  it("PERMITS the reversal fields — this is the write that records an undo", async () => {
+    const { withTenant } = await import("@/db");
+    const { sql } = await import("drizzle-orm");
+    const runId = await makeRun();
+    const companyId = await writeCompanyWithProvenance(runId);
+
+    await expect(
+      withTenant(tenantId, (tx) =>
+        tx.execute(sql`
+          UPDATE import_row_provenance
+             SET reversed_at = now(), reversal_id = gen_random_uuid()
+           WHERE tenant_id = ${tenantId} AND target_id = ${companyId}
+        `),
+      ),
+    ).resolves.toBeDefined();
   });
 });
 
@@ -797,7 +898,29 @@ describe("§7 the two findings this corpus produced, recorded as tests so they c
    * what a reversal can undo: a reversal reading only the declared target
    * would find the transaction and leave every journal leg behind.
    */
-  it("FINDING: the trial balance writes `journal_entries`, which its contract does not declare", async () => {
+  /**
+   * ⭐ THIS FINDING WAS REAL, AND IT HAS SINCE BEEN FIXED. The test is kept
+   * and inverted rather than deleted, which is what "recorded so they
+   * cannot fade" has to mean once a finding is closed: it now asserts the
+   * fix, so a regression re-opens the original defect as a failure.
+   *
+   * ══════════════════════════════════════════════════════════════════════
+   * ⚠️ AND IT HAD NEVER ONCE RUN — WAVE 4 INTEGRATION
+   * ══════════════════════════════════════════════════════════════════════
+   * `verifyDryRun` calls `import_destination_row_count()`, which SQL 0216
+   * creates, and 0216 was one of the fourteen files held back from
+   * production. So this whole section could only ever fail with "function
+   * does not exist". Its expectation was written by reading the code, not
+   * by running it. The first real run said something different: the
+   * contract now declares `journal_entries`, and the undeclared
+   * destination reported instead was `change_log` — which is not a
+   * destination at all, and is now filtered by `NEVER_A_DESTINATION` in
+   * `server/import/dryrun.ts`.
+   *
+   * 🔴 THE LESSON, BECAUSE IT IS THE ONE THIS REPOSITORY KEEPS RE-LEARNING:
+   * a test that cannot execute is not a weaker test, it is a comment.
+   */
+  it("FINDING (fixed): the trial balance now declares `journal_entries`, the table that holds the money", async () => {
     const csv =
       "Account code,Account name,As at,Debit,Credit\n" +
       `${CODE_DEBIT},Opening Bank,2026-06-30,55000.00,\n` +
@@ -806,35 +929,35 @@ describe("§7 the two findings this corpus produced, recorded as tests so they c
     const verdict = await verify("opening-trial-balance", csv, "fail");
 
     expect(verdict.problems).toEqual([]);
-    expect(verdict.undeclaredDestinations).toContain("journal_entries");
 
     const { declaredDestinations } = await import("@/server/import/dryrun");
     const { ALL_IMPORT_ENTITIES } = await import("@/lib/import/entities");
-    expect(declaredDestinations(ALL_IMPORT_ENTITIES["opening-trial-balance"])).not.toContain(
-      "journal_entries",
-    );
+    const declared = declaredDestinations(ALL_IMPORT_ENTITIES["opening-trial-balance"]);
+
+    /* The fix: the writer inserts into both, and the contract says both. */
+    expect(declared).toContain("transactions");
+    expect(declared).toContain("journal_entries");
+
+    /*
+     * ⚠️ AND NOTHING IS LEFT UNDECLARED. A reversal reads the declared
+     * targets to decide what it may undo; a target the writer touches and
+     * the contract omits is a leg the undo leaves behind.
+     */
+    expect(verdict.undeclaredDestinations).toEqual([]);
   });
 
   /**
-   * 🔴 FINDING 2 — AN ATOMIC ENTITY WITH ONE UNRESOLVABLE LOOKUP DRIFTS.
-   *
-   * A lookup miss is removed from `validRows` in `server/actions/import.ts`
-   * AFTER `fileRule` has already balanced the WHOLE file. What reaches the
-   * writer is therefore an unbalanced subset, and the deferred
-   * `journal_entries_balance_check` refuses the transaction at COMMIT.
-   *
-   * ⚠️ THE PREVIEW PROMISED THOSE ROWS AND THEY DO NOT LAND. It is not a
-   * data-loss bug — nothing is written — but it is precisely the number
-   * that does not match, which is what this phase exists to catch.
-   *
-   * ⭐ IT IS ASSERTED AS DRIFT RATHER THAN "FIXED", because the fix is in
-   * `server/actions/import.ts` and in `lib/import/opening-entities.ts`,
-   * neither of which Phase 3 owns. `PATCH-REQUEST-PHASE-3.md` carries it.
-   * A test that asserted the correct behaviour would be red on delivery
-   * and would be deleted by somebody in a hurry; a test that asserts the
-   * defect goes red the moment it is fixed, which is when somebody should
-   * come back and read this comment.
+   * 🔴 AND THE FILTER IS NOT A BLINDFOLD. `change_log` is excluded from the
+   * undeclared REPORT and still measured, so the recorders cannot become a
+   * place a write hides.
    */
+  it("the change recorder is measured even though it is not reported as a destination", async () => {
+    const { NEVER_A_DESTINATION } = await import("@/server/import/dryrun");
+    expect(NEVER_A_DESTINATION).toContain("change_log");
+    expect(NEVER_A_DESTINATION).not.toContain("transactions");
+    expect(NEVER_A_DESTINATION).not.toContain("import_row_provenance");
+  });
+
   it("FINDING: an atomic file with one unresolvable account promises rows that cannot land", async () => {
     const csv =
       "Account code,Account name,As at,Debit,Credit\n" +

@@ -1,6 +1,6 @@
 {
   "name": "ordence",
-  "version": "1.93.0-alpha",
+  "version": "1.95.0-alpha",
   "private": true,
   "scripts": {
     "gen:cron-runbook": "node scripts/generate-cron-runbook.mjs",

@@ -227,6 +227,17 @@ export const ENV_CATEGORIES: EnvCategory[] = [
       "CSP_ENFORCE",
       "CSP_REPORT_URI",
       /**
+       * ⭐ WAVE 3B. The HMAC key behind the `_ordence-challenge` TXT
+       * record that proves a customer owns a custom domain.
+       *
+       * ⚠️ IT IS CATALOGUED BECAUSE ITS ABSENCE IS SILENT EVERYWHERE
+       * ELSE. Unset, the product still boots, still routes and still
+       * shows the settings screen — and every attempt to verify a domain
+       * refuses. `/api/diag` is the one endpoint built to say which
+       * setting is missing, and it reports only catalogued names.
+       */
+      "CUSTOM_DOMAIN_VERIFICATION_SECRET",
+      /**
        * ⚠️ Read by `scripts/` only, never by the application, and still an
        * operator-set safety catch. Listed for that reason.
        */

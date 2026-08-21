@@ -456,6 +456,24 @@ async function resolveLookups(
             and(
               eq(stockItems.tenantId, ctx.tenant.id),
               eq(stockItems.isActive, true),
+              /*
+               * 🔴 `deleted_at IS NULL`, AND `is_active` IS NOT THE SAME
+               *    QUESTION — Wave 4 integration.
+               *
+               * The unique index here is PARTIAL and excludes soft-deleted
+               * rows, so one workspace can hold a deleted `CEM-53` and a
+               * live one at the same time. Filtering on `is_active` alone
+               * let the lookup return the deleted one, and the preview
+               * reported `create: 1` with no error — a batch, or an entire
+               * opening stock quantity, attached to an item nobody in the
+               * product can see.
+               *
+               * ⚠️ IT WAS THREE LOOKUPS, NOT ONE. `PATCH-REQUEST-PHASE-7.md`
+               * named `stock_item_by_sku`; `warehouse_by_code` had exactly
+               * the same shape and nothing had asked about it. Both are
+               * fixed here.
+               */
+              isNull(stockItems.deletedAt),
               inArray(sql`lower(${stockItems.sku})`, list),
             ),
           )
@@ -474,6 +492,8 @@ async function resolveLookups(
             and(
               eq(warehouses.tenantId, ctx.tenant.id),
               eq(warehouses.isActive, true),
+              /* Same defect, same fix — see the note on stock items above. */
+              isNull(warehouses.deletedAt),
               inArray(sql`lower(${warehouses.code})`, list),
             ),
           )

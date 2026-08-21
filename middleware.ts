@@ -21,6 +21,7 @@ import {
   TENANT_HEADERS,
   SPOOFABLE_HEADERS,
   resolveTenantFromHost,
+  encodeTenantHostClaim,
   generateRequestId,
 } from "@/lib/tenant";
 import { buildCsp, cspHeaderName, generateNonce } from "@/lib/security/csp";
@@ -841,6 +842,37 @@ async function run(auth: ClerkAuth, req: NextRequest) {
     platformHost: platformHost(),
   });
 
+  /* -- 2b. ⭐ WAVE 3B — RECORD THE HOST, ONCE, BEFORE ANY EXIT --------
+   *
+   * ══════════════════════════════════════════════════════════════════
+   * 🔴 THIS IS THE ONLY WRITE, AND IT IS UNCONDITIONAL ON PURPOSE
+   * ══════════════════════════════════════════════════════════════════
+   * `requireTenantContext` refuses a request that arrives on a custom
+   * domain the workspace has not verified. That refusal is only worth
+   * anything if the header is present on EVERY request that reaches a
+   * server component , a branch that forwarded headers without setting
+   * it would be a silent hole in exactly the check this wave adds.
+   *
+   * So it is set here, immediately after the locator exists and before
+   * the console-host branch, the rewrite, the redirects and `forward()`.
+   * Every later exit inherits it.
+   *
+   * ⚠️ IT REPLACES the old `x-tenant-slug: domain:<host>` write, which
+   * was overwritten by the organisation slug further down and read by
+   * nothing. `tenantSlug` now means one thing only: the Clerk
+   * organisation's label.
+   */
+  headers.set(
+    TENANT_HEADERS.tenantHost,
+    encodeTenantHostClaim(
+      locator.kind === "subdomain"
+        ? { kind: "subdomain", slug: locator.slug }
+        : locator.kind === "custom-domain"
+          ? { kind: "custom-domain", domain: locator.domain }
+          : { kind: "root" },
+    ),
+  );
+
   /**
    * ⭐ THE STAFF CONSOLE HOST — `admin.ordence.com`.
    *
@@ -922,9 +954,14 @@ async function run(auth: ClerkAuth, req: NextRequest) {
 
   if (locator.kind === "subdomain") {
     headers.set(TENANT_HEADERS.tenantSlug, locator.slug);
-  } else if (locator.kind === "custom-domain") {
-    headers.set(TENANT_HEADERS.tenantSlug, `domain:${locator.domain}`);
   }
+  /*
+   * ⚠️ NO `else if` FOR THE CUSTOM DOMAIN ANY MORE , WAVE 3B.
+   * It used to write `domain:<host>` into `tenantSlug` here, and step 8
+   * below overwrote it with `orgSlug` on every authenticated request.
+   * The host now travels in `TENANT_HEADERS.tenantHost`, set at step 2b,
+   * which nothing overwrites and `requireTenantContext` enforces.
+   */
 
   /*
    * ⚠️ `withCsp` IS APPLIED HERE AND ON THE REWRITE ABOVE — AND NOWHERE

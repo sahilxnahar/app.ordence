@@ -763,31 +763,43 @@ describe("an irreversible refusal", () => {
 });
 
 /* ================================================================== */
-/* ④ 🔴 THE FINDING: 0215 REFUSES WHAT 0205 EXISTS TO PERMIT           */
+/* ④ ⭐ THE FINDING, NOW FIXED: 0215 REFUSED WHAT 0205 EXISTS TO PERMIT */
 /* ================================================================== */
 
-describe("SQL 0215 §4 against SQL 0205 §5", () => {
+describe("the import pack, as it now ships, permits an undo to complete", () => {
   /**
-   * 🔴 BOTH FILES ARE IN THE UNAPPLIED TWELVE, AND THEY DEFINE THE SAME
-   * TABLE TWICE.
+   * ══════════════════════════════════════════════════════════════════════
+   * 🔴 WHAT THIS SECTION FOUND, AND WHAT WAS DONE ABOUT IT
+   * ══════════════════════════════════════════════════════════════════════
+   * Phase 2 and Phase 3 each wrote `import_row_provenance` without seeing
+   * the other, and each gave it an update rule:
    *
-   *   0205 §5 `import_row_provenance_immutable` — every column is frozen
-   *           EXCEPT `reversed_at` and `reversal_id`, which is precisely
-   *           how a reversal marks a row as undone, in the same
-   *           transaction as the undo itself.
+   *   0205 `import_row_provenance_immutable` — every evidential column is
+   *        frozen EXCEPT `reversed_at` and `reversal_id`, which is exactly
+   *        how a reversal marks a row undone, in the same transaction as
+   *        the undo.
    *
-   *   0215 §4 `import_row_provenance_is_append_only` — RAISE EXCEPTION on
-   *           BEFORE UPDATE, unconditionally, for every role.
+   *   0215 `import_row_provenance_is_append_only` — RAISE EXCEPTION on
+   *        BEFORE UPDATE, unconditionally, for every role.
    *
-   * They are two DIFFERENT trigger names on the same table, so the second
-   * does not replace the first: it sits beside it and refuses first. The
-   * result, applied as the ordered pack integration intends to send, is
-   * that NO undo of any kind can complete — every one reports `partial`,
-   * 0 of N, `23001`, and correctly keeps the file claimed forever.
+   * Two different trigger NAMES on one table, so the second did not
+   * replace the first — it sat beside it and refused first. Applied as the
+   * ordered pack, NO undo of any kind could complete: every one reported
+   * `partial`, 0 of N, SQLSTATE 23001, and correctly kept the file claimed
+   * forever. This section proved it by induction from both sides.
    *
-   * ⚠️ THIS IS PROVED BY INDUCTION FROM BOTH SIDES. With the 0215 trigger
-   * present: 0 of 3. With it dropped, the same code on the same fixture:
-   * 3 of 3. A test that only showed the failure could be a broken fixture.
+   * ⭐ WAVE 4 INTEGRATION RECONCILED THE TWO FILES. 0215 no longer creates
+   * the table and no longer carries the blanket trigger; it keeps only the
+   * change-log decision, and refuses if the blanket trigger is found. The
+   * shape that ships is 0205's, because that is the one
+   * `db/schema/import-runs.ts` declares and `server/import/reversal.ts`
+   * writes.
+   *
+   * ⚠️ THE TEST IS INVERTED, NOT DELETED, AND THE INDUCTION IS KEPT. It now
+   * proves the undo completes as shipped, AND re-creates the superseded
+   * trigger to prove the failure was real and would be caught again. A
+   * finding that is merely deleted once fixed is a finding that can come
+   * back quietly.
    */
   const BLANKET = "import_row_provenance_no_update";
 
@@ -843,51 +855,65 @@ describe("SQL 0215 §4 against SQL 0205 §5", () => {
     return { t, runId: run.runId, result };
   }
 
-  it("makes every undo 0-of-N with the pack as ordered, and 3-of-3 without it", async () => {
-    /** The two triggers really are both there, which is the finding. */
+  it("undoes 3 of 3 with the pack as it now ships", async () => {
     const triggers = await triggersOnProvenance();
+    /** 0205's trigger is the one that survived, and it is still there. */
     expect(triggers).toContain("import_row_provenance_immutable");
-    expect(triggers).toContain(BLANKET);
+    /** The blanket trigger is gone, and its absence is the fix. */
+    expect(triggers).not.toContain(BLANKET);
 
-    const blocked = await undoThreeInvoices("pack-on");
-    expect(blocked.result.ok).toBe(true);
-    if (!blocked.result.ok) throw new Error("unreachable");
-    expect(blocked.result.data.status).toBe("partial");
-    expect(blocked.result.data.rowsReversed).toBe(0);
-    expect(blocked.result.data.rowsUnreversed).toBe(3);
-    for (const failure of blocked.result.data.failures) {
-      expect(failure.sqlstate).toBe("23001");
-      expect(failure.blockedBy).toContain("append-only");
-    }
-    /** The rows are still in the workspace, and the file is still claimed. */
-    expect(await countOf("sales_invoices", "tenant_id = $1", [blocked.t])).toBe(3);
-    expect(await supersededAt(blocked.runId)).toBeNull();
-    await cleanupTenant(blocked.t);
+    const freed = await undoThreeInvoices("pack-shipped");
+    expect(freed.result.ok).toBe(true);
+    if (!freed.result.ok) throw new Error("unreachable");
+    expect(freed.result.data.status).toBe("reversed");
+    expect(freed.result.data.rowsReversed).toBe(3);
+    expect(freed.result.data.rowsUnreversed).toBe(0);
+    expect(await countOf("sales_invoices", "tenant_id = $1", [freed.t])).toBe(0);
+    /** A COMPLETE undo releases the claim — the other half of the rule. */
+    expect(await supersededAt(freed.runId)).not.toBeNull();
+    await cleanupTenant(freed.t);
+  });
 
-    /** ⭐ THE OTHER SIDE OF THE INDUCTION. */
+  it("and the superseded trigger, re-created, still breaks every undo — so the fix is load-bearing", async () => {
     await asSuperuser((c) =>
-      c.query(`DROP TRIGGER ${BLANKET} ON public.import_row_provenance`),
+      c.query(
+        `CREATE OR REPLACE FUNCTION public.import_row_provenance_is_append_only()
+         RETURNS trigger LANGUAGE plpgsql AS $fn$
+         BEGIN
+           RAISE EXCEPTION 'import_row_provenance is append-only. Row %', OLD.id
+             USING ERRCODE = 'restrict_violation';
+         END $fn$`,
+      ),
     );
+    await asSuperuser((c) =>
+      c.query(
+        `CREATE TRIGGER ${BLANKET} BEFORE UPDATE ON public.import_row_provenance
+           FOR EACH ROW EXECUTE FUNCTION public.import_row_provenance_is_append_only()`,
+      ),
+    );
+
     try {
-      const freed = await undoThreeInvoices("pack-off");
-      expect(freed.result.ok).toBe(true);
-      if (!freed.result.ok) throw new Error("unreachable");
-      expect(freed.result.data.status).toBe("reversed");
-      expect(freed.result.data.rowsReversed).toBe(3);
-      expect(freed.result.data.rowsUnreversed).toBe(0);
-      expect(await countOf("sales_invoices", "tenant_id = $1", [freed.t])).toBe(0);
-      /** A COMPLETE undo does release the claim — the other half of the rule. */
-      expect(await supersededAt(freed.runId)).not.toBeNull();
-      await cleanupTenant(freed.t);
+      const blocked = await undoThreeInvoices("pack-superseded");
+      expect(blocked.result.ok).toBe(true);
+      if (!blocked.result.ok) throw new Error("unreachable");
+      expect(blocked.result.data.status).toBe("partial");
+      expect(blocked.result.data.rowsReversed).toBe(0);
+      expect(blocked.result.data.rowsUnreversed).toBe(3);
+      for (const failure of blocked.result.data.failures) {
+        expect(failure.sqlstate).toBe("23001");
+        expect(failure.blockedBy).toContain("append-only");
+      }
+      /** The rows stay, and the file stays claimed. Both are correct. */
+      expect(await countOf("sales_invoices", "tenant_id = $1", [blocked.t])).toBe(3);
+      expect(await supersededAt(blocked.runId)).toBeNull();
+      await cleanupTenant(blocked.t);
     } finally {
+      await asSuperuser((c) => c.query(`DROP TRIGGER ${BLANKET} ON public.import_row_provenance`));
       await asSuperuser((c) =>
-        c.query(
-          `CREATE TRIGGER ${BLANKET} BEFORE UPDATE ON public.import_row_provenance
-             FOR EACH ROW EXECUTE FUNCTION public.import_row_provenance_is_append_only()`,
-        ),
+        c.query(`DROP FUNCTION IF EXISTS public.import_row_provenance_is_append_only()`),
       );
     }
 
-    expect(await triggersOnProvenance()).toContain(BLANKET);
+    expect(await triggersOnProvenance()).not.toContain(BLANKET);
   });
 });

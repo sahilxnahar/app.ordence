@@ -1,3 +1,153 @@
+# v1.95.0-alpha , WAVE 4: THE SQL PACK, AND WHAT IT WAS HIDING
+
+**Repo: `app.ordence`** * 🔴 **SQL: fourteen files, `0205`-`0275`, in that order, AFTER the code push** * ⚠️ **No new environment variables beyond v1.94.0's `CUSTOM_DOMAIN_VERIFICATION_SECRET`**
+
+**31/31 gates green. 1,656 tests passing across 71 files. `tsc` clean.**
+**Applied end to end against a real PostgreSQL 16, twice, from an empty database.**
+
+- 🔴🔴 **PHASE 2 AND PHASE 3 EACH BUILT THE SAME TABLE, AND THE TWO COULD NOT
+  BOTH BE APPLIED.** Track M1 specified `import_row_provenance` as SQL 0196 and
+  shipped no DDL. Two parallel chats noticed the gap independently and each
+  wrote the table, neither able to see the other. Their shapes disagree, both
+  are `CREATE TABLE IF NOT EXISTS`, so whichever ran second was a silent no-op
+  and then its own shape assertion, correctly, refused. **The pack would have
+  aborted partway through, in production, on the seventh file.**
+
+- 🔴🔴 **AND THE LOSING VERSION WOULD HAVE BROKEN EVERY UNDO.** Phase 3's
+  `import_row_provenance_no_update` raised on every UPDATE, unconditionally, for
+  every role. A reversal is recorded ON THAT ROW , `server/import/reversal.ts`
+  sets `reversed_at` and `reversal_id`. The first customer to undo an import
+  would have been told the table is append-only; their rows would have stayed
+  imported; the feature would have read as broken rather than the migration.
+  **Proved by induction against a live database: 0 of 3 with that trigger,
+  3 of 3 without it.** Wave 2B had already found this and written it up as a
+  failing test, expecting integration to resolve it. This is the resolution.
+
+- 🔴 **ONE FILE SAID LOG THIS TABLE, THE OTHER SAID DO NOT.** 0205 calls
+  `attach_change_log_triggers()`; 0215 declares the table exempt. The function
+  skips excluded tables, so the outcome depended purely on which ran first , and
+  in the ordered pack, the losing order. The exemption is right: one change_log
+  row per imported row, each carrying two JSONB copies of a row that can never
+  differ, into the fastest-growing table in the product, during a bulk import.
+  0215 now also DETACHES the recorder, because declaring the exemption without
+  removing the trigger leaves a table both recorded and declared exempt , and
+  0122's coverage check passes on either, so nothing would ever have said so.
+
+- 🔴 **0205 THEN REFUSED ITS OWN RE-RUN.** Its self-verification demanded four
+  triggers, one of them the change-log recorder 0215 removes. A first forward
+  run passed by luck of ordering; a second failed. These files are written
+  idempotent precisely so they can be re-run. The assertion now asks the same
+  question `attach_change_log_triggers()` asks , attached UNLESS excluded , and
+  refuses the contradictory both-at-once state as well.
+
+- ⭐ **A GUARD I ADDED, THEN DELETED.** The reconciliation first kept Phase 3's
+  trigger refusing provenance that names a destination table which does not
+  exist. 0205's `same_transaction` already refuses exactly that and more , a
+  denied table, a table with no `tenant_id`, a target row this transaction did
+  not write , and fires first, so the second copy could never even produce its
+  message. **A second copy of a guard is two places to fix and one of them gets
+  missed.** Removed before shipping, and 0215 now refuses a database that has it.
+
+- 🔴 **A SOFT-DELETED STOCK ITEM STILL MATCHED AN IMPORT LOOKUP.** The unique
+  index is partial and excludes deleted rows, so a workspace can hold a deleted
+  `CEM-53` and a live one at once; `resolveLookups` filtered on `is_active` and
+  not on `deleted_at`. A preview reported `create: 1` with no error , a batch,
+  or an entire opening stock quantity, attached to an item nobody in the product
+  can see. **It was three lookups, not the one the patch request named.**
+
+- 🔴 **MOST OF THE THIRTY GATES HAVE NEVER RUN IN CI.** `security-ci.yml` ran
+  four hand-picked ones, not the manifest. `npm run gates:static` and
+  `gates:database` are now both wired in, so registering a gate is enough to
+  make it run.
+
+- 🔴 **AND A WAVE 1 REGRESSION OF MY OWN, CAUGHT THE MOMENT THE SUITE HAD A
+  DATABASE.** `server/platform/adopt-clerk-org.ts` calls Clerk's admin user API,
+  which `enumeration-prevention.test.ts` forbids in runtime code. The call is
+  gated behind the platform console and refuses on an ambiguous match , the
+  second of the two fixes that test's own comment names. It is now a declared
+  exemption with a stated reason, and a second test refuses that exemption once
+  it goes stale.
+
+- ⚠️ **FOUR TESTS ASSERTED DEFECTS THAT HAD SINCE BEEN FIXED**, and one asserted
+  the absence of files that now exist. Every one is inverted rather than deleted,
+  so each now guards its own fix. Three of them could never have run at all:
+  they call a function SQL 0216 creates, and 0216 was in the held-back pack.
+  **A test that cannot execute is not a weaker test, it is a comment.**
+
+- ⚠️ **`change_log` WAS BEING REPORTED AS AN UNDECLARED IMPORT DESTINATION**,
+  for every entity, always, because the footprint sweep asks the catalogue for
+  every table with a `tenant_id`. `NEVER_A_DESTINATION` now mirrors the denied
+  list inside 0205's own trigger, so the database and the measurement agree by
+  construction. Those tables are still MEASURED , a preview that wrote an audit
+  row is still caught.
+
+- ⚠️ **DELETING A WORKSPACE IS STILL BLOCKED**, now by a second mechanism.
+  Track D documented `security_events` refusing the `SET NULL`; this run found
+  `lead_activities` refusing the cascade DELETE. The product is unchanged here
+  and the decision stays Track D's. Recorded, with the drill.
+
+# v1.94.0-alpha , WAVE 3B: THE HOSTNAME NOBODY CHECKED
+
+**Repo: `app.ordence`** * ⚠️ **No SQL. Nothing to run, in either order.** * 🔴 **One new environment variable: `CUSTOM_DOMAIN_VERIFICATION_SECRET`**
+
+- 🔴🔴 **ANY HOSTNAME POINTED AT ORDENCE SERVED A WORKSPACE.**
+  `resolveTenantFromHost` has classified an unrecognised host as
+  `{ kind: "custom-domain" }` since the beginning, and the deployment answers on
+  it with a valid wildcard certificate. Nothing checked that the name had
+  anything to do with the workspace being rendered. Point DNS at us, sign in,
+  and the product drew your own ledger under someone else's name.
+  **It was never a data leak** , RLS scoped every query to the caller's own
+  workspace throughout, and no row of anyone else's data was reachable. It was
+  an **impersonation surface**: a phishing page the product hosted on request.
+
+- 🔴 **THE TWO COLUMNS BUILT TO PREVENT IT WERE DECORATIVE.**
+  `tenants.custom_domain` and `tenants.custom_domain_verified_at` have existed
+  since `0091`, with a partial unique index on the first.
+  **No code in the product wrote either one**, and middleware did not route on
+  them. This wave makes the first writer, and the first reader.
+
+- 🔴 **AND THE HEADER THAT WAS SUPPOSED TO CARRY THE HOST DIED IN TRANSIT.**
+  Middleware wrote `x-tenant-slug: domain:<host>` , and seventy lines later
+  overwrote it with the Clerk organisation slug on every authenticated request.
+  Nothing read it in either state. The host now travels in its own header,
+  `x-tenant-host`, set once, before every exit, overwritten by nothing.
+
+- ⭐ **ENFORCED WHERE THE TENANT IS ALREADY LOADED, AT ZERO QUERY COST.**
+  The check could not go in middleware: that file's own header states why , *a
+  slow query takes every tenant hostname offline*. `requireTenantContext` has
+  the tenant row in hand for a different reason, so the refusal costs nothing.
+  A request on a custom domain must match that workspace's `custom_domain`
+  **and** carry a non-null `custom_domain_verified_at`. Both halves, because a
+  claimed-but-unverified domain is a state any attacker can reach unaided.
+
+- ⭐ **OWNERSHIP IS PROVED BY DNS, AND THE CHALLENGE IS DERIVED, NOT STORED.**
+  An HMAC over `<tenant id>:<domain>`, published as TXT at
+  `_ordence-challenge.<domain>`. No third column that nothing writes , the
+  defect this wave closes is not re-introduced by the fix for it. The token is
+  bound to both the workspace and the name, so it proves nothing anywhere else.
+
+- 🔴 **THE RAILWAY HOSTNAME WAS ONE DEPLOY FROM LOCKING EVERYONE OUT.**
+  The resolver excused `.workers.dev` and `.vercel.app` from tenant resolution
+  and **not the platform we actually run on**. Harmless while a custom-domain
+  verdict changed nothing; with this wave's refusal in place, the first deploy
+  would have refused every signed-in request on `<service>.up.railway.app` ,
+  including from whoever went there to find out why. Added, with the reasoning.
+
+- ⭐ **THE SCREEN SHIPS IN THE SAME COMMIT AS THE REFUSAL.**
+  Settings ▸ Custom domain shows three states and never pretends to be in a
+  fourth: no domain, claimed-and-not-working-yet (in those words, with the
+  record to publish), verified. A refusal with no screen to clear it is a
+  lockout, and this codebase has thirteen prior instances of shipping the engine
+  without the navigation.
+
+- ⚠️ **THE SECRET IS OPTIONAL IN THE SCHEMA AND REFUSED AT USE.** Unset,
+  verification reports that the deployment is not configured. It must never mean
+  *no token expected*, because a check that expects nothing passes against a
+  domain that carries nothing.
+
+**All static gates green. `tsc` and the four `tsx`-backed gates could not run in
+this environment , see the delivery note.**
+
 # v1.68.0-alpha , TWO STATUTES THE PRODUCT WAS NOT APPLYING
 
 **Repo: `app.ordence`** * 🔴 **SQL: `0106`, run it before or after the push, either order is safe** * ⚠️ **No new environment variables**
@@ -373,7 +523,7 @@ them: a column that is stored and read by nothing.
   project has been saved by running a file the way it is actually used
   rather than the way it reads.**
 
-# v1.55.0-alpha — EVERY LINK IN THE STAFF CONSOLE
+# v1.55.0-alpha , EVERY LINK IN THE STAFF CONSOLE
 
 **Repo: `app.ordence`** · 🔴 **SQL: unchanged (`0086`–`0090`)** · ⚠️ **No new variables**
 
@@ -398,7 +548,7 @@ them: a column that is stored and read by nothing.
 - ⭐ **EIGHTEENTH GATE: `check:console-links`.** No hard-coded `/platform`
   href inside `app/platform/**`. Proven by reintroducing one.
 - ⚠️ **Eighteen gates green. 128 test files, 4,467 passing.**
-# v1.54.0-alpha — THE 500 ON EVERY ROUTE
+# v1.54.0-alpha , THE 500 ON EVERY ROUTE
 
 **Repo: `app.ordence`** · 🔴 **SQL: unchanged (`0086`–`0090`)** · ⚠️ **No new variables**
 
@@ -419,7 +569,7 @@ them: a column that is stored and read by nothing.
   lives at `admin.ordence.com`. That is the documented behaviour, not a
   regression.
 - ⚠️ **Seventeen gates green. 128 test files, 4,467 passing.**
-# v1.53.0-alpha — THE BUILD FIX, AND THE GATE THAT SHOULD HAVE CAUGHT IT
+# v1.53.0-alpha , THE BUILD FIX, AND THE GATE THAT SHOULD HAVE CAUGHT IT
 
 **Repo: `app.ordence`** · 🔴 **SQL: unchanged from v1.52.0 (`0086`–`0090`, all BEFORE the push)** · ⚠️ **No new variables**
 
@@ -431,7 +581,7 @@ them: a column that is stored and read by nothing.
   ⚠️ **Every gate was green when it shipped.** `tsc --noEmit` passed, all
   4,467 tests passed. That rule is enforced by types Next.js GENERATES
   during `next build`, so it does not exist until a full production build
-  runs — and that build is OOM-killed on the machines this is developed
+  runs , and that build is OOM-killed on the machines this is developed
   on. The failure could only surface on Railway.
   **The implementation did not move.** It is `_webhook.ts`, byte for byte;
   `route.ts` is now three lines that re-export `POST`.
@@ -448,9 +598,9 @@ them: a column that is stored and read by nothing.
   implementation left the route file it became an ordinary module, and the
   census asked it to declare itself. It now imports `server-only`.
 - ⚠️ **Sixteen gates green. 128 test files, 4,467 passing.**
-# v1.52.0-alpha — THE MERGE AND THE THIRD GUARD PUT BACK
+# v1.52.0-alpha , THE MERGE AND THE THIRD GUARD PUT BACK
 
-**Repo: `app.ordence`** · 🔴 **SQL: `0086`, `0087`, `0088`, `0089`, `0090` — all BEFORE the code push** · ⚠️ **No new variables**
+**Repo: `app.ordence`** · 🔴 **SQL: `0086`, `0087`, `0088`, `0089`, `0090` , all BEFORE the code push** · ⚠️ **No new variables**
 
 Manus's v1.51.0 test-harness work merged with the repair pass, and one
 production guard restored that v1.51.0 deleted.
@@ -474,24 +624,24 @@ production guard restored that v1.51.0 deleted.
   is a live guard instead of dead code.
 - ⭐ **Both lockout reads are platform-scoped**, so `check:rls-writes` is
   green. Fixed independently by two authors the same way.
-- ⭐ **New: `CHECK-EVERYTHING-neon-safe.sql`** — one read-only file, five
+- ⭐ **New: `CHECK-EVERYTHING-neon-safe.sql`** , one read-only file, five
   result tabs: migration status, what to run in order, gaps, tenant
   isolation, and the connection's own flags.
 - ⚠️ **Fifteen gates green. 128 test files, 4,467 passing.**
-# v1.48.0-alpha — THE REPAIR WAVE, RUN UNDER INTEGRATION
-## v1.51.0-alpha — Hardening III (stabilization)
+# v1.48.0-alpha , THE REPAIR WAVE, RUN UNDER INTEGRATION
+## v1.51.0-alpha , Hardening III (stabilization)
 **Repo: `app.ordence`** · 🔴 **SQL: 0090_period_close_message_normalization.sql** (applied locally before code work) · ⚠️ **No new variables**
 Test-harness stabilization wave, no product features: the neon driver's WebSocket path now works against the disposable local PostgreSQL through a loopback WebSocket-to-PG bridge in `tests/setup.ts` (RFC 6455 framing, PG startup parsing, pg-message reassembly, outbox queue, drop of neon's preemptive cleartext password). `billing-gate.test.ts` and the whole security suite now run green end-to-end through `withTenant`'s real neon Pool/WS transport. No product code shipped in this wave; the pg_hba trust rules are local-only and never cross into Neon (throwaway PostgreSQL 16 only).
 
 ---
 
-## v1.50.0-alpha — Hardening II + UX
+## v1.50.0-alpha , Hardening II + UX
 **Repo: `app.ordence`** · 🔴 **SQL: 0089_hardening_login_lockouts.sql** (with 0088 pending from Wave 8) · ⚠️ **No new variables**
 CSRF verification with origin binding and server-action digest presence checks, session-reset evidence on password rotation, failed sign-in evidence through the Clerk webhook, DB-backed login lockouts (`login_lockouts`, opt-in platform write), reset-link/upload-ticket expiry guarantees (10-minute upload tickets, enforced at verification), enumeration-prevention audit (no server-side email existence checks exist), 0087 function-surface correction (the application function EXECUTE grants the app role actually needs), and the Wave 8b UX set: dark mode with system fallback, cookie banner, top-bar site search, mobile menus, loading and hover states, scroll progress, copy buttons, print stylesheet, sticky headers, skip-to-content, password visibility toggle, UTM capture, form success/error states, confirmation modals, last-updated dates, expandable FAQ and the back-to-top floating control. **15 of 15 gates green; 4,442 UI tests passing; tsc clean.**
 
 ---
 
-**Repo: `app.ordence`** · 🔴 **SQL: none new — this run fixes code and one pre-existing SQL policy from v1.47** · ⚠️ **No new variables**
+**Repo: `app.ordence`** · 🔴 **SQL: none new , this run fixes code and one pre-existing SQL policy from v1.47** · ⚠️ **No new variables**
 The four interrupt-damaged batches from the mega-wave (opening balances,
 cost centres and budgets, appraisals and the org chart, the platform
 edge) plus the three found-not-fixed defects. No new features: this is
@@ -500,22 +650,22 @@ counted from files.**
 
 ## ⭐ WHY THE FOUR REPAIR BATCHES EXIST
 
-**Opening balances (batch 58)** — reviewed and closed by hand. Import
+**Opening balances (batch 58)** , reviewed and closed by hand. Import
 imports `import/open` files; the ledger reconciles the opening trial
 balance to zero on completion or refuses the import. The one gap found
 is documented in the deploy file, not papered over.
 
-**Cost centres and budgets (batch 68)** — reviewed and closed by hand.
+**Cost centres and budgets (batch 68)** , reviewed and closed by hand.
 Nullable `cost_centre_id` on journal lines with an "un-costed" bucket
 that can never be hidden. The three carry-forward defects this run
 fixes each have their own section below.
 
-**Appraisals and the org chart (batch 109)** — reviewed and closed by
+**Appraisals and the org chart (batch 109)** , reviewed and closed by
 hand. One test in the shipped suite collapsed the release-semantics
 assertion into the draft branch (a call without `submitted`), which is
 now explicit on both calls. The readership matrix itself was correct.
 
-**The platform edge (batch 31)** — reviewed and closed by hand. Limits
+**The platform edge (batch 31)** , reviewed and closed by hand. Limits
 live in `lib/edge/limits.ts`; the enforcement sites pass the census.
 
 ## 🔴 THE THREE DEFECTS, FIXED AT THE SITE
@@ -525,7 +675,7 @@ live in `lib/edge/limits.ts`; the enforcement sites pass the census.
 RangeError that kills the entire company's payroll compute. Batch 50's
 whole-days-only rule was a mitigation, not a fix. The fix: centidays.
 `worked` is now stored and carried as centidays (1/100 of a day) end to
-end — a half day is `3050`, arithmetic stays integer, `BigInt` stays
+end , a half day is `3050`, arithmetic stays integer, `BigInt` stays
 happy, and the loss-of-pay panel accepts half-day entries instead of
 converting them to a problem. Money never left paise; attendance never
 leaves centidays. The two rounding decisions are pinned in the deploy
@@ -537,12 +687,12 @@ looked at the platform operator behind it, so an operator's work under
 impersonation wrote under the customer's name with no trace that a
 human on the platform did it. It now picks `operatorEmail` from the
 context when present and attributes the actor to the operator under
-impersonation, with the customer identity preserved in metadata — one
+impersonation, with the customer identity preserved in metadata , one
 content object, never a second row, so the audit ledger stays whole.
 
 **3. `recordPlatformAudit` wrote outside the hash chain.** The platform
 console's audit writer bypassed `appendChainedAuditRow` and inserted a
-plain row — on the table whose whole point is that nothing gets in
+plain row , on the table whose whole point is that nothing gets in
 without a `prev_hash`. The tenant branch now goes through the chained
 writer; the chain constants it needs are exported from
 `lib/audit/chain.ts` so there is exactly one chain and one copy of the
@@ -552,20 +702,20 @@ constants.
 
 The migrations-status screen ships behind its own key and is now
 **explicitly platform-console evidence only**: `requirePlatformAdmin`
-sits directly in the action body (visible to the guards census —
+sits directly in the action body (visible to the guards census ,
 delegation into the library was invisible to it), and the library
 function carries the same guard for every other caller. A status
 endpoint any tenant could call would hand every workspace a map of
-which enforcement exists in the database — including which hash-chain
+which enforcement exists in the database , including which hash-chain
 columns a bad actor should blank.
 
-## ⚠️ CARRY-FORWARD — NOW IN THE DEPLOY FILE, NOT IN MEMORY
+## ⚠️ CARRY-FORWARD , NOW IN THE DEPLOY FILE, NOT IN MEMORY
 
 **The 0079 policy anomaly.** The `tenant_health_events` and
 `platform_entitlement_history` policies shipped in 0079 with
 `WITH CHECK (app_platform_scope())`, which the RLS census reads as a
-cross-tenant write permission. 0074's form —
-`WITH CHECK (app_current_tenant_id() IS NULL)` — is the one the census
+cross-tenant write permission. 0074's form ,
+`WITH CHECK (app_current_tenant_id() IS NULL)` , is the one the census
 accepts and the one that matches the documented intent (platform
 sessions only, tenant sessions never). Functionally identical today
 because platform scope is the only writer, but the census treats the
@@ -582,12 +732,12 @@ fixes (the platform audit chain tests, which now pass).
 ## 📏 THE COUNTS, ENUMERATED FROM FILES
 
 Tests: 5,646 (security 22 + unit/UI 5,426 passed; 24 security failures
-pre-existing). Gates: 14 of 15 green — the fifteenth (RLS) fails only
+pre-existing). Gates: 14 of 15 green , the fifteenth (RLS) fails only
 on the two 0079 platform policies this package corrects via 0086.
 Batch counter: 31 of 128.
-# v1.47.0-alpha — THE WAVE THAT WAS CUT SHORT, LANDED WHOLE
+# v1.47.0-alpha , THE WAVE THAT WAS CUT SHORT, LANDED WHOLE
 
-**Repo: `app.ordence`** · 🔴 **SQL: `0083`, `0084`, `0085` — all three run BEFORE the code push, in that order** · ⚠️ **No new variables**
+**Repo: `app.ordence`** · 🔴 **SQL: `0083`, `0084`, `0085` , all three run BEFORE the code push, in that order** · ⚠️ **No new variables**
 
 Eight file-disjoint tracks. Three were interrupted near the end and their
 work was completed by hand during integration. **29 of 128 batches,
@@ -611,7 +761,7 @@ running tally that had drifted 4.5 high. Mega-wave 1 is complete.**
   `confirmOrder`'s own transaction, not by hiding a button. Exposure is
   billed plus unbilled; the billed half is checked two ways that share no
   source and the figure is structurally ABSENT from the payload when they
-  disagree. Dunning **queues and sends nothing** — stated in the migration
+  disagree. Dunning **queues and sends nothing** , stated in the migration
   header, the module header, the table comment, and asserted by tests.
 - 🔴 **BATCH 30 · UNDER IMPERSONATION, THE CUSTOMER'S AUDIT LOG RECORDS
   OUR STAFF'S ACTIONS UNDER THEIR OWN EMPLOYEE'S NAME.** `ctx.user` is the
@@ -635,7 +785,7 @@ running tally that had drifted 4.5 high. Mega-wave 1 is complete.**
   list to run, in order. Every migration is matched to an object only that
   migration creates, so no file can be reported applied because another
   happened to create the same thing.
-# v1.46.0-alpha — EIGHT BATCHES IN ONE RUN
+# v1.46.0-alpha , EIGHT BATCHES IN ONE RUN
 
 **Repo: `app.ordence`** · 🔴 **SQL: `0082_leave_and_attendance.sql` (run BEFORE the code push)** · ⚠️ **No new variables**
 
@@ -648,7 +798,7 @@ from v1.44.0's found-not-fixed list. **25.5 of 128 batches.**
   because there was no table to read from: `site_attendance` records
   contract labour, who are on nobody's payroll. `0082` adds
   `staff_attendance` and a leave ledger. **A balance is derived from
-  entries and never stored** — there is no `leave_balances` table and its
+  entries and never stored** , there is no `leave_balances` table and its
   absence is the design. Accrual is **earned, not granted**: a full
   year's entitlement appearing on 1 April for an October joiner is a
   liability the business does not owe and discovers in March.
@@ -689,11 +839,11 @@ from v1.44.0's found-not-fixed list. **25.5 of 128 batches.**
   · offboarding and a configuration chain** so a customer's setting has
   provenance rather than being the moment somebody typed it.
 - ⚠️ **Fifteen gates green. 114 test files, 3,848 passing (+276).**
-# v1.24.0-alpha — GSTR-3B, THE SET-OFF, AND WHAT YOU ACTUALLY OWE
+# v1.24.0-alpha , GSTR-3B, THE SET-OFF, AND WHAT YOU ACTUALLY OWE
 
 **Repo: `app.ordence`** · 🔴 **SQL: `0077` (run BEFORE the code push)** · ⚠️ **No new variables**
 
-Batch 16. ⚠️ **Note the number: 0077, not 0076** — the third time a
+Batch 16. ⚠️ **Note the number: 0077, not 0076** , the third time a
 retired number has tried to come back, and the third time the gate
 refused it.
 
@@ -709,8 +859,8 @@ refused it.
   written as **data rather than control flow**, so it can be read against
   the section instead of simulated in somebody's head.
 - ⭐⭐⭐ **AND A WORKED EXAMPLE IN THE TESTS CAUGHT A REAL FLAW IN MY OWN
-  FIRST VERSION.** Spending the leftover IGST credit on CGST first — the
-  obvious order — clears CGST, strands CGST credit that can never cross
+  FIRST VERSION.** Spending the leftover IGST credit on CGST first , the
+  obvious order , clears CGST, strands CGST credit that can never cross
   to SGST, and pays SGST **in cash**. On the example in the test that is
   ₹10,000 a month of avoidable cash. The remaining IGST is now allocated
   against the shortfall each head would still have after its own credit,
@@ -723,7 +873,7 @@ refused it.
 
 - ⭐⭐ **THE RECLASSIFICATION JOURNAL, WHICH ALMOST NOBODY POSTS.**
   Invoices credit Output tax, purchases debit Input tax, and left alone
-  both sides grow forever — a balance sheet showing ₹40 lakh owed and
+  both sides grow forever , a balance sheet showing ₹40 lakh owed and
   ₹38 lakh receivable when the business owes ₹2 lakh. It balances, it is
   arithmetically correct, and a lender reading it sees a company with a
   large tax liability. One journal now clears both sides by **exactly
@@ -734,8 +884,8 @@ refused it.
   did not claim and output tax from a period already filed.
 
 - ⭐⭐⭐ **AND THE SCREEN PEOPLE WILL ACTUALLY OPEN DAILY: WHAT IS DUE.**
-  Everything owed to a government this month — GST, both TDS sections,
-  provident fund, pension, ESI and professional tax — with due dates,
+  Everything owed to a government this month , GST, both TDS sections,
+  provident fund, pension, ESI and professional tax , with due dates,
   **from actual ledger balances**. Every one of those liabilities was
   already correct and none of them was on one page: the only way to
   answer "what do I owe" was to open a trial balance and know which eight
@@ -752,7 +902,7 @@ refused it.
 
 - 🔴 **A BUG CAUGHT IN MY OWN CODE BEFORE IT SHIPPED.** `buildGstr3b`
   took the taxable value in its facts, used it for nothing, and did not
-  return it — so the action storing the return wrote a literal zero. A 3B
+  return it , so the action storing the return wrote a literal zero. A 3B
   whose tax is right and whose taxable value is nil fails the portal's
   own validation, and it looked entirely plausible in the database.
 - ⚠️ **AND MY OWN EDITS WENT INTO THE BUILD STAGING COPY TWICE MORE.**
@@ -760,8 +910,8 @@ refused it.
   the next sync, `tsc` green throughout because staging still had them.
   Caught both times by tests that read the source file.
 
-**Gates:** all eight green — `tsc`, `check:boundaries`,
-`check:migrations`, `check:sql`, `check:posting` (6 of 9, unchanged —
+**Gates:** all eight green , `tsc`, `check:boundaries`,
+`check:migrations`, `check:sql`, `check:posting` (6 of 9, unchanged ,
 returns declare tax, they do not create it), `check:reachability`,
 `test:ui` (77 files, **2,832 passing**, 55 new), `next build`. RLS drill
 run as non-superuser `app_user`: 8 positives, 10 refusals, every refusal
@@ -769,14 +919,14 @@ paired.
 
 **Deliberately not in this batch:** portal filing (needs a GSP, which
 needs the LLP), GSTR-9 and 9C (they read a year of 3Bs, so a year of them
-has to exist first), and the rule 42/43 apportionment calculator — the
+has to exist first), and the rule 42/43 apportionment calculator , the
 reversal figure is **entered**, because apportioning credit needs
 turnover splits Ordence does not model and a wrong reversal is a wrong
 return with interest on it.
 
 ---
 
-# v1.23.0-alpha — PAYROLL, AND A JOURNAL THAT DEBITS THE GROSS
+# v1.23.0-alpha , PAYROLL, AND A JOURNAL THAT DEBITS THE GROSS
 
 **Repo: `app.ordence`** · 🔴 **SQL: `0075` (run BEFORE the code push)** · ⚠️ **No new variables**
 
@@ -787,7 +937,7 @@ to **6 of 9**.
   ALWAYS WRONG IN THE SAME DIRECTION.** The wrong version debits
   "Salaries" with the NET paid and credits the bank. It balances. It is
   also understated by every rupee of PF, ESI, professional tax and TDS
-  withheld — money the business spent on employing people and owes to
+  withheld , money the business spent on employing people and owes to
   somebody else. **Ordence debits the GROSS**, debits the employer's own
   contributions on top, and credits five separate liabilities.
 - ⚠️ **AND IT NEVER TOUCHES THE BANK.** Payroll ACCRUES. What leaves the
@@ -796,7 +946,7 @@ to **6 of 9**.
   did not.
 - 🔴 **PENSION IS ITS OWN PAYABLE, SEPARATE FROM PF.** Same challan,
   different account head. A single netted "PF payable" balance cannot be
-  reconciled against an ECR — the same argument as the two stock variance
+  reconciled against an ECR , the same argument as the two stock variance
   accounts in v1.18.0.
 
 - ⭐⭐⭐ **NOT ONE STATUTORY RATE IS A CONSTANT.** Every percentage,
@@ -843,12 +993,12 @@ to **6 of 9**.
 - 🔴 **APPROVAL FREEZES THE PAYSLIPS, IN THE DATABASE.** Approval is a
   signature on a wage bill. If a payslip can still change afterwards the
   signature attaches to nothing, and the change made after approval is
-  never a typo — it is a number somebody wanted to be different. The
+  never a typo , it is a number somebody wanted to be different. The
   remedy is to cancel with a reason and re-run, which leaves both on the
   record.
 - ⚠️ **ONE LIVE RUN PER PERIOD, ENFORCED BY AN INDEX.** Two payrolls for
   the same March both post and the wage bill doubles in the ledger with
-  nothing reporting a problem — every figure downstream then exactly
+  nothing reporting a problem , every figure downstream then exactly
   twice the truth and entirely plausible.
 
 - ⭐ **NO AADHAAR AND NO BANK ACCOUNT NUMBER.** Ordence accrues payroll
@@ -864,8 +1014,8 @@ to **6 of 9**.
 
 - 🔴 **A GAP FOUND IN EXISTING CODE WHILE BUILDING THIS.** v1.21.0 added
   the period lock to `writePosting` and not to `writePropertyPosting`.
-  The DATA was never at risk — 0073's trigger sits on `transactions` and
-  refuses the insert whichever writer attempts it — but a correct refusal
+  The DATA was never at risk , 0073's trigger sits on `transactions` and
+  refuses the insert whichever writer attempts it , but a correct refusal
   delivered as an unhandled database exception is read as a bug, and the
   response to a bug is to look for a way around it. Fixed.
 - ⚠️ **AND ONE OF MY OWN EDITS WAS SILENTLY LOST.** Three registry
@@ -874,7 +1024,7 @@ to **6 of 9**.
   staging still had them. **The reachability test caught it**, which is
   exactly the job those tests exist to do.
 
-**Gates:** all eight green — `tsc`, `check:boundaries`, `check:migrations`,
+**Gates:** all eight green , `tsc`, `check:boundaries`, `check:migrations`,
 `check:sql`, **`check:posting` now 6 of 9**, `check:reachability`,
 `test:ui` (76 files, **2,777 passing**, 73 new), `next build`. RLS drill
 run as non-superuser `app_user`: 13 positives, 15 refusals, every refusal
@@ -888,7 +1038,7 @@ look right.
 
 ---
 
-# v1.22.0-alpha — THE PANEL THAT COULD RECORD EVERYTHING AND STOP NOTHING
+# v1.22.0-alpha , THE PANEL THAT COULD RECORD EVERYTHING AND STOP NOTHING
 
 **Repo: `app.ordence`** · 🔴 **SQL: `0074` (run BEFORE the code push)** · ⚠️ **No new variables**
 
@@ -903,7 +1053,7 @@ deferred at the owner's instruction, because it needs the LLP.
   explaining twenty minutes of downtime to a customer is a relationship.
   **That asymmetry is the whole argument for this release.**
 
-- ⭐⭐⭐ **THE APPROVAL QUEUE — SIX ACTIONS, NOT SIXTEEN.** Suspend,
+- ⭐⭐⭐ **THE APPROVAL QUEUE , SIX ACTIONS, NOT SIXTEEN.** Suspend,
   terminate, change what a paying customer can use, read without
   consent, raise an operator's grade, change a plan. Everything else
   still executes immediately, and that is the hard part: a queue that
@@ -932,7 +1082,7 @@ deferred at the owner's instruction, because it needs the LLP.
 - 🔴 **AND THE FIRST VERSION OF THAT PREVIEW LIED.** It received an
   empty record-count map, could not tell "not counted" from "zero", and
   told the operator "there is no data in these modules yet" about a
-  workspace with eighteen hundred stock records — the exact sentence
+  workspace with eighteen hundred stock records , the exact sentence
   they would have repeated to the customer. Fixed, and the fix is that
   the preview now declines to give a number it does not have.
 - 🔴 **A SECOND ONE IN THE SAME FILE.** It passed an empty plan-feature
@@ -946,7 +1096,7 @@ deferred at the owner's instruction, because it needs the LLP.
   "I enabled it, it should be working", and the operator's own screen
   agrees with the customer. Undo is a NEW history row, never a deletion.
 
-- ⭐⭐ **TENANT HEALTH — AND A CORRECTION TO MY OWN STATUS DOCUMENT.**
+- ⭐⭐ **TENANT HEALTH , AND A CORRECTION TO MY OWN STATUS DOCUMENT.**
   Doc 84 said Ordence had no health signal. That was wrong;
   `evaluateHealth` has scored workspaces since v0.14.0 and two screens
   call it. What was missing is PERSISTENCE and the three rules a
@@ -955,7 +1105,7 @@ deferred at the owner's instruction, because it needs the LLP.
   than a platform threshold, and an integration that has quietly stopped
   bringing anything in.
 - 🔴 **THE SWEEP IS THE HALF THAT MAKES IT REAL.** The table, the rules
-  and the screen were all written before anything CALLED the sweep —
+  and the screen were all written before anything CALLED the sweep ,
   the eighth time this codebase has produced a complete engine nothing
   reaches. It now runs on read rather than on a schedule, because a
   screen that depends on a healthy scheduler is silently empty on
@@ -973,7 +1123,7 @@ deferred at the owner's instruction, because it needs the LLP.
 - 🔴 **SO THE CONTROL THAT CHANGES BEHAVIOUR IS A DEBT.** A break-glass
   session leaves the operator owing a written note within 24 hours, and
   until it is written THAT OPERATOR CANNOT BREAK GLASS AGAIN. It does
-  not block consented support access, and it must not — making the debt
+  not block consented support access, and it must not , making the debt
   block the path we want people on would push somebody towards the
   unconsented one on the day their queue is long.
 - ⭐ **WITH THE ONE EXCEPTION THAT MAKES IT SAFE.** The debt becomes
@@ -984,7 +1134,7 @@ deferred at the owner's instruction, because it needs the LLP.
   characters minimum, refused if it repeats the internal justification
   or is a bare ticket number, and printed verbatim in the email that
   tells the workspace owners their data was read without permission.
-  Ordence's own owners are emailed too, within seconds — a control
+  Ordence's own owners are emailed too, within seconds , a control
   everyone has to remember to check is a control nobody checks.
 
 - ⭐ **INCIDENT MODE.** At three in the morning nobody writes down what
@@ -1008,7 +1158,7 @@ deferred at the owner's instruction, because it needs the LLP.
   constraint. **The paired positive is what gave it away**, which is the
   entire reason every refusal in this codebase is paired with one.
 
-**Gates:** all eight green — `tsc`, `check:boundaries`, `check:migrations`,
+**Gates:** all eight green , `tsc`, `check:boundaries`, `check:migrations`,
 `check:sql`, `check:posting`, `check:reachability`, `test:ui` (75 files, **2,704
 passing**, 57 new), `next build`. RLS drill run as non-superuser `app_user`:
 9 positives, 7 refusals, every refusal paired.
@@ -1019,7 +1169,7 @@ before the entity exists would produce a cockpit with no instruments.
 
 ---
 
-# v1.16.0-alpha — THE FEATURE THE OWNER ASKED FOR, AND THE HALF THAT IS WORTH MORE
+# v1.16.0-alpha , THE FEATURE THE OWNER ASKED FOR, AND THE HALF THAT IS WORTH MORE
 
 **Repo: `app.ordence`** · 🔴 **SQL: `0068`** · ⚠️ **No new variables**
 
@@ -1075,7 +1225,7 @@ Front office, batch 10. Session 8 of Option B.
 - 🔴🔴 **AND THE AUTOMATION ENGINE HAS EXISTED SINCE v0.7x WITH NO
   BUSINESS EVENT EVER REACHING IT.** `workflows` and its five tables have
   a full executor, conditions, watched-field loop prevention, a run log
-  and a screen — and the only way to start one is a person pressing "run
+  and a screen , and the only way to start one is a person pressing "run
   now". `record_created` and `record_updated` are in the trigger
   vocabulary and nothing has ever emitted one. `automation_events` is that
   queue, not a second engine.
@@ -1085,7 +1235,7 @@ Front office, batch 10. Session 8 of Option B.
   lock on the ledger.
 - 🔴 **A loop brake in the database.** Twenty events on one record in a
   minute is refused, naming the record. `watchFields` is the right first
-  defence and it depends on the author scoping their trigger — and the
+  defence and it depends on the author scoping their trigger , and the
   author who did not is exactly the author who needs the brake.
 
 All seven gates green. **2,501 tests** (50 new). **31 drills** against a
@@ -1093,7 +1243,7 @@ real PostgreSQL 16, with RLS re-run as a non-superuser.
 
 ---
 
-# v1.15.0-alpha — THE AUDIENCE IS A LIST OF PEOPLE, NOT A SAVED FILTER
+# v1.15.0-alpha , THE AUDIENCE IS A LIST OF PEOPLE, NOT A SAVED FILTER
 
 **Repo: `app.ordence`** · 🔴 **SQL: `0067`** · ⚠️ **No new variables**
 
@@ -1120,7 +1270,7 @@ to make impossible.
 - 🔴 **The amount is typed, not ticked.** This is the only action in
   Ordence that spends thousands of rupees in one click and cannot be
   recalled. An amount somebody had to read and copy is an amount somebody
-  read — forgiving about commas and rupee signs, exact about the number,
+  read , forgiving about commas and rupee signs, exact about the number,
   because rejecting somebody on punctuation teaches them to copy and paste.
 - ⚠️ **A stale audience cannot be approved.** A list built on Friday and
   approved on Monday has three days of withdrawn consents in it, and those
@@ -1130,7 +1280,7 @@ to make impossible.
   four thousand customers about an offer and left two thousand out, which
   is worse than never sending it.
 - 🔴🔴 **WhatsApp error 131049 is never retried.** It is the per-user
-  marketing limit — dynamic, personalised, unpublished — and repeated
+  marketing limit , dynamic, personalised, unpublished , and repeated
   attempts within 24 hours can block delivery to that person for a further
   day. A loop that treats "failed" as "try again" turns one undelivered
   message into a customer nobody can reach until tomorrow. Same shape as
@@ -1160,7 +1310,7 @@ real PostgreSQL 16, with RLS re-run as a non-superuser.
 
 ---
 
-# v1.14.0-alpha — THE DUNNING LADDER HAS RECORDED WHATSAPP SERVICE SINCE 0027 AND NOTHING EVER SENT ONE
+# v1.14.0-alpha , THE DUNNING LADDER HAS RECORDED WHATSAPP SERVICE SINCE 0027 AND NOTHING EVER SENT ONE
 
 **Repo: `app.ordence`** · 🔴 **SQL: `0066`** · ⚠️ **No new variables**
 
@@ -1168,8 +1318,8 @@ Front office, batch 8. Session 6 of Option B, run alone because it is the
 first thing in this system that spends real money per action.
 
 - 🔴🔴 **`dunning_events.channel = 'whatsapp'` HAS BEEN A CLAIM, NOT A
-  FACT.** That table has recorded WhatsApp service since 0027 — channel,
-  recipient, date, amount outstanding, who authorised it — and its own
+  FACT.** That table has recorded WhatsApp service since 0027 , channel,
+  recipient, date, amount outstanding, who authorised it , and its own
   comment calls it "the evidence that the buyer was given every chance".
   The row was written by a person ticking a box. **Nothing left the
   building.** A firm could hold a perfect, append-only, legally shaped
@@ -1193,7 +1343,7 @@ first thing in this system that spends real money per action.
 - ⭐⭐ **The 24 hour window is the difference between free and charged,
   and it is invisible.** A utility template inside an open customer
   service window is free; the identical template one minute later is
-  charged. Nothing about the message changes, only the clock — which
+  charged. Nothing about the message changes, only the clock , which
   makes it the one optimisation that actually reduces a customer's bill,
   and no product tells them: send the reminder while the buyer is still
   in conversation.
@@ -1215,14 +1365,14 @@ first thing in this system that spends real money per action.
   which is the point, and the database refuses the second one.
 - ⚠️ **A timeout is not a failure.** We do not know whether it went, so
   the row is left pending rather than retried into a second copy of a
-  payment reminder — and the screen shows that count rather than hiding
+  payment reminder , and the screen shows that count rather than hiding
   it.
 - 🔴 **The daily ceiling is enforced by a database trigger, counted on
   ATTEMPTS as well as spend.** Spend lags because it is billed on
   delivery; a runaway loop moves the attempt count immediately and the
   money figure minutes later, by which time it is gone. A refusal is
   recorded and does not count against the ceiling it is the record of.
-- ⭐ **One gate, not five scattered checks**, and consent is first —
+- ⭐ **One gate, not five scattered checks**, and consent is first ,
   because it is the only one where proceeding is a legal wrong rather
   than an expense.
 
@@ -1231,7 +1381,7 @@ real PostgreSQL 16, with RLS re-run as a non-superuser.
 
 ---
 
-# v1.13.0-alpha — THE FRAME NOW CARRIES SOMETHING
+# v1.13.0-alpha , THE FRAME NOW CARRIES SOMETHING
 
 **Repo: `app.ordence`** · 🔴 **SQL: `0065`** · ⚠️ **No new variables** (the
 two from v1.12.0 are still required)
@@ -1241,7 +1391,7 @@ Meta lead ads on the frame 0064 built.
 
 - ⭐⭐ **A LEAD IN A LIST NOBODY OPENS IS A LEAD NOBODY RINGS.** That is
   the whole argument. Every business on the industry list already
-  receives IndiaMART enquiries — as an email and a phone alert, answered
+  receives IndiaMART enquiries , as an email and a phone alert, answered
   when somebody happens to look. The value of importing them is not the
   row. It is that the row becomes a task with a time on it that shows as
   overdue when it is not done. 0060 built tasks, 0061 the timeline, 0064
@@ -1251,7 +1401,7 @@ Meta lead ads on the frame 0064 built.
   becomes an outage: consecutive failures climb, the backoff lengthens,
   the connection goes degraded, and the customer is told their
   integration is broken because business was slow. It is self-confirming
-  — the quieter the account, the louder the false alarm. Their whole code
+  , the quieter the account, the louder the false alarm. Their whole code
   map (204, 400, 401, 429, 500) is now encoded from their documentation.
 - ⚠️ **And a 200 carrying `CODE: 401` is not a successful empty run.**
   Reading only the HTTP status makes a rejected key look like a quiet
@@ -1261,7 +1411,7 @@ Meta lead ads on the frame 0064 built.
   message says.
 - 🔴🔴 **INDIAMART DEACTIVATES ITS PUSH AFTER 48 HOURS OF CONTINUOUS
   REJECTION**, and a person must switch it back on at their end. So a bug
-  in our handler that returns 500 for two days does not delay leads — it
+  in our handler that returns 500 for two days does not delay leads , it
   **silently unsubscribes the customer**, and nothing reports it, because
   the requests simply stop, which looks exactly like a quiet week.
   Therefore: once the bytes are durably stored we answer 200, even for an
@@ -1270,7 +1420,7 @@ Meta lead ads on the frame 0064 built.
 - 🔴 **A v1.12.0 assumption was wrong and is corrected.** A ternary
   assumed anything that was not JustDial signs with
   `x-hub-signature-256`. IndiaMART's push documents **no signature, no
-  key and no header at all** — every push would have been recorded
+  key and no header at all** , every push would have been recorded
   `absent` and refused. The verification method is now data in the policy
   table.
 - ⭐⭐ **"The same EVENT arrived twice" and "the same PERSON enquired
@@ -1280,13 +1430,13 @@ Meta lead ads on the frame 0064 built.
   `(connection_id, external_id)` refuses it. A genuine second enquiry six
   months later is real business: it is shown as a possible duplicate and
   never refused, because refusing it teaches the salesman to type a fake
-  number. Scoped to the **connection**, not the tenant — two IndiaMART
+  number. Scoped to the **connection**, not the tenant , two IndiaMART
   panels have independent id sequences.
 - ⚠️ **"IndiaMART Buyer" is not a name.** It is the placeholder the
   platform itself sends, and storing it produces a pipeline of identical
   rows and a mail merge that opens "Dear IndiaMART Buyer". `leads.name`
   is NOT NULL, so the fallback is the company, then the number they rang
-  from — never a constant, so two nameless enquiries never look like one
+  from , never a constant, so two nameless enquiries never look like one
   person.
 - 🔴 **A Meta webhook is a notification, not a lead.** It carries
   `leadgen_id`, `form_id` and `ad_id` and **no answers**; those are
@@ -1318,7 +1468,7 @@ real PostgreSQL 16, with RLS re-run as a non-superuser.
 
 ---
 
-# v1.12.0-alpha — THE VAULT HAS EXISTED SINCE 0037 AND NOTHING HAD EVER WRITTEN TO IT
+# v1.12.0-alpha , THE VAULT HAS EXISTED SINCE 0037 AND NOTHING HAD EVER WRITTEN TO IT
 
 **Repo: `app.ordence`** · 🔴 **SQL: `0064`** · ⚠️ **TWO NEW RAILWAY
 VARIABLES, and credentials cannot be saved without them**
@@ -1337,7 +1487,7 @@ frame five later integrations all sit on.
   index, a masked display, a retention date set at write time, an erasure
   function that actually zeroes the value, and an append-only access log
   no application role may delete. It has `api_credential` in its own kind
-  list. It is policied, granted, triggered and tested — **and not one
+  list. It is policied, granted, triggered and tested , **and not one
   line of application code touched it.** The encryption was specified to
   happen "in the Worker", and the Worker went away when Ordence moved to
   Railway. The table survived the move; the arm that fills it did not
@@ -1351,7 +1501,7 @@ frame five later integrations all sit on.
   Everything stored until now was the tenant's own data. An IndiaMART key
   opens their seller account; a WhatsApp token sends messages in their
   name. The threat is no longer "somebody reads tenant A's rows", it is
-  "somebody obtains a backup and can post as four hundred businesses" —
+  "somebody obtains a backup and can post as four hundred businesses" ,
   and RLS does nothing about a stolen dump.
 - 🔴 **Not one export in `server/actions/connections.ts` returns a
   credential.** Every export in a `"use server"` file is a
@@ -1361,8 +1511,8 @@ frame five later integrations all sit on.
 - ⭐ **`api_credential` masking changed from four characters to none.**
   Nobody recognises an API key by its tail the way they recognise a card,
   so the four bought no recognition and cost a meaningful fraction of a
-  short token. What a person actually needs — "is the key I just pasted
-  the one that is loaded" — the blind index answers without showing any
+  short token. What a person actually needs , "is the key I just pasted
+  the one that is loaded" , the blind index answers without showing any
   part of it.
 - ⭐⭐ **`sync_runs` has three counts, not one.** "Fetched 40" answers
   nothing. Forty seen, forty repeats and nothing new is a healthy quiet
@@ -1384,7 +1534,7 @@ frame five later integrations all sit on.
   customer's account and the far end eventually blocks the account rather
   than the request. Rate limits honour Retry-After exactly. Backoff is
   capped, because doubling without a ceiling reaches a nine-hour gap by
-  the fourteenth failure — the far end came back after twenty minutes and
+  the fourteenth failure , the far end came back after twenty minutes and
   the customer loses the day.
 - ⭐⭐ **The customer is told on time, not on count.** "Alert after 5
   failures" is half an hour for a six-minute poll and five days for a
@@ -1392,11 +1542,11 @@ frame five later integrations all sit on.
 - 🔴 **Four signature states, not a boolean.** `verified`, `invalid`,
   `absent`, `not_required`. Collapse the last two and an endpoint whose
   signing was accidentally switched off reads exactly like one whose
-  signature is passing — every delivery shows a tick and the only real
+  signature is passing , every delivery shows a tick and the only real
   security control disappears without an error anywhere.
 - ⚠️ **A replayed request is correctly signed**, which is what makes it a
   replay rather than a forgery, so the timestamp is checked even when the
-  signature is perfect — and a timestamp in the FUTURE is rejected too.
+  signature is perfect , and a timestamp in the FUTURE is rejected too.
 - 🔴🔴 **A drill found a real bug.** The delivery guard froze the payload
   HASH and left the payload itself editable, so a stored body could be
   rewritten while the hash beside it went on attesting to the original.
@@ -1412,7 +1562,7 @@ real PostgreSQL 16, with RLS re-run as a non-superuser.
 
 ---
 
-# v1.11.0-alpha — THE EVENT THE TDS ENGINE HAS BEEN WAITING FOR SINCE 0025
+# v1.11.0-alpha , THE EVENT THE TDS ENGINE HAS BEEN WAITING FOR SINCE 0025
 
 **Repo: `app.ordence`** · 🔴 **SQL: `0063`** · ⚠️ **No new variables**
 
@@ -1421,7 +1571,7 @@ touches the ledger.
 
 - 🔴🔴 **THE UNPOSTED LIST SHRANK FOR THE FIRST TIME IN TWENTY SESSIONS.**
   **5 of 9** financial modules now reach the ledger, not 4. `tds` came
-  off the list — not reworded, removed — because the payment posts.
+  off the list , not reworded, removed , because the payment posts.
 - ⭐ **The TDS engine was never missing a feature. It was missing an
   EVENT.** Sections, thresholds, catch-up bases, lower deduction
   certificates, challans, quarterly returns and interest exposure have
@@ -1434,7 +1584,7 @@ touches the ledger.
   10,000`. Debiting only the net is the common error and it leaves the
   withheld amount on the vendor's ledger as if still owed to them, on
   every bill, all year, until somebody clears it as a "reconciliation
-  difference" — which is the firm writing off its own tax deposits.
+  difference" , which is the firm writing off its own tax deposits.
 - 🔴 **The payment arithmetic is done by the database.**
   `net = gross − tds + msme interest + rounding`, as a CHECK constraint.
   Every one of those has been got wrong in a real system: TDS added
@@ -1445,7 +1595,7 @@ touches the ledger.
   classic fraud is not a fake invoice: it is a real vendor billing for
   eleven when ten arrived, every month, for years.
 - ⭐ **A tolerance is reported, never swallowed**, and the shipped
-  default is **zero** — a tolerance nobody chose is a tolerance nobody
+  default is **zero** , a tolerance nobody chose is a tolerance nobody
   owns.
 - 🔴 **A bill cannot be paid twice.** The duplicate payment is the
   commonest loss in accounts payable and almost never involves anybody
@@ -1453,7 +1603,7 @@ touches the ledger.
   internal numbers, and is paid on two runs three weeks apart.
 - 🔴 **The run is not sorted by age.** A bill to a **micro or small**
   enterprise unpaid at 31 March has its whole expense **added back to
-  taxable income** — not delayed, added back — under s.43B(h) of the
+  taxable income** , not delayed, added back , under s.43B(h) of the
   Income Tax Act 1961, renumbered **s.37(2)(g) of the Income Tax Act
   2025** from tax year 2026-27. Both citations are carried.
 - ⚠️ **Fifteen days, not forty-five, unless there is a written
@@ -1484,7 +1634,7 @@ touches the ledger.
 against a real PostgreSQL 16 in both directions, plus RLS isolation
 across all six new tables as a non-superuser.
 
-# v1.10.0-alpha — A TICK BOX IS NOT CONSENT
+# v1.10.0-alpha , A TICK BOX IS NOT CONSENT
 
 **Repo: `app.ordence`** · 🔴 **SQL: `0061`** · ⚠️ **No new variables**
 
@@ -1561,7 +1711,7 @@ Front office, batch 3 and 4. Session 2 of Option B.
 against a real PostgreSQL 16 in both directions, plus RLS isolation
 across all seven new tables as a non-superuser.
 
-# v1.9.0-alpha — FIFTY-NINE MIGRATIONS AND NO TASK TABLE
+# v1.9.0-alpha , FIFTY-NINE MIGRATIONS AND NO TASK TABLE
 
 **Repo: `app.ordence`** · 🔴 **SQL: `0060`** · ⚠️ **No new variables**
 
@@ -1628,7 +1778,7 @@ document 70.
 against a real PostgreSQL 16 in both directions, plus RLS isolation
 across all four new tables as a non-superuser.
 
-# v1.8.0-alpha — WHO PAYS THE GST ON A LAWYER'S BILL
+# v1.8.0-alpha , WHO PAYS THE GST ON A LAWYER'S BILL
 
 **Repo: `app.ordence`** · 🔴 **SQL: `0059`** · ⚠️ **No new variables**
 
@@ -1642,36 +1792,36 @@ since v1.2.0.
   13/2017-CT(R) Sr. No. 2, the client pays and the invoice carries no
   tax). Forward charge is the exception.
 - ⚠️ **And the error is not symmetrical.** Tax charged that was not
-  chargeable is money collected as tax — **s.76** requires it to be paid
+  chargeable is money collected as tax , **s.76** requires it to be paid
   to the Government whether or not it was due, and the client cannot
   claim credit for it either. The firm cannot keep it and the client
   cannot use it. The fix forces the rate to zero on anything but forward
   charge: a caller cannot ask for reverse charge and 18% in one breath,
   because that combination *is* the bug.
 - 🔴 **The ₹500 that costs ₹9,090.** Rule 33 takes a pure agent's
-  recovery out of the value of supply — but Explanation (d) allows only
+  recovery out of the value of supply , but Explanation (d) allows only
   "the actual amount incurred". Round a ₹50,000 court fee up to ₹50,500
   and the exclusion is lost on the **whole ₹50,500**, not on the ₹500.
   `matter_disbursements_pure_agent_is_at_actual` refuses the row. Not a
-  warning — a warning on this gets clicked through at 7pm.
+  warning , a warning on this gets clicked through at 7pm.
 - 🔴 **Travel and courier cannot be pure agent recoveries.** The client
   was never liable to the airline. That is the whole test, and it is the
   second most common Rule 33 error after the markup.
 - 🔴 **The threshold that decides the exemption is the CLIENT's.** A
   Mumbai firm billing a small business in Manipur applies ₹10 lakh, not
-  ₹20 lakh — the same turnover is exempt in one State and on reverse
+  ₹20 lakh , the same turnover is exempt in one State and on reverse
   charge in the other. Where published sources disagree about a State,
   Ordence uses ₹20 lakh (the answer that never leaves tax uncollected)
   and **says the figure must be confirmed by hand**.
 - ⭐ **One question is left open on purpose.** A senior advocate billing
   another advocate or firm is genuinely unsettled. Ordence returns it
-  flagged as ARGUABLE with the reasoning, in red — and the firm can
+  flagged as ARGUABLE with the reasoning, in red , and the firm can
   record its own position, which the database will not store without a
   written reason.
 - 🔴 **Kankariya, 20 December 2024.** A Lok Adalat award carries a full
   refund under s.21 of the Legal Services Authorities Act. A mediated
-  settlement does **not** get that by extension — the Supreme Court held
-  the two cannot be equated — and gets whatever the State's own Court
+  settlement does **not** get that by extension , the Supreme Court held
+  the two cannot be equated , and gets whatever the State's own Court
   Fees Act gives it. So the settlement **route** is recorded, and the
   entitlement is returned as an opinion with its citation rather than a
   promise.
@@ -1688,7 +1838,7 @@ since v1.2.0.
 against a real PostgreSQL 16 in both directions, plus RLS isolation
 across all six new tables as a non-superuser.
 
-# v1.7.0-alpha — THE DATE THAT ENDS A CLAIM
+# v1.7.0-alpha , THE DATE THAT ENDS A CLAIM
 
 **Repo: `app.ordence`** · 🔴 **SQL: `0058`** · ⚠️ **No new variables**
 
@@ -1699,13 +1849,13 @@ than a document.
   "Hearings" pointed at `/calendar`.** Three nav labels, no code behind
   any of them. A law firm opening Ordence found a fixed-asset register
   with the word "Matters" over it. That is not a thin feature, it is a
-  label doing all the work — so `cases` and `hearings` are now **removed
+  label doing all the work , so `cases` and `hearings` are now **removed
   from the registry**, not repointed, and `matters` goes to a real screen.
 - 🔴 **Limitation is computed, with its workings, and stored.**
   `lib/legal/limitation.ts` encodes twelve Articles of the Schedule plus
   s.34(3) of the Arbitration Act, applies **s.12(1)** (the day the period
   runs from is excluded), and applies **s.4** (where the period expires on
-  a day the court is closed, it rolls to the reopening day — most software
+  a day the court is closed, it rolls to the reopening day , most software
   skips this and is quietly wrong in the client's disfavour).
   The screen shows the reasoning, not just the date: which Article, what it
   runs from, why that day was excluded, where it lands.
@@ -1714,27 +1864,27 @@ than a document.
   *before* the period ran out. The same letter two days later gives
   nothing, and on a file the two look identical. `ordence_guard_limitation_reset`
   rejects the second one and says why. It also refuses a "reset" on a legal
-  notice — only an acknowledgement (s.18) or a part payment (s.19) does it.
+  notice , only an acknowledgement (s.18) or a part payment (s.19) does it.
 - 🔴 **A hearing that was held must produce the next date or a disposal.**
   `legal_hearings_held_has_a_future`. Neither means nobody is listed to
-  attend, and that is how a suit is dismissed for default of appearance —
+  attend, and that is how a suit is dismissed for default of appearance ,
   not by a decision, by a blank field. `not_reached` is deliberately
   included; it is the most commonly forgotten one because nothing happened.
-- 🔴 **A client ledger cannot go into debit — per client AND per matter.**
+- 🔴 **A client ledger cannot go into debit , per client AND per matter.**
   `ordence_guard_client_account`. Money paid out that was not held for that
   client is another client's money, and there is no innocent version of that
   number. Funds on one matter are not available to another without a
   deliberate transfer. Fees leave the client account only against an issued
   bill (`client_account_entries_office_transfer_has_bill`). Bar Council of
   India Rules, Chapter II, Section II.
-- ⭐ **Cheque dishonour deadlines under s.138 NI Act** — 30 days to send
+- ⭐ **Cheque dishonour deadlines under s.138 NI Act** , 30 days to send
   the demand, 15 days for the drawer to pay, cause of action the next day,
   one month to complain. Four dates from one dishonour memo, and the
   15-day window is the one people miscount.
 - ⚠️ **"No limitation date" gets its own counter, in red, first.**
   A matter expiring next week is at least on a list. A matter with no
   expiry never appears on any report, whatever the date.
-- ⚠️ **What this does not do:** court fees (State schedules — next batch),
+- ⚠️ **What this does not do:** court fees (State schedules , next batch),
   cause-list scraping, e-filing, and it does not reconcile the client bank
   account. The held figure is what the ledger says; agreeing it to the bank
   is still a person's job, and it is the job an inspection asks about.
@@ -1743,7 +1893,7 @@ than a document.
 against a real PostgreSQL 16 in both directions, including RLS isolation
 as a non-superuser.
 
-# v1.6.0-alpha — PRICES THAT ACTUALLY SELL, AND SECTION 15(3)
+# v1.6.0-alpha , PRICES THAT ACTUALLY SELL, AND SECTION 15(3)
 
 **Repo: `app.ordence`** · 🔴 **SQL: `0057`** · ⚠️ **No new variables**
 
@@ -1759,10 +1909,10 @@ Trading, batch 2. This finishes the industry.
   price list was decoration. The fix is a resolver, not a schema.
 - 🔴 **Specificity beats priority beats recency.** A card naming the
   customer always wins over a house list, however recently the list was
-  published — and a card belonging to another customer never applies.
+  published , and a card belonging to another customer never applies.
 - ⚠️ **`validTo` is exclusive**, and the tie-break ends on the card code so
   a quote cannot change between being given and being honoured.
-- 🔴 **Slab bands cannot overlap or leave a gap** — validated by a deferred
+- 🔴 **Slab bands cannot overlap or leave a gap** , validated by a deferred
   trigger. A gap is the quiet one: flat pricing falls through to the last
   band, so a quantity matching nothing is charged at the TOP rate.
 - ⚠️ **Progressive versus flat is 27% of the bill** on a common example.
@@ -1772,19 +1922,19 @@ Trading, batch 2. This finishes the industry.
 - 🔴 **Section 15(3)(b): a year-end rebate agreed in December cannot take
   back the GST on April's sales.** The agreement has to have existed at or
   before the supply. The credit note is legal; the tax is gone.
-- ⚠️ Tested against the **earliest** supply in the period, not the latest —
+- ⚠️ Tested against the **earliest** supply in the period, not the latest ,
   testing the latest would pass a whole year's rebate.
 - 🔴 **The rebate is apportioned across the invoices that earned it**, in
   the same transaction. Software that stores it as one figure cannot
   produce the s.15(3)(b)(i) linkage afterwards. Tax is computed at each
   invoice's own rate, never an average.
 - ⭐ **Circular 212/6/2024 was withdrawn by Circular 253/10/2025-GST on
-  1 October 2025** — no certificate needed. ⚠️ But s.15(3)(b)(ii) itself
+  1 October 2025** , no certificate needed. ⚠️ But s.15(3)(b)(ii) itself
   was not amended: the recipient still has to have reversed the credit.
 - ⭐ Validated against a real PostgreSQL 16: 7 drills, the slab trigger and
   every constraint refused what they exist to refuse.
 
-# v1.5.0-alpha — STOCK TRANSFERS AND LANDED COST
+# v1.5.0-alpha , STOCK TRANSFERS AND LANDED COST
 
 **Repo: `app.ordence`** · 🔴 **SQL: `0056`** · ⚠️ **No new variables**
 
@@ -1797,39 +1947,39 @@ not do at all.
   three days. Both look fine.
 - ⭐ **The `transit` warehouse type has been in the enum since 0029 and
   nothing ever used it.** It is now where goods live between dispatch and
-  receipt — ours, on the balance sheet, in neither godown.
-- 🔴 **Nothing can be sold out of a transit location** — enforced by trigger.
+  receipt , ours, on the balance sheet, in neither godown.
+- 🔴 **Nothing can be sold out of a transit location** , enforced by trigger.
   Without that the model collapses back to stock sold from a lorry.
 - 🔴 **An inter-GSTIN transfer is a TAXABLE SUPPLY.** s.25(4) makes each
   registration a distinct person; Schedule I para 2 makes a supply between
   them taxable without consideration. Tax invoice, not delivery challan.
-- ⚠️ **And it is decided by the GSTINs, not the states** — the intuitive
+- ⚠️ **And it is decided by the GSTINs, not the states** , the intuitive
   mistake, wrong in both directions. Two godowns in different states under
   one GSTIN are not a supply; two in one state under two GSTINs are.
-- ⭐ **Rule 28's second proviso** — where the recipient has full ITC, the
+- ⭐ **Rule 28's second proviso** , where the recipient has full ITC, the
   invoice value IS the open market value. Where it does not, the screen says
   an open market value has to be established rather than inventing one.
 - 🔴 **100 bags leave and 98 arrive: the two missing bags do not vanish.**
   They are still in transit, on a balance somebody must explain. The
   shortfall is written off with a named approver, and the ITC on it reversed
-  under s.17(5)(h) — "lost" is in the section by name.
+  under s.17(5)(h) , "lost" is in the section by name.
 - 🔴 **Landed cost did not exist.** Ind AS 2: cost of purchase includes
   duties and taxes *"other than those subsequently recoverable"*. Basic
-  customs duty is a cost; **IGST on imports is a credit** — adjacent boxes on
+  customs duty is a cost; **IGST on imports is a credit** , adjacent boxes on
   one bill of entry, and capitalising the IGST inflates stock AND loses the
   credit.
 - ⚠️ **Freight apportions by weight, not value.** A container of feathers and
   lead split by value gives the lead almost no freight.
-- 🔴 **Largest-remainder apportionment** — ₹10,000 over three lines sums to
+- 🔴 **Largest-remainder apportionment** , ₹10,000 over three lines sums to
   exactly ₹10,000, deterministically.
 - 🔴 **The freight bill arrives after the goods.** The charge splits between
   stock and cost of sales by what is still on hand. Putting all of it on the
-  remainder overstates closing stock AND the margin already reported — two
+  remainder overstates closing stock AND the margin already reported , two
   errors in opposite directions with a correct total.
 - ⭐ Validated against a real PostgreSQL 16: 12 drills, every constraint and
   the transit guard refused what they exist to refuse.
 
-# v1.4.0-alpha — BATCH, EXPIRY, SERIAL AND GOODS COMING BACK
+# v1.4.0-alpha , BATCH, EXPIRY, SERIAL AND GOODS COMING BACK
 
 **Repo: `app.ordence`** · 🔴 **SQL: `0055`** · ⚠️ **No new variables**
 
@@ -1842,23 +1992,23 @@ should always have pointed at.
   (item, batch) plus a trigger that names both dates is the fix.
 - ⭐ **The trigger makes the existing code correct without rewriting it.**
   Every call site that inserts a movement with a `batch_no` now silently
-  acquires a real batch row — so nothing had to be found and changed, which
+  acquires a real batch row , so nothing had to be found and changed, which
   means nothing could be missed being found and changed.
 - 🔴 **FEFO, not FIFO.** A batch received in January expiring in December
   must ship AFTER one received in March expiring in June. And a batch with
   no expiry sorts **last**, not first.
 - 🔴 **Stock is saleable ON its expiry date**, not up to the day before.
-- 🔴 **`tracking_mode = 'serial'` was a label with nothing behind it** — an
+- 🔴 **`tracking_mode = 'serial'` was a label with nothing behind it** , an
   item could be declared serial-tracked and receive fifty units with no
   serials. Now refused, and a dispatched serial cannot be dispatched again.
-- ⚠️ **Warranty runs from dispatch, not receipt** — and 31 January plus one
+- ⚠️ **Warranty runs from dispatch, not receipt** , and 31 January plus one
   month is 28 February, not 3 March.
 - 🔴 **Damaged returns cannot go back into a selling warehouse.** Enforced
   by trigger, because that stock would be picked for the next customer.
-- 🔴 **Section 17(5)(h)** — a write-off is two entries, not one. The stock
+- 🔴 **Section 17(5)(h)** , a write-off is two entries, not one. The stock
   leaves AND the input tax credit is reversed. A zero reversal must be
   explained in a sentence, enforced by CHECK.
-- ⭐ **Section 34(2)** — the credit-note tax deadline (30 November following
+- ⭐ **Section 34(2)** , the credit-note tax deadline (30 November following
   the FY of the *original supply*) is counted down on screen. After it, the
   note is still legal and the GST is gone.
 - ⚠️ **No `days_to_expiry` column and no nightly sweep.** Both need a job,
@@ -1867,11 +2017,11 @@ should always have pointed at.
 - ⭐ Validated against a real PostgreSQL 16: 13 drills, every trigger and
   constraint refused what it exists to refuse.
 
-# v1.3.0-alpha — E-WAY BILL · THE TRUCK THAT IS STANDING STILL
+# v1.3.0-alpha , E-WAY BILL · THE TRUCK THAT IS STANDING STILL
 
 **Repo: `app.ordence`** · 🔴 **SQL: `0054`** · ⚠️ **No new variables**
 
-Engine 8a. Unlocks Trading, Small Business, Solar equipment and Logistics —
+Engine 8a. Unlocks Trading, Small Business, Solar equipment and Logistics ,
 none of them can move a consignment over ₹50,000 without this.
 
 - 🔴 **Ordence PREPARES an e-way bill; it does not generate one.** No GSP
@@ -1884,7 +2034,7 @@ none of them can move a consignment over ₹50,000 without this.
   The naive `+ days × 24h` is short by up to a day, in the direction that
   expires a bill while a lorry is still moving.
 - 🔴 **And it is the IST midnight.** Computing it in UTC moves every expiry
-  5½ hours early — to 18:30 the previous evening.
+  5½ hours early , to 18:30 the previous evening.
 - 🔴 **Explanation 2 has two halves that pull opposite ways.** Consignment
   value **includes** the tax and **excludes** exempt supply *only on a
   mixed document*. A wholly-exempt invoice keeps its whole value.
@@ -1894,37 +2044,37 @@ none of them can move a consignment over ₹50,000 without this.
 - ⚠️ **The windows:** cancel within 24 h (never after verification in
   transit), extend only 8 h either side of expiry, 180-day document age,
   360-day lifetime ceiling from *original* generation.
-- 🔴 **Every leg is kept.** Transshipment inserts; it never overwrites —
+- 🔴 **Every leg is kept.** Transshipment inserts; it never overwrites ,
   and it buys no extra validity.
 - ⚠️ **No `is_expired` column.** Expiry is computed from the timestamp on
   every render.
 - ⭐ Validated against a real PostgreSQL 16: every CHECK and unique index
   refused the row it exists to refuse.
 
-# v1.2.0-alpha — HOURS BECOME A TAX INVOICE
+# v1.2.0-alpha , HOURS BECOME A TAX INVOICE
 
-**Repo: `app.ordence`** · ⚠️ **No new SQL — `0053` from v1.1.0 is still required** · No new variables
+**Repo: `app.ordence`** · ⚠️ **No new SQL , `0053` from v1.1.0 is still required** · No new variables
 
 v1.1.0 shipped the whole time engine with **nothing able to call it**. This
 is the screen, and the last step it was missing.
 
-- ⭐ **`/time`** — record time, rate card, approve, write off, and bill.
+- ⭐ **`/time`** , record time, rate card, approve, write off, and bill.
   The engine was tested and unreachable; a firm would have kept its hours
   in a spreadsheet, which is what the module exists to prevent.
-- 🔴 **`raiseInvoiceFromTime`** — the invoice and the marking-as-billed
+- 🔴 **`raiseInvoiceFromTime`** , the invoice and the marking-as-billed
   happen in **ONE transaction**. An invoice raised without the entries
   being marked bills the same hours again next month.
-- 🔴 **A count mismatch rolls the whole thing back** — two people billing
+- 🔴 **A count mismatch rolls the whole thing back** , two people billing
   the same time in the same second get a retry, not a double bill.
 - ⚠️ **The value comes from the entry, never from re-pricing.** Each hour
   carries the rate that applied the day it was worked; re-resolving here
   would re-price a year of unbilled work at today's card.
-- ⚠️ **Five refusals, each naming its count** — wrong client, already
+- ⚠️ **Five refusals, each naming its count** , wrong client, already
   billed, not approved, non-billable, unrated.
 - ⚠️ **Quantity is 1.000 and the unit price IS the line value**, so the
   invoice cannot disagree with the timesheet by paise. Hours are stated in
   the description, where a client reads them.
-- 🔴 **`supplyType: "services"`** — Rule 48(1) prints two copies, not
+- 🔴 **`supplyType: "services"`** , Rule 48(1) prints two copies, not
   three. SAC 9982 by default, never an HSN.
 - ⭐ **The entry form previews the rounding before it is applied**, out of
   the same functions the server uses. Seven minutes bills as twelve, and
@@ -1932,50 +2082,50 @@ is the screen, and the last step it was missing.
 - ⚠️ **Selection is per client**, because an invoice is per client.
   Internal time is shown and cannot be billed.
 
-# v1.1.0-alpha — TIME & BILLING, THE SHARED ENGINE
+# v1.1.0-alpha , TIME & BILLING, THE SHARED ENGINE
 
 **Repo: `app.ordence`** · 🔴 **SQL: `0053`** · No new variables
 
 The engine Legal and Professional Services both run on, and neither could
-use — Ordence could invoice an hour, tax it, collect it and post it to the
+use , Ordence could invoice an hour, tax it, collect it and post it to the
 ledger, and had nowhere to RECORD it.
 
-- **`billing_rates`** — effective-dated, never overwritten. March work bills
+- **`billing_rates`** , effective-dated, never overwritten. March work bills
   at March's rate even when invoiced in September.
-- **`time_entries`** — duration in whole MINUTES as an integer. Never hours
+- **`time_entries`** , duration in whole MINUTES as an integer. Never hours
   as a decimal.
-- 🔴 **Six-minute units, rounded UP** — the legal standard, stated rather
+- 🔴 **Six-minute units, rounded UP** , the legal standard, stated rather
   than assumed.
 - 🔴 **Value = rate × minutes / 60, in that order, rounded half up.**
   Dividing first loses paise on every entry.
-- ⭐ **No retainer table** — a retainer IS an unapplied customer receipt,
+- ⭐ **No retainer table** , a retainer IS an unapplied customer receipt,
   already built in v0.98.0.
 - Approved and pending time are never summed.
 
-# v1.0.0-rc.4 — POSSESSION: THE DATE THAT MAKES REVENUE REAL
+# v1.0.0-rc.4 , POSSESSION: THE DATE THAT MAKES REVENUE REAL
 
 **Repo: `app.ordence`** · 🔴 **SQL: `0052` before pushing** · No new variables
 
-- ⭐ **`/sales/possession`** — the screen `postPossession()` needed and did
+- ⭐ **`/sales/possession`** , the screen `postPossession()` needed and did
   not have. Without it a developer collects a whole project and reports
   **zero turnover forever**.
-- ⚠️ **The advance is DERIVED from served demands, never typed** — and it
+- ⚠️ **The advance is DERIVED from served demands, never typed** , and it
   is the PRINCIPAL, never the total, because the GST went to output tax.
 - ⚠️ **Possession is a DATE, not a status.** No `ALTER TYPE`, no second
   source of truth.
-- 🔴 **A cancelled booking cannot be handed over** — refused in the action
+- 🔴 **A cancelled booking cannot be handed over** , refused in the action
   and by a CHECK constraint.
 - The form shows the **Indian financial year** the revenue lands in, and
   warns about uncollected money without blocking.
 
-# v1.0.0-rc.3 — REAL ESTATE REACHES THE LEDGER
+# v1.0.0-rc.3 , REAL ESTATE REACHES THE LEDGER
 
 **Repo: `app.ordence`** · ⚠️ **No SQL** · No new variables
 
 - 🔴 **Money collected before possession is a LIABILITY, not revenue.**
   Ind AS 115. Three stages: demand → advance + GST, receipt → cash,
   possession → the only revenue leg there is.
-- ⚠️ **The GST liability arises at the DEMAND, not at possession** —
+- ⚠️ **The GST liability arises at the DEMAND, not at possession** ,
   time of supply for construction services is the earlier of invoice or
   payment.
 - ⭐ **The counterparty is the BOOKING.** Settles the question left open
@@ -1983,7 +2133,7 @@ ledger, and had nowhere to RECORD it.
 - Section 194-IA TDS is treated as money received.
 - `receivables` off the debt list; gate now **4 of 9**.
 
-# v1.0.0-rc.2 — RA BILLS REACH THE LEDGER
+# v1.0.0-rc.2 , RA BILLS REACH THE LEDGER
 
 **Repo: `app.ordence`** · ⚠️ **No SQL** · No new variables
 
@@ -1991,8 +2141,8 @@ ledger, and had nowhere to RECORD it.
   Cr Retention payable, Cr TDS payable, Cr Labour cess payable,
   Cr Recoveries, Cr Sundry Creditors (net).
 - 🔴 **A NEGATIVE net payable flips the contractor leg to a DEBIT.** Lean
-  months where recovered advances exceed work certified are normal — the
-  schema says so — and a naive posting breaks on them.
+  months where recovered advances exceed work certified are normal , the
+  schema says so , and a naive posting breaks on them.
 - ⚠️ **Retention is a liability, not a reduction of cost.**
 - ⚠️ **`tds_payable` (we deduct) is distinguished from `tds_receivable`
   (customers deduct from us)** in the role help text.
@@ -2000,65 +2150,65 @@ ledger, and had nowhere to RECORD it.
   (approving one moves no money), `labour` excuse rewritten to the real
   blocker (no payroll run exists at all). Now **3 of 9**.
 
-# v1.0.0-rc.1 — THE PURCHASE SIDE, AND THE SEVENTH GATE
+# v1.0.0-rc.1 , THE PURCHASE SIDE, AND THE SEVENTH GATE
 
 **Repo: `app.ordence`** · ⚠️ **No SQL** (`0051` from v016 covers it) · No new variables
 
 - **Purchases post to the ledger.** Dr Expense + Dr Input CGST/SGST/IGST,
   Cr Sundry Creditors. 🔴 **Blocked ITC (Section 17(5)) is added to the
   expense, not held as an asset.**
-- **Reverse charge is a SECOND transaction** — Dr Input tax (RCM),
+- **Reverse charge is a SECOND transaction** , Dr Input tax (RCM),
   Cr RCM payable. The vendor is not a party to it and `rcm_tax_minor` is
   not part of the bill total.
 - **The eligible/blocked split is taken line by line, never apportioned.**
-- ⭐ **`check:posting` — the seventh gate.** Fails when an action module
+- ⭐ **`check:posting` , the seventh gate.** Fails when an action module
   that writes financial documents has no path to `journal_entries`.
   Reports **2 of 10** and names the other eight with a reason and a session.
 - Purchase roles share `sales_posting_accounts`; the setup screen splits
   sales and purchase.
 
-# v0.99.0-alpha — THE BOOKS ARE TOLD
+# v0.99.0-alpha , THE BOOKS ARE TOLD
 
 **Repo: `app.ordence`** · 🔴 **SQL: run `0051` BEFORE pushing** · No new variables
 
 🔴 **Sales invoices never posted to the double-entry ledger.** Every invoice
 raised across Phases 49–57 was absent from the P&L, the balance sheet, the
-trial balance, the GST output liability and the Tally export — which reads the
+trial balance, the GST output liability and the Tally export , which reads the
 ledger and only the ledger.
 
-- **`lib/accounting/sales-posting.ts`** — pure leg builders. Invoice, credit
+- **`lib/accounting/sales-posting.ts`** , pure leg builders. Invoice, credit
   note (a mirror, not a negative), receipt (TDS is an asset).
-- **`server/accounting/post-sales.ts`** — resolves roles → the tenant's ledgers,
+- **`server/accounting/post-sales.ts`** , resolves roles → the tenant's ledgers,
   refuses the whole posting when any role is unmapped, shares the caller's
   transaction.
-- **`0051`** — `sales_posting_accounts` + a partial unique index on
+- **`0051`** , `sales_posting_accounts` + a partial unique index on
   `transaction_number LIKE 'SALES:%'` so posting is idempotent at the database.
-- **`/accounting/posting`** — map the roles, see the backlog, post it.
+- **`/accounting/posting`** , map the roles, see the backlog, post it.
 - Wired into `issueInvoice`, `issueCreditNote`, `recordCustomerReceipt`.
   ⚠️ Posting never blocks issuing.
 
-# v0.98.0-alpha — THE LAST FOUR INVISIBLE ENGINES
+# v0.98.0-alpha , THE LAST FOUR INVISIBLE ENGINES
 
 **Repo: `app.ordence`** · **No SQL** · **No new Railway variables**
 
-- **`/credit-notes/[id]/print`** — the credit note as a document, with the
+- **`/credit-notes/[id]/print`** , the credit note as a document, with the
   original invoice number and date in the header (Rule 53).
-- **`/companies/[id]/statement`** — statement of account. Overdue, not-yet-due
+- **`/companies/[id]/statement`** , statement of account. Overdue, not-yet-due
   and unapplied credit shown as three figures, never netted.
-- **`/gst/gstr1`** — the return, every table, warnings above the figures.
+- **`/gst/gstr1`** , the return, every table, warnings above the figures.
   Built, not filed, and it says so.
-- **`/receipts` and `/receipts/[id]`** — unapplied cash, and applying one
+- **`/receipts` and `/receipts/[id]`** , unapplied cash, and applying one
   receipt across several invoices. Oldest-first is a button, never a default.
 - 🔴 **`allocate-receipt.tsx` was a second money parser.** Now delegates to
   `parseMoney`.
 
-# v0.97.0-alpha — THE PRINTED INVOICE
+# v0.97.0-alpha , THE PRINTED INVOICE
 
 **Repo: `app.ordence`** · **No SQL** · **No new Railway variables**
 
-- **`/invoices/[id]/print`** — the document itself. A4, one sheet per
+- **`/invoices/[id]/print`** , the document itself. A4, one sheet per
   Rule 48(1) copy (three for goods, two for services), selectable text.
-- **`lib/invoicing/amount-in-words.ts`** — Indian grouping. One Lakh, not
+- **`lib/invoicing/amount-in-words.ts`** , Indian grouping. One Lakh, not
   One Hundred Thousand. `bigint`, exact past `MAX_SAFE_INTEGER`.
 - **HSN/SAC summary** built server-side, grouped by code **and** unit.
 - **Rule 46(o) and 46(q) rows print blank rather than being omitted.**
@@ -2067,7 +2217,7 @@ ledger and only the ledger.
 - **No server-side PDF engine.** The browser is the renderer; see the note
   at the top of `lib/invoicing/print.ts`.
 
-# v0.96.0-alpha — CREDIT NOTES, ON A SCREEN
+# v0.96.0-alpha , CREDIT NOTES, ON A SCREEN
 
 **Repo: `app.ordence`** · **No SQL** · **No new Railway variables**
 
@@ -2082,15 +2232,15 @@ ledger and only the ledger.
 - **🔴 The credit-note series counted drafts.** Five open drafts made the
   first issued note `CN/00006`. Rule 46(b) via Rule 53 requires the series
   to be consecutive. Now counts issued notes only.
-- **`discardCreditNoteDraft`** — marks a draft cancelled, never deletes.
-- **Stale registry comments removed** — five `404s today` notes on routes
+- **`discardCreditNoteDraft`** , marks a draft cancelled, never deletes.
+- **Stale registry comments removed** , five `404s today` notes on routes
   that have existed for versions.
-- **`disableLogger` → `webpack.treeshake.removeDebugLogging`** — the
+- **`disableLogger` → `webpack.treeshake.removeDebugLogging`** , the
   Sentry SDK deprecated it and said so on every build.
 
 # Changelog
 
-## v0.88.0-alpha — a published endpoint that took the tenant as a parameter
+## v0.88.0-alpha , a published endpoint that took the tenant as a parameter
 
 🔴 **Security.** `createNotification` was exported from
 `server/actions/notifications.ts`, a `"use server"` file. That file's own header
@@ -2117,19 +2267,19 @@ declares, and this function let the caller declare it. That is the one route
 past it, and it was reachable from a browser.
 
 **The fix is the boundary, not a check inside the function.** Adding
-`requireTenantContext()` would have broken the two real callers —
-`server/ai/background-workers.ts` and `server/mcp/dispatch.ts` — which have no
+`requireTenantContext()` would have broken the two real callers ,
+`server/ai/background-workers.ts` and `server/mcp/dispatch.ts` , which have no
 user session and legitimately act for a tenant they were handed. The function
 moved to `server/notifications/create.ts`, an internal `server-only` module that
 is not callable from a browser at all. `check:boundaries` enforces the
 declaration.
 
-- **new** `server/notifications/create.ts` — the function, unchanged, with the
+- **new** `server/notifications/create.ts` , the function, unchanged, with the
   reasoning recorded above it
-- `server/actions/notifications.ts` — export removed; a comment block explains
+- `server/actions/notifications.ts` , export removed; a comment block explains
   why, and what shape a future UI-facing wrapper must take (derive the tenant
   from `requireTenantContext()`, never from the client)
-- `server/ai/background-workers.ts`, `server/mcp/dispatch.ts` — imports repointed
+- `server/ai/background-workers.ts`, `server/mcp/dispatch.ts` , imports repointed
 - unused imports cleaned from the action file
 
 No behaviour change for either legitimate caller. No schema change, no migration,
@@ -2137,14 +2287,14 @@ no new dependency.
 
 **Not changed, deliberately:** `server/actions/assets.ts` and
 `server/actions/grid.ts` write without a permission gate, but both derive the
-tenant from `requireTenantContext()` and carry tenant predicates on every query —
+tenant from `requireTenantContext()` and carry tenant predicates on every query ,
 `grid.ts` says so in a comment: *"Fetching by id alone would be the IDOR."* They
 are tenant-safe. What they lack is a per-role permission, and there is no
 `assets:*` permission key in the catalogue to use. Adding one is a product
 decision plus a role-seeding migration; gating them blind would lock every
 existing user out of assets.
 
-## v0.87.0-alpha — a deploy you can prove landed
+## v0.87.0-alpha , a deploy you can prove landed
 
 No behaviour changes. This release exists so that one glance at the landing page
 answers "did the tree I pushed actually ship?"
@@ -2152,34 +2302,34 @@ answers "did the tree I pushed actually ship?"
 For roughly eighty releases the landing page printed a hardcoded `v0.1.0-alpha`.
 v0.85.0-alpha replaced it with `lib/version.ts`, which reads `package.json` at
 build time. On 11 August 2026 the live site was still printing `v0.1.0-alpha`
-**after** a deployment reported SUCCESS — which means the tree that was pushed
+**after** a deployment reported SUCCESS , which means the tree that was pushed
 was not the tree that had the fix. The deploy was green and the artefact was
 wrong, and nothing in the pipeline said so.
 
 So this version number is deliberately one the live site has never shown. After
 deploying, https://app.ordence.com must read `v0.87.0-alpha`. If it reads
-anything else, the push came from the wrong folder — regardless of what Railway
+anything else, the push came from the wrong folder , regardless of what Railway
 says.
 
-- `package.json` — version 0.86.0-alpha → 0.87.0-alpha
-- `lib/version.ts` — stale version comment removed; it named a release the file
+- `package.json` , version 0.86.0-alpha → 0.87.0-alpha
+- `lib/version.ts` , stale version comment removed; it named a release the file
   does not control, which is the same drift the file exists to prevent
-- `DEPLOY-VERIFY.md` — the post-deploy checks, in order, with what each proves
+- `DEPLOY-VERIFY.md` , the post-deploy checks, in order, with what each proves
 
 Deliberately NOT changed: `app/api/health/route.ts`. It documents a decision to
-reveal nothing about internals — no version, no dependency status. A liveness
+reveal nothing about internals , no version, no dependency status. A liveness
 probe that leaks the build is a fingerprint; the landing page already carries
 the version for humans, and that is the right place for it.
 
-## v0.84.0-alpha — CI hardening: the three gates that would have caught this project's worst incidents
+## v0.84.0-alpha , CI hardening: the three gates that would have caught this project's worst incidents
 
 Every check below exists because something got through. None is hypothetical.
 
-### Added — `scripts/check-server-boundaries.mjs` (`npm run check:boundaries`)
+### Added , `scripts/check-server-boundaries.mjs` (`npm run check:boundaries`)
 
 A recursive `sed` once stripped `import "server-only"` from **66 files**,
 including `tenant-context.ts`, `billing/access.ts`, `platform/guard.ts`,
-`audit.ts` and both payment providers. **Every existing gate stayed green** —
+`audit.ts` and both payment providers. **Every existing gate stayed green** ,
 `tsc`, the build, the entire security suite. The guard has no runtime
 behaviour; deleting it removes only the alarm.
 
@@ -2189,66 +2339,66 @@ or `@/lib/env` declares a boundary · no `"use client"` file imports a
 
 **Found two real gaps on its first run**, both now fixed: `lib/queue/processors.ts`
 (opens `withTenant()` transactions, no guard) and `db/index.ts` (exports the
-client and both scope functions — the single most important module never to
+client and both scope functions , the single most important module never to
 reach a browser, and the one file that did not say so). 80 → **84** guarded.
 
 ⚠️ Its first draft flagged 30+ files in `lib/` that import `@/db/schema` for
-**types only**. Type imports are erased at compile time — those modules are
+**types only**. Type imports are erased at compile time , those modules are
 pure GST/interest/seat arithmetic and are correctly importable anywhere.
 Demanding a boundary on them is how a check trains people to silence it. The
 rule now strips type imports and ignores `@/db/schema` entirely.
 
-### Added — `scripts/check-migrations.mjs` (`npm run check:migrations`)
+### Added , `scripts/check-migrations.mjs` (`npm run check:migrations`)
 
 Three files were numbered 0062/0072/0076 when the highest real one was 0045.
 `SQL-FILES/` is applied in numeric order, so numbering **is** execution order.
 Nothing in CI read SQL filenames.
 
 Checks duplicates, gaps, and reuse of a `_superseded/` number. The two
-historical gaps (0004, 0010) are allowed **by name, with reasons** — a check
+historical gaps (0004, 0010) are allowed **by name, with reasons** , a check
 that tolerates a category of fault stops catching that fault.
 
-### Added — `scripts/check-rls-coverage.mjs` (`npm run check:rls`)
+### Added , `scripts/check-rls-coverage.mjs` (`npm run check:rls`)
 
 Four tenant-scoped tables shipped with no RLS at all. The existing CI step
-asserts a **floor** (`count >= 100`) — adding four unprotected tables to 160
+asserts a **floor** (`count >= 100`) , adding four unprotected tables to 160
 protected ones leaves the count at 160. **A floor measures what was done
 right; it cannot see what was done wrong.**
 
 This asks the opposite question, exhaustively: for *every* table with a
-`tenant_id` column — RLS enabled, forced, policied on `app_current_tenant_id()`,
+`tenant_id` column , RLS enabled, forced, policied on `app_current_tenant_id()`,
 and no `app_platform_scope()` in `WITH CHECK`. Zero thresholds. Fails closed
 when it cannot run, because "found nothing" is not "passed".
 
-### Added — `scripts/preflight.mjs` (`npm run preflight`)
+### Added , `scripts/preflight.mjs` (`npm run preflight`)
 
 One gate, invoked identically by CI and locally. Ordered by cost: the two
 static checks take milliseconds and catch the two worst incidents here, so the
 common case fails in under a second instead of after a four-minute build.
 Runs all checks even after one fails, and reports a table.
 
-### Added — `scripts/neon-status.mjs` (`npm run db:status`)
+### Added , `scripts/neon-status.mjs` (`npm run db:status`)
 
-`SQL-FILES/` has no migration ledger — nothing records what ran. This reads
+`SQL-FILES/` has no migration ledger , nothing records what ran. This reads
 every `CREATE TABLE` out of every numbered file and reports each as APPLIED,
 PARTIAL or MISSING against a live database. Read-only. **PARTIAL is the
 interesting result**: a file that failed part-way, or a `drizzle-kit push`
 that dropped something, leaves a database no single file describes.
 
-### Added — `scripts/make-release.sh` (`npm run release`)
+### Added , `scripts/make-release.sh` (`npm run release`)
 
 Builds a verified archive into `~/Downloads/ORDENCE ERP - APP.ORDENCE.COM/`.
-Runs preflight first and aborts on failure — a zip built from a tree that does
+Runs preflight first and aborts on failure , a zip built from a tree that does
 not compile is worse than no zip. Verifies with `unzip -t` (a truncated
 archive lists its entries happily until the central directory is read),
 scans for secrets with an **anchored** match, and writes a checksum and
 release notes.
 
 ⚠️ The secret scan is `grep -x`, not a substring. Unanchored, it flags
-`.env.test.example` — a committed template with no real values — and a check
+`.env.test.example` , a committed template with no real values , and a check
 that cries wolf on a safe file is one people learn to ignore.
 
-### Changed — `.github/workflows/security-ci.yml`
+### Changed , `.github/workflows/security-ci.yml`
 
 Boundary census and migration numbering run in the `build` job before `tsc`.
 Exhaustive RLS coverage runs in `security-tests` after the SQL is applied,
@@ -2258,11 +2408,11 @@ alongside the existing floor check rather than replacing it.
 service container and writes `.env.test` itself, so `billing-gate.test.ts`
 runs automatically under `npm run test:security`.
 
-## v0.83.2-alpha — Security Track S1: the billing gate on core CRM writes
+## v0.83.2-alpha , Security Track S1: the billing gate on core CRM writes
 
 `tsc --noEmit` passes clean. No new dependencies.
 
-### 🔴 S1 — `past_due` workspaces could still write core CRM records
+### 🔴 S1 , `past_due` workspaces could still write core CRM records
 
 `requireAccess()` had **17 call sites** against `requirePermission()`'s 151,
 and was absent from the three most-used write paths in the product. A
@@ -2284,7 +2434,7 @@ allowed to submit.
 `AccessRestrictedError` is now caught **first** in each file's
 `toActionError()` and surfaced with the billing wording. Folding it into
 "Something went wrong. Please try again." would tell a customer whose card
-expired that the software is broken — the one message guaranteed to produce
+expired that the software is broken , the one message guaranteed to produce
 a support ticket instead of a payment.
 
 Reads are untouched. A customer in arrears must still be able to see their
@@ -2292,41 +2442,41 @@ own data.
 
 ### 🔴 The MCP surface bypassed the gate entirely
 
-`server/actions/deals.ts` needed no change — its only export is
+`server/actions/deals.ts` needed no change , its only export is
 `listDealPipeline()`, a read. Auditing *why* surfaced the real hole: the
 **only** deal write in the codebase is `ordence_update_deal_stage` in
 `server/mcp/dispatch.ts`, and that dispatcher checked the token, the scope
-and RLS — but never whether the workspace was still paying.
+and RLS , but never whether the workspace was still paying.
 
 So a company's own staff were correctly read-only while an AI agent holding
 a `read_write` token for the same workspace kept writing. Read-only that one
 caller can walk around is not read-only.
 
-- **`server/billing/access.ts`** — added `getAccessDecisionForTenant()` and
+- **`server/billing/access.ts`** , added `getAccessDecisionForTenant()` and
   `requireAccessForTenant()`. The existing path resolves the tenant from a
   Clerk session; MCP has no Clerk session, only `session.tenantId`. Both new
-  functions fail OPEN on their own errors, matching `getAccessDecision()` —
+  functions fail OPEN on their own errors, matching `getAccessDecision()` ,
   a billing-table outage must not stop a customer's agent pipeline. The
   subscription read runs inside `withTenant()`, because a plain `db` read
   with no tenant context returns zero rows under RLS and would have looked
   like "no subscription" and granted everyone full access.
-- **`server/mcp/dispatch.ts`** — every tool declared `scope: "read_write"`
+- **`server/mcp/dispatch.ts`** , every tool declared `scope: "read_write"`
   now passes the gate before executing. Read tools are unaffected; an agent
   answering "what do I owe?" is the call most likely to end in a payment.
 
 ### Changed
 
-- **`server/actions/deals.ts`** — a header explaining why it has no
+- **`server/actions/deals.ts`** , a header explaining why it has no
   `requireAccess()` call and what to do the moment a write is added. A new
   write added without the guard silently reopens this hole and nothing in
   the type system would notice.
 
 ### Removed / renamed
 
-- **`lib/command/registry.ts`** — deleted. Dead code with zero importers;
+- **`lib/command/registry.ts`** , deleted. Dead code with zero importers;
   the working ⌘K palette is `components/layout/command-bar.tsx` and carries
   its own action list. Two lists of command destinations would drift.
-- **`MASTER_PLAN.md` → `docs/BATCH-PLAN-460.md`** — renamed rather than
+- **`MASTER_PLAN.md` → `docs/BATCH-PLAN-460.md`** , renamed rather than
   deleted. It is **not** a duplicate of `docs/MASTER-PLAN.md`: that file is
   a v0.25.0-alpha product roadmap (Waves A–H, "what unlocks money") and
   contains zero mentions of the 460 batches, the seven departments or
@@ -2335,20 +2485,20 @@ caller can walk around is not read-only.
 
 ### Tests
 
-**`tests/security/billing-gate.test.ts`** — 16 assertions across five groups,
+**`tests/security/billing-gate.test.ts`** , 16 assertions across five groups,
 against a real throwaway Postgres.
 
-⚠️ **It drives `unpaid` + expired grace, NOT `past_due`** — and the header
+⚠️ **It drives `unpaid` + expired grace, NOT `past_due`** , and the header
 explains why at length. `tests/ui/access-state.test.tsx` already pins the
 commercial rule in a test named *"⭐ past_due NEVER restricts writes, at any
 failure count"*: while the provider is still retrying, cutting access loses
 the customer **and** the payment. Restriction begins only once the status is
-`unpaid` and its seven-day grace window has closed — roughly three weeks
+`unpaid` and its seven-day grace window has closed , roughly three weeks
 after the first failure.
 
 A suite written against `past_due` would have gone red and looked like the S1
 gate was broken, inviting somebody to "fix" it by making `past_due`
-restrictive — silently reversing that decision and locking customers out on
+restrictive , silently reversing that decision and locking customers out on
 their first failed card.
 
 Covers: writes refused · **reads still succeed** · billing and export never
@@ -2357,7 +2507,7 @@ MCP `read_write` gated while read tools stay available · RLS unaffected by
 billing state.
 
 Two of the groups are **source assertions**, deliberately. Every behavioural
-test above passes whether or not `contacts.ts` actually calls the gate — they
+test above passes whether or not `contacts.ts` actually calls the gate , they
 test the gate, not its callers, and that is the exact shape of the original
 defect: a correct, tested `requireAccess` with 17 call sites where 151 were
 needed. So the suite also reads the source and asserts each write path calls
@@ -2369,12 +2519,12 @@ gained no write function.
 
 `requireAccess` / `requireAccessForTenant` call sites: **17 → 32**.
 
-## v0.83.1-alpha — The Build Fix, the Pooling Fix, and the Missing RLS
+## v0.83.1-alpha , The Build Fix, the Pooling Fix, and the Missing RLS
 
 Canonical tree: **`ordence-v55 2`**. `tsc --noEmit` passes clean.
-No new dependencies — `package.json` gained nothing.
+No new dependencies , `package.json` gained nothing.
 
-### 🔴 THE BUILD FAILURE — found and fixed
+### 🔴 THE BUILD FAILURE , found and fixed
 
 `next build` had been failing with:
 
@@ -2384,7 +2534,7 @@ No new dependencies — `package.json` gained nothing.
 
 `components/platform/user-actions.tsx` is a `"use client"` component and it
 imported `updateUserStatus` / `updateUserRole` **straight from**
-`server/platform/users.ts` — a `server-only` module that reaches
+`server/platform/users.ts` , a `server-only` module that reaches
 `guard.ts` → `withPlatformScope()`, the cross-tenant read escape hatch.
 
 This is why `tsc --noEmit` always passed: TypeScript does not check bundler
@@ -2399,7 +2549,7 @@ written. Added `updateUserStatusAction` and `updateUserRoleAction`.
 
 **⚠️ A `sed` had deleted `import "server-only";` from `users.ts` as an
 attempted fix. That has been reverted** (restored byte-identical from the
-untouched sibling). Deleting the line removes the alarm, not the fault — and
+untouched sibling). Deleting the line removes the alarm, not the fault , and
 it does not even work: the same error immediately reappears in `guard.ts`,
 which also imports `next/headers` and genuinely cannot exist client-side.
 
@@ -2408,16 +2558,16 @@ only violation; the other 32 were already correct.
 
 ### 🔴 Missing row-level security
 
-`SQL-FILES/0062`, `0072` and `0076` created four tenant-scoped tables —
+`SQL-FILES/0062`, `0072` and `0076` created four tenant-scoped tables ,
 `deployment_releases`, `deployment_backups`, `security_batches`,
-`flow_submissions` — with **no `ENABLE`, no `FORCE`, no policy**. In this
+`flow_submissions` , with **no `ENABLE`, no `FORCE`, no policy**. In this
 codebase RLS *is* the tenant boundary; a `tenant_id` column with no policy
 behind it is a column, not isolation.
 
 They were also numbered 0062/0072/0076 when the highest real migration was
 0045, leaving permanent gaps.
 
-Replaced by **`0046_deployment_flows_governance.sql`** — contiguous
+Replaced by **`0046_deployment_flows_governance.sql`** , contiguous
 numbering, the same four tables plus the `ui_governance_checks` tracker the
 460-batch plan referenced but never defined, all with the policy shape every
 other table here uses:
@@ -2425,7 +2575,7 @@ other table here uses:
     USING      (tenant_id = app_current_tenant_id() OR app_platform_scope())
     WITH CHECK (tenant_id = app_current_tenant_id())
 
-Platform scope in `USING` only — read across tenants for support, never
+Platform scope in `USING` only , read across tenants for support, never
 write. The old files moved to `SQL-FILES/_superseded/` with a README. 0046
 is idempotent, so it repairs an already-migrated database rather than
 duplicating.
@@ -2433,7 +2583,7 @@ duplicating.
 ### 🔴 The v55 notification regression
 
 - **Every notification emailed everyone.** The severity test read
-  `critical || warning || !input.severity` — the third clause meant the
+  `critical || warning || !input.severity` , the third clause meant the
   DEFAULT case emailed every active user, and `background-workers.ts`
   creates those on a schedule.
 - **50 sequential awaited Resend calls** on the request path → now
@@ -2441,7 +2591,7 @@ duplicating.
 - **Returned the literal string `"created"`** instead of the UUID its own
   return type promised. `ordence_create_reminder` was handing the word
   "created" to an AI agent.
-- **The tenant-name lookup read zero rows, always** — it used the plain `db`
+- **The tenant-name lookup read zero rows, always** , it used the plain `db`
   client with no tenant context, so RLS matched nothing. Every email said
   "Your workspace". Folded into the tenant transaction, collapsing three
   connections per notification into one.
@@ -2449,7 +2599,7 @@ duplicating.
 ### ⭐ `withTenant()` no longer opens a pool per call
 
 `db/index.ts` created a new `Pool` and called `pool.end()` on **every**
-tenant-scoped query — correct for Cloudflare Workers, wrong for the
+tenant-scoped query , correct for Cloudflare Workers, wrong for the
 long-lived Node process Railway runs, where it meant a fresh TCP handshake
 and TLS negotiation per query and a straight run at Neon's connection limit.
 
@@ -2462,22 +2612,22 @@ transaction, so it is discarded at COMMIT before the connection is reused.
 
 It omitted `period_start` and `period_end` (both NOT NULL) and supplied
 `due_date`, whose schema comment reads *"Written by trigger. Never accept
-this from a form."* A cast — `as unknown as typeof complianceTasks.$inferInsert`
-— suppressed the only check that would have caught it. Now matches the
+this from a form."* A cast , `as unknown as typeof complianceTasks.$inferInsert`
+, suppressed the only check that would have caught it. Now matches the
 documented convention in `server/actions/compliance.ts` and is idempotent by
 constraint.
 
 ### Added
 
-- `components/layout/command-bar.tsx` — ⌘K palette on `@radix-ui/react-dialog`
+- `components/layout/command-bar.tsx` , ⌘K palette on `@radix-ui/react-dialog`
   (already a dependency) rather than adding `cmdk`. Filtering is server-side
   via `globalSearch()` under RLS. 200ms debounce, because search is
   rate-limited server-side.
-- `server/actions/bulk.ts` — bulk soft-delete and owner reassignment over a
+- `server/actions/bulk.ts` , bulk soft-delete and owner reassignment over a
   hardcoded entity allowlist. One transaction, one audit entry with a
   `batchId`, permission checked once before the first write, capped at 500.
   Soft delete only. Calls `requireAccess()`.
-- `lib/documents/csv.ts` — CSV export with formula-injection neutralising
+- `lib/documents/csv.ts` , CSV export with formula-injection neutralising
   (CWE-1236), UTF-8 BOM so ₹ and Devanagari survive Excel, CRLF per RFC 4180,
   explicit column allowlist.
 
@@ -2488,12 +2638,12 @@ constraint.
   part of this project, and `lib/billing/invoice-render.ts` already emits a
   Rule-46 invoice with print styles.
 - **The seven files pasted in from the previous AI session are retained and
-  currently imported by zero modules** — `lib/ui/tokens.ts`,
+  currently imported by zero modules** , `lib/ui/tokens.ts`,
   `lib/command/registry.ts`, `lib/flows/registry.ts`,
   `lib/security/toolkit.ts`, the two `components/ui/` wrappers, and
   `deployment-control/page.tsx`. They compile; nothing uses them yet.
   `lib/security/toolkit.ts` also duplicates token hashing that
-  `server/mcp/dispatch.ts` already does — two hashing paths will diverge.
+  `server/mcp/dispatch.ts` already does , two hashing paths will diverge.
 - **Still open:** `requireAccess()` has 17 call sites against
   `requirePermission()`'s 151, and is absent from `contacts.ts`,
   `companies.ts` and `deals.ts`. A `past_due` workspace is meant to be
@@ -2501,27 +2651,27 @@ constraint.
 - `npm install` reports 12 vulnerabilities (6 high) and an
   `eslint@10` / `eslint-config-next@16` peer conflict against `next@15`.
 
-## v0.21.0-alpha — PITR, Backup & Restore (1 August 2026)
+## v0.21.0-alpha , PITR, Backup & Restore (1 August 2026)
 
 **Wave 2 complete** (bar the admin-console wiring). A recycle bin, a
 tenant export, a disaster-recovery runbook, and a drill that proves a
 restore actually works.
 
 ### Added
-- **`lib/backup/recoverable.ts`** — the catalogue of what can be restored,
+- **`lib/backup/recoverable.ts`** , the catalogue of what can be restored,
   with per-entity preconditions. Deliberate omissions (users, tenants,
   payment methods) each carry a reason.
-- **`server/backup/restore.ts`** — the recycle bin, with preconditions
+- **`server/backup/restore.ts`** , the recycle bin, with preconditions
   checked BEFORE writing and re-checked inside the transaction.
-- **`server/backup/export.ts`** — a complete tenant export. Answers three
+- **`server/backup/export.ts`** , a complete tenant export. Answers three
   requirements at once: disaster recovery, the DPDP right of access, and
   the ability to leave.
-- **`scripts/restore-drill.ts`** (`npm run drill:restore`) — a real
+- **`scripts/restore-drill.ts`** (`npm run drill:restore`) , a real
   restore against a real database, refusing to run against production.
-- **`docs/DISASTER-RECOVERY.md`** — four incident levels, each with a
+- **`docs/DISASTER-RECOVERY.md`** , four incident levels, each with a
   different response, and an explicit list of what the runbook does not
   cover.
-- **`app/(crm)/settings/recovery/`** — the recycle bin and export UI.
+- **`app/(crm)/settings/recovery/`** , the recycle bin and export UI.
 
 ### The decisions
 - **Nothing hard-deletes on a timer.** The 30-day window governs what the
@@ -2530,7 +2680,7 @@ restore actually works.
 - **Restore is blocked when the parent is deleted**, when a live row has
   taken a unique value, or when it falls in a closed financial period.
   Each message names the remedy, not just the status.
-- **The export is an allowlist**, never a scan of `information_schema` —
+- **The export is an allowlist**, never a scan of `information_schema` ,
   a dynamic export is one migration away from including a token table.
 - **The export includes soft-deleted rows**, deliberately: "a copy of your
   data" means everything, and it is what makes the file a real backup.
@@ -2540,7 +2690,7 @@ restore actually works.
 ### Found by these tests
 - **Two wrong column names in my own catalogue** (`contacts.full_name`,
   `custom_object_records.object_definition_id`). Either would have made
-  a whole category of the recycle bin throw and render empty — which reads
+  a whole category of the recycle bin throw and render empty , which reads
   to a customer as "gone forever". Caught by coherence tests that check
   the catalogue against the live schema.
 - **The drill initially ran everything on one connection** and failed at
@@ -2550,44 +2700,44 @@ restore actually works.
   suite already does.
 
 ### Tests
-- `tests/security/recovery.test.ts` — 21 tests, including a sweep proving
+- `tests/security/recovery.test.ts` , 21 tests, including a sweep proving
   a tenant-scoped read of every exported table returns zero foreign rows.
 - Totals: **361 security** (was 340), **556 UI** (unchanged).
 
 ---
 
 
-## v0.16.0-alpha — Invoicing & the Billing Portal (1 August 2026)
+## v0.16.0-alpha , Invoicing & the Billing Portal (1 August 2026)
 
 **Wave 1 complete.** GST-compliant invoice generation, a customer billing
 portal, and the constraints that stop an invoice being created wrongly.
 
 ### Added
-- **`server/billing/invoice-generator.ts`** — draft → attach lines → issue,
+- **`server/billing/invoice-generator.ts`** , draft → attach lines → issue,
   all in one transaction. The order is forced by the database, not by
   convention.
-- **`lib/billing/invoice-lines.ts`** — pure line composition. Extra seats
+- **`lib/billing/invoice-lines.ts`** , pure line composition. Extra seats
   get their OWN line; prorations show credit and charge separately.
-- **`lib/billing/invoice-render.ts`** — a self-contained GST tax invoice
+- **`lib/billing/invoice-render.ts`** , a self-contained GST tax invoice
   with every field Rule 46 requires, amount-in-words in the Indian
   numbering system, and print styles.
-- **`server/actions/invoicing.ts`** — read, download, issue by hand, void.
-- **`app/(crm)/settings/billing/`** — the portal, with a per-panel Suspense
+- **`server/actions/invoicing.ts`** , read, download, issue by hand, void.
+- **`app/(crm)/settings/billing/`** , the portal, with a per-panel Suspense
   boundary so one slow query cannot blank the page a lapsed customer came
   to fix.
-- **`SQL-FILES/0015_phase16_invoicing.sql`** — the duplicate-period index,
+- **`SQL-FILES/0015_phase16_invoicing.sql`** , the duplicate-period index,
   the empty-invoice guard, REVOKE-before-GRANT, 8 verification checks.
 
 ### The constraints that matter
 - **One invoice per subscription period**, by partial unique index.
   Proven by racing four concurrent attempts: exactly one wins.
-- **A voided invoice frees the period** for a corrected one — the only
+- **A voided invoice frees the period** for a corrected one , the only
   supported route back from a mistaken issue.
 - **An invoice cannot be issued with no lines.** The Phase 11 trigger
   prevents CHANGING an issued invoice, not issuing an empty one.
 - **No DELETE on invoices.** A number that vanishes from a series is
   exactly what an auditor asks about.
-- Invoice numbers are unique across the whole platform, not per tenant —
+- Invoice numbers are unique across the whole platform, not per tenant ,
   GST requires the series consecutive across the registration.
 
 ### Fixed
@@ -2597,7 +2747,7 @@ portal, and the constraints that stop an invoice being created wrongly.
 - **A concurrency test was asserting a property the code deliberately does
   not have.** It fired four deltas at a level starting from zero and
   expected an order-independent sum; the clamp at zero discards a negative
-  delta that lands first. The clamp is correct — a negative storage level
+  delta that lands first. The clamp is correct , a negative storage level
   would hand a tenant unlimited free quota. The test was rewritten to
   assert what is true and valuable, with the clamp given its own test.
 - **Two tests were mutating shared fixture state**, producing failures that
@@ -2608,9 +2758,9 @@ portal, and the constraints that stop an invoice being created wrongly.
   file that imports the database.
 
 ### Tests
-- `tests/ui/invoicing.test.tsx` — 35 tests: every Rule 46 field, hostile
+- `tests/ui/invoicing.test.tsx` , 35 tests: every Rule 46 field, hostile
   input in the customer's own legal name, Indian numbering.
-- `tests/security/invoicing-integrity.test.ts` — 11 tests including the
+- `tests/security/invoicing-integrity.test.ts` , 11 tests including the
   concurrency race.
 - Totals: **556 UI** (was 521), **340 security** (was 328). Both stable
   across repeated runs.
@@ -2618,7 +2768,7 @@ portal, and the constraints that stop an invoice being created wrongly.
 ---
 
 
-## v0.15.0-alpha — Usage Metering, Integrated (1 August 2026)
+## v0.15.0-alpha , Usage Metering, Integrated (1 August 2026)
 
 Phase 15 wired into the running application, and the Phase 17/18 schema
 brought into the barrel and the composite SQL.
@@ -2631,10 +2781,10 @@ brought into the barrel and the composite SQL.
   using. Both are silent, so they land together or not at all.
 - **Release on delete is best-effort and outside the transaction.** Rolling
   back a failed meter update would leave the blob already gone from storage
-  while the row survived — a document the customer can see and never open.
+  while the row survived , a document the customer can see and never open.
   An over-count that the nightly reconcile corrects beats a dangling
   reference that nothing does.
-- **Quota gate on upload only.** Never on delete, download or export — a
+- **Quota gate on upload only.** Never on delete, download or export , a
   customer at their limit must always be able to free space and to leave
   with their data. Asserted by test.
 - Portal-link creation metered, best-effort.
@@ -2644,7 +2794,7 @@ brought into the barrel and the composite SQL.
 ### Fixed
 - **Test pool was sized exactly to demand.** `max: 4` with a concurrency
   test needing exactly 4 simultaneous connections. Any lingering connection
-  starved it, and the suite then reported a CONCURRENCY test failing —
+  starved it, and the suite then reported a CONCURRENCY test failing ,
   pointing at the code under test rather than the harness. That is the worst
   shape a flake can take in a security suite. Doubled, with the reasoning
   recorded.
@@ -2654,7 +2804,7 @@ brought into the barrel and the composite SQL.
   surfaced twice as nineteen unrelated AUTHORISATION tests failing.
 - The upload suite now mocks the quota gate (it reaches the database, and
   `getServerEnv()` correctly refuses to run under jsdom) **and asserts the
-  gate is present and ordered before token issuance** — a mocked dependency
+  gate is present and ordered before token issuance** , a mocked dependency
   you also rely on being present can otherwise be deleted with the suite
   still green.
 
@@ -2664,16 +2814,16 @@ brought into the barrel and the composite SQL.
 ---
 
 
-## v0.14.0-alpha — Lockout, Dunning & Access Restriction (31 July 2026)
+## v0.14.0-alpha , Lockout, Dunning & Access Restriction (31 July 2026)
 
-**Wave 1, Phase 4 of 6.** The paywall — written around one principle:
+**Wave 1, Phase 4 of 6.** The paywall , written around one principle:
 **never lock out a customer who is trying to pay you.**
 
 ### Added
-- **`lib/billing/access-state.ts`** — a five-rung ladder (full → notice →
+- **`lib/billing/access-state.ts`** , a five-rung ladder (full → notice →
   warning → restricted → locked) with the copy for each. Pure and
   isomorphic.
-- **`server/billing/access.ts`** — `requireAccess()`, `checkAccess()`,
+- **`server/billing/access.ts`** , `requireAccess()`, `checkAccess()`,
   `getAccessBanner()`, `AccessRestrictedError`.
 - Access gate wired ahead of the entitlement and permission gates on all
   twelve write paths.
@@ -2688,18 +2838,18 @@ brought into the barrel and the composite SQL.
 - **Export is permitted at every level, including a hard lock.** Retaining
   someone's data while denying them a copy is a DPDP problem, not a
   collections strategy.
-- **Billing is reachable at every level** — a paywall you cannot pay
+- **Billing is reachable at every level** , a paywall you cannot pay
   through is just a wall. Enforced by an exempt-prefix list, tested
   against adversarial namespaces.
-- **A trial does not hard-stop at midnight** — three days of read-write
+- **A trial does not hard-stop at midnight** , three days of read-write
   grace, because a trial that stops dead catches people mid-evaluation.
 - **Cancelling keeps full access through the paid period.**
 - **Administrative suspension outranks billing**, checked first, so paying
   an invoice cannot silently un-suspend a workspace suspended for abuse.
-- **No collections language.** Asserted by test — no "delinquent",
+- **No collections language.** Asserted by test , no "delinquent",
   "overdue", "arrears".
 
-### Design note — this gate FAILS OPEN
+### Design note , this gate FAILS OPEN
 Every other gate fails closed. This one cannot: a failed subscription
 query must not take every paying customer's workspace away. A few hours
 of unbilled access is a smaller blast radius than a self-inflicted outage.
@@ -2707,7 +2857,7 @@ Administrative suspension still applies, because it is decided from the
 tenant row rather than the query that failed.
 
 ### Tests
-- `tests/ui/access-state.test.tsx` — 28 tests, including a sweep over every
+- `tests/ui/access-state.test.tsx` , 28 tests, including a sweep over every
   status × grace × trial combination asserting no state ever hides or
   blocks export of a customer's own data.
 - Totals: **395 UI** (was 367), **238 security** (unchanged).
@@ -2715,15 +2865,15 @@ tenant row rather than the query that failed.
 ---
 
 
-## v0.13.0-alpha — Seat Licensing (31 July 2026)
+## v0.13.0-alpha , Seat Licensing (31 July 2026)
 
 **Wave 1, Phase 3 of 6.** Seat counting and enforcement. No new tables, no
 new dependencies, shared bundle unchanged.
 
 ### Added
-- **`lib/billing/seats.ts`** — pure seat arithmetic. `occupiesSeat`,
+- **`lib/billing/seats.ts`** , pure seat arithmetic. `occupiesSeat`,
   `computeSeatState`, `canTakeSeats`, overage and warning copy.
-- **`server/billing/seats.ts`** — `countSeatsInUse`, `countSeatsPurchased`,
+- **`server/billing/seats.ts`** , `countSeatsInUse`, `countSeatsPurchased`,
   `requireSeat`, `getSeatSummary`, `SeatLimitError`.
 - `getSeatUsage()` action for the team page.
 - Enforcement on user reactivation and on the Clerk membership webhook.
@@ -2732,12 +2882,12 @@ new dependencies, shared bundle unchanged.
 - **Invited users HOLD a seat.** The most commonly got-wrong rule: without
   it a 5-seat workspace can invite fifty people and someone is surprised
   on acceptance day.
-- **Suspended users free a seat** — that is how a customer swaps one
+- **Suspended users free a seat** , that is how a customer swaps one
   employee for another. The consequence is that *reactivating* someone
   consumes a seat and can fail, which is checked and explained.
 - **`platform_super_admin` never consumes a customer's seat.** Billing
   someone for our own support engineer would be indefensible.
-- **Guests never consume a seat** — closer to a portal visitor than an
+- **Guests never consume a seat** , closer to a portal visitor than an
   employee.
 - **Nobody is auto-suspended when a workspace goes over.** Choosing six of
   eleven employees to lock out is not a decision an algorithm should make.
@@ -2750,7 +2900,7 @@ new dependencies, shared bundle unchanged.
   need every status-changing path to remember to adjust it, and one missed
   path means a customer is blocked with seats free, or exceeds what they
   paid for.
-- The Clerk webhook path **does not refuse** — a non-2xx makes Clerk retry
+- The Clerk webhook path **does not refuse** , a non-2xx makes Clerk retry
   forever and strands the user in the identity provider. It creates the
   user, lets the workspace go over, and writes an audit row.
 - The seat rule is written twice (SQL and TypeScript).
@@ -2758,39 +2908,39 @@ new dependencies, shared bundle unchanged.
   database over a fixture covering every status and both exempt roles.
 
 ### Tests
-- `tests/security/seat-licensing.test.ts` — 30 tests.
+- `tests/security/seat-licensing.test.ts` , 30 tests.
 - Totals: **238 security** (was 208), **367 UI** (unchanged).
 
 ---
 
 
-## v0.12.0-alpha — Entitlements & Feature Gating (31 July 2026)
+## v0.12.0-alpha , Entitlements & Feature Gating (31 July 2026)
 
 **Wave 1, Phase 2 of 6.** One `can(feature)` gate the whole product
 consults. No new dependencies; shared bundle unchanged at 102 kB.
 
 ### Added
-- **`lib/entitlements/features.ts`** — 26 gateable features, each with a
+- **`lib/entitlements/features.ts`** , 26 gateable features, each with a
   `minTier`. Pure and isomorphic so the pricing page, the navigation and
   the server gate read one matrix. Tiers are a ladder, so a higher tier is
   always a strict superset.
-- **`server/entitlements.ts`** — `requireFeature()` (throws, for writes),
+- **`server/entitlements.ts`** , `requireFeature()` (throws, for writes),
   `checkFeature()` / `can()` (returns, for reads), `checkFeatures()`,
   `getEntitlementSummary()`. Deduplicated per-request with React `cache()`.
-- **`components/billing/feature-gate.tsx`** — `FeatureGate`,
+- **`components/billing/feature-gate.tsx`** , `FeatureGate`,
   `UpgradePrompt`, `LockedControl`.
 - Gates wired into 12 write paths across accounting, periods, storage,
   custom objects, contracts and the portal.
 
 ### Design decisions
 - **Entitlement is checked BEFORE permission.** Order does not change the
-  outcome, only the message — and telling a workspace owner they "lack
+  outcome, only the message , and telling a workspace owner they "lack
   permission" for something they have not bought sends them to ask an
   administrator who is themselves.
 - **Reads are never gated.** A downgrade must not make the customer's own
   ledger, contracts or documents look deleted. They can look; they cannot
   write.
-- **A trial is treated as Advanced**, not as the cheapest tier — a trial
+- **A trial is treated as Advanced**, not as the cheapest tier , a trial
   that unlocks the least impressive version sells nothing.
 - **A lapsed workspace drops to Basic**, not to zero, and its message says
   "paused, your data is safe" rather than "upgrade".
@@ -2805,15 +2955,15 @@ consults. No new dependencies; shared bundle unchanged at 102 kB.
   `Object.hasOwn`.
 - **`inert=""` rendered nothing.** React drops an empty string for
   boolean-ish attributes, so the "locked" subtree stayed fully keyboard
-  focusable with no visible symptom — only a keyboard or screen-reader
+  focusable with no visible symptom , only a keyboard or screen-reader
   user would ever have found it. Now `inert={true}`.
 - **An automated pass put three gates on `getTrialBalance` and none on
-  `postTransaction`** — reads gated, writes open. Corrected, and a test
+  `postTransaction`** , reads gated, writes open. Corrected, and a test
   now fails if any action whose name starts with `get`/`list`/`find` is
   ever feature-gated again.
 
 ### Tests
-- `tests/ui/entitlements.test.tsx` — 29 tests including the
+- `tests/ui/entitlements.test.tsx` , 29 tests including the
   superset property across every tier pair, prototype-pollution keys, and
   a source scan asserting no action compares `planTier` directly.
 - Totals: **236 UI** (was 207), **171 security** (unchanged).
@@ -2821,45 +2971,45 @@ consults. No new dependencies; shared bundle unchanged at 102 kB.
 ---
 
 
-## v0.11.0-alpha — Billing Foundation (31 July 2026)
+## v0.11.0-alpha , Billing Foundation (31 July 2026)
 
 **Wave 1, Phase 1 of 6.** The machinery to charge people. No new production
 dependencies; the shared client bundle is unchanged at 102 kB.
 
 ### Added
-- **`db/schema/billing.ts`** — six tables: `plans` (platform catalogue, no
+- **`db/schema/billing.ts`** , six tables: `plans` (platform catalogue, no
   tenant_id, protected by GRANT), `subscriptions`, `invoices`,
   `invoice_lines`, `payment_events` (append-only evidence), `payment_methods`
-  (provider tokens only — no PAN, no CVV, no PCI scope).
-- **`lib/billing/money.ts`** — exact BigInt minor-unit arithmetic, GST
+  (provider tokens only , no PAN, no CVV, no PCI scope).
+- **`lib/billing/money.ts`** , exact BigInt minor-unit arithmetic, GST
   computation (CGST/SGST vs IGST), GSTIN validation with mod-36 checksum,
   second-based proration, month-end-safe interval arithmetic.
-- **`lib/billing/providers/`** — Razorpay, Stripe and manual adapters behind
+- **`lib/billing/providers/`** , Razorpay, Stripe and manual adapters behind
   one interface. HMAC verification via `node:crypto`; no SDKs.
-- **`lib/billing/state-machine.ts`** — the pure subscription transition
+- **`lib/billing/state-machine.ts`** , the pure subscription transition
   table, extracted so it is testable without a database.
-- **`lib/billing/redact.ts`** — Luhn-checked payload redaction before
+- **`lib/billing/redact.ts`** , Luhn-checked payload redaction before
   permanent storage.
-- **`server/billing/reconcile.ts`** — the single path by which a provider
+- **`server/billing/reconcile.ts`** , the single path by which a provider
   event changes state. Idempotent, transactional, order-aware.
-- **`app/api/webhooks/{razorpay,stripe}/route.ts`** — public endpoints,
+- **`app/api/webhooks/{razorpay,stripe}/route.ts`** , public endpoints,
   Node runtime, verify-before-parse.
-- **`server/actions/billing.ts`** — checkout, plan preview, cancellation,
+- **`server/actions/billing.ts`** , checkout, plan preview, cancellation,
   manual settlement, billing profile.
-- **`SQL-FILES/0009_phase11_billing.sql`** — RLS on five tables, append-only
+- **`SQL-FILES/0009_phase11_billing.sql`** , RLS on five tables, append-only
   triggers, issued-invoice immutability, invoice numbering sequence, grants.
-- **`scripts/seed-plans.ts`** (`npm run seed:plans`) — idempotent upsert that
+- **`scripts/seed-plans.ts`** (`npm run seed:plans`) , idempotent upsert that
   never reprices existing customers.
 
 ### Security
-- **Webhook replay protection** — UNIQUE index on
+- **Webhook replay protection** , UNIQUE index on
   `payment_events(provider, provider_event_id)`, global rather than
   per-tenant so one tenant cannot replay another's event.
-- **Out-of-order protection** — `subscriptions.last_provider_event_at`
+- **Out-of-order protection** , `subscriptions.last_provider_event_at`
   high-water mark against the provider's timestamp.
-- **One live subscription per tenant** — partial unique index, preventing
+- **One live subscription per tenant** , partial unique index, preventing
   double billing after a failed cancellation.
-- **Issued invoices immutable** — amounts, number, tenant, tax identity and
+- **Issued invoices immutable** , amounts, number, tenant, tax identity and
   line items all fixed once issued; drafts remain editable.
 - **🔴 Fixed: additive GRANTs were not a restriction.** The grant block only
   added privileges, so a prior blanket `GRANT ALL` would have left the
@@ -2869,12 +3019,12 @@ dependencies; the shared client bundle is unchanged at 102 kB.
 - 30 tables now under forced RLS (was 25).
 
 ### Tests
-- `tests/security/billing-isolation.test.ts` — 45 tests, real PostgreSQL 16,
+- `tests/security/billing-isolation.test.ts` , 45 tests, real PostgreSQL 16,
   non-superuser.
-- `tests/ui/billing-webhooks.test.tsx` — 60 tests: signature forgery,
+- `tests/ui/billing-webhooks.test.tsx` , 60 tests: signature forgery,
   replay, tampering, secret rotation, event normalisation, redaction, and
   the full state machine.
-- `tests/ui/billing-money.test.tsx` — 45 tests including property tests over
+- `tests/ui/billing-money.test.tsx` , 45 tests including property tests over
   every hour of a month.
 - Totals: **171 security** (was 126), **207 UI** (was 102).
 
@@ -2899,7 +3049,7 @@ within a batch increments PATCH. Each version passes a security run before relea
 
 ---
 
-## [v0.10.0-alpha] — 2026-07-31 — Executive Dashboards & Financial Analytics
+## [v0.10.0-alpha] , 2026-07-31 , Executive Dashboards & Financial Analytics
 
 **Security run:** PASS ([report](docs/SECURITY-REPORT-v0.10.0.md))
 **Tests:** 228 passing (126 security + 102 UI) · **Build:** clean, 28 routes · **Prod vulns:** 0
@@ -2907,16 +3057,16 @@ within a batch increments PATCH. Each version passes a security run before relea
 ### Added
 - **Three SQL analytics views**, all created `WITH (security_invoker = true)`:
   `v_asset_portfolio`, `v_ledger_daily` (30-day date spine), `v_contract_pipeline`
-- **`db/schema/analytics.ts`** — Drizzle view TYPES only, via `.existing()`, so
+- **`db/schema/analytics.ts`** , Drizzle view TYPES only, via `.existing()`, so
   `drizzle-kit push` cannot recreate them without `security_invoker`
-- **`server/actions/analytics.ts`** — aggregates inside `withTenant()`, summed in
+- **`server/actions/analytics.ts`** , aggregates inside `withTenant()`, summed in
   BigInt paise, never floats
-- **Rebuilt dashboard** — six independent `<Suspense>` boundaries, each panel
+- **Rebuilt dashboard** , six independent `<Suspense>` boundaries, each panel
   fetching its own data so the page streams instead of blocking on the slowest query
 - **Skeleton loaders** that reserve layout, preventing content jump
 - **`FinancialBarChart`**, **`AssetPipelinePieChart`**, **`RecentActivityFeed`**
   (virtualized), **`QuickActions`**
-- **`npm run db:verify`** — interrogates the live database and exits non-zero if
+- **`npm run db:verify`** , interrogates the live database and exits non-zero if
   RLS, policies, `WITH CHECK`, `security_invoker` or integrity triggers are missing
 - **13 new tests** proving RLS isolation through the views
 
@@ -2929,7 +3079,7 @@ before  npm run db:push  ->  25 tables with RLS,  25 policies
 after   npm run db:push  ->   0 tables with RLS,   0 policies
 ```
 
-The application keeps working — every page renders, every query succeeds. The only
+The application keeps working , every page renders, every query succeeds. The only
 difference is that tenants can read each other's data.
 
 No harm has occurred: every deployment guide runs `ALL-IN-ONE-SETUP.sql` *after*
@@ -2940,7 +3090,7 @@ printed by `db:push`, a CI step, and explicit documentation. **SEC-022** recomme
 
 ### ⭐ RLS does NOT cascade into SQL views
 A PostgreSQL view runs as its OWNER, not the caller. Measured before writing any
-view — a non-superuser session pinned to ONE tenant:
+view , a non-superuser session pinned to ONE tenant:
 
 ```
 naive view      (no option)                ->  6 tenants visible
@@ -2952,7 +3102,7 @@ three views use `security_invoker`, the SQL refuses to run on PostgreSQL < 15, a
 a test builds both kinds side by side to demonstrate the difference rather than
 assert it.
 
-### Bundle impact — Recharts does NOT bloat the app
+### Bundle impact , Recharts does NOT bloat the app
 ```
 Routes loading the Recharts chunk:  1 of 33  (/dashboard)
 Recharts chunk:                     105 kB gzipped
@@ -2961,7 +3111,7 @@ Public portal route:                120 kB          (UNCHANGED)
 ```
 
 ### Chart design
-Colour was **computed, not chosen** — every hue validated against the real chart
+Colour was **computed, not chosen** , every hue validated against the real chart
 surfaces. Three light-mode hues measured below 3:1 contrast, so every chart ships a
 legend, direct value labels and a **"View as table"** toggle. Categorical hues in
 fixed order, never cycled; donut capped at 5 slices with the tail folded to "Other";
@@ -2974,51 +3124,51 @@ no dual-axis charts; status colours reserved and always paired with a word.
 ### Known limitations
 - **SEC-023 (new, low):** views re-aggregate on every load. Correct and fast for a
   single tenant's row counts; revisit past ~1M journal entries.
-- The dashboard has **not been rendered in a real browser** yet — data layer, types
+- The dashboard has **not been rendered in a real browser** yet , data layer, types
   and build are verified; visual geometry is not.
 
 ---
 
-## [v0.9.0-alpha] — 2026-07-31 — External Client Portal & Secure Approvals
+## [v0.9.0-alpha] , 2026-07-31 , External Client Portal & Secure Approvals
 
 **Security run:** PASS ([report](docs/SECURITY-REPORT-v0.9.0.md))
 **Tests:** 215 passing (113 security + 102 UI) · **Build:** clean, 28 routes · **Prod vulns:** 0
 
 ### Added
-- **`portal_links` table** — 256-bit bearer credentials, stored as SHA-256
+- **`portal_links` table** , 256-bit bearer credentials, stored as SHA-256
   hashes. RLS `ENABLE` + `FORCE`, plus a tamper-guard trigger covering the
   token, target, permission and expiry
-- **`contract_signatures` table** — append-only signature evidence with IP,
+- **`contract_signatures` table** , append-only signature evidence with IP,
   user agent, content hash and the verbatim consent statement
-- **`lib/portal/tokens.ts`** — `crypto.randomBytes` generation, hashing,
+- **`lib/portal/tokens.ts`** , `crypto.randomBytes` generation, hashing,
   shape validation, constant-time comparison, masking
-- **`server/portal-context.ts`** — sessionless tenant resolution:
+- **`server/portal-context.ts`** , sessionless tenant resolution:
   `token → resolve → tenantId → withTenant() → RLS`
-- **`/portal/[token]`** — public, branded, read-only document view requiring
+- **`/portal/[token]`** , public, branded, read-only document view requiring
   no Clerk account
-- **`/portal/[token]/documents/[id]`** — token-authenticated download, separate
+- **`/portal/[token]/documents/[id]`** , token-authenticated download, separate
   from the internal route by design
-- **`server/actions/signatures.ts`** — approve-and-sign with three independent
+- **`server/actions/signatures.ts`** , approve-and-sign with three independent
   layers of replay prevention
-- **`server/actions/portal.ts`** — generate, list, revoke, revoke-all
-- **`components/crm/portal-manager.tsx`** — one-time link reveal, copy, revoke
+- **`server/actions/portal.ts`** , generate, list, revoke, revoke-all
+- **`components/crm/portal-manager.tsx`** , one-time link reveal, copy, revoke
 - **`ContractReadyEmail` now carries the portal URL**, so a recipient clicks
   from their inbox straight into the document instead of a sign-in page
-- **48 new tests** — 25 portal isolation and token rejection, 23 token
+- **48 new tests** , 25 portal isolation and token rejection, 23 token
   cryptography
 
 ### Fixed
 - **🔴 `withTenant()` was silently returning zero rows.** It set
   `app.current_tenant_id` with `is_local => true` but opened no transaction, so
   the setting was discarded before the next statement and every RLS policy
-  matched nothing. Present since Phase 1. It failed **closed** — nothing
-  leaked — but any code path relying on it for scoping returned nothing.
+  matched nothing. Present since Phase 1. It failed **closed** , nothing
+  leaked , but any code path relying on it for scoping returned nothing.
   Fixed with an explicit transaction; both behaviours are now asserted in
   `tests/security/withtenant-scope.test.ts`.
 
   The obvious alternative (`is_local => false`) was **rejected as dangerous**:
   it sets the value for the pooled *connection*, which then returns to the pool
-  still carrying that tenant. Verified — the next borrower inherits it.
+  still carrying that tenant. Verified , the next borrower inherits it.
 
 - **🟠 Tamper-guard tests passed for the wrong reason.** Our triggers raise
   SQLSTATE 42501, and so does a missing `GRANT`. The test role had no
@@ -3027,7 +3177,7 @@ no dual-axis charts; status colours reserved and always paired with a word.
   message and explicitly rejects `permission denied for table`.
 
 - **🟠 The portal returned 500 on a database outage**, exposing a stack trace
-  to an anonymous visitor. `resolvePortalToken` now never throws — any
+  to an anonymous visitor. `resolvePortalToken` now never throws , any
   unexpected failure becomes a refusal, which is the fail-closed direction.
   Verified: with the database unreachable, the portal returns a clean 404.
 
@@ -3041,11 +3191,11 @@ no dual-axis charts; status colours reserved and always paired with a word.
 - **Replay is prevented three ways:** an atomic compare-and-swap that consumes
   the link *before* writing the signature, a UNIQUE index on
   `portal_link_id`, and a contract status guard.
-- **A view-only link can never be upgraded to signing** — that would turn a
+- **A view-only link can never be upgraded to signing** , that would turn a
   read-only share into signing authority without the recipient being told.
   Downgrading is allowed.
 - **`Referrer-Policy: no-referrer` and `X-Frame-Options: DENY` on `/portal`.**
-  The token is in the URL, so a `Referer` leak is the realistic risk — not
+  The token is in the URL, so a `Referer` leak is the realistic risk , not
   brute force against 256 bits.
 
 ### Known limitations
@@ -3057,38 +3207,38 @@ no dual-axis charts; status colours reserved and always paired with a word.
 
 ---
 
-## [v0.8.0-alpha] — 2026-07-31 — Cloud Storage, Document Assembly & Transactional Email
+## [v0.8.0-alpha] , 2026-07-31 , Cloud Storage, Document Assembly & Transactional Email
 
 **Security run:** PASS ([report](docs/SECURITY-REPORT-v0.8.0.md))
 **Tests:** 165 passing (86 security + 79 UI) · **Build:** clean, 26 routes · **Prod vulns:** 0
 
 ### Added
-- **`documents` table** (`db/schema/storage.ts`) — polymorphic attachments for
+- **`documents` table** (`db/schema/storage.ts`) , polymorphic attachments for
   contracts, assets, deals, contacts and companies. RLS `ENABLE` + **`FORCE`**,
   plus two immutability triggers (tenant and parent/pathname)
-- **`/api/upload`** — Vercel Blob client-token issuer. Verifies the Clerk
+- **`/api/upload`** , Vercel Blob client-token issuer. Verifies the Clerk
   session, **rebuilds the storage path from the session's tenant id**, and
   attaches the content-type allowlist, size ceiling and a 10-minute expiry to
   the token itself
-- **`/api/documents/[id]/download`** — authenticated streaming download. Files
+- **`/api/documents/[id]/download`** , authenticated streaming download. Files
   are stored **private**; this route re-checks session and tenant on every
   request
-- **`saveDocumentRecord` / `getDocuments` / `deleteDocument`** — with parent
+- **`saveDocumentRecord` / `getDocuments` / `deleteDocument`** , with parent
   ownership verification standing in for the foreign key a polymorphic link
   cannot have
-- **`lib/email/resend.ts`** — typed dispatcher that never throws, degrades
+- **`lib/email/resend.ts`** , typed dispatcher that never throws, degrades
   cleanly without an API key, and de-duplicates via idempotency keys
-- **`ContractReadyEmail` and `LedgerAlertEmail`** — HTML + plain-text, every
+- **`ContractReadyEmail` and `LedgerAlertEmail`** , HTML + plain-text, every
   interpolation escaped, `href` schemes allowlisted
-- **`DocumentVault`** — drag-and-drop, per-file progress, virtualized list
+- **`DocumentVault`** , drag-and-drop, per-file progress, virtualized list
 - **Contract detail page** with the vault mounted and a "Send to Client" flow
 - **Contracts list page**
-- **36 new tests** — 17 document isolation (real PostgreSQL), 19 Blob token
+- **36 new tests** , 17 document isolation (real PostgreSQL), 19 Blob token
   authorisation, and 41 email-safety assertions
 
 ### Security decisions worth knowing
 - **Blobs are `private`, not `public`.** A public blob URL is readable by
-  anyone who ever sees it, forever, with no session and no tenant check — and
+  anyone who ever sees it, forever, with no session and no tenant check , and
   RLS cannot help, because the bytes are not in PostgreSQL. This is the single
   most consequential choice in the phase.
 - **The upload path is rebuilt server-side.** The client's requested pathname
@@ -3105,11 +3255,11 @@ no dual-axis charts; status colours reserved and always paired with a word.
 
 ### Fixed / avoided during this phase
 - **`onUploadCompleted` removed rather than shipped broken.** `/api/upload` is
-  not a public route, so `middleware.ts` requires a session — Vercel's
+  not a public route, so `middleware.ts` requires a session , Vercel's
   server-to-server webhook would have received a 401 on every call. It also
   never fires on localhost. The authoritative write is the server action.
 - **Literal control characters in two regexes**, in `sanitizeFileName` and
-  `escUrl` — the same defect this codebase shipped once before in the URL
+  `escUrl` , the same defect this codebase shipped once before in the URL
   sanitiser. Both rewritten with explicit `\u` escapes and tested against tab
   and newline scheme-splitting payloads.
 - **A stray non-English word** in a code comment, and an `access: "public"`
@@ -3118,40 +3268,40 @@ no dual-axis charts; status colours reserved and always paired with a word.
 ### Known limitation
 - **SEC-018 (new, low):** if the browser tab closes between the upload
   completing and `saveDocumentRecord` committing, the object is orphaned in
-  storage with no row. A storage-cost leak, not an exposure — the object is
+  storage with no row. A storage-cost leak, not an exposure , the object is
   private and unreachable without a row. A reconciliation sweep is the fix.
 
 ---
 
-## [v0.7.0-alpha] — 2026-07-31 — The CRUD Surface & Application UI
+## [v0.7.0-alpha] , 2026-07-31 , The CRUD Surface & Application UI
 
 **Security run:** PASS ([report](docs/SECURITY-REPORT-v0.7.0.md))
 **Tests:** 19 UI + 69 security = 88 passing · **Build:** clean, 22 routes · **Prod vulns:** 0
 
 ### Added
-- **Form infrastructure** — `useActionForm` hook wiring Zod schemas to server
+- **Form infrastructure** , `useActionForm` hook wiring Zod schemas to server
   actions, with server field errors mapped back onto the inputs they belong to
-- **`DynamicFieldSet`** — renders a working form from `custom_field_definitions`
+- **`DynamicFieldSet`** , renders a working form from `custom_field_definitions`
   rows; 12 field types, no migration required to add one
-- **Contacts** — create and edit pages, one component serving both modes
-- **Companies** — full CRUD (`server/actions/companies.ts`), list, create, edit
-- **Assets** — `server/actions/assets.ts` and a create page whose Details
+- **Contacts** , create and edit pages, one component serving both modes
+- **Companies** , full CRUD (`server/actions/companies.ts`), list, create, edit
+- **Assets** , `server/actions/assets.ts` and a create page whose Details
   section is generated from the tenant's own field definitions
-- **Accounting page** — trial balance, journal entry form, period list
-- **Period close/reopen dialogs** — **resolves SEC-014**. Reopening requires a
+- **Accounting page** , trial balance, journal entry form, period list
+- **Period close/reopen dialogs** , **resolves SEC-014**. Reopening requires a
   written reason of 15+ characters, recorded in the audit log
-- **Settings** — General, Team and Financial tabs as separate routes
-- **Role management** (`server/actions/team.ts`) — assign roles, suspend and
+- **Settings** , General, Team and Financial tabs as separate routes
+- **Role management** (`server/actions/team.ts`) , assign roles, suspend and
   reinstate, with three anti-escalation rules enforced server-side
-- **`<Toaster />`** mounted in the root layout — without it every toast in the
+- **`<Toaster />`** mounted in the root layout , without it every toast in the
   application was a silent no-op
-- **UI test suite** — 19 tests in jsdom driving real components with real
+- **UI test suite** , 19 tests in jsdom driving real components with real
   keyboard input; wired into the CI security gate as a required job
 
 ### Fixed
 - **`watch("legs")` did not track the field array** in the journal entry form.
   The running balance read ₹0.00 no matter what was typed, so the submit button
-  could never enable — **the accounting form was completely unusable**. Replaced
+  could never enable , **the accounting form was completely unusable**. Replaced
   with `useWatch`. Found by the balance-gate tests, not by reading the code.
 - **`required` never reached the form controls.** Every field component passed
   it to the label (for the asterisk) but not to the input, so required fields
@@ -3162,7 +3312,7 @@ no dual-axis charts; status colours reserved and always paired with a word.
   a file into a public RPC endpoint; the build fails once a page imports it.
   Moved to `lib/validators/`. Verified the failure mode with a probe build
   rather than assuming it.
-- **`ASSIGNABLE_ROLES` exported from `server/actions/team.ts`** — the same
+- **`ASSIGNABLE_ROLES` exported from `server/actions/team.ts`** , the same
   defect, introduced during this phase and caught by the build.
 - Removed a duplicate role-ranking table from the team UI. Two copies of a
   privilege ordering is exactly the kind of duplication that drifts apart.
@@ -3176,18 +3326,18 @@ no dual-axis charts; status colours reserved and always paired with a word.
 
 ---
 
-## [v0.6.0-alpha] — 2026-07-31 — Automated Security Tests & CI
+## [v0.6.0-alpha] , 2026-07-31 , Automated Security Tests & CI
 
 **Security run:** PASS ([report](docs/SECURITY-REPORT-v0.6.0.md))
 **Tests:** 69 passing against real PostgreSQL 16 · **Build:** clean · **Prod vulns:** 0
 
 ### Added
 - **Vitest setup** with a 6-check production-database guard (3 verified firing)
-- **`tests/security/rls-isolation.test.ts`** — 24 tests
-- **`tests/security/accounting-triggers.test.ts`** — 23 tests
-- **`tests/security/audit-immutability.test.ts`** — 22 tests
-- **`.github/workflows/security-ci.yml`** — 5 jobs, real Postgres service container
-- **`docs/PROJECT-STATUS.md`** — full done/pending inventory
+- **`tests/security/rls-isolation.test.ts`** , 24 tests
+- **`tests/security/accounting-triggers.test.ts`** , 23 tests
+- **`tests/security/audit-immutability.test.ts`** , 22 tests
+- **`.github/workflows/security-ci.yml`** , 5 jobs, real Postgres service container
+- **`docs/PROJECT-STATUS.md`** , full done/pending inventory
 
 ### Fixed
 - **`drizzle.config.ts` pointed at `./db/schema.ts`**, which stopped existing in
@@ -3197,39 +3347,39 @@ no dual-axis charts; status colours reserved and always paired with a word.
   non-superuser role, with a startup check that aborts if it detects one.
 
 ### Security
-- **SEC-004 RESOLVED** — isolation is now machine-verified on every commit
+- **SEC-004 RESOLVED** , isolation is now machine-verified on every commit
 - Coverage tests fail if any future table with a `tenant_id` lacks RLS or a policy
 - Trigger *timing* asserted, not just existence: balance check deferred, period lock immediate
 
 ### Known limitations
-- **SEC-016:** branch protection not yet enabled — CI reports but cannot block
+- **SEC-016:** branch protection not yet enabled , CI reports but cannot block
 
 ---
 
-## [v0.5.0-alpha] — 2026-07-31 — Financial Controls, RBAC, Audit & Dashboards
+## [v0.5.0-alpha] , 2026-07-31 , Financial Controls, RBAC, Audit & Dashboards
 
 **Security run:** PASS ([report](docs/SECURITY-REPORT-v0.5.0.md))
 **Build:** Clean · TS strict · 0 prod vulns · 10/10 period-lock · 11/11 RBAC · 7/7 permission engine
 
 ### Added
-- **Financial period close** (`financial_periods` + `enforce_period_close` trigger) —
+- **Financial period close** (`financial_periods` + `enforce_period_close` trigger) ,
   the database rejects any journal entry dated inside a closed period, on INSERT,
   UPDATE and DELETE. Periods cannot overlap (`EXCLUDE USING gist`). **Resolves SEC-012.**
-- **Period actions** (`server/actions/periods.ts`) — create, close (with trial-balance
+- **Period actions** (`server/actions/periods.ts`) , create, close (with trial-balance
   verification and a ledger snapshot), reopen (separate permission, written reason,
   critical-severity audit).
-- **Permission catalog** (`db/schema/auth.ts`) — 50 permissions, 9 role templates,
+- **Permission catalog** (`db/schema/auth.ts`) , 50 permissions, 9 role templates,
   `permission_denials` table for security review.
-- **Permission engine** (`lib/permissions.ts`) — pure, Edge-safe, fail-closed.
+- **Permission engine** (`lib/permissions.ts`) , pure, Edge-safe, fail-closed.
   Revoke always beats grant.
-- **Audit enforcement** (`server/audit.ts`) — `checkPermission` / `requirePermission`
+- **Audit enforcement** (`server/audit.ts`) , `checkPermission` / `requirePermission`
   decide and record in one call. Dangerous denials also write a `security_event`.
-- **Executive dashboard** (`app/(crm)/dashboard/`) — Recharts, polymorphic by industry.
+- **Executive dashboard** (`app/(crm)/dashboard/`) , Recharts, polymorphic by industry.
   Real estate: cost-to-completion, retainage, unit status. Legal: retainer balances,
   contract lifecycle. Every chart paired with a screen-reader data table.
-- **Phase 5 seeder** — 9 users across 8 roles, 8 ledgers, 4 periods (2 closed),
+- **Phase 5 seeder** , 9 users across 8 roles, 8 ledgers, 4 periods (2 closed),
   50 balanced transactions, 100 audit logs, 18 permission denials.
-- **`SQL-FILES/` folder** — all SQL in one place. `ALL-IN-ONE-SETUP.sql` is now
+- **`SQL-FILES/` folder** , all SQL in one place. `ALL-IN-ONE-SETUP.sql` is now
   1,134 lines, 13 sections, 12 verification checks, 22 protected tables.
 
 ### Changed
@@ -3244,76 +3394,76 @@ no dual-axis charts; status colours reserved and always paired with a word.
 - 4 tables now append-only: audit_logs, contract_versions, journal_entries, permission_denials.
 - Separation of duties verified by executed test: the Accountant role can post
   entries but cannot close a period.
-- Unknown permission strings are DENIED — a typo cannot grant access.
+- Unknown permission strings are DENIED , a typo cannot grant access.
 - 22 tables under Row-Level Security.
 
 ### Known limitations
-- No UI for period close — server action only (SEC-014)
+- No UI for period close , server action only (SEC-014)
 - No admin UI for permission overrides (SEC-015)
-- **No automated cross-tenant isolation test suite (SEC-004)** — the most valuable
+- **No automated cross-tenant isolation test suite (SEC-004)** , the most valuable
   remaining gap
 
 ---
 
-## [v0.4.0-alpha] — 2026-07-31 — Legal CLM, Trust Accounting, Grid Persistence & Workers
+## [v0.4.0-alpha] , 2026-07-31 , Legal CLM, Trust Accounting, Grid Persistence & Workers
 
 **Security run:** PASS ([report](docs/SECURITY-REPORT-v0.4.0.md))
 **Build:** Clean · TS strict · 0 prod vulnerabilities · 7/7 balance tests · 10/10 worker auth · 12/12 grid checks
 
 ### Added
-- **Grid persistence** (`server/actions/grid.ts`) — `updateAssetCell`,
+- **Grid persistence** (`server/actions/grid.ts`) , `updateAssetCell`,
   `updateCustomRecordCell`, `bulkUpdateAssetStatus`. JSONB path allowlisting,
   prototype-pollution guards, depth/key caps, full audit trail. **Resolves SEC-009.**
-- **Legal CLM** (`db/schema/clm.ts`) — `contracts`, `contract_versions`
+- **Legal CLM** (`db/schema/clm.ts`) , `contracts`, `contract_versions`
   (immutable, SHA-256 hash-chained), `clause_library`.
-- **Double-entry accounting** (`db/schema/accounting.ts`) — `ledgers`,
+- **Double-entry accounting** (`db/schema/accounting.ts`) , `ledgers`,
   `transactions`, `journal_entries`. Trust/escrow/retention ledger types.
-- **Balance enforcement** — deferred constraint trigger validates debits = credits
+- **Balance enforcement** , deferred constraint trigger validates debits = credits
   at COMMIT. Exact BigInt paise arithmetic in the app layer; NUMERIC(18,2) in the DB.
-- **BullMQ queue** (`lib/queue/bullmq.ts`, `lib/queue/processors.ts`) — 4 job kinds,
+- **BullMQ queue** (`lib/queue/bullmq.ts`, `lib/queue/processors.ts`) , 4 job kinds,
   tenant-asserted payloads, graceful degradation when Redis is absent.
-- **Worker endpoint** (`app/api/workers/route.ts`) — QStash signature, bearer secret
+- **Worker endpoint** (`app/api/workers/route.ts`) , QStash signature, bearer secret
   (timing-safe), or Vercel Cron. Fail-closed. Bounded to 7.5s / 5 jobs.
-- **Document assembly** (`server/actions/documents.ts`) — merge-field resolution,
+- **Document assembly** (`server/actions/documents.ts`) , merge-field resolution,
   version chaining, `verifyContractIntegrity()`.
-- **Contract renderer** (`lib/documents/render.ts`) — print-optimised HTML, fully escaped.
-- **⭐ `ALL-IN-ONE-SETUP.sql`** — every migration (Phases 1–4) consolidated into one
+- **Contract renderer** (`lib/documents/render.ts`) , print-optimised HTML, fully escaped.
+- **⭐ `ALL-IN-ONE-SETUP.sql`** , every migration (Phases 1–4) consolidated into one
   idempotent file with six built-in verification checks.
 
 ### Security
-- Money never touches a JS float — proven in test: `0.1 + 0.2 !== 0.3`.
+- Money never touches a JS float , proven in test: `0.1 + 0.2 !== 0.3`.
 - Journal entries, contract versions and audit logs are all append-only at DB level.
 - Cross-tenant journal posting blocked by trigger (ledger AND transaction tenancy).
-- Worker secrets compared with `timingSafeEqual` — `===` leaks the prefix by timing.
+- Worker secrets compared with `timingSafeEqual` , `===` leaks the prefix by timing.
 - 20 tables now under Row-Level Security.
 
 ### Known limitations
-- No period-close locking — back-dated entries are possible (**SEC-012**, Phase 5)
+- No period-close locking , back-dated entries are possible (**SEC-012**, Phase 5)
 - PDF output is print-ready HTML, not binary PDF (SEC-011)
 - Bank reconciliation schema exists but has no UI (SEC-013)
 
 ---
 
-## [v0.3.0-alpha] — 2026-07-31 — Industry Routing, Asset Catalog & Virtual Grids
+## [v0.3.0-alpha] , 2026-07-31 , Industry Routing, Asset Catalog & Virtual Grids
 
 **Security run:** PASS ([report](docs/SECURITY-REPORT-v0.3.0.md))
 **Build:** Compiles clean · TypeScript strict · 0 production vulnerabilities · 33/33 XSS checks pass
 
 ### Added
-- **Industry routing engine** (`lib/industry-templates.ts`, `app/(crm)/layout.tsx`) —
+- **Industry routing engine** (`lib/industry-templates.ts`, `app/(crm)/layout.tsx`) ,
   Real Estate Developer and Legal Advocate templates. Navigation, dashboard widgets
   and terminology morph from one database field. Role-filtered server-side.
-- **Universal asset schema** (`db/schema/assets.ts`) — `assets` (20 asset types,
+- **Universal asset schema** (`db/schema/assets.ts`) , `assets` (20 asset types,
   12 statuses, JSONB attributes, GIN-indexed) and `asset_relationships` (graph edges
   with 8 relationship types).
-- **Virtualized grid** (`components/crm/virtual-grid.tsx`) — TanStack Table v8 +
+- **Virtualized grid** (`components/crm/virtual-grid.tsx`) , TanStack Table v8 +
   TanStack Virtual. Infinite scroll, inline editing with optimistic updates,
   bulk selection, dynamic JSONB columns. Constant DOM footprint.
-- **Safe rendering layer** (`lib/safe-render.ts`) — XSS-hardened JSONB display.
-- **Stress-test seeder** (`scripts/seed-basaveshwar-project.ts`) — real Basaveshwar
+- **Safe rendering layer** (`lib/safe-render.ts`) , XSS-hardened JSONB display.
+- **Stress-test seeder** (`scripts/seed-basaveshwar-project.ts`) , real Basaveshwar
   Nagar development: 194 assets, 193 relationships, 4-level-deep JSONB.
-- **Global search** (`server/actions/search.ts`) — 4 entities, tenant-filtered first.
-- **TanStack Query provider** (`app/providers.tsx`) — per-session client.
+- **Global search** (`server/actions/search.ts`) , 4 entities, tenant-filtered first.
+- **TanStack Query provider** (`app/providers.tsx`) , per-session client.
 - RLS policies + cross-tenant graph triggers (`0003_phase3_rls.sql`).
 
 ### Fixed
@@ -3330,41 +3480,41 @@ no dual-axis charts; status colours reserved and always paired with a word.
 - Cross-tenant asset graph edges blocked at the database level.
 - Self-referencing asset edges blocked (would loop tree traversal forever).
 - Prototype-pollution keys blocked in JSONB path lookups.
-- `QueryClient` created per session — a module-level client leaks cache across tenants during SSR.
+- `QueryClient` created per session , a module-level client leaks cache across tenants during SSR.
 
 ### Known limitations
-- Inline edits do not persist — `onCellEdit` is a stub pending Phase 4 (**SEC-009**)
+- Inline edits do not persist , `onCellEdit` is a stub pending Phase 4 (**SEC-009**)
 - `/assets` caps at 1,000 rows; needs cursor pagination (SEC-010)
 - No CSP yet (SEC-002); no rate limiting on search (SEC-005)
 
 ---
 
-## [v0.2.0-alpha] — 2026-07-31 — Vertical Core, Clerk Sync & Custom Objects
+## [v0.2.0-alpha] , 2026-07-31 , Vertical Core, Clerk Sync & Custom Objects
 
 **Security run:** PASS ([report](docs/SECURITY-REPORT-v0.2.0.md))
 **Build:** Compiles clean · TypeScript strict · 0 production vulnerabilities · Middleware 87.1 kB
 
 ### Added
-- **Clerk organization webhook** (`app/api/webhooks/clerk/route.ts`) — Svix-verified,
+- **Clerk organization webhook** (`app/api/webhooks/clerk/route.ts`) , Svix-verified,
   handles `organization.created/updated/deleted` and `organizationMembership.created/updated/deleted`.
   Auto-provisions tenants with default branding, INR/IST settings and a 14-day trial.
-- **CRM entities** (`db/schema/crm.ts`) — `companies`, `contacts`, `deals` with
+- **CRM entities** (`db/schema/crm.ts`) , `companies`, `contacts`, `deals` with
   JSONB custom fields, GIN indexes, soft delete and tenant-led composite indexes.
-- **Dynamic custom object engine** (`db/schema/custom-objects.ts`) —
+- **Dynamic custom object engine** (`db/schema/custom-objects.ts`) ,
   `custom_object_definitions`, `custom_field_definitions`, `custom_object_records`.
   Tenants define new business entities with zero migrations. 12 field types.
-- **Server actions** (`server/actions/`) — full CRUD for contacts, define/read/create
+- **Server actions** (`server/actions/`) , full CRUD for contacts, define/read/create
   for custom objects. All Zod-validated, all tenant-scoped from the session.
-- **Data grid** (`components/crm/data-grid.tsx`) — TanStack Table v8, sorting,
+- **Data grid** (`components/crm/data-grid.tsx`) , TanStack Table v8, sorting,
   pagination, search, WCAG 2.1 AA (aria-sort, keyboard rows, live regions).
   `buildDynamicColumns()` renders JSONB custom fields by declared type.
-- **Schema barrel** (`db/schema/index.ts`) — single import surface.
-- **Validators** (`lib/validators/crm.ts`) — schemas and pure helpers, importable by clients.
+- **Schema barrel** (`db/schema/index.ts`) , single import surface.
+- **Validators** (`lib/validators/crm.ts`) , schemas and pure helpers, importable by clients.
 - RLS policies and cross-tenant reference triggers for all six new tables (`0002_phase2_rls.sql`).
 
 ### Fixed
 - Build failure: `"use server"` files may only export async functions. Zod schemas and
-  pure helpers moved to `lib/validators/crm.ts` — also removes them as unintended RPC endpoints.
+  pure helpers moved to `lib/validators/crm.ts` , also removes them as unintended RPC endpoints.
 
 ### Security
 - 10/10 server actions verified to derive `tenantId` from session and scope every query.
@@ -3376,12 +3526,12 @@ no dual-axis charts; status colours reserved and always paired with a word.
 ### Known limitations
 - `updateCustomRecord` / `deleteCustomRecord` not yet implemented (SEC-007)
 - `isUnique` on custom fields declared but not enforced (SEC-008)
-- No CSP yet — needs nonce configuration for Clerk (SEC-002)
+- No CSP yet , needs nonce configuration for Clerk (SEC-002)
 - Webhook endpoint is not rate-limited (SEC-005)
 
 ---
 
-## [v0.1.0-alpha] — 2026-07-31 — Foundation
+## [v0.1.0-alpha] , 2026-07-31 , Foundation
 
 **Security run:** ✅ PASS ([report](docs/SECURITY-REPORT-v0.1.0.md))
 **Build:** ✅ Compiles clean · TypeScript strict · 0 production vulnerabilities
@@ -3397,7 +3547,7 @@ no dual-axis charts; status colours reserved and always paired with a word.
 - Zod-validated environment with browser-access guard
 - Tenant-namespaced Redis cache and rate limiter
 - Security headers (HSTS, nosniff, frame-options, permissions-policy)
-- Clerk Organizations integration — sign-in, sign-up, onboarding, dashboard
+- Clerk Organizations integration , sign-in, sign-up, onboarding, dashboard
 - Deployment guide, cost/upgrade guide, security report
 
 ### Security
@@ -3407,11 +3557,11 @@ no dual-axis charts; status colours reserved and always paired with a word.
 - Disabled production source maps and `x-powered-by` header
 
 ### Known limitations
-- Tenant rows are not auto-created yet — Clerk webhook lands in Phase 2 (SEC-003)
-- No Content-Security-Policy yet — needs nonce config for Clerk (SEC-002)
+- Tenant rows are not auto-created yet , Clerk webhook lands in Phase 2 (SEC-003)
+- No Content-Security-Policy yet , needs nonce config for Clerk (SEC-002)
 - BullMQ workers cannot run on Vercel; separate host needed from Phase 3 (SEC-006)
 
-## v1.37.0-alpha — Mega-wave 1, batches 33 and 35 (partial)
+## v1.37.0-alpha , Mega-wave 1, batches 33 and 35 (partial)
 
 ### 🔴 The tax was decided by comparing two strings (Batch 33)
 
@@ -3427,11 +3577,11 @@ unit, or an intra-UT supply. SQL 0080 adds six columns to `sales_orders`,
 `state_code` to `projects`, and four CHECK constraints.
 
 Three further sites found by the new gate rather than by reading:
-- `lib/inventory/transfer.ts` — its own comment named the SEZ case four
+- `lib/inventory/transfer.ts` , its own comment named the SEZ case four
   lines above the comparison that got it wrong.
-- `server/actions/time-billing.ts` — took `isInterState` as a
+- `server/actions/time-billing.ts` , took `isInterState` as a
   client-supplied boolean and defaulted place of supply to `"27"`.
-- the same file — `isUnionTerritory: false`, hardcoded.
+- the same file , `isUnionTerritory: false`, hardcoded.
 
 ### Twelve links led to a 404 (Batch 35, partial)
 
@@ -3440,10 +3590,10 @@ seven working sub-sections underneath it; that one is built. Eleven
 remain, registered with a budget that may only decrease.
 
 ### Gates: thirteen
-- ⭐ `check:tax-decisions` (new) — no tax split derived from a comparison
-- ⭐ `check:links` (new) — no internal link without a destination
+- ⭐ `check:tax-decisions` (new) , no tax split derived from a comparison
+- ⭐ `check:links` (new) , no internal link without a destination
 
-## v1.38.0-alpha — Mega-wave 1, batch 51
+## v1.38.0-alpha , Mega-wave 1, batch 51
 
 ### 🔴 One hardcoded `"0"` made every month behave like April
 
@@ -3473,7 +3623,7 @@ Feeding real attendance into the run needs an attendance table. There
 isn't one: `labour.ts` has an `attendanceKindEnum` for construction
 labour and nothing for staff. Batch 50 cannot ship before Batch 59.
 
-## v1.39.0-alpha — Mega-wave 1, batch 36 (bank accounts)
+## v1.39.0-alpha , Mega-wave 1, batch 36 (bank accounts)
 
 ### 🔴 `insert(bankAccounts)` appeared nowhere in the tree
 
@@ -3504,7 +3654,7 @@ A new test walks all 256 `pgTable` exports and asserts `bankAccounts` and
 what the master checklist already flagged as unreachable, including
 `campaigns`, `worksContracts` and `retentionReleases`.
 
-## v1.40.0-alpha — Mega-wave 2, batch 41 (support consent)
+## v1.40.0-alpha , Mega-wave 2, batch 41 (support consent)
 
 ### 🔴 No screen anywhere granted consent, so every visit was break-glass
 
@@ -3524,7 +3674,7 @@ modes, immediate revocation, and the full history.
 right: `requireTenantContext()` answers "who are you", not "may you do
 this". The door now asks a permission and the engine still asks a role.
 
-## v1.41.0-alpha — Mega-wave 1, batch 34 (order detail)
+## v1.41.0-alpha , Mega-wave 1, batch 34 (order detail)
 
 ### 🔴 Eleven of twelve actions in `orders.ts` had no caller
 
@@ -3549,7 +3699,7 @@ cancelOrder, holdOrder, releaseOrder, closeOrder.
 
 ### check:links budget 11 → 10
 
-## v1.42.0-alpha — Batch 34 complete: the product can take an order
+## v1.42.0-alpha , Batch 34 complete: the product can take an order
 
 ### 🔴 `createOrder` had no caller
 
@@ -3578,7 +3728,7 @@ Batch 33 makes the engine refuse a works contract with no site state
 code. The project dropdown shows which projects have one, so the refusal
 is visible while choosing rather than a surprise at save time.
 
-## v1.43.0-alpha — Batch 38, first half: the GRN moves the stock
+## v1.43.0-alpha , Batch 38, first half: the GRN moves the stock
 
 ### 🔴 A goods receipt wrote its own row and left the stock ledger alone
 
@@ -3605,18 +3755,18 @@ hundred and sold ten showed minus ten.
 `recordPurchaseInvoice` has none either. The correctness half is done;
 the screens are the second half.
 
-## v1.44.0-alpha — four batches in one run (first parallel wave)
+## v1.44.0-alpha , four batches in one run (first parallel wave)
 
 Four file-disjoint tracks built concurrently by subagents, then one
 integration pass. Previous runs delivered one batch each.
 
-### Batch 38 second half — the purchase receipt screen
+### Batch 38 second half , the purchase receipt screen
 `/purchases/orders/[id]` reaches `recordGoodsReceipt` (first path by
 which inventory can go UP) and `runThreeWayMatch` (first thing ever able
 to set `purchase_invoices.match_state`, which the payment run has read
 since v1.11.0).
 
-### Batch 37 — statement periods
+### Batch 37 , statement periods
 P&L, balance sheet and trial balance take a period, defaulting to the
 current Indian FY rather than since inception. 🔴 The balance sheet takes
 an "as at" and keeps `from: null`, because a from-date would filter out
@@ -3627,25 +3777,25 @@ added so the accounting identity still holds in year two.
 every load. `BigInt("1234.56")` throws, and the action produces decimal
 strings. Any tenant with one ledger row got an exception.
 
-### Batch 45 — canary probes
+### Batch 45 , canary probes
 `/api/cron/canary` attempts cross-tenant reads against real tenant ids on
 a schedule. 🔴 Refuses to report a pass when the connection bypasses RLS,
 returning 503 INCONCLUSIVE rather than a green tick that would be false
 assurance forever. Also detects the third bypass vector: a table owner is
 exempt from its own policies without FORCE.
 
-### Batch 35 — lead screens
+### Batch 35 , lead screens
 `/sales/leads/new` and `/sales/leads/[id]`. All 8 exports of
 `sales-leads.ts` now have callers; five had none.
 
 ### check:links budget 10 → 8
 
-## v1.45.0-alpha — six batches in one run
+## v1.45.0-alpha , six batches in one run
 
 🔴 SQL: yes. `0081_audit_hash_chain.sql`.
 🔴 ORDER: run the SQL FIRST, then push the code. This is the OPPOSITE of
 0079 and 0080. The new writer inserts columns that raise 42703 on an
-unmigrated database, and `writeAudit`'s catch would swallow it — silently
+unmigrated database, and `writeAudit`'s catch would swallow it , silently
 turning the audit trail off, which is the exact defect this hardens.
 
 ### Three-way match was matching across purchase orders
@@ -3657,12 +3807,12 @@ own order, one row per bill line. A bill with no `po_id` returns
 Also: `recomputeOrderStatus` compared totals across all lines, so an
 over-delivery on one line masked a shortfall on another.
 
-### Batch 57 — CSV import, the first data import of any kind
+### Batch 57 , CSV import, the first data import of any kind
 Generic framework, two entities, own parser (BOM, CRLF, quoted newlines).
 Preview and commit share one code path with the mode branch below every
 decision. Failed rows download as a valid re-uploadable CSV.
 
-### Batch 65 — cash flow statement, indirect method
+### Batch 65 , cash flow statement, indirect method
 Closing cash computed twice by two routes sharing no ledger. When they
 disagree it renders NO figure, including the true closing balance.
 
@@ -3671,12 +3821,12 @@ disagree it renders NO figure, including the true closing balance.
 corrected, leaving turnover permanently lower in a statement that still
 balances.
 
-### Batch 42 — platform staff console
+### Batch 42 , platform staff console
 `grantPlatformStaff`/`revokePlatformStaff` had zero callers; every grant
 was hand-written SQL.
 
-### Batch 44 — audit hash chaining (SQL 0081)
-### Batch 107 — employee self-service
+### Batch 44 , audit hash chaining (SQL 0081)
+### Batch 107 , employee self-service
 
 ### check:guards TIER2 list gained `guardImport`
 The list was incomplete, not the code.
